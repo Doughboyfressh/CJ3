@@ -1,0 +1,28 @@
+# toolcheck: flashtools.pi against the real terminal and the real internet, without the brain or the GPU. Every command
+# here only reads. Not a golden: its output depends on the machine and the network.
+import "flashtools.pi"
+
+skill head(s) -> Any {
+  print(slice(s, 0, min(len(s), 700)))
+  print("---- " ++ str(len(s)) ++ " bytes")
+  return 0
+}
+
+skill main() -> Any {
+  head(ft_shell("echo hello from the shell & ver", null))
+  head(ft_shell("echo one\necho two\ncd", null))
+  head(ft_shell("exit /b 3", null))
+  head(ft_shell("nosuchcommand_xyz", null))
+  // the limit: stops it and the ping under it
+  head(ft_shell("ping -n 30 127.0.0.1", "2"))
+  // long output comes back as its two ends; binary output comes back as text the tokenizer can take
+  head(ft_shell("dir /s examples", null))
+  head(ft_shell("type seed\\pic.exe", null))
+  head(ft_shell("", null))
+  head(ft_web("https://example.com", null, null, null, null, null))
+  head(ft_web("https://html.duckduckgo.com/html/?q=pi+programming+language", null, null, null, null, null))
+  head(ft_web("https://example.com/nosuchpage", null, null, null, null, null))
+  head(ft_web("https://no-such-host.invalid/", null, null, null, null, null))
+  head(ft_web("file:///c:/windows/win.ini", null, null, null, null, null))
+  return 0
+}

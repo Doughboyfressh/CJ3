@@ -1,0 +1,151 @@
+# Rounds: the library compounds. Each round Pi dreams problems USING ITS CURRENT VOCABULARY, solves them, and the
+# step-pairs its solutions need become new single steps -- so later macros are built from earlier ones (macros of
+# macros). Reach is measured every round on a fixed held-out test set (base programs of length 3..6, never used
+# for learning) at the SAME search depth 2, with the honest protocol: search on inputs 1..5, verify on unseen
+# 6..8. Deterministic -> golden.
+import "dreamlib.pi"
+
+skill nth_idx(a, l, idx) -> Any {
+  let out = []
+  let x = idx
+  for p in range(0, l) {
+    let out = append(out, x % a)
+    let x = x // a
+  }
+  return out
+}
+
+skill prog_of(alpha, ids) -> Any {
+  let p = []
+  for i in ids { let p = append(p, alpha[i]) }
+  return p
+}
+
+# shortest program (as alphabet indices) of length <= maxlen fitting the examples, or null
+skill solve_ids(alpha, maxlen, ex) -> Any {
+  let a = len(alpha)
+  for l in range(1, maxlen + 1) {
+    for idx in range(0, power(a, l)) {
+      let ids = nth_idx(a, l, idx)
+      if matches(prog_of(alpha, ids), ex) { return ids }
+    }
+  }
+  return null
+}
+
+# [verified, used a learned macro]
+skill solved(alpha, target) -> Any {
+  let ids = solve_ids(alpha, 2, examples_of(target, 1, 6))
+  if ids == null { return [0, 0] }
+  if verifies(prog_of(alpha, ids), target) == 0 { return [0, 0] }
+  let m = 0
+  for i in ids {
+    if i >= 8 { let m = 1 }
+  }
+  return [1, m]
+}
+
+# can ANY base program of length <= 2 match the target on all of 1..8? (the exhaustive ceiling without a library)
+skill base_reachable(target) -> Any {
+  let base = alphabet()
+  let all = examples_of(target, 1, 9)
+  for l in range(1, 3) {
+    for idx in range(0, power(len(base), l)) {
+      if matches(nth_prog(base, l, idx), all) { return 1 }
+    }
+  }
+  return 0
+}
+
+# one round of learning: dream with the current vocabulary, keep irreducible 2-step solutions, and turn the k most
+# frequent new pairs into macros -> [macros, seed, learned keys]
+skill learn_round(alpha, seed, learned, k) -> Any {
+  let count = {}
+  for d in range(0, 80) {
+    let dt = dream_target(seed, alpha, 2)
+    let target = dt[0]
+    let seed = dt[1]
+    let ids = solve_ids(alpha, 2, examples_of(target, 1, 6))
+    if ids != null {
+      if len(ids) == 2 and verifies(prog_of(alpha, ids), target) == 1 {
+        let key = str(ids[0]) ++ "|" ++ str(ids[1])
+        let h = count[key]
+        if h == null { let h = 0 }
+        let count = put(count, key, h + 1)
+      }
+    }
+  }
+  let macros = []
+  for t in range(0, k) {
+    let bestk = ""
+    let bestc = 0
+    for key in keys(count) {
+      if contains(learned, key) == false and count[key] > bestc {
+        let bestc = count[key]
+        let bestk = key
+      }
+    }
+    if bestk != "" {
+      let learned = append(learned, bestk)
+      let parts = split(bestk, "|")
+      let macros = append(macros, [4, [alpha[num(parts[0])], alpha[num(parts[1])]]])
+    }
+  }
+  return [macros, seed, learned]
+}
+
+# the fixed held-out test set: 15 base programs of each length 3, 4, 5, 6
+skill test_set() -> Any {
+  let base = alphabet()
+  let seed = 4242
+  let out = []
+  for l in range(3, 7) {
+    for i in range(0, 15) {
+      let t = []
+      for j in range(0, l) {
+        let r = pick(seed, len(base))
+        let t = append(t, base[r[0]])
+        let seed = r[1]
+      }
+      let out = append(out, t)
+    }
+  }
+  return out
+}
+
+skill main() -> Any {
+  let tests = test_set()
+  let alpha = alphabet()
+  let learned = []
+  let seed = 777
+  let ceiling = 0
+  for t in tests { let ceiling = ceiling + base_reachable(t) }
+  let report = "base-only ceiling " ++ str(ceiling) ++ "/60; "
+  for r in range(0, 8) {
+    let bylen = [0, 0, 0, 0]
+    let total = 0
+    let viam = 0
+    for i in range(0, len(tests)) {
+      let sv = solved(alpha, tests[i])
+      let ok = sv[0]
+      let total = total + ok
+      let viam = viam + sv[1]
+      let li = i // 15
+      let bylen = put_at(bylen, li, bylen[li] + ok)
+    }
+    let report = report ++ "round " ++ str(r) ++ ": vocab " ++ str(len(alpha)) ++ ", solved " ++ str(total) ++ "/60 (via macro " ++ str(viam) ++ ") [len3 " ++ str(bylen[0]) ++ " len4 " ++ str(bylen[1]) ++ " len5 " ++ str(bylen[2]) ++ " len6 " ++ str(bylen[3]) ++ "]; "
+    let lr = learn_round(alpha, seed, learned, 4)
+    let alpha = alpha ++ lr[0]
+    let seed = lr[1]
+    let learned = lr[2]
+  }
+  return report
+}
+
+skill put_at(xs, at, v) -> Any {
+  let out = []
+  for j in range(0, len(xs)) {
+    if j == at { let out = append(out, v) } else { let out = append(out, xs[j]) }
+  }
+  return out
+}

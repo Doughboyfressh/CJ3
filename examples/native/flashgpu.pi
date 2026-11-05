@@ -1,0 +1,674 @@
+# flashgpu: Pi's kernels for Qwen3.8 Flash Next (qwen4exp) -- general sizes, the model's own quant formats.
+# fmv: rows of a matrix times vectors, one warp per row, straight from the GGUF blocks: F32 (0), Q8_0 (8), Q6_K (14),
+# IQ4_NL (20), IQ3_S (21), BF16 (30). Activations are doubles in GPU memory (as rt_gpu_put / rt_gpu_get use); the
+# GPU works in float32. With a table (pT != 0) row r is row r % rpe of the matrix at tab[r / rpe], and its input is
+# vector (r / rpe) / xd -- how the experts sitting in any VRAM cache slots run in one launch.
+import "ggufl.pi"
+import "gpuengine.pi"
+
+# ggml's tables: the IQ3_S grid (512 words of 4 magnitudes) and the IQ4_NL values
+skill fg_grid() -> Any {
+  return "16843009,16843011,16843013,16843019,16843023,16843521,16843523,16843525,16843529,16843533,16844033,16844035,16844043,16844551,16845057,16845061,16845067,16845071,16845571,16845575,16846081,16846085,16846595,16846601,16846607,16974081,16974083,16974085,16974089,16974593,16974595,16974603,16975105,16975111,16975119,16975619,16975627,16976137,16977155,16977163,16977669,17105153,17105155,17105163,17105167,17105665,17105671,17105677,17106179,17106187,17106689,17106697,17107205,17107211,17107215,17107715,17107719,17108737,17108743,17236231,17236739,17236747,17237249,17237253,17237763,17237767,17237773,17238281,17238785,17238789,17239311,17239811,17239819,17367297,17367815,17367823,17368323,17368329,17368837,17369345,17369351,17369859,17370881,17498373,17498377,17499393,17499397,17499405,17499911,17500419,17500427,17500431,17501453,17501959,17629453,17629955,17629959,17630979,17632005,17633027,17760513,17760517,17760521,17761537,17761541,17761549,17762055,17763073,17763081,50397441,50397443,50397445,50397449,50397953,50397955,50397959,50397963,50397967,50398465,50398469,50398979,50398985,50398989,50400009,50400013,50400515,50401029,50528513,50528515,50528519,50528525,50529025,50529033,50529539,50530049,50530055,50530563,50531073,50531077,50532097,50532109,50659585,50660101,50660107,50660111,50660609,50660617,50661125,50661633,50661639,50662155,50662657,50663173,50790659,50790665,50790671,50791169,50791175,50791683,50791695,50792193,50792201,50792707,50793733,50794241,50921735,50921739,50922245,50922249,50923267,50923271,50923781,50923789,50924289,50924297,51052803,51053313,51053319,51053827,51054337,51054341,51055363,51184897,51184905,51184911,51185929,51185933,51314947,51314951,51315457,51315461,51315971,51316491,51316995,51318021,51318529,83951873,83951875,83951879,83951883,83951887,83952385,83952389,83952393,83952397,83952899,83952903,83952911,83953409,83953413,83953923,83953927,83953931,83954433,83954437,83954959,83955457,83955463,83955467,84082945,84082949,84083457,84083463,84083471,84083973,84083979,84084483,84084489,84084997,84085507,84214019,84214025,84214031,84215043,84215047,84215553,84215567,84216067,84216583,84216591,84217603,84217609,84345089,84345093,84345099,84345603,84346117,84346121,84346627,84346631,84347141,84347649,84348173,84476163,84476175,84477185,84477191,84477701,84477707,84478211,84479749,84479755,84607241,84607747,84608261,84608783,84609281,84609799,84610817,84738305,84738309,84738319,84739331,84740875,84741379,84869387,84869891,84870413,84870913,84871431,84871937,117506309,117506819,117506823,117506827,117506831,117507333,117507843,117507847,117507851,117508357,117508361,117508367,117508867,117509383,117509891,117637379,117637383,117637387,117637897,117638403,117638407,117639425,117640449,117640965,117640973,117768449,117768965,117769473,117769989,117769993,117771009,117899523,117900033,117900041,117900547,117900551,117900559,117901057,117901571,117901575,117901583,117902091,117903111,118030599,118031107,118031117,118031621,118032131,118033157,118033665,118033673,118161667,118162177,118162181,118162699,118163205,118163721,118164237,118165255,118293261,118294787,118423811,118423815,118424833,118424837,118425355,151060737,151060745,151061253,151061761,151061769,151061775,151062277,151062787,151063297,151064321,151191813,151191823,151192323,151192327,151192837,151193345,151193355,151193863,151194371,151194379,151322883,151322887,151323393,151323403,151323907,151324423,151324929,151325455,151325957,151326465,151453961,151454467,151454471,151454977,151454981,151455491,151455499,151585025,151585029,151586057,151586575,151587073,151588611,151716107,151716111,151717123,151719173,151847687,151848713,151850241,151978753,151978763,151979777,151980295,151980803,184615173,184615681,184615689,184616197,184617217,184617225,184617231,184617733,184618253,184618761,184746243,184746247,184746251,184746757,184747267,184747781,184749829,184877313,184877827,184878343,184878849,184878861,184879879,185008389,185008399,185008897,185009423,185010441,185010947,185011467,185011975,185139459,185139465,185140481,185140997,185141517,185271045,185271565,185273091,185273095,185403653,185532677,185532681,185533701,218170115,218170119,218170123,218171139,218171143,218172673,218300673,218301697,218301711,218303753,218432261,218433289,218433797,218434315,218434821,218435329,218562817,218563337,218563843,218564865,218694923,218695943,218696965,218824961,218824967,218826505,218828033,218956043,218958081,219087619,219087623,251724033,251724041,251724047,251725057,251725061,251725581,251726081,251726601,251727109,251855109,251855619,251856137,251857159,251857163,251986179,251986185,251986689,251986701,251987203,251987713,251988739,252117253,252118789,252118795,252119815,252248323,252248331,252248839,252249345,252250881,252380421,252381445,252510469,252512003,252641537"
+}
+skill fg_kv() -> Any { return "-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113" }
+
+# warp sum of the f32 register v (every lane gets it)
+skill fg_wsum(v, tmp) -> Any {
+  let s = ""
+  for k in [16, 8, 4, 2, 1] { let s = s ++ "shfl.sync.bfly.b32 " ++ tmp ++ ", " ++ v ++ ", " ++ str(k) ++ ", 31, 0xffffffff;\nadd.f32 " ++ v ++ ", " ++ v ++ ", " ++ tmp ++ ";\n" }
+  return s
+}
+
+# %f4 = x[k] (a double at %rd base + 8k, as float32)
+skill fg_x(base, k) -> Any { return "ld.shared.f32 %f4, [" ++ base ++ "+" ++ str(4 * k) ++ "];\n" }
+
+# ---- the row bodies: row bytes at %rd5, input doubles at %rd6, n = %r1, lane %r91; add into %f1, then bra WR ---------
+# F32: four weights of the lane in flight at once (k, k + 32, k + 64, k + 96), added in the same order as one by one
+skill fg_f32() -> Any {
+  let s = "mov.u32 %r20, %r91;\nTF:\nsetp.ge.u32 %p4, %r20, %r1;\n@%p4 bra WR;\nadd.u32 %r21, %r20, 32;\nsetp.lt.u32 %p10, %r21, %r1;\nadd.u32 %r22, %r20, 64;\nsetp.lt.u32 %p11, %r22, %r1;\nadd.u32 %r23, %r20, 96;\nsetp.lt.u32 %p12, %r23, %r1;\nmul.wide.u32 %rd14, %r20, 4;\nadd.u64 %rd14, %rd5, %rd14;\nld.global.f32 %f3, [%rd14];\n@%p10 ld.global.f32 %f8, [%rd14+128];\n@%p11 ld.global.f32 %f9, [%rd14+256];\n@%p12 ld.global.f32 %f10, [%rd14+384];\nmul.wide.u32 %rd15, %r20, 4;\nadd.u64 %rd15, %rd6, %rd15;\n"
+  let s = s ++ "ld.shared.f32 %f4, [%rd15];\nfma.rn.f32 %f1, %f3, %f4, %f1;\n@%p10 ld.shared.f32 %f4, [%rd15+128];\n@%p10 fma.rn.f32 %f1, %f8, %f4, %f1;\n@%p11 ld.shared.f32 %f4, [%rd15+256];\n@%p11 fma.rn.f32 %f1, %f9, %f4, %f1;\n@%p12 ld.shared.f32 %f4, [%rd15+384];\n@%p12 fma.rn.f32 %f1, %f10, %f4, %f1;\n"
+  return s ++ "add.u32 %r20, %r20, 128;\nbra TF;\n"
+}
+
+skill fg_bf16() -> Any {
+  return "mov.u32 %r20, %r91;\nTB:\nsetp.ge.u32 %p4, %r20, %r1;\n@%p4 bra WR;\nmul.wide.u32 %rd14, %r20, 2;\nadd.u64 %rd14, %rd5, %rd14;\nld.global.u16 %r21, [%rd14];\nshl.b32 %r21, %r21, 16;\nmov.b32 %f3, %r21;\nmul.wide.u32 %rd15, %r20, 4;\nadd.u64 %rd15, %rd6, %rd15;\n" ++ fg_x("%rd15", 0) ++ "fma.rn.f32 %f1, %f3, %f4, %f1;\nadd.u32 %r20, %r20, 32;\nbra TB;\n"
+}
+
+# Q8_0: blocks of 32 (34 bytes: f16 d, 32 int8); a lane per block
+skill fg_q8() -> Any {
+  let s = "shr.u32 %r21, %r1, 5;\nmov.u32 %r20, %r91;\nT8:\nsetp.ge.u32 %p4, %r20, %r21;\n@%p4 bra WR;\nmul.wide.u32 %rd14, %r20, 34;\nadd.u64 %rd14, %rd5, %rd14;\nld.global.b16 %h1, [%rd14];\ncvt.f32.f16 %f5, %h1;\nshl.b32 %r22, %r20, 5;\nmul.wide.u32 %rd15, %r22, 4;\nadd.u64 %rd15, %rd6, %rd15;\nmov.f32 %f6, 0f00000000;\n"
+  for j in range(0, 32) { let s = s ++ "ld.global.s8 %q1, [%rd14+" ++ str(2 + j) ++ "];\ncvt.rn.f32.s32 %f3, %q1;\n" ++ fg_x("%rd15", j) ++ "fma.rn.f32 %f6, %f3, %f4, %f6;\n" }
+  return s ++ "fma.rn.f32 %f1, %f5, %f6, %f1;\nadd.u32 %r20, %r20, 32;\nbra T8;\n"
+}
+
+# IQ4_NL: blocks of 32 (18 bytes: f16 d, 16 bytes of two 4-bit indices into kvi); a lane per block
+skill fg_iq4nl() -> Any {
+  let s = "shr.u32 %r21, %r1, 5;\nmov.u32 %r20, %r91;\nmov.u64 %rd16, skv;\nT20:\nsetp.ge.u32 %p4, %r20, %r21;\n@%p4 bra WR;\nmul.wide.u32 %rd14, %r20, 18;\nadd.u64 %rd14, %rd5, %rd14;\nld.global.b16 %h1, [%rd14];\ncvt.f32.f16 %f5, %h1;\nshl.b32 %r22, %r20, 5;\nmul.wide.u32 %rd15, %r22, 4;\nadd.u64 %rd15, %rd6, %rd15;\nmov.f32 %f6, 0f00000000;\n"
+  for j in range(0, 16) {
+    let s = s ++ "ld.global.u8 %r24, [%rd14+" ++ str(2 + j) ++ "];\nand.b32 %r25, %r24, 15;\nshr.u32 %r26, %r24, 4;\n"
+    let s = s ++ "mul.wide.u32 %rd17, %r25, 4;\nadd.u64 %rd17, %rd16, %rd17;\nld.shared.s32 %q2, [%rd17];\ncvt.rn.f32.s32 %f3, %q2;\n" ++ fg_x("%rd15", j) ++ "fma.rn.f32 %f6, %f3, %f4, %f6;\n"
+    let s = s ++ "mul.wide.u32 %rd17, %r26, 4;\nadd.u64 %rd17, %rd16, %rd17;\nld.shared.s32 %q2, [%rd17];\ncvt.rn.f32.s32 %f3, %q2;\n" ++ fg_x("%rd15", j + 16) ++ "fma.rn.f32 %f6, %f3, %f4, %f6;\n"
+  }
+  return s ++ "fma.rn.f32 %f1, %f5, %f6, %f1;\nadd.u32 %r20, %r20, 32;\nbra T20;\n"
+}
+
+# IQ3_S: blocks of 256 (110 bytes: f16 d, qs[64], qh[8], signs[32], scales[4]). Lane = (sub-block b, group l) of 8
+# weights, the same in every block: grid1 = qs[8b+2l] | bit 2l of qh[b] << 8, grid2 = qs[8b+2l+1] | bit 2l+1 << 8;
+# sign bit j of signs[4b+l]; scale d (1 + 2 nibble b of scales)
+skill fg_iq3s() -> Any {
+  let s = "shr.u32 %r21, %r1, 8;\nshr.u32 %r27, %r91, 2;\nand.b32 %r28, %r91, 3;\nshl.b32 %r29, %r27, 3;\nshl.b32 %r30, %r28, 1;\nadd.u32 %r29, %r29, %r30;\nadd.u32 %r29, %r29, 2;\nadd.u32 %r30, %r27, 66;\nshl.b32 %r31, %r27, 2;\nadd.u32 %r31, %r31, %r28;\nadd.u32 %r31, %r31, 74;\nshr.u32 %r32, %r27, 1;\nadd.u32 %r32, %r32, 106;\nand.b32 %r33, %r27, 1;\nshl.b32 %r33, %r33, 2;\nshl.b32 %r34, %r28, 1;\nmov.u32 %r35, 8;\nsub.u32 %r35, %r35, %r34;\nmov.u32 %r36, 7;\nsub.u32 %r36, %r36, %r34;\nshl.b32 %r37, %r27, 5;\nshl.b32 %r38, %r28, 3;\nadd.u32 %r37, %r37, %r38;\nmov.u32 %r20, 0;\nmov.u64 %rd18, sgrid;\n"
+  let s = s ++ "T21:\nsetp.ge.u32 %p4, %r20, %r21;\n@%p4 bra WR;\nmul.wide.u32 %rd14, %r20, 110;\nadd.u64 %rd14, %rd5, %rd14;\nld.global.b16 %h1, [%rd14];\ncvt.f32.f16 %f5, %h1;\ncvt.u64.u32 %rd19, %r32;\nadd.u64 %rd19, %rd14, %rd19;\nld.global.u8 %r40, [%rd19];\nshr.u32 %r40, %r40, %r33;\nand.b32 %r40, %r40, 15;\nshl.b32 %r40, %r40, 1;\nadd.u32 %r40, %r40, 1;\ncvt.rn.f32.u32 %f7, %r40;\nmul.f32 %f5, %f5, %f7;\n"
+  let s = s ++ "cvt.u64.u32 %rd19, %r29;\nadd.u64 %rd19, %rd14, %rd19;\nld.global.u8 %r41, [%rd19];\nld.global.u8 %r42, [%rd19+1];\ncvt.u64.u32 %rd19, %r30;\nadd.u64 %rd19, %rd14, %rd19;\nld.global.u8 %r43, [%rd19];\nshl.b32 %r44, %r43, %r35;\nand.b32 %r44, %r44, 256;\nor.b32 %r41, %r41, %r44;\nshl.b32 %r45, %r43, %r36;\nand.b32 %r45, %r45, 256;\nor.b32 %r42, %r42, %r45;\ncvt.u64.u32 %rd19, %r31;\nadd.u64 %rd19, %rd14, %rd19;\nld.global.u8 %r46, [%rd19];\n"
+  let s = s ++ "mul.wide.u32 %rd20, %r41, 4;\nadd.u64 %rd20, %rd18, %rd20;\nld.shared.u32 %r47, [%rd20];\nmul.wide.u32 %rd20, %r42, 4;\nadd.u64 %rd20, %rd18, %rd20;\nld.shared.u32 %r48, [%rd20];\nshl.b32 %r49, %r20, 8;\nadd.u32 %r49, %r49, %r37;\nmul.wide.u32 %rd21, %r49, 4;\nadd.u64 %rd21, %rd6, %rd21;\nmov.f32 %f6, 0f00000000;\n"
+  for j in range(0, 8) {
+    let g = if j < 4 { "%r47" } else { "%r48" }
+    let s = s ++ "bfe.u32 %r50, " ++ g ++ ", " ++ str(8 * (j % 4)) ++ ", 8;\ncvt.rn.f32.u32 %f3, %r50;\nand.b32 %r51, %r46, " ++ str(2 ^ j) ++ ";\nsetp.ne.u32 %p5, %r51, 0;\n@%p5 neg.f32 %f3, %f3;\n" ++ fg_x("%rd21", j) ++ "fma.rn.f32 %f6, %f3, %f4, %f6;\n"
+  }
+  return s ++ "fma.rn.f32 %f1, %f5, %f6, %f1;\nadd.u32 %r20, %r20, 1;\nbra T21;\n"
+}
+
+# IQ4_XS: blocks of 256 (136 bytes: f16 d, u16 scales_h, scales_l[4], qs[128]). Lane = (sub-block ib = lane / 4,
+# quarter q = lane % 4): bytes 4q .. 4q+3 of the sub-block's 16, weights 32 ib + j (low nibble) and + 16 (high);
+# scale d (ls - 32), ls = nibble ib of scales_l | 2 bits ib of scales_h << 4
+skill fg_iq4xs() -> Any {
+  let s = "shr.u32 %r21, %r1, 8;\nshr.u32 %r27, %r91, 2;\nand.b32 %r28, %r91, 3;\nshr.u32 %r29, %r27, 1;\nadd.u32 %r29, %r29, 4;\nand.b32 %r30, %r27, 1;\nshl.b32 %r30, %r30, 2;\nshl.b32 %r31, %r27, 1;\nshl.b32 %r32, %r27, 4;\nshl.b32 %r33, %r28, 2;\nadd.u32 %r32, %r32, %r33;\nadd.u32 %r32, %r32, 8;\nshl.b32 %r34, %r27, 5;\nadd.u32 %r34, %r34, %r33;\nmov.u32 %r20, 0;\nmov.u64 %rd16, skv;\n"
+  let s = s ++ "T23:\nsetp.ge.u32 %p4, %r20, %r21;\n@%p4 bra WR;\nmul.wide.u32 %rd14, %r20, 136;\nadd.u64 %rd14, %rd5, %rd14;\nld.global.b16 %h1, [%rd14];\ncvt.f32.f16 %f5, %h1;\nld.global.u16 %r35, [%rd14+2];\ncvt.u64.u32 %rd19, %r29;\nadd.u64 %rd19, %rd14, %rd19;\nld.global.u8 %r36, [%rd19];\nshr.u32 %r36, %r36, %r30;\nand.b32 %r36, %r36, 15;\nshr.u32 %r37, %r35, %r31;\nand.b32 %r37, %r37, 3;\nshl.b32 %r37, %r37, 4;\nor.b32 %r36, %r36, %r37;\ncvt.rn.f32.u32 %f7, %r36;\nsub.f32 %f7, %f7, 0f42000000;\nmul.f32 %f5, %f5, %f7;\ncvt.u64.u32 %rd19, %r32;\nadd.u64 %rd19, %rd14, %rd19;\nshl.b32 %r49, %r20, 8;\nadd.u32 %r49, %r49, %r34;\nmul.wide.u32 %rd21, %r49, 4;\nadd.u64 %rd21, %rd6, %rd21;\nmov.f32 %f6, 0f00000000;\n"
+  for j in range(0, 4) {
+    let s = s ++ "ld.global.u8 %r24, [%rd19+" ++ str(j) ++ "];\nand.b32 %r25, %r24, 15;\nshr.u32 %r26, %r24, 4;\nmul.wide.u32 %rd17, %r25, 4;\nadd.u64 %rd17, %rd16, %rd17;\nld.shared.s32 %q2, [%rd17];\ncvt.rn.f32.s32 %f3, %q2;\n" ++ fg_x("%rd21", j) ++ "fma.rn.f32 %f6, %f3, %f4, %f6;\n"
+    let s = s ++ "mul.wide.u32 %rd17, %r26, 4;\nadd.u64 %rd17, %rd16, %rd17;\nld.shared.s32 %q2, [%rd17];\ncvt.rn.f32.s32 %f3, %q2;\n" ++ fg_x("%rd21", j + 16) ++ "fma.rn.f32 %f6, %f3, %f4, %f6;\n"
+  }
+  return s ++ "fma.rn.f32 %f1, %f5, %f6, %f1;\nadd.u32 %r20, %r20, 1;\nbra T23;\n"
+}
+
+# Q6_K: blocks of 256 (210 bytes: ql[128], qh[64], int8 scales[16], f16 d at 208). Lane l: for each half h the four
+# weights 128h + l + {0, 32, 64, 96}
+skill fg_q6k() -> Any {
+  let s = "shr.u32 %r21, %r1, 8;\nmov.u32 %r20, 0;\nshr.u32 %r27, %r91, 4;\nT14:\nsetp.ge.u32 %p4, %r20, %r21;\n@%p4 bra WR;\nmul.wide.u32 %rd14, %r20, 210;\nadd.u64 %rd14, %rd5, %rd14;\nld.global.b16 %h1, [%rd14+208];\ncvt.f32.f16 %f5, %h1;\nshl.b32 %r49, %r20, 8;\nadd.u32 %r49, %r49, %r91;\nmul.wide.u32 %rd21, %r49, 4;\nadd.u64 %rd21, %rd6, %rd21;\ncvt.u64.u32 %rd22, %r91;\nadd.u64 %rd22, %rd14, %rd22;\ncvt.u64.u32 %rd23, %r27;\nadd.u64 %rd23, %rd14, %rd23;\nmov.f32 %f6, 0f00000000;\n"
+  for h in range(0, 2) {
+    # ql[64h + l], ql[64h + l + 32], qh[32h + l] (at 128 + 32h + l)
+    let s = s ++ "ld.global.u8 %r60, [%rd22+" ++ str(64 * h) ++ "];\nld.global.u8 %r61, [%rd22+" ++ str(64 * h + 32) ++ "];\nld.global.u8 %r62, [%rd22+" ++ str(128 + 32 * h) ++ "];\n"
+    let parts = [["%r60", 0, 15, 0, 0], ["%r61", 0, 15, 2, 2], ["%r60", 4, 15, 4, 4], ["%r61", 4, 15, 6, 6]]
+    for k in range(0, 4) {
+      let pp = parts[k]
+      # q = ((ql >> lo4) & 15) | (((qh >> 2k) & 3) << 4)) - 32; scale sc[8h + is + 2k] (is = l / 16, in %r27)
+      let s = s ++ "shr.u32 %r63, " ++ pp[0] ++ ", " ++ str(pp[1]) ++ ";\nand.b32 %r63, %r63, 15;\nshr.u32 %r64, %r62, " ++ str(pp[3]) ++ ";\nand.b32 %r64, %r64, 3;\nshl.b32 %r64, %r64, 4;\nor.b32 %r63, %r63, %r64;\ncvt.rn.f32.u32 %f3, %r63;\nsub.f32 %f3, %f3, 0f42000000;\n"
+      let s = s ++ "ld.global.s8 %q3, [%rd23+" ++ str(192 + 8 * h + pp[4]) ++ "];\ncvt.rn.f32.s32 %f7, %q3;\nmul.f32 %f3, %f3, %f7;\n" ++ fg_x("%rd21", 128 * h + 32 * k) ++ "fma.rn.f32 %f6, %f3, %f4, %f6;\n"
+    }
+  }
+  return s ++ "fma.rn.f32 %f1, %f5, %f6, %f1;\nadd.u32 %r20, %r20, 1;\nbra T14;\n"
+}
+
+skill fg_k_fmv() -> Any { return fg_k_fmv_g(false) }
+
+# fmvt (rw): table mode only, a block = 32 rows of one slot, 4 per warp, so the table copy and the staging are paid
+# once per 32 rows (the experts' down matrices have short rows: there the prologue was most of the time)
+skill fg_k_fmv_g(rw) -> Any {
+  let s = ge_kern(if rw { "fmvt" } else { "fmv" }, ["pW", "pX", "pY", "pT"], ["pn", "prows", "ptype", "prb", "pnv", "prpe", "pxd"])
+  # every thread stays to the end (they all copy the input into shared memory and meet at the barriers); a warp past
+  # the last row computes nothing. The 8 rows of a block share their input: in table mode rpe is a multiple of 8.
+  let s = s ++ (if rw { "mul.lo.u32 %r19, %r89, 32;\nsetp.eq.u64 %p2, %rd4, 0;\ndiv.u32 %r11, %r19, %r6;\nrem.u32 %r11, %r11, %r5;\ndiv.u32 %r14, %r11, %r7;\nadd.u32 %r15, %r14, 1;\nmov.u64 %rd6, fxs;\n" } else { "mul.lo.u32 %r19, %r89, 8;\nadd.u32 %r10, %r19, %r92;\nsetp.lt.u32 %p1, %r10, %r2;\nsetp.eq.u64 %p2, %rd4, 0;\n@%p2 bra NOTAB;\ndiv.u32 %r11, %r19, %r6;\nrem.u32 %r11, %r11, %r5;\ndiv.u32 %r14, %r11, %r7;\nadd.u32 %r15, %r14, 1;\n@!%p1 bra ROWGO;\ndiv.u32 %r11, %r10, %r6;\nrem.u32 %r12, %r10, %r6;\nmul.wide.u32 %rd10, %r11, 8;\nadd.u64 %rd10, %rd4, %rd10;\nld.global.u64 %rd11, [%rd10];\nmul.wide.u32 %rd12, %r12, %r4;\nadd.u64 %rd5, %rd11, %rd12;\nbra ROWGO;\nNOTAB:\nmul.wide.u32 %rd12, %r10, %r4;\nadd.u64 %rd5, %rd1, %rd12;\nmov.u32 %r14, 0;\nmov.u32 %r15, %r5;\nROWGO:\nmov.u64 %rd6, fxs;\n" })
+  # the IQ3_S grid and the IQ4_NL values into shared memory (coalesced from global): the lanes of a warp look them up
+  # at 32 different indices, which constant memory serves one address at a time. The first barrier below orders it.
+  let s = s ++ "setp.eq.u32 %p13, %r3, 21;\n@%p13 bra TBL0;\nsetp.eq.u32 %p13, %r3, 20;\n@%p13 bra TBL0;\nsetp.eq.u32 %p13, %r3, 23;\n@%p13 bra TBL0;\nbra VL;\nTBL0:\nmov.u32 %r73, 16;\nsetp.eq.u32 %p13, %r3, 21;\n@%p13 mov.u32 %r73, 512;\nmov.u32 %r70, %r90;\nTBL:\nsetp.ge.u32 %p13, %r70, %r73;\n@%p13 bra VL;\nmul.wide.u32 %rd64, %r70, 4;\nmov.u64 %rd63, ggrid;\nadd.u64 %rd63, %rd63, %rd64;\nld.global.u32 %r71, [%rd63];\nmov.u64 %rd63, sgrid;\nadd.u64 %rd63, %rd63, %rd64;\nst.shared.u32 [%rd63], %r71;\nsetp.ge.u32 %p13, %r70, 16;\n@%p13 bra TBLN;\nmov.u64 %rd63, gkv;\nadd.u64 %rd63, %rd63, %rd64;\nld.global.u32 %r71, [%rd63];\nmov.u64 %rd63, skv;\nadd.u64 %rd63, %rd63, %rd64;\nst.shared.u32 [%rd63], %r71;\nTBLN:\nadd.u32 %r70, %r70, %r93;\nbra TBL;\n"
+  # per input vector: copy it into shared memory as float32 (four loads in flight per thread), then the rows
+  let s = s ++ "VL:\nsetp.ge.u32 %p3, %r14, %r15;\n@%p3 bra DONE;\nbar.sync 0;\nmul.lo.u32 %r16, %r14, %r1;\nmov.u32 %r60, %r90;\nmul.wide.u32 %rd65, %r93, 8;\nmul.wide.u32 %rd66, %r93, 4;\nSTG:\nsetp.ge.u32 %p9, %r60, %r1;\n@%p9 bra STGE;\nadd.u32 %r61, %r16, %r60;\n" ++ ge_at("%rd61", "%rd2", "%r61")
+  let s = s ++ "add.u32 %r70, %r60, %r93;\nsetp.lt.u32 %p10, %r70, %r1;\nadd.u32 %r71, %r70, %r93;\nsetp.lt.u32 %p11, %r71, %r1;\nadd.u32 %r72, %r71, %r93;\nsetp.lt.u32 %p12, %r72, %r1;\nld.global.f64 %fd61, [%rd61];\nadd.u64 %rd63, %rd61, %rd65;\n@%p10 ld.global.f64 %fd62, [%rd63];\nadd.u64 %rd63, %rd63, %rd65;\n@%p11 ld.global.f64 %fd63, [%rd63];\nadd.u64 %rd63, %rd63, %rd65;\n@%p12 ld.global.f64 %fd64, [%rd63];\n"
+  let s = s ++ "mul.wide.u32 %rd62, %r60, 4;\nadd.u64 %rd62, %rd6, %rd62;\ncvt.rn.f32.f64 %f62, %fd61;\nst.shared.f32 [%rd62], %f62;\nadd.u64 %rd62, %rd62, %rd66;\ncvt.rn.f32.f64 %f63, %fd62;\n@%p10 st.shared.f32 [%rd62], %f63;\nadd.u64 %rd62, %rd62, %rd66;\ncvt.rn.f32.f64 %f64, %fd63;\n@%p11 st.shared.f32 [%rd62], %f64;\nadd.u64 %rd62, %rd62, %rd66;\ncvt.rn.f32.f64 %f65, %fd64;\n@%p12 st.shared.f32 [%rd62], %f65;\nadd.u32 %r60, %r72, %r93;\nbra STG;\n" ++ (if rw { "STGE:\nbar.sync 0;\nmov.u32 %r85, 0;\nRL:\nmad.lo.u32 %r10, %r85, 8, %r19;\nadd.u32 %r10, %r10, %r92;\nsetp.lt.u32 %p1, %r10, %r2;\n@!%p1 bra NEXTR;\ndiv.u32 %r11, %r10, %r6;\nrem.u32 %r12, %r10, %r6;\nmul.wide.u32 %rd10, %r11, 8;\nadd.u64 %rd10, %rd4, %rd10;\nld.global.u64 %rd11, [%rd10];\nmul.wide.u32 %rd12, %r12, %r4;\nadd.u64 %rd5, %rd11, %rd12;\nmov.f32 %f1, 0f00000000;\n" } else { "STGE:\nbar.sync 0;\n@!%p1 bra NEXTV;\nmov.f32 %f1, 0f00000000;\n" }) ++ ""
+  let s = s ++ "setp.eq.u32 %p6, %r3, 21;\n@%p6 bra B21;\nsetp.eq.u32 %p6, %r3, 20;\n@%p6 bra B20;\nsetp.eq.u32 %p6, %r3, 8;\n@%p6 bra B8;\nsetp.eq.u32 %p6, %r3, 14;\n@%p6 bra B14;\nsetp.eq.u32 %p6, %r3, 30;\n@%p6 bra B30;\nsetp.eq.u32 %p6, %r3, 23;\n@%p6 bra B23;\n" ++ fg_f32()
+  let s = s ++ "B21:\n" ++ fg_iq3s() ++ "B20:\n" ++ fg_iq4nl() ++ "B8:\n" ++ fg_q8() ++ "B14:\n" ++ fg_q6k() ++ "B30:\n" ++ fg_bf16() ++ "B23:\n" ++ fg_iq4xs()
+  # the warp's sum -> y: in table mode y[row], else y[v * rows + row]
+  let s = s ++ "WR:\n" ++ fg_wsum("%f1", "%f2") ++ "mul.lo.u32 %r17, %r14, %r2;\nadd.u32 %r17, %r17, %r10;\nselp.u32 %r17, %r17, %r10, %p2;\nsetp.eq.u32 %p7, %r91, 0;\nmul.wide.u32 %rd24, %r17, 8;\nadd.u64 %rd24, %rd3, %rd24;\ncvt.f64.f32 %fd3, %f1;\n" ++ (if rw { "@%p7 st.global.f64 [%rd24], %fd3;\nNEXTR:\nadd.u32 %r85, %r85, 1;\nsetp.lt.u32 %p14, %r85, 4;\n@%p14 bra RL;\nNEXTV:\n" } else { "@%p7 st.global.f64 [%rd24], %fd3;\nNEXTV:\n" }) ++ "add.u32 %r14, %r14, 1;\nbra VL;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# ---- the glue between the matrices: activations are doubles; weights the GGUF's float32 vectors ---------------------
+skill fg_sig(d, s) -> Any { return "neg.f64 %fd60, " ++ s ++ ";\ncvt.rn.f32.f64 %f60, %fd60;\nmul.f32 %f60, %f60, 0f3FB8AA3B;\nex2.approx.ftz.f32 %f60, %f60;\nadd.f32 %f60, %f60, 0f3F800000;\nrcp.rn.f32 %f60, %f60;\ncvt.f64.f32 " ++ d ++ ", %f60;\n" }
+# %fd = the float32 weight number idx of the vector at base
+skill fg_w(d, base, idx) -> Any { return ge_at4("%rd60", base, idx) ++ "ld.global.f32 %f61, [%rd60];\ncvt.f64.f32 " ++ d ++ ", %f61;\n" }
+skill fg_eps() -> Any { return "0d3EB0C6F7A0B5ED8D" }
+
+# hcnorm: block b normalises row b (n doubles) of X by its RMS and scales it by gamma (W + (b % S) n; none if W is 0)
+skill fg_k_hcnorm() -> Any {
+  let s = ge_kern("hcnorm", ["pX", "pW", "pY"], ["pn", "pS"])
+  let s = s ++ "mul.lo.u32 %r10, %r89, %r1;\nrem.u32 %r11, %r89, %r2;\nmul.lo.u32 %r11, %r11, %r1;\nmov.f64 %fd1, 0d0000000000000000;\nmov.u32 %r12, %r90;\nA1:\nsetp.ge.u32 %p1, %r12, %r1;\n@%p1 bra A1E;\nadd.u32 %r13, %r10, %r12;\n" ++ ge_at("%rd10", "%rd1", "%r13") ++ "ld.global.f64 %fd2, [%rd10];\nfma.rn.f64 %fd1, %fd2, %fd2, %fd1;\nadd.u32 %r12, %r12, %r93;\nbra A1;\nA1E:\n" ++ ge_bred("%fd1", 8, "add.rn.f64")
+  let s = s ++ "setp.ne.u32 %p5, %r90, 0;\n@%p5 bra ONE;\ncvt.rn.f64.u32 %fd3, %r1;\ndiv.rn.f64 %fd1, %fd1, %fd3;\nadd.f64 %fd1, %fd1, " ++ fg_eps() ++ ";\nsqrt.rn.f64 %fd1, %fd1;\nrcp.rn.f64 %fd1, %fd1;\nst.shared.f64 [sbuf], %fd1;\nONE:\nbar.sync 0;\nld.shared.f64 %fd1, [sbuf];\nsetp.eq.u64 %p2, %rd2, 0;\nmov.u32 %r12, %r90;\nA2:\nsetp.ge.u32 %p1, %r12, %r1;\n@%p1 bra DONE;\nadd.u32 %r13, %r10, %r12;\n" ++ ge_at("%rd10", "%rd1", "%r13") ++ "ld.global.f64 %fd2, [%rd10];\nmul.f64 %fd2, %fd2, %fd1;\n@%p2 bra A3;\nadd.u32 %r14, %r11, %r12;\n" ++ fg_w("%fd4", "%rd2", "%r14") ++ "mul.f64 %fd2, %fd2, %fd4;\nA3:\n" ++ ge_at("%rd12", "%rd3", "%r13") ++ "st.global.f64 [%rd12], %fd2;\nadd.u32 %r12, %r12, %r93;\nbra A2;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# act: n elements. op 1: y = silu(x / 4); op 2: y = silu(x) * z; op 3: y = x * sigmoid(z)
+skill fg_k_act() -> Any {
+  let s = ge_kern("act", ["pX", "pZ", "pY"], ["pn", "pop"])
+  let s = s ++ "mul.lo.u32 %r10, %r89, %r93;\nadd.u32 %r10, %r10, %r90;\nsetp.ge.u32 %p1, %r10, %r1;\n@%p1 bra DONE;\n" ++ ge_at("%rd10", "%rd1", "%r10") ++ "ld.global.f64 %fd1, [%rd10];\n" ++ ge_at("%rd11", "%rd2", "%r10") ++ "setp.eq.u32 %p2, %r2, 1;\n@%p2 mul.f64 %fd1, %fd1, 0d3FD0000000000000;\nsetp.eq.u32 %p3, %r2, 3;\n@%p3 bra OP3;\n" ++ fg_sig("%fd2", "%fd1") ++ "mul.f64 %fd1, %fd1, %fd2;\n@%p2 bra ST;\nld.global.f64 %fd3, [%rd11];\nmul.f64 %fd1, %fd1, %fd3;\nbra ST;\nOP3:\nld.global.f64 %fd3, [%rd11];\n" ++ fg_sig("%fd2", "%fd3") ++ "mul.f64 %fd1, %fd1, %fd2;\nST:\n" ++ ge_at("%rd12", "%rd3", "%r10") ++ "st.global.f64 [%rd12], %fd1;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# hcmix: out[t][i] = mean over the 4 streams of xn[t][c][i] * sigmoid(g[t][c * 2560 + i]); T * 2560 threads
+skill fg_k_hcmix() -> Any {
+  let s = ge_kern("hcmix", ["pXN", "pG", "pO"], ["pTE"])
+  let s = s ++ "mul.lo.u32 %r10, %r89, %r93;\nadd.u32 %r10, %r10, %r90;\nsetp.ge.u32 %p1, %r10, %r1;\n@%p1 bra DONE;\ndiv.u32 %r11, %r10, 2560;\nrem.u32 %r12, %r10, 2560;\nmul.lo.u32 %r13, %r11, 10240;\nadd.u32 %r13, %r13, %r12;\nmov.f64 %fd1, 0d0000000000000000;\n"
+  for c in range(0, 4) { let s = s ++ "add.u32 %r14, %r13, " ++ str(2560 * c) ++ ";\n" ++ ge_at("%rd10", "%rd1", "%r14") ++ "ld.global.f64 %fd2, [%rd10];\n" ++ ge_at("%rd11", "%rd2", "%r14") ++ "ld.global.f64 %fd3, [%rd11];\n" ++ fg_sig("%fd4", "%fd3") ++ "fma.rn.f64 %fd1, %fd2, %fd4, %fd1;\n" }
+  return s ++ "mul.f64 %fd1, %fd1, 0d3FD0000000000000;\n" ++ ge_at("%rd12", "%rd3", "%r10") ++ "st.global.f64 [%rd12], %fd1;\nDONE:\nret;\n}\n"
+}
+
+# embq8: block t, 256 threads: token t's Q8_0 embedding row (2720 raw bytes at RAW + 2720 t: 80 blocks of f16 d and
+# 32 int8) -> all 4 hyper-connection streams of RES[t] (d * q is exact in float32: 11 + 8 bits)
+skill fg_k_embq8() -> Any {
+  let s = ge_kern("embq8", ["pRAW", "pRES"], [])
+  return s ++ "mul.lo.u32 %r10, %r89, 2720;\nmov.u32 %r12, %r90;\nA1:\nsetp.ge.u32 %p1, %r12, 2560;\n@%p1 bra DONE;\nshr.u32 %r13, %r12, 5;\nand.b32 %r14, %r12, 31;\nmad.lo.u32 %r15, %r13, 34, %r10;\ncvt.u64.u32 %rd10, %r15;\nadd.u64 %rd10, %rd1, %rd10;\nld.global.b16 %h1, [%rd10];\ncvt.f32.f16 %f1, %h1;\ncvt.u64.u32 %rd11, %r14;\nadd.u64 %rd11, %rd10, %rd11;\nld.global.s8 %q1, [%rd11+2];\ncvt.rn.f32.s32 %f2, %q1;\nmul.f32 %f3, %f1, %f2;\ncvt.f64.f32 %fd1, %f3;\nmul.lo.u32 %r16, %r89, 10240;\nadd.u32 %r16, %r16, %r12;\n" ++ ge_at("%rd12", "%rd2", "%r16") ++ "st.global.f64 [%rd12], %fd1;\nst.global.f64 [%rd12+20480], %fd1;\nst.global.f64 [%rd12+40960], %fd1;\nst.global.f64 [%rd12+61440], %fd1;\nadd.u32 %r12, %r12, 256;\nbra A1;\nDONE:\nret;\n}\n"
+}
+
+# pleiq4: block b = 16 t + r, 160 threads: n-gram row r of token t (90 raw bytes at RAW + 90 b: 5 IQ4_NL blocks of
+# f16 d and 16 bytes, the low nibbles values 0 .. 15 of the block, the high ones 16 .. 31) -> EMB[t][160 r + i]
+skill fg_k_pleiq4() -> Any {
+  let s = ge_kern("pleiq4", ["pRAW", "pEMB"], [])
+  return s ++ "mul.lo.u32 %r10, %r89, 90;\nshr.u32 %r11, %r90, 5;\nand.b32 %r12, %r90, 31;\nmad.lo.u32 %r13, %r11, 18, %r10;\ncvt.u64.u32 %rd10, %r13;\nadd.u64 %rd10, %rd1, %rd10;\nld.global.b16 %h1, [%rd10];\ncvt.f32.f16 %f1, %h1;\nand.b32 %r14, %r12, 15;\ncvt.u64.u32 %rd11, %r14;\nadd.u64 %rd11, %rd10, %rd11;\nld.global.u8 %r15, [%rd11+2];\nsetp.ge.u32 %p1, %r12, 16;\nshr.u32 %r16, %r15, 4;\nand.b32 %r17, %r15, 15;\nselp.b32 %r18, %r16, %r17, %p1;\nmul.wide.u32 %rd12, %r18, 4;\nmov.u64 %rd13, gkv;\nadd.u64 %rd13, %rd13, %rd12;\nld.global.s32 %q2, [%rd13];\ncvt.rn.f32.s32 %f2, %q2;\nmul.f32 %f3, %f1, %f2;\ncvt.f64.f32 %fd1, %f3;\nmad.lo.u32 %r19, %r89, 160, %r90;\n" ++ ge_at("%rd14", "%rd2", "%r19") ++ "st.global.f64 [%rd14], %fd1;\nret;\n}\n"
+}
+
+# hcnormi: hcnorm (S streams of n) that also takes the inject's dot products of its stream: block b (token b / S,
+# stream b % S) adds y[i] * WI[r][(b % S) n + i] for the four inject rows r -> IP[b][r]; hccomb sums the S of them
+# hcnormi: n <= 2560 (256 threads x 10): each thread keeps its 10 elements in registers for both passes (all their
+# loads in flight together); one block sum for the norm; the four inject sums reduced together (one barrier)
+skill fg_k_hcnormi() -> Any {
+  let s = ge_kern("hcnormi", ["pX", "pW", "pY", "pI", "pIP"], ["pn", "pS"])
+  s = s ++ "mul.lo.u32 %r10, %r89, %r1;\nrem.u32 %r11, %r89, %r2;\nmul.lo.u32 %r11, %r11, %r1;\nmul.lo.u32 %r20, %r2, %r1;\nmov.f32 %f1, 0f00000000;\n"
+  for k in range(0, 10) {
+    let x = "%f" ++ str(50 + k)
+    let p = "%p" ++ str(k + 1)
+    s = s ++ "add.u32 %r30, %r90, " ++ str(256 * k) ++ ";\nsetp.lt.u32 " ++ p ++ ", %r30, %r1;\nadd.u32 %r31, %r10, %r30;\n" ++ ge_at("%rd10", "%rd1", "%r31") ++ "mov.f64 %fd2, 0d0000000000000000;\n@" ++ p ++ " ld.global.f64 %fd2, [%rd10];\ncvt.rn.f32.f64 " ++ x ++ ", %fd2;\n"
+  }
+  for k in range(0, 10) { s = s ++ "fma.rn.f32 %f1, %f" ++ str(50 + k) ++ ", %f" ++ str(50 + k) ++ ", %f1;\n" }
+  s = s ++ "cvt.f64.f32 %fd1, %f1;\n" ++ ge_bred("%fd1", 8, "add.rn.f64")
+  s = s ++ "setp.ne.u32 %p15, %r90, 0;\n@%p15 bra ONE;\ncvt.rn.f64.u32 %fd3, %r1;\ndiv.rn.f64 %fd1, %fd1, %fd3;\nadd.f64 %fd1, %fd1, " ++ fg_eps() ++ ";\nsqrt.rn.f64 %fd1, %fd1;\nrcp.rn.f64 %fd1, %fd1;\nst.shared.f64 [sbuf], %fd1;\nONE:\nbar.sync 0;\nld.shared.f64 %fd1, [sbuf];\ncvt.rn.f32.f64 %f3, %fd1;\nmov.f32 %f20, 0f00000000;\nmov.f32 %f21, 0f00000000;\nmov.f32 %f22, 0f00000000;\nmov.f32 %f23, 0f00000000;\n"
+  for k in range(0, 10) {
+    let x = "%f" ++ str(50 + k)
+    let p = "%p" ++ str(k + 1)
+    s = s ++ "add.u32 %r30, %r90, " ++ str(256 * k) ++ ";\nadd.u32 %r31, %r10, %r30;\nadd.u32 %r32, %r11, %r30;\n" ++ ge_at4("%rd14", "%rd2", "%r32") ++ "@" ++ p ++ " ld.global.f32 %f4, [%rd14];\nmul.f32 " ++ x ++ ", " ++ x ++ ", %f3;\nmul.f32 " ++ x ++ ", " ++ x ++ ", %f4;\ncvt.f64.f32 %fd2, " ++ x ++ ";\n" ++ ge_at("%rd12", "%rd3", "%r31") ++ "@" ++ p ++ " st.global.f64 [%rd12], %fd2;\n" ++ ge_at4("%rd15", "%rd4", "%r32")
+    for r in range(0, 4) {
+      if r > 0 { s = s ++ "mul.wide.u32 %rd16, %r20, 4;\nadd.u64 %rd15, %rd15, %rd16;\n" }
+      s = s ++ "mov.f32 %f5, 0f00000000;\n@" ++ p ++ " ld.global.f32 %f5, [%rd15];\nfma.rn.f32 %f" ++ str(20 + r) ++ ", " ++ x ++ ", %f5, %f" ++ str(20 + r) ++ ";\n"
+    }
+  }
+  // the four sums: each warp's by shuffles, then thread 0 adds the 8 warps' (in order) -> IP[b][r]
+  for r in range(0, 4) { s = s ++ fg_wsum("%f" ++ str(20 + r), "%f2") }
+  s = s ++ "setp.ne.u32 %p15, %r91, 0;\n@%p15 bra W1;\nmov.u64 %rd70, red;\nmul.lo.u32 %r33, %r92, 16;\ncvt.u64.u32 %rd71, %r33;\nadd.u64 %rd71, %rd70, %rd71;\nst.shared.f32 [%rd71], %f20;\nst.shared.f32 [%rd71+4], %f21;\nst.shared.f32 [%rd71+8], %f22;\nst.shared.f32 [%rd71+12], %f23;\nW1:\nbar.sync 0;\nsetp.ne.u32 %p15, %r90, 0;\n@%p15 bra DONE;\nshl.b32 %r16, %r89, 2;\n" ++ ge_at("%rd13", "%rd5", "%r16")
+  for r in range(0, 4) {
+    s = s ++ "mov.f64 %fd20, 0d0000000000000000;\n"
+    for w in range(0, 8) { s = s ++ "ld.shared.f32 %f6, [red+" ++ str(16 * w + 4 * r) ++ "];\ncvt.f64.f32 %fd21, %f6;\nadd.f64 %fd20, %fd20, %fd21;\n" }
+    s = s ++ "st.global.f64 [%rd13+" ++ str(8 * r) ++ "], %fd20;\n"
+  }
+  return s ++ "DONE:\nret;\n}\n"
+}
+
+# hccomb: res[t][c][i] += out[t][i] * 2 sigmoid(inj[t][c] / 4), inj[t][c] the sum over the 4 streams s of hcnormi's
+# IP[t][s][c] (in stream order); T * 10240 threads
+skill fg_k_hccomb() -> Any {
+  let s = ge_kern("hccomb", ["pR", "pO", "pJ"], ["pTE"])
+  return s ++ "mul.lo.u32 %r10, %r89, %r93;\nadd.u32 %r10, %r10, %r90;\nsetp.ge.u32 %p1, %r10, %r1;\n@%p1 bra DONE;\ndiv.u32 %r11, %r10, 10240;\nrem.u32 %r12, %r10, 10240;\ndiv.u32 %r13, %r12, 2560;\nrem.u32 %r14, %r12, 2560;\nshl.b32 %r15, %r11, 4;\nadd.u32 %r15, %r15, %r13;\n" ++ ge_at("%rd10", "%rd3", "%r15") ++ "ld.global.f64 %fd1, [%rd10];\nld.global.f64 %fd5, [%rd10+32];\nadd.f64 %fd1, %fd1, %fd5;\nld.global.f64 %fd5, [%rd10+64];\nadd.f64 %fd1, %fd1, %fd5;\nld.global.f64 %fd5, [%rd10+96];\nadd.f64 %fd1, %fd1, %fd5;\nmul.f64 %fd1, %fd1, 0d3FD0000000000000;\n" ++ fg_sig("%fd2", "%fd1") ++ "add.f64 %fd2, %fd2, %fd2;\nmul.lo.u32 %r16, %r11, 2560;\nadd.u32 %r16, %r16, %r14;\n" ++ ge_at("%rd11", "%rd2", "%r16") ++ "ld.global.f64 %fd3, [%rd11];\n" ++ ge_at("%rd12", "%rd1", "%r10") ++ "ld.global.f64 %fd4, [%rd12];\nfma.rn.f64 %fd4, %fd3, %fd2, %fd4;\nst.global.f64 [%rd12], %fd4;\nDONE:\nret;\n}\n"
+}
+
+# qkrope: block (t, h): h < 24 -> query head h of QF (rms, gamma WQ, rope) to Q[t][h]; h 24, 25 -> key head h - 24
+# (rms, WK, rope) and its value into the caches at position pos0 + t. RO[t][i] = [cos, sin] of angle i (i < 32).
+skill fg_k_qkrope() -> Any {
+  let s = ge_kern("qkrope", ["pQF", "pK", "pV", "pWQ", "pWK", "pQ", "pKC", "pVC", "pRO"], ["ppos0"])
+  let s = s ++ "div.u32 %r10, %r89, 26;\nrem.u32 %r11, %r89, 26;\nsetp.ge.u32 %p3, %r11, 24;\n@%p3 bra KH;\nmul.lo.u32 %r12, %r10, 12288;\nmul.lo.u32 %r13, %r11, 512;\nadd.u32 %r12, %r12, %r13;\nadd.u32 %r12, %r12, %r90;\n" ++ ge_at("%rd10", "%rd1", "%r12") ++ "ld.global.f64 %fd1, [%rd10];\nmov.u64 %rd30, %rd4;\nbra NRM;\nKH:\nsub.u32 %r14, %r11, 24;\nmul.lo.u32 %r12, %r10, 512;\nshl.b32 %r13, %r14, 8;\nadd.u32 %r12, %r12, %r13;\nadd.u32 %r12, %r12, %r90;\n" ++ ge_at("%rd10", "%rd2", "%r12") ++ "ld.global.f64 %fd1, [%rd10];\nmov.u64 %rd30, %rd5;\n"
+  let s = s ++ "NRM:\nmul.f64 %fd2, %fd1, %fd1;\n" ++ ge_bred("%fd2", 8, "add.rn.f64") ++ "div.rn.f64 %fd2, %fd2, 0d4070000000000000;\nadd.f64 %fd2, %fd2, " ++ fg_eps() ++ ";\nsqrt.rn.f64 %fd2, %fd2;\nrcp.rn.f64 %fd2, %fd2;\nmul.f64 %fd1, %fd1, %fd2;\n" ++ fg_w("%fd3", "%rd30", "%r90") ++ "mul.f64 %fd1, %fd1, %fd3;\nmov.u64 %rd31, sbuf;\nmul.wide.u32 %rd32, %r90, 8;\nadd.u64 %rd32, %rd31, %rd32;\nst.shared.f64 [%rd32], %fd1;\nbar.sync 0;\n"
+  # rope on dims < 64: i = tid % 32; a = sbuf[i], b = sbuf[i + 32]
+  let s = s ++ "setp.ge.u32 %p4, %r90, 64;\n@%p4 bra RD;\nand.b32 %r15, %r90, 31;\nmul.wide.u32 %rd33, %r15, 8;\nadd.u64 %rd33, %rd31, %rd33;\nld.shared.f64 %fd4, [%rd33];\nld.shared.f64 %fd5, [%rd33+256];\nmul.lo.u32 %r16, %r10, 64;\nshl.b32 %r17, %r15, 1;\nadd.u32 %r16, %r16, %r17;\n" ++ ge_at("%rd34", "%rd9", "%r16") ++ "ld.global.f64 %fd6, [%rd34];\nld.global.f64 %fd7, [%rd34+8];\nsetp.ge.u32 %p5, %r90, 32;\nmul.f64 %fd8, %fd4, %fd6;\nmul.f64 %fd9, %fd5, %fd7;\nsub.f64 %fd10, %fd8, %fd9;\nmul.f64 %fd8, %fd5, %fd6;\nfma.rn.f64 %fd11, %fd4, %fd7, %fd8;\nselp.f64 %fd1, %fd11, %fd10, %p5;\nRD:\n"
+  # store: query -> Q[t][h][tid]; key -> KC[pos][kv][tid], and the value V[t][kv][tid] -> VC[pos][kv][tid]
+  let s = s ++ "@%p3 bra KS;\nmul.lo.u32 %r18, %r10, 24;\nadd.u32 %r18, %r18, %r11;\nshl.b32 %r18, %r18, 8;\nadd.u32 %r18, %r18, %r90;\n" ++ ge_at("%rd35", "%rd6", "%r18") ++ "st.global.f64 [%rd35], %fd1;\nbra DONE;\nKS:\nadd.u32 %r19, %r1, %r10;\nshl.b32 %r19, %r19, 9;\nshl.b32 %r20, %r14, 8;\nadd.u32 %r19, %r19, %r20;\nadd.u32 %r19, %r19, %r90;\n" ++ ge_at4("%rd35", "%rd7", "%r19") ++ "cvt.rn.f32.f64 %f9, %fd1;\nst.global.f32 [%rd35], %f9;\n" ++ ge_at("%rd36", "%rd3", "%r12") ++ "ld.global.f64 %fd12, [%rd36];\n" ++ ge_at4("%rd37", "%rd8", "%r19") ++ "cvt.rn.f32.f64 %f10, %fd12;\nst.global.f32 [%rd37], %f10;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# attn: block (t, h): dense causal attention of query Q[t][h] over cache positions 0 .. pos0 + t (kv head h / 12),
+# scale 1/16; times sigmoid(the head's gate in QF) -> O[t][h * 256 + d]. SC: scratch [T * 24][MAXPOS] doubles.
+skill fg_k_attn() -> Any {
+  let s = ge_kern("attn", ["pQ", "pKC", "pVC", "pQF", "pO", "pSC", "pSEL"], ["ppos0", "pmaxp", "pNB"])
+  let s = s ++ "div.u32 %r10, %r89, 24;\nrem.u32 %r11, %r89, 24;\ndiv.u32 %r12, %r11, 12;\nadd.u32 %r13, %r1, %r10;\nadd.u32 %r13, %r13, 1;\nmul.lo.u32 %r14, %r89, 256;\nadd.u32 %r14, %r14, %r90;\n" ++ ge_at("%rd10", "%rd1", "%r14") ++ "ld.global.f64 %fd1, [%rd10];\nmov.u64 %rd31, sbuf;\nmul.wide.u32 %rd32, %r90, 8;\nadd.u64 %rd32, %rd31, %rd32;\nst.shared.f64 [%rd32], %fd1;\nbar.sync 0;\nmul.wide.u32 %rd40, %r89, %r2;\nshl.b64 %rd40, %rd40, 3;\nadd.u64 %rd40, %rd6, %rd40;\n"
+  # pass 1: scores and their maximum
+  # QSA: with a selection (pSEL != 0) position p counts only in the tail (p >= (q + 1) / 4 * 4) or a chosen block
+  let s = s ++ "mov.f64 %fd20, 0dFFF0000000000000;\nmov.u32 %r15, %r90;\nand.b32 %r30, %r13, 4294967292;\nP1:\nsetp.ge.u32 %p1, %r15, %r13;\n@%p1 bra P1E;\nsetp.eq.u64 %p6, %rd7, 0;\n@%p6 bra INC;\nsetp.ge.u32 %p7, %r15, %r30;\n@%p7 bra INC;\nshr.u32 %r31, %r15, 2;\nmad.lo.u32 %r32, %r10, %r3, %r31;\n" ++ ge_at("%rd41", "%rd7", "%r32") ++ "ld.global.f64 %fd40, [%rd41];\nsetp.ne.f64 %p8, %fd40, 0d0000000000000000;\n@%p8 bra INC;\nmul.wide.u32 %rd15, %r15, 8;\nadd.u64 %rd15, %rd40, %rd15;\nst.global.f64 [%rd15], 0dFFF0000000000000;\nadd.u32 %r15, %r15, %r93;\nbra P1;\nINC:\nshl.b32 %r16, %r15, 9;\nshl.b32 %r17, %r12, 8;\nadd.u32 %r16, %r16, %r17;\n" ++ ge_at4("%rd11", "%rd2", "%r16") ++ "mov.f64 %fd2, 0d0000000000000000;\nmov.u32 %r18, 0;\nP1D:\nmul.wide.u32 %rd12, %r18, 8;\nadd.u64 %rd13, %rd31, %rd12;\nld.shared.f64 %fd3, [%rd13];\nmul.wide.u32 %rd19, %r18, 4;\nadd.u64 %rd14, %rd11, %rd19;\nld.global.f32 %f4, [%rd14];\ncvt.f64.f32 %fd4, %f4;\nfma.rn.f64 %fd2, %fd3, %fd4, %fd2;\nadd.u32 %r18, %r18, 1;\nsetp.lt.u32 %p2, %r18, 256;\n@%p2 bra P1D;\nmul.f64 %fd2, %fd2, 0d3FB0000000000000;\nmul.wide.u32 %rd15, %r15, 8;\nadd.u64 %rd15, %rd40, %rd15;\nst.global.f64 [%rd15], %fd2;\nmax.f64 %fd20, %fd20, %fd2;\nadd.u32 %r15, %r15, %r93;\nbra P1;\nP1E:\n" ++ ge_bred("%fd20", 8, "max.f64")
+  # pass 2: exp and the sum
+  let s = s ++ "mov.f64 %fd21, 0d0000000000000000;\nmov.u32 %r15, %r90;\nP2:\nsetp.ge.u32 %p1, %r15, %r13;\n@%p1 bra P2E;\nmul.wide.u32 %rd15, %r15, 8;\nadd.u64 %rd15, %rd40, %rd15;\nld.global.f64 %fd2, [%rd15];\nsub.f64 %fd2, %fd2, %fd20;\ncvt.rn.f32.f64 %f2, %fd2;\nmul.f32 %f2, %f2, 0f3FB8AA3B;\nex2.approx.ftz.f32 %f2, %f2;\ncvt.f64.f32 %fd2, %f2;\nst.global.f64 [%rd15], %fd2;\nadd.f64 %fd21, %fd21, %fd2;\nadd.u32 %r15, %r15, %r93;\nbra P2;\nP2E:\n" ++ ge_bred("%fd21", 8, "add.rn.f64") ++ "membar.cta;\nbar.sync 0;\n"
+  # pass 3: thread d sums the weighted values
+  let s = s ++ "mov.f64 %fd22, 0d0000000000000000;\nmov.u32 %r15, 0;\nP3:\nsetp.ge.u32 %p1, %r15, %r13;\n@%p1 bra P3E;\nmul.wide.u32 %rd15, %r15, 8;\nadd.u64 %rd15, %rd40, %rd15;\nld.global.f64 %fd2, [%rd15];\nshl.b32 %r16, %r15, 9;\nshl.b32 %r17, %r12, 8;\nadd.u32 %r16, %r16, %r17;\nadd.u32 %r16, %r16, %r90;\n" ++ ge_at4("%rd16", "%rd3", "%r16") ++ "ld.global.f32 %f5, [%rd16];\ncvt.f64.f32 %fd3, %f5;\nfma.rn.f64 %fd22, %fd2, %fd3, %fd22;\nadd.u32 %r15, %r15, 1;\nbra P3;\nP3E:\ndiv.rn.f64 %fd22, %fd22, %fd21;\n"
+  let s = s ++ "mul.lo.u32 %r19, %r10, 12288;\nmul.lo.u32 %r20, %r11, 512;\nadd.u32 %r19, %r19, %r20;\nadd.u32 %r19, %r19, 256;\nadd.u32 %r19, %r19, %r90;\n" ++ ge_at("%rd17", "%rd4", "%r19") ++ "ld.global.f64 %fd5, [%rd17];\n" ++ fg_sig("%fd6", "%fd5") ++ "mul.f64 %fd22, %fd22, %fd6;\nmul.lo.u32 %r21, %r10, 6144;\nshl.b32 %r22, %r11, 8;\nadd.u32 %r21, %r21, %r22;\nadd.u32 %r21, %r21, %r90;\n" ++ ge_at("%rd18", "%rd5", "%r21") ++ "st.global.f64 [%rd18], %fd22;\nret;\n}\n"
+  return s
+}
+
+# dnconv: thread c of C channels: the causal 4-tap convolution over T tokens with the 3 rows of history H[3][C] (kept
+# and updated), silu -> CV[t][c]; taps CW[c][0..3], oldest first
+skill fg_k_dnconv() -> Any {
+  let s = ge_kern("dnconv", ["pM", "pH", "pCW", "pCV", "pCK"], ["pTn", "pC"])
+  let s = s ++ "mul.lo.u32 %r10, %r89, %r93;\nadd.u32 %r10, %r10, %r90;\nsetp.ge.u32 %p1, %r10, %r2;\n@%p1 bra DONE;\nshl.b32 %r11, %r10, 2;\n"
+  for k in range(0, 4) { let s = s ++ "add.u32 %r12, %r11, " ++ str(k) ++ ";\n" ++ fg_w("%fd" ++ str(10 + k), "%rd3", "%r12") }
+  for k in range(0, 3) { let s = s ++ "mad.lo.u32 %r13, %r2, " ++ str(k) ++ ", %r10;\n" ++ ge_at("%rd11", "%rd2", "%r13") ++ "ld.global.f64 %fd" ++ str(20 + k) ++ ", [%rd11];\n" }
+  let s = s ++ "mov.u32 %r14, 0;\nTL:\nsetp.ge.u32 %p2, %r14, %r1;\n@%p2 bra TE;\nmad.lo.u32 %r15, %r14, %r2, %r10;\n" ++ ge_at("%rd12", "%rd1", "%r15") ++ "ld.global.f64 %fd23, [%rd12];\nmul.f64 %fd1, %fd10, %fd20;\nfma.rn.f64 %fd1, %fd11, %fd21, %fd1;\nfma.rn.f64 %fd1, %fd12, %fd22, %fd1;\nfma.rn.f64 %fd1, %fd13, %fd23, %fd1;\n" ++ fg_sig("%fd2", "%fd1") ++ "mul.f64 %fd1, %fd1, %fd2;\n" ++ ge_at("%rd13", "%rd4", "%r15") ++ "st.global.f64 [%rd13], %fd1;\nmov.f64 %fd20, %fd21;\nmov.f64 %fd21, %fd22;\nmov.f64 %fd22, %fd23;\nsetp.eq.u64 %p3, %rd5, 0;\n@%p3 bra NOCK;\nadd.u32 %r16, %r14, 1;\nsetp.ge.u32 %p3, %r16, %r1;\n@%p3 bra NOCK;\nmul.wide.u32 %rd14, %r14, 11796480;\nadd.u64 %rd14, %rd5, %rd14;\n" ++ ge_at("%rd15", "%rd14", "%r10") ++ "mul.wide.u32 %rd16, %r2, 8;\nst.global.f64 [%rd15], %fd20;\nadd.u64 %rd15, %rd15, %rd16;\nst.global.f64 [%rd15], %fd21;\nadd.u64 %rd15, %rd15, %rd16;\nst.global.f64 [%rd15], %fd22;\nNOCK:\nadd.u32 %r14, %r14, 1;\nbra TL;\nTE:\n"
+  for k in range(0, 3) { let s = s ++ "mad.lo.u32 %r13, %r2, " ++ str(k) ++ ", %r10;\n" ++ ge_at("%rd11", "%rd2", "%r13") ++ "st.global.f64 [%rd11], %fd" ++ str(20 + k) ++ ";\n" }
+  return s ++ "DONE:\nret;\n}\n"
+}
+
+# dnstep's state column S[a][b], a < 128, lives in registers %sv0 .. %sv127 for the whole call: loaded once (all 128
+# loads in flight together), stored once at the end -- each token's two passes no longer wait on memory 256 times.
+# The arithmetic is the loop's, in the same order (the next token reads the float32-rounded value, as from memory).
+skill fg_dn_load() -> Any {
+  let s = ".reg .f32 %sv<128>;\n"
+  for a in range(0, 128) { s = s ++ "ld.global.f32 %sv" ++ str(a) ++ ", [%rd40+" ++ str(512 * a) ++ "];\n" }
+  return s
+}
+
+# a verify pass (pCK != 0): the state after token t < T - 1 also goes to checkpoint t (stride: one whole S, 48 x 48 x
+# 16384 floats), so a draft rejected after token t rolls back by one copy
+skill fg_dn_ck() -> Any {
+  let s = "setp.eq.u64 %p8, %rd8, 0;\n@%p8 bra NOCK;\nadd.u32 %r21, %r12, 1;\nsetp.ge.u32 %p8, %r21, %r1;\n@%p8 bra NOCK;\nmul.wide.u32 %rd41, %r12, 150994944;\nsub.u64 %rd42, %rd40, %rd6;\nadd.u64 %rd42, %rd42, %rd8;\nadd.u64 %rd42, %rd42, %rd41;\n"
+  for a in range(0, 128) { s = s ++ "st.global.f32 [%rd42+" ++ str(512 * a) ++ "], %sv" ++ str(a) ++ ";\n" }
+  return s ++ "NOCK:\n"
+}
+
+skill fg_dn_store() -> Any {
+  let s = ""
+  for a in range(0, 128) { s = s ++ "st.global.f32 [%rd40+" ++ str(512 * a) ++ "], %sv" ++ str(a) ++ ";\n" }
+  return s
+}
+
+# the two passes in float32 (the state is float32 already; float64 runs at 1/64 speed on this GPU): decay %f9,
+# k in sbuf2 and q in sbuf as floats
+skill fg_dn_pass1() -> Any {
+  let s = "mov.f32 %f40, 0f00000000;\n"
+  for a in range(0, 128) { s = s ++ "mul.f32 %f41, %sv" ++ str(a) ++ ", %f9;\nld.shared.f32 %f42, [sbuf2+" ++ str(4 * a) ++ "];\nfma.rn.f32 %f40, %f41, %f42, %f40;\n" }
+  return s ++ "cvt.rn.f32.f64 %f43, %fd5;\ncvt.rn.f32.f64 %f44, %fd6;\nsub.f32 %f45, %f43, %f40;\nmul.f32 %f45, %f45, %f44;\n"
+}
+
+skill fg_dn_pass2() -> Any {
+  let s = "mov.f32 %f46, 0f00000000;\n"
+  for a in range(0, 128) { s = s ++ "mul.f32 %f41, %sv" ++ str(a) ++ ", %f9;\nld.shared.f32 %f42, [sbuf2+" ++ str(4 * a) ++ "];\nfma.rn.f32 %sv" ++ str(a) ++ ", %f42, %f45, %f41;\nld.shared.f32 %f47, [sbuf+" ++ str(4 * a) ++ "];\nfma.rn.f32 %f46, %sv" ++ str(a) ++ ", %f47, %f46;\n" }
+  return s ++ "cvt.f64.f32 %fd12, %f46;\n"
+}
+
+# dnstep: block j (48 value heads), 128 threads (value dim b): the gated delta rule over T tokens on the head's state
+# S[j][a][b] (float32, kept). q, k from key head j % 16 of CV, L2-normalised; beta = sigmoid(BA); decay =
+# exp(softplus(AL + DT[j]) * SA[j]); o = S^T q / sqrt(128) -> O[t][j * 128 + b]
+skill fg_k_dnstep() -> Any {
+  let s = ge_kern("dnstep", ["pCV", "pBA", "pAL", "pDT", "pSA", "pS", "pO", "pCK"], ["pTn"])
+  let s = s ++ "rem.u32 %r10, %r89, 16;\nmul.lo.u32 %r11, %r89, 16384;\nmov.u64 %rd31, sbuf;\nmov.u64 %rd32, sbuf2;\nmul.wide.u32 %rd33, %r90, 8;\n" ++ fg_w("%fd30", "%rd4", "%r89") ++ fg_w("%fd31", "%rd5", "%r89") ++ "add.u32 %r19, %r11, %r90;\n" ++ ge_at4("%rd40", "%rd6", "%r19") ++ fg_dn_load() ++ "mov.u32 %r12, 0;\nTL:\nsetp.ge.u32 %p1, %r12, %r1;\n@%p1 bra TLE;\nmul.lo.u32 %r13, %r12, 10240;\nshl.b32 %r14, %r10, 7;\nadd.u32 %r14, %r14, %r13;\nadd.u32 %r14, %r14, %r90;\n" ++ ge_at("%rd10", "%rd1", "%r14") ++ "ld.global.f64 %fd1, [%rd10];\nld.global.f64 %fd2, [%rd10+16384];\nmul.f64 %fd3, %fd1, %fd1;\n" ++ ge_bred("%fd3", 4, "add.rn.f64") ++ "mul.f64 %fd4, %fd2, %fd2;\n" ++ ge_bred("%fd4", 4, "add.rn.f64")
+  # q / max(|q|, eps), k likewise; q also / sqrt(128)
+  let s = s ++ "sqrt.rn.f64 %fd3, %fd3;\nmax.f64 %fd3, %fd3, " ++ fg_eps() ++ ";\ndiv.rn.f64 %fd1, %fd1, %fd3;\nmul.f64 %fd1, %fd1, 0d3FB6A09E667F3BCC;\nsqrt.rn.f64 %fd4, %fd4;\nmax.f64 %fd4, %fd4, " ++ fg_eps() ++ ";\ndiv.rn.f64 %fd2, %fd2, %fd4;\nmul.wide.u32 %rd36, %r90, 4;\nadd.u64 %rd34, %rd31, %rd36;\ncvt.rn.f32.f64 %f48, %fd1;\nst.shared.f32 [%rd34], %f48;\nadd.u64 %rd35, %rd32, %rd36;\ncvt.rn.f32.f64 %f49, %fd2;\nst.shared.f32 [%rd35], %f49;\nbar.sync 0;\n"
+  # v_b, beta, decay
+  let s = s ++ "add.u32 %r15, %r13, 4096;\nshl.b32 %r16, %r89, 7;\nadd.u32 %r15, %r15, %r16;\nadd.u32 %r15, %r15, %r90;\n" ++ ge_at("%rd11", "%rd1", "%r15") ++ "ld.global.f64 %fd5, [%rd11];\nmad.lo.u32 %r17, %r12, 48, %r89;\n" ++ ge_at("%rd12", "%rd2", "%r17") ++ "ld.global.f64 %fd6, [%rd12];\n" ++ fg_sig("%fd6", "%fd6") ++ ge_at("%rd13", "%rd3", "%r17") ++ "ld.global.f64 %fd7, [%rd13];\nadd.f64 %fd7, %fd7, %fd30;\ncvt.rn.f32.f64 %f7, %fd7;\nmul.f32 %f8, %f7, 0f3FB8AA3B;\nex2.approx.ftz.f32 %f8, %f8;\nadd.f32 %f8, %f8, 0f3F800000;\nlg2.approx.ftz.f32 %f8, %f8;\nmul.f32 %f8, %f8, 0f3F317218;\nsetp.gt.f32 %p2, %f7, 0f41A00000;\nselp.f32 %f8, %f7, %f8, %p2;\ncvt.f64.f32 %fd7, %f8;\nmul.f64 %fd7, %fd7, %fd31;\ncvt.rn.f32.f64 %f9, %fd7;\nmul.f32 %f9, %f9, 0f3FB8AA3B;\nex2.approx.ftz.f32 %f9, %f9;\ncvt.f64.f32 %fd7, %f9;\n"
+  # pass 1: sk = sum_a decay S[a][b] k[a]; pass 2: S[a][b] = decay S + k[a] d; o += S[a][b] q[a] (the column in registers)
+  let s = s ++ fg_dn_pass1() ++ fg_dn_pass2()
+  let s = s ++ "mad.lo.u32 %r20, %r12, 6144, %r16;\nadd.u32 %r20, %r20, %r90;\n" ++ ge_at("%rd18", "%rd7", "%r20") ++ "st.global.f64 [%rd18], %fd12;\n" ++ fg_dn_ck() ++ "bar.sync 0;\nadd.u32 %r12, %r12, 1;\nbra TL;\nTLE:\n" ++ fg_dn_store() ++ "ret;\n}\n"
+  return s
+}
+
+# dngnorm: block (t, j), 128 threads: rms(O head j) * SN[b] * sigmoid(Z) -> F
+skill fg_k_dngnorm() -> Any {
+  let s = ge_kern("dngnorm", ["pO", "pZ", "pSN", "pF"], [])
+  return s ++ "shl.b32 %r10, %r89, 7;\nadd.u32 %r10, %r10, %r90;\n" ++ ge_at("%rd10", "%rd1", "%r10") ++ "ld.global.f64 %fd1, [%rd10];\nmul.f64 %fd2, %fd1, %fd1;\n" ++ ge_bred("%fd2", 4, "add.rn.f64") ++ "div.rn.f64 %fd2, %fd2, 0d4060000000000000;\nadd.f64 %fd2, %fd2, " ++ fg_eps() ++ ";\nsqrt.rn.f64 %fd2, %fd2;\nrcp.rn.f64 %fd2, %fd2;\nmul.f64 %fd1, %fd1, %fd2;\n" ++ fg_w("%fd3", "%rd3", "%r90") ++ "mul.f64 %fd1, %fd1, %fd3;\n" ++ ge_at("%rd11", "%rd2", "%r10") ++ "ld.global.f64 %fd4, [%rd11];\n" ++ fg_sig("%fd5", "%fd4") ++ "mul.f64 %fd1, %fd1, %fd5;\n" ++ ge_at("%rd12", "%rd4", "%r10") ++ "st.global.f64 [%rd12], %fd1;\nret;\n}\n"
+}
+
+# route: block t, one warp: the top 10 of 512 router logits (first best on ties) -> E[t][k] (as doubles) and the
+# softmax of those ten -> W[t][k] (the full softmax's denominator cancels when the ten are renormalised)
+skill fg_k_route() -> Any {
+  let s = ge_kern("route", ["pLG", "pE", "pW"], [])
+  let s = s ++ "mul.lo.u32 %r10, %r89, 512;\n"
+  for j in range(0, 16) { let s = s ++ "add.u32 %r11, %r10, " ++ str(32 * j) ++ ";\nadd.u32 %r11, %r11, %r91;\n" ++ ge_at("%rd10", "%rd1", "%r11") ++ "ld.global.f64 %fd" ++ str(10 + j) ++ ", [%rd10];\n" }
+  let s = s ++ "mov.u32 %r20, 0;\nRK:\nmov.f64 %fd1, 0dFFF0000000000000;\nmov.u32 %r21, 0;\n"
+  for j in range(0, 16) { let s = s ++ "setp.gt.f64 %p2, %fd" ++ str(10 + j) ++ ", %fd1;\n@%p2 mov.f64 %fd1, %fd" ++ str(10 + j) ++ ";\n@%p2 mov.u32 %r21, " ++ str(j) ++ ";\n" }
+  # the warp's best (value, then the smallest global index)
+  let s = s ++ "shl.b32 %r22, %r21, 5;\nadd.u32 %r22, %r22, %r91;\n"
+  for k in [16, 8, 4, 2, 1] { let s = s ++ "mov.b64 {%b1, %b2}, %fd1;\nshfl.sync.bfly.b32 %b3, %b1, " ++ str(k) ++ ", 31, 0xffffffff;\nshfl.sync.bfly.b32 %b4, %b2, " ++ str(k) ++ ", 31, 0xffffffff;\nmov.b64 %fd2, {%b3, %b4};\nshfl.sync.bfly.b32 %r23, %r22, " ++ str(k) ++ ", 31, 0xffffffff;\nsetp.gt.f64 %p3, %fd2, %fd1;\nsetp.eq.f64 %p4, %fd2, %fd1;\nsetp.lt.u32 %p5, %r23, %r22;\nand.pred %p4, %p4, %p5;\nor.pred %p3, %p3, %p4;\n@%p3 mov.f64 %fd1, %fd2;\n@%p3 mov.u32 %r22, %r23;\n" }
+  # the owner knocks it out; lane 0 writes it; the ten logits go to sbuf
+  let s = s ++ "and.b32 %r24, %r22, 31;\nshr.u32 %r25, %r22, 5;\nsetp.eq.u32 %p6, %r24, %r91;\n"
+  for j in range(0, 16) { let s = s ++ "setp.eq.u32 %p7, %r25, " ++ str(j) ++ ";\nand.pred %p7, %p7, %p6;\n@%p7 mov.f64 %fd" ++ str(10 + j) ++ ", 0dFFF0000000000000;\n" }
+  let s = s ++ "setp.eq.u32 %p8, %r91, 0;\nmad.lo.u32 %r26, %r89, 10, %r20;\n" ++ ge_at("%rd11", "%rd2", "%r26") ++ "cvt.rn.f64.u32 %fd3, %r22;\n@%p8 st.global.f64 [%rd11], %fd3;\nmov.u64 %rd31, sbuf;\nmul.wide.u32 %rd32, %r20, 8;\nadd.u64 %rd32, %rd31, %rd32;\n@%p8 st.shared.f64 [%rd32], %fd1;\nadd.u32 %r20, %r20, 1;\nsetp.lt.u32 %p9, %r20, 10;\n@%p9 bra RK;\nbar.sync 0;\n"
+  # weights: exp(l_k - l_0) / sum (l_0 is the largest)
+  let s = s ++ "setp.ge.u32 %p10, %r91, 10;\n@%p10 bra DONE;\nld.shared.f64 %fd4, [sbuf];\nmov.f64 %fd5, 0d0000000000000000;\n"
+  for k in range(0, 10) { let s = s ++ "ld.shared.f64 %fd6, [sbuf+" ++ str(8 * k) ++ "];\nsub.f64 %fd6, %fd6, %fd4;\ncvt.rn.f32.f64 %f6, %fd6;\nmul.f32 %f6, %f6, 0f3FB8AA3B;\nex2.approx.ftz.f32 %f6, %f6;\ncvt.f64.f32 %fd6, %f6;\nadd.f64 %fd5, %fd5, %fd6;\n" }
+  let s = s ++ "mul.wide.u32 %rd33, %r91, 8;\nadd.u64 %rd33, %rd31, %rd33;\nld.shared.f64 %fd7, [%rd33];\nsub.f64 %fd7, %fd7, %fd4;\ncvt.rn.f32.f64 %f7, %fd7;\nmul.f32 %f7, %f7, 0f3FB8AA3B;\nex2.approx.ftz.f32 %f7, %f7;\ncvt.f64.f32 %fd7, %f7;\ndiv.rn.f64 %fd7, %fd7, %fd5;\nmad.lo.u32 %r27, %r89, 10, %r91;\n" ++ ge_at("%rd12", "%rd3", "%r27") ++ "st.global.f64 [%rd12], %fd7;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# moesum: thread (t, i): sum_k W[t][k] D[t * 10 + k][i] + sigmoid(SG[t]) SH[t][i] -> O[t][i]
+skill fg_k_moesum() -> Any {
+  let s = ge_kern("moesum", ["pD", "pW", "pSH", "pSG", "pO"], ["pTE"])
+  let s = s ++ "mul.lo.u32 %r10, %r89, %r93;\nadd.u32 %r10, %r10, %r90;\nsetp.ge.u32 %p1, %r10, %r1;\n@%p1 bra DONE;\ndiv.u32 %r11, %r10, 2560;\nrem.u32 %r12, %r10, 2560;\nmov.f64 %fd1, 0d0000000000000000;\n"
+  for k in range(0, 10) { let s = s ++ "mad.lo.u32 %r13, %r11, 10, " ++ str(k) ++ ";\n" ++ ge_at("%rd10", "%rd2", "%r13") ++ "ld.global.f64 %fd2, [%rd10];\nmad.lo.u32 %r14, %r13, 2560, %r12;\n" ++ ge_at("%rd11", "%rd1", "%r14") ++ "ld.global.f64 %fd3, [%rd11];\nfma.rn.f64 %fd1, %fd2, %fd3, %fd1;\n" }
+  return s ++ ge_at("%rd12", "%rd4", "%r11") ++ "ld.global.f64 %fd4, [%rd12];\n" ++ fg_sig("%fd5", "%fd4") ++ ge_at("%rd13", "%rd3", "%r10") ++ "ld.global.f64 %fd6, [%rd13];\nfma.rn.f64 %fd1, %fd5, %fd6, %fd1;\n" ++ ge_at("%rd14", "%rd5", "%r10") ++ "st.global.f64 [%rd14], %fd1;\nDONE:\nret;\n}\n"
+}
+
+# plegate: block (t, c), 256 threads: s = key[t][c] . qry[t][c] / sqrt(2560); gate = sigmoid(sign(s) sqrt(max(|s|,
+# 1e-6))); G[t][c][i] = VAL[t][i] gate
+skill fg_k_plegate() -> Any {
+  let s = ge_kern("plegate", ["pK", "pQ", "pV", "pG"], [])
+  let s = s ++ "mul.lo.u32 %r10, %r89, 2560;\nshr.u32 %r11, %r89, 2;\nmul.lo.u32 %r11, %r11, 2560;\nmov.f64 %fd1, 0d0000000000000000;\nmov.u32 %r12, %r90;\nA1:\nsetp.ge.u32 %p1, %r12, 2560;\n@%p1 bra A1E;\nadd.u32 %r13, %r10, %r12;\n" ++ ge_at("%rd10", "%rd1", "%r13") ++ "ld.global.f64 %fd2, [%rd10];\n" ++ ge_at("%rd11", "%rd2", "%r13") ++ "ld.global.f64 %fd3, [%rd11];\nfma.rn.f64 %fd1, %fd2, %fd3, %fd1;\nadd.u32 %r12, %r12, 256;\nbra A1;\nA1E:\n" ++ ge_bred("%fd1", 8, "add.rn.f64")
+  let s = s ++ "div.rn.f64 %fd1, %fd1, 0d40494C583ADA5B53;\nabs.f64 %fd4, %fd1;\nmax.f64 %fd4, %fd4, " ++ fg_eps() ++ ";\nsqrt.rn.f64 %fd4, %fd4;\nsetp.lt.f64 %p2, %fd1, 0d0000000000000000;\n@%p2 neg.f64 %fd4, %fd4;\n" ++ fg_sig("%fd5", "%fd4") ++ "mov.u32 %r12, %r90;\nA2:\nsetp.ge.u32 %p1, %r12, 2560;\n@%p1 bra DONE;\nadd.u32 %r14, %r11, %r12;\n" ++ ge_at("%rd12", "%rd3", "%r14") ++ "ld.global.f64 %fd6, [%rd12];\nmul.f64 %fd6, %fd6, %fd5;\nadd.u32 %r13, %r10, %r12;\n" ++ ge_at("%rd13", "%rd4", "%r13") ++ "st.global.f64 [%rd13], %fd6;\nadd.u32 %r12, %r12, 256;\nbra A2;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# pleconv: thread c of 10240 channels: the 4-tap causal conv dilated by 3 (x[t-9], x[t-6], x[t-3], x[t]) of X over T
+# tokens with 9 rows of history H[9][10240] (kept); RES[t][c] += G[t][c] + silu(conv)
+skill fg_ple_ck() -> Any {
+  let s = ""
+  for k in range(0, 9) { s = s ++ "st.global.f64 [%rd15+" ++ str(81920 * k) ++ "], %fd" ++ str(20 + k) ++ ";\n" }
+  return s
+}
+
+skill fg_k_pleconv() -> Any {
+  let s = ge_kern("pleconv", ["pX", "pH", "pCW", "pR", "pG", "pCK"], ["pTn"])
+  let s = s ++ "mul.lo.u32 %r10, %r89, %r93;\nadd.u32 %r10, %r10, %r90;\nsetp.ge.u32 %p1, %r10, 10240;\n@%p1 bra DONE;\nshl.b32 %r11, %r10, 2;\n"
+  for k in range(0, 4) { let s = s ++ "add.u32 %r12, %r11, " ++ str(k) ++ ";\n" ++ fg_w("%fd" ++ str(10 + k), "%rd3", "%r12") }
+  for k in range(0, 9) { let s = s ++ "mad.lo.u32 %r13, " ++ str(k) ++ ", 10240, %r10;\n" ++ ge_at("%rd11", "%rd2", "%r13") ++ "ld.global.f64 %fd" ++ str(20 + k) ++ ", [%rd11];\n" }
+  let s = s ++ "mov.u32 %r14, 0;\nTL:\nsetp.ge.u32 %p2, %r14, %r1;\n@%p2 bra TE;\nmad.lo.u32 %r15, %r14, 10240, %r10;\n" ++ ge_at("%rd12", "%rd1", "%r15") ++ "ld.global.f64 %fd29, [%rd12];\nmul.f64 %fd1, %fd10, %fd20;\nfma.rn.f64 %fd1, %fd11, %fd23, %fd1;\nfma.rn.f64 %fd1, %fd12, %fd26, %fd1;\nfma.rn.f64 %fd1, %fd13, %fd29, %fd1;\n" ++ fg_sig("%fd2", "%fd1") ++ "mul.f64 %fd1, %fd1, %fd2;\n" ++ ge_at("%rd13", "%rd5", "%r15") ++ "ld.global.f64 %fd3, [%rd13];\nadd.f64 %fd1, %fd1, %fd3;\n" ++ ge_at("%rd14", "%rd4", "%r15") ++ "ld.global.f64 %fd4, [%rd14];\nadd.f64 %fd4, %fd4, %fd1;\nst.global.f64 [%rd14], %fd4;\n"
+  for k in range(0, 8) { let s = s ++ "mov.f64 %fd" ++ str(20 + k) ++ ", %fd" ++ str(21 + k) ++ ";\n" }
+  let s = s ++ "mov.f64 %fd28, %fd29;\nsetp.eq.u64 %p3, %rd6, 0;\n@%p3 bra NOCK;\nadd.u32 %r16, %r14, 1;\nsetp.ge.u32 %p3, %r16, %r1;\n@%p3 bra NOCK;\nmul.wide.u32 %rd14, %r14, 737280;\nadd.u64 %rd14, %rd6, %rd14;\n" ++ ge_at("%rd15", "%rd14", "%r10") ++ fg_ple_ck() ++ "NOCK:\nadd.u32 %r14, %r14, 1;\nbra TL;\nTE:\n"
+  for k in range(0, 9) { let s = s ++ "mad.lo.u32 %r13, " ++ str(k) ++ ", 10240, %r10;\n" ++ ge_at("%rd11", "%rd2", "%r13") ++ "st.global.f64 [%rd11], %fd" ++ str(20 + k) ++ ";\n" }
+  return s ++ "DONE:\nret;\n}\n"
+}
+
+# ---- QSA, the sparse attention's lightning indexer (llama.cpp qwen4exp build_qsa_top_k / set_input_qsa) ---------
+# rope helper: %fd1 holds this thread's value (dim tid of a 128-wide head) and sbuf has the head; position p (%r40):
+# dims < 64 rotate in pairs (i, i + 32) with RT[p][i] = [cos, sin]
+skill fg_rope128() -> Any {
+  return "mov.u64 %rd31, sbuf;\nmul.wide.u32 %rd32, %r90, 8;\nadd.u64 %rd32, %rd31, %rd32;\nst.shared.f64 [%rd32], %fd1;\nbar.sync 0;\nsetp.ge.u32 %p4, %r90, 64;\n@%p4 bra RD;\nand.b32 %r15, %r90, 31;\nmul.wide.u32 %rd33, %r15, 8;\nadd.u64 %rd33, %rd31, %rd33;\nld.shared.f64 %fd4, [%rd33];\nld.shared.f64 %fd5, [%rd33+256];\nshl.b32 %r16, %r40, 6;\nshl.b32 %r17, %r15, 1;\nadd.u32 %r16, %r16, %r17;\n" ++ ge_at("%rd34", "%rd30", "%r16") ++ "ld.global.f64 %fd6, [%rd34];\nld.global.f64 %fd7, [%rd34+8];\nsetp.ge.u32 %p5, %r90, 32;\nmul.f64 %fd8, %fd4, %fd6;\nmul.f64 %fd9, %fd5, %fd7;\nsub.f64 %fd10, %fd8, %fd9;\nmul.f64 %fd8, %fd5, %fd6;\nfma.rn.f64 %fd11, %fd4, %fd7, %fd8;\nselp.f64 %fd1, %fd11, %fd10, %p5;\nRD:\n"
+}
+
+# %fd1 -> rms over the block's 128 threads, times gamma W[tid] (the pointer in %rd29)
+skill fg_rms128() -> Any {
+  return "mul.f64 %fd2, %fd1, %fd1;\n" ++ ge_bred("%fd2", 4, "add.rn.f64") ++ "div.rn.f64 %fd2, %fd2, 0d4060000000000000;\nadd.f64 %fd2, %fd2, " ++ fg_eps() ++ ";\nsqrt.rn.f64 %fd2, %fd2;\nrcp.rn.f64 %fd2, %fd2;\nmul.f64 %fd1, %fd1, %fd2;\n" ++ fg_w("%fd3", "%rd29", "%r90") ++ "mul.f64 %fd1, %fd1, %fd3;\n"
+}
+
+# qsaq: block (t, h) of T x 4, 128 threads: IQ[t][h] (index_q_proj) -> rms * QN, rope at pos0 + t -> IQN[t][h]
+skill fg_k_qsaq() -> Any {
+  let s = ge_kern("qsaq", ["pIQ", "pQN", "pRT", "pO"], ["ppos0"])
+  return s ++ "shr.u32 %r10, %r89, 2;\nshl.b32 %r11, %r89, 7;\nadd.u32 %r11, %r11, %r90;\n" ++ ge_at("%rd10", "%rd1", "%r11") ++ "ld.global.f64 %fd1, [%rd10];\nmov.u64 %rd29, %rd2;\n" ++ fg_rms128() ++ "add.u32 %r40, %r1, %r10;\nmov.u64 %rd30, %rd3;\n" ++ fg_rope128() ++ ge_at("%rd11", "%rd4", "%r11") ++ "st.global.f64 [%rd11], %fd1;\nret;\n}\n"
+}
+
+# qsapool: block b0 + i (i < grid), 128 threads: mean of the raw keys IK[4b .. 4b+3] -> rms * KN, rope at position 4b
+# -> PK[b]
+skill fg_k_qsapool() -> Any {
+  let s = ge_kern("qsapool", ["pIK", "pKN", "pRT", "pPK"], ["pb0"])
+  let s = s ++ "add.u32 %r10, %r1, %r89;\nshl.b32 %r11, %r10, 9;\nadd.u32 %r11, %r11, %r90;\nmov.f64 %fd1, 0d0000000000000000;\n"
+  for c in range(0, 4) { let s = s ++ "add.u32 %r12, %r11, " ++ str(128 * c) ++ ";\n" ++ ge_at("%rd10", "%rd1", "%r12") ++ "ld.global.f64 %fd2, [%rd10];\nadd.f64 %fd1, %fd1, %fd2;\n" }
+  return s ++ "mul.f64 %fd1, %fd1, 0d3FD0000000000000;\nmov.u64 %rd29, %rd2;\n" ++ fg_rms128() ++ "shl.b32 %r40, %r10, 2;\nmov.u64 %rd30, %rd3;\n" ++ fg_rope128() ++ "shl.b32 %r13, %r10, 7;\nadd.u32 %r13, %r13, %r90;\n" ++ ge_at("%rd11", "%rd4", "%r13") ++ "st.global.f64 [%rd11], %fd1;\nret;\n}\n"
+}
+
+# qsascore: thread (t, b) over T x NB (NB = complete blocks): sum over the 4 heads of relu(IQN[t][h] . PK[b]) for a
+# block wholly at or before the query (4b + 3 <= pos0 + t), else -inf -> SB[t][b]
+skill fg_k_qsascore() -> Any {
+  let s = ge_kern("qsascore", ["pIQN", "pPK", "pSB"], ["pNB", "ppos0", "pTn"])
+  let s = s ++ "mul.lo.u32 %r10, %r89, %r93;\nadd.u32 %r10, %r10, %r90;\nmul.lo.u32 %r11, %r1, %r3;\nsetp.ge.u32 %p1, %r10, %r11;\n@%p1 bra DONE;\ndiv.u32 %r12, %r10, %r1;\nrem.u32 %r13, %r10, %r1;\nadd.u32 %r14, %r2, %r12;\nshl.b32 %r15, %r13, 2;\nadd.u32 %r15, %r15, 3;\nmov.f64 %fd1, 0dFFF0000000000000;\nsetp.gt.u32 %p2, %r15, %r14;\n@%p2 bra ST;\nmov.f64 %fd1, 0d0000000000000000;\nshl.b32 %r16, %r13, 7;\n" ++ ge_at("%rd10", "%rd2", "%r16")
+  for h in range(0, 4) {
+    let s = s ++ "mov.f64 %fd2, 0d0000000000000000;\nshl.b32 %r17, %r12, 9;\nadd.u32 %r17, %r17, " ++ str(128 * h) ++ ";\n" ++ ge_at("%rd11", "%rd1", "%r17") ++ "mov.u32 %r18, 0;\nH" ++ str(h) ++ ":\nmul.wide.u32 %rd12, %r18, 8;\nadd.u64 %rd13, %rd11, %rd12;\nld.global.f64 %fd3, [%rd13];\nadd.u64 %rd14, %rd10, %rd12;\nld.global.f64 %fd4, [%rd14];\nfma.rn.f64 %fd2, %fd3, %fd4, %fd2;\nadd.u32 %r18, %r18, 1;\nsetp.lt.u32 %p3, %r18, 128;\n@%p3 bra H" ++ str(h) ++ ";\nmax.f64 %fd2, %fd2, 0d0000000000000000;\nadd.f64 %fd1, %fd1, %fd2;\n"
+  }
+  return s ++ "ST:\n" ++ ge_at("%rd15", "%rd3", "%r10") ++ "st.global.f64 [%rd15], %fd1;\nDONE:\nret;\n}\n"
+}
+
+# qsasel: block t, 256 threads: SEL[t][b] = 1 for the K best of the NB scores in SB[t] (ties: the lower index), 0
+# for the rest -- the K-th largest found by bisection on the doubles' order, then the ties filled in index order
+skill fg_k_qsasel() -> Any {
+  let s = ge_kern("qsasel", ["pSB", "pSEL"], ["pNB", "pK"])
+  let s = s ++ "mul.lo.u32 %r10, %r89, %r1;\n"
+  # bisection over the threshold value: lo, hi doubles; 64 rounds of counting scores >= mid
+  let s = s ++ "mov.f64 %fd30, 0d0000000000000000;\nmov.f64 %fd31, 0d41E0000000000000;\nmov.u32 %r30, 0;\nBI:\nadd.f64 %fd32, %fd30, %fd31;\nmul.f64 %fd32, %fd32, 0d3FE0000000000000;\nmov.f64 %fd1, 0d0000000000000000;\nmov.u32 %r11, %r90;\nC1:\nsetp.ge.u32 %p1, %r11, %r1;\n@%p1 bra C1E;\nadd.u32 %r12, %r10, %r11;\n" ++ ge_at("%rd10", "%rd1", "%r12") ++ "ld.global.f64 %fd2, [%rd10];\nsetp.ge.f64 %p2, %fd2, %fd32;\n@%p2 add.f64 %fd1, %fd1, 0d3FF0000000000000;\nadd.u32 %r11, %r11, 256;\nbra C1;\nC1E:\n" ++ ge_bred("%fd1", 8, "add.rn.f64") ++ "cvt.rn.f64.u32 %fd3, %r2;\nsetp.ge.f64 %p3, %fd1, %fd3;\n@%p3 mov.f64 %fd30, %fd32;\n@!%p3 mov.f64 %fd31, %fd32;\nadd.u32 %r30, %r30, 1;\nsetp.lt.u32 %p4, %r30, 80;\n@%p4 bra BI;\n"
+  # strictly above lo -> 1; exactly lo -> 1 while the count is short (thread 0, in index order)
+  let s = s ++ "mov.u32 %r11, %r90;\nmov.f64 %fd5, 0d0000000000000000;\nS1:\nsetp.ge.u32 %p1, %r11, %r1;\n@%p1 bra S1E;\nadd.u32 %r12, %r10, %r11;\n" ++ ge_at("%rd10", "%rd1", "%r12") ++ "ld.global.f64 %fd2, [%rd10];\nsetp.gt.f64 %p2, %fd2, %fd30;\nselp.f64 %fd6, 0d3FF0000000000000, 0d0000000000000000, %p2;\nadd.f64 %fd5, %fd5, %fd6;\n" ++ ge_at("%rd11", "%rd2", "%r12") ++ "st.global.f64 [%rd11], %fd6;\nadd.u32 %r11, %r11, 256;\nbra S1;\nS1E:\n" ++ ge_bred("%fd5", 8, "add.rn.f64")
+  let s = s ++ "setp.ne.u32 %p5, %r90, 0;\n@%p5 bra DONE;\ncvt.rn.f64.u32 %fd3, %r2;\nmov.u32 %r11, 0;\nS2:\nsetp.ge.u32 %p1, %r11, %r1;\n@%p1 bra DONE;\nsetp.ge.f64 %p6, %fd5, %fd3;\n@%p6 bra DONE;\nadd.u32 %r12, %r10, %r11;\n" ++ ge_at("%rd10", "%rd1", "%r12") ++ "ld.global.f64 %fd2, [%rd10];\nsetp.eq.f64 %p2, %fd2, %fd30;\n@!%p2 bra S2N;\n" ++ ge_at("%rd11", "%rd2", "%r12") ++ "st.global.f64 [%rd11], 0d3FF0000000000000;\nadd.f64 %fd5, %fd5, 0d3FF0000000000000;\nS2N:\nadd.u32 %r11, %r11, 1;\nbra S2;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# amax: one block of 1024 threads: the largest of n doubles at X (the first on ties) -> Y[0] = value, Y[1] = index
+skill fg_k_amax() -> Any {
+  let s = ge_kern("amax", ["pX", "pY"], ["pn"])
+  let s = s ++ "mul.lo.u32 %r20, %r89, %r1;\nmul.wide.u32 %rd20, %r20, 8;\nadd.u64 %rd1, %rd1, %rd20;\nmul.wide.u32 %rd20, %r89, 16;\nadd.u64 %rd2, %rd2, %rd20;\nmov.f64 %fd1, 0dFFF0000000000000;\nmov.u32 %r10, 0;\nmov.u32 %r11, %r90;\nL1:\nsetp.ge.u32 %p1, %r11, %r1;\n@%p1 bra L1E;\n" ++ ge_at("%rd10", "%rd1", "%r11") ++ "ld.global.f64 %fd2, [%rd10];\nsetp.gt.f64 %p2, %fd2, %fd1;\n@%p2 mov.f64 %fd1, %fd2;\n@%p2 mov.u32 %r10, %r11;\nadd.u32 %r11, %r11, %r93;\nbra L1;\nL1E:\n"
+  for k in [16, 8, 4, 2, 1] { let s = s ++ "mov.b64 {%b1, %b2}, %fd1;\nshfl.sync.bfly.b32 %b3, %b1, " ++ str(k) ++ ", 31, 0xffffffff;\nshfl.sync.bfly.b32 %b4, %b2, " ++ str(k) ++ ", 31, 0xffffffff;\nmov.b64 %fd2, {%b3, %b4};\nshfl.sync.bfly.b32 %r12, %r10, " ++ str(k) ++ ", 31, 0xffffffff;\nsetp.gt.f64 %p3, %fd2, %fd1;\nsetp.eq.f64 %p4, %fd2, %fd1;\nsetp.lt.u32 %p5, %r12, %r10;\nand.pred %p4, %p4, %p5;\nor.pred %p3, %p3, %p4;\n@%p3 mov.f64 %fd1, %fd2;\n@%p3 mov.u32 %r10, %r12;\n" }
+  let s = s ++ "setp.eq.u32 %p6, %r91, 0;\nmov.u64 %rd11, red;\nmul.wide.u32 %rd12, %r92, 8;\nadd.u64 %rd12, %rd11, %rd12;\n@%p6 st.shared.f64 [%rd12], %fd1;\nmov.u64 %rd13, redi;\nmul.wide.u32 %rd14, %r92, 4;\nadd.u64 %rd14, %rd13, %rd14;\n@%p6 st.shared.u32 [%rd14], %r10;\nbar.sync 0;\nsetp.ne.u32 %p7, %r90, 0;\n@%p7 bra DONE;\nld.shared.f64 %fd1, [red];\nld.shared.u32 %r10, [redi];\nmov.u32 %r13, 1;\nW1:\nmul.wide.u32 %rd12, %r13, 8;\nadd.u64 %rd12, %rd11, %rd12;\nld.shared.f64 %fd2, [%rd12];\nmul.wide.u32 %rd14, %r13, 4;\nadd.u64 %rd14, %rd13, %rd14;\nld.shared.u32 %r12, [%rd14];\nsetp.gt.f64 %p3, %fd2, %fd1;\nsetp.eq.f64 %p4, %fd2, %fd1;\nsetp.lt.u32 %p5, %r12, %r10;\nand.pred %p4, %p4, %p5;\nor.pred %p3, %p3, %p4;\n@%p3 mov.f64 %fd1, %fd2;\n@%p3 mov.u32 %r10, %r12;\nadd.u32 %r13, %r13, 1;\nsetp.lt.u32 %p8, %r13, 32;\n@%p8 bra W1;\nst.global.f64 [%rd2], %fd1;\ncvt.rn.f64.u32 %fd3, %r10;\nst.global.f64 [%rd2+8], %fd3;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# ---- fmw: the dense matvec rebuilt for many vectors at once and for the GPU's memory system -----------------------
+# One warp per row as in fmv, but V vectors per pass over the row: each weight is decoded once and used V times (a
+# prompt chunk, a draft's check). The input is staged in chunks of C (V C <= 10240) into fxs as V planes, vector v at
+# float v C, so any n works. Q8_0: half a warp per block, each lane two neighbouring weights (16-bit loads), so a warp
+# reads 64 contiguous bytes per load and its shared reads are conflict-free -- fmv's lane-per-block layout put all 32
+# lanes on one shared-memory bank. Dense types only: F32 (0), Q8_0 (8), Q6_K (14), BF16 (30). Row sums %fa0 ..
+# %fa(V-1); chunk k0 = %r30 .. k1 = %r31; %rd6 = fxs - 4 k0, so x[k] of vector v is at %rd6 + 4 k + 4 v C.
+
+# acc_v += w * x_v for every vector, the x at shared address addr + off (+ 4 v C); pr predicates the adds
+skill fgw_mac(V, C, addr, off, w, acc, pr) -> Any {
+  let s = ""
+  for v in range(0, V) { s = s ++ "ld.shared.f32 %f4, [" ++ addr ++ "+" ++ str(off + 4 * v * C) ++ "];\n" ++ pr ++ "fma.rn.f32 " ++ acc ++ str(v) ++ ", " ++ w ++ ", %f4, " ++ acc ++ str(v) ++ ";\n" }
+  return s
+}
+
+# F32 and BF16: lane-strided elements, four in flight (bf: 2-byte weights, the high half of a float)
+skill fgw_flt(V, C, bf) -> Any {
+  let lbl = if bf { "WB" } else { "WF" }
+  let s = "add.u32 %r20, %r30, %r91;\nmad.lo.u32 %r20, %r80, 128, %r20;\n" ++ lbl ++ ":\nsetp.ge.u32 %p4, %r20, %r31;\n@%p4 bra CHN;\n"
+  for u in range(0, 4) {
+    let r = "%r" ++ str(21 + u)
+    let p = "%p" ++ str(10 + u)
+    let a = "%rd" ++ str(20 + u)
+    s = s ++ "add.u32 " ++ r ++ ", %r20, " ++ str(32 * u) ++ ";\nsetp.lt.u32 " ++ p ++ ", " ++ r ++ ", %r31;\nmul.wide.u32 " ++ a ++ ", " ++ r ++ ", " ++ (if bf { "2" } else { "4" }) ++ ";\nadd.u64 " ++ a ++ ", %rd5, " ++ a ++ ";\n"
+    if bf { s = s ++ "@" ++ p ++ " ld.global.u16 %r" ++ str(50 + u) ++ ", [" ++ a ++ "];\n" } else { s = s ++ "@" ++ p ++ " ld.global.f32 %f" ++ str(10 + u) ++ ", [" ++ a ++ "];\n" }
+  }
+  for u in range(0, 4) {
+    let r = "%r" ++ str(21 + u)
+    let a = "%rd" ++ str(30 + u)
+    if bf { s = s ++ "shl.b32 %r" ++ str(50 + u) ++ ", %r" ++ str(50 + u) ++ ", 16;\nmov.b32 %f" ++ str(10 + u) ++ ", %r" ++ str(50 + u) ++ ";\n" }
+    s = s ++ "mul.wide.u32 " ++ a ++ ", " ++ r ++ ", 4;\nadd.u64 " ++ a ++ ", %rd6, " ++ a ++ ";\n" ++ fgw_mac(V, C, a, 0, "%f" ++ str(10 + u), "%fa", "@%p" ++ str(10 + u) ++ " ")
+  }
+  return s ++ "add.u32 %r20, %r20, %r82;\nbra " ++ lbl ++ ";\n"
+}
+
+# Q8_0 (34-byte blocks: f16 d, 32 int8): lane l takes block b + l / 16, weights 2 (l % 16) and + 1; a step covers 8
+# blocks (four loads in flight per lane). w = d q is exact in float32 (11 + 8 bits).
+skill fgw_q8(V, C) -> Any {
+  let s = "shr.u32 %r40, %r30, 5;\nshr.u32 %r41, %r31, 5;\nshr.u32 %r42, %r91, 4;\nand.b32 %r43, %r91, 15;\nshl.b32 %r44, %r43, 1;\ncvt.u64.u32 %rd15, %r44;\nmad.lo.u32 %r20, %r80, 8, %r40;\nW8L:\nsetp.ge.u32 %p4, %r20, %r41;\n@%p4 bra CHN;\n"
+  for u in range(0, 4) {
+    let r = "%r" ++ str(45 + u)
+    let p = "%p" ++ str(10 + u)
+    let a = "%rd" ++ str(20 + u)
+    s = s ++ "add.u32 " ++ r ++ ", %r20, " ++ str(2 * u) ++ ";\nadd.u32 " ++ r ++ ", " ++ r ++ ", %r42;\nsetp.lt.u32 " ++ p ++ ", " ++ r ++ ", %r41;\nmul.wide.u32 " ++ a ++ ", " ++ r ++ ", 34;\nadd.u64 " ++ a ++ ", %rd5, " ++ a ++ ";\n@" ++ p ++ " ld.global.b16 %h" ++ str(1 + u) ++ ", [" ++ a ++ "];\nadd.u64 " ++ a ++ ", " ++ a ++ ", %rd15;\n@" ++ p ++ " ld.global.u16 %r" ++ str(50 + u) ++ ", [" ++ a ++ "+2];\n"
+  }
+  for u in range(0, 4) {
+    let r = "%r" ++ str(45 + u)
+    let a = "%rd" ++ str(30 + u)
+    let pr = "@%p" ++ str(10 + u) ++ " "
+    s = s ++ "cvt.f32.f16 %f5, %h" ++ str(1 + u) ++ ";\nbfe.s32 %q4, %r" ++ str(50 + u) ++ ", 0, 8;\nbfe.s32 %q5, %r" ++ str(50 + u) ++ ", 8, 8;\ncvt.rn.f32.s32 %f10, %q4;\ncvt.rn.f32.s32 %f11, %q5;\nmul.f32 %f10, %f10, %f5;\nmul.f32 %f11, %f11, %f5;\nshl.b32 %r49, " ++ r ++ ", 5;\nadd.u32 %r49, %r49, %r44;\nmul.wide.u32 " ++ a ++ ", %r49, 4;\nadd.u64 " ++ a ++ ", %rd6, " ++ a ++ ";\n"
+    for v in range(0, V) { s = s ++ "ld.shared.v2.f32 {%f20, %f21}, [" ++ a ++ "+" ++ str(4 * v * C) ++ "];\n" ++ pr ++ "fma.rn.f32 %fa" ++ str(v) ++ ", %f10, %f20, %fa" ++ str(v) ++ ";\n" ++ pr ++ "fma.rn.f32 %fa" ++ str(v) ++ ", %f11, %f21, %fa" ++ str(v) ++ ";\n" }
+  }
+  return s ++ "add.u32 %r20, %r20, %r83;\nbra W8L;\n"
+}
+
+# Q6_K (fg_q6k's lane layout, which is already conflict-free), its superblocks of this chunk, V vectors
+skill fgw_q6k(V, C) -> Any {
+  let s = "shr.u32 %r20, %r30, 8;\nadd.u32 %r20, %r20, %r80;\nshr.u32 %r21, %r31, 8;\nshr.u32 %r27, %r91, 4;\nW14:\nsetp.ge.u32 %p4, %r20, %r21;\n@%p4 bra CHN;\nmul.wide.u32 %rd14, %r20, 210;\nadd.u64 %rd14, %rd5, %rd14;\nld.global.b16 %h1, [%rd14+208];\ncvt.f32.f16 %f5, %h1;\nshl.b32 %r49, %r20, 8;\nadd.u32 %r49, %r49, %r91;\nmul.wide.u32 %rd21, %r49, 4;\nadd.u64 %rd21, %rd6, %rd21;\ncvt.u64.u32 %rd22, %r91;\nadd.u64 %rd22, %rd14, %rd22;\ncvt.u64.u32 %rd23, %r27;\nadd.u64 %rd23, %rd14, %rd23;\n"
+  for v in range(0, V) { s = s ++ "mov.f32 %fb" ++ str(v) ++ ", 0f00000000;\n" }
+  for h in range(0, 2) {
+    s = s ++ "ld.global.u8 %r60, [%rd22+" ++ str(64 * h) ++ "];\nld.global.u8 %r61, [%rd22+" ++ str(64 * h + 32) ++ "];\nld.global.u8 %r62, [%rd22+" ++ str(128 + 32 * h) ++ "];\n"
+    let parts = [["%r60", 0, 15, 0, 0], ["%r61", 0, 15, 2, 2], ["%r60", 4, 15, 4, 4], ["%r61", 4, 15, 6, 6]]
+    for k in range(0, 4) {
+      let pp = parts[k]
+      s = s ++ "shr.u32 %r63, " ++ pp[0] ++ ", " ++ str(pp[1]) ++ ";\nand.b32 %r63, %r63, 15;\nshr.u32 %r64, %r62, " ++ str(pp[3]) ++ ";\nand.b32 %r64, %r64, 3;\nshl.b32 %r64, %r64, 4;\nor.b32 %r63, %r63, %r64;\ncvt.rn.f32.u32 %f3, %r63;\nsub.f32 %f3, %f3, 0f42000000;\n"
+      s = s ++ "ld.global.s8 %q3, [%rd23+" ++ str(192 + 8 * h + pp[4]) ++ "];\ncvt.rn.f32.s32 %f7, %q3;\nmul.f32 %f3, %f3, %f7;\n" ++ fgw_mac(V, C, "%rd21", 4 * (128 * h + 32 * k), "%f3", "%fb", "")
+    }
+  }
+  for v in range(0, V) { s = s ++ "fma.rn.f32 %fa" ++ str(v) ++ ", %f5, %fb" ++ str(v) ++ ", %fa" ++ str(v) ++ ";\n" }
+  return s ++ "add.u32 %r20, %r20, %r81;\nbra W14;\n"
+}
+
+skill fg_k_fmw(V, S) -> Any {
+  let C = 10240 // V // 256 * 256
+  let lg = if S == 8 { 3 } else if S == 4 { 2 } else if S == 2 { 1 } else { 0 }
+  let s = ge_kern(fg_fmw_name(V, S), ["pW", "pX", "pY", "pT"], ["pn", "prows", "ptype", "prb", "pnv", "prpe", "pxd"])
+  s = s ++ ".reg .f32 %fa<8>;\n.reg .f32 %fb<8>;\nmul.lo.u32 %r19, %r89, " ++ str(8 // S) ++ ";\nshr.u32 %r84, %r92, " ++ str(lg) ++ ";\nadd.u32 %r10, %r19, %r84;\nand.b32 %r80, %r92, " ++ str(S - 1) ++ ";\nmov.u32 %r81, " ++ str(S) ++ ";\nmov.u32 %r82, " ++ str(128 * S) ++ ";\nmov.u32 %r83, " ++ str(8 * S) ++ ";\nsetp.lt.u32 %p1, %r10, %r2;\nmul.wide.u32 %rd12, %r10, %r4;\nadd.u64 %rd5, %rd1, %rd12;\nmov.u64 %rd60, fxs;\nmov.u32 %r14, 0;\nVG:\nsetp.ge.u32 %p3, %r14, %r5;\n@%p3 bra DONE;\n"
+  for v in range(0, V) { s = s ++ "mov.f32 %fa" ++ str(v) ++ ", 0f00000000;\n" }
+  s = s ++ "mov.u32 %r30, 0;\nCH:\nsetp.ge.u32 %p5, %r30, %r1;\n@%p5 bra WR;\nadd.u32 %r31, %r30, " ++ str(C) ++ ";\nmin.u32 %r31, %r31, %r1;\nsub.u32 %r32, %r31, %r30;\nbar.sync 0;\n"
+  // staging: vector r14 + v, elements k0 .. k1, four loads in flight per thread
+  for v in range(0, V) {
+    let sv = str(v)
+    s = s ++ "add.u32 %r33, %r14, " ++ sv ++ ";\nsetp.lt.u32 %p6, %r33, %r5;\n@!%p6 bra SK" ++ sv ++ ";\nmad.lo.u32 %r34, %r33, %r1, %r30;\nmov.u32 %r35, %r90;\nST" ++ sv ++ ":\nsetp.ge.u32 %p7, %r35, %r32;\n@%p7 bra SK" ++ sv ++ ";\n"
+    for u in range(0, 4) {
+      let p = "%p" ++ str(10 + u)
+      s = s ++ "add.u32 %r36, %r35, " ++ str(256 * u) ++ ";\nsetp.lt.u32 " ++ p ++ ", %r36, %r32;\nadd.u32 %r37, %r34, %r36;\n" ++ ge_at("%rd" ++ str(61 + u), "%rd2", "%r37") ++ "@" ++ p ++ " ld.global.f64 %fd" ++ str(61 + u) ++ ", [%rd" ++ str(61 + u) ++ "];\n"
+    }
+    for u in range(0, 4) {
+      let p = "%p" ++ str(10 + u)
+      s = s ++ "add.u32 %r36, %r35, " ++ str(256 * u) ++ ";\nmul.wide.u32 %rd65, %r36, 4;\nadd.u64 %rd65, %rd60, %rd65;\ncvt.rn.f32.f64 %f" ++ str(62 + u) ++ ", %fd" ++ str(61 + u) ++ ";\n@" ++ p ++ " st.shared.f32 [%rd65+" ++ str(4 * v * C) ++ "], %f" ++ str(62 + u) ++ ";\n"
+    }
+    s = s ++ "add.u32 %r35, %r35, 1024;\nbra ST" ++ sv ++ ";\nSK" ++ sv ++ ":\n"
+  }
+  s = s ++ "bar.sync 0;\n@!%p1 bra CHN;\nmul.wide.u32 %rd64, %r30, 4;\nsub.u64 %rd6, %rd60, %rd64;\nsetp.eq.u32 %p8, %r3, 8;\n@%p8 bra B8;\nsetp.eq.u32 %p8, %r3, 14;\n@%p8 bra B14;\nsetp.eq.u32 %p8, %r3, 30;\n@%p8 bra B30;\n" ++ fgw_flt(V, C, false)
+  s = s ++ "B8:\n" ++ fgw_q8(V, C) ++ "B14:\n" ++ fgw_q6k(V, C) ++ "B30:\n" ++ fgw_flt(V, C, true)
+  s = s ++ "CHN:\nmov.u32 %r30, %r31;\nbra CH;\nWR:\nsetp.eq.u32 %p9, %r91, 0;\n"
+  if S == 1 {
+    s = s ++ "@!%p1 bra NV;\n"
+    for v in range(0, V) {
+      s = s ++ fg_wsum("%fa" ++ str(v), "%f2") ++ "add.u32 %r33, %r14, " ++ str(v) ++ ";\nsetp.lt.u32 %p6, %r33, %r5;\nand.pred %p6, %p6, %p9;\nmad.lo.u32 %r37, %r33, %r2, %r10;\n" ++ ge_at("%rd24", "%rd3", "%r37") ++ "cvt.f64.f32 %fd3, %fa" ++ str(v) ++ ";\n@%p6 st.global.f64 [%rd24], %fd3;\n"
+    }
+  } else {
+    s = s ++ "mov.u64 %rd70, red;\n@!%p1 bra WR2;\n"
+    for v in range(0, V) {
+      s = s ++ fg_wsum("%fa" ++ str(v), "%f2") ++ "mad.lo.u32 %r38, %r92, 8, " ++ str(v) ++ ";\nmul.wide.u32 %rd71, %r38, 4;\nadd.u64 %rd71, %rd70, %rd71;\n@%p9 st.shared.f32 [%rd71], %fa" ++ str(v) ++ ";\n"
+    }
+    s = s ++ "WR2:\nbar.sync 0;\n@!%p1 bra NV;\nsetp.ne.u32 %p6, %r80, 0;\n@%p6 bra NV;\n"
+    for v in range(0, V) {
+      s = s ++ "mov.f32 %f20, 0f00000000;\n"
+      for j in range(0, S) { s = s ++ "add.u32 %r38, %r92, " ++ str(j) ++ ";\nmad.lo.u32 %r38, %r38, 8, " ++ str(v) ++ ";\nmul.wide.u32 %rd71, %r38, 4;\nadd.u64 %rd71, %rd70, %rd71;\nld.shared.f32 %f21, [%rd71];\nadd.f32 %f20, %f20, %f21;\n" }
+      s = s ++ "add.u32 %r33, %r14, " ++ str(v) ++ ";\nsetp.lt.u32 %p6, %r33, %r5;\nand.pred %p6, %p6, %p9;\nmad.lo.u32 %r37, %r33, %r2, %r10;\n" ++ ge_at("%rd24", "%rd3", "%r37") ++ "cvt.f64.f32 %fd3, %f20;\n@%p6 st.global.f64 [%rd24], %fd3;\n"
+    }
+  }
+  return s ++ "NV:\nadd.u32 %r14, %r14, " ++ str(V) ++ ";\nbra VG;\nDONE:\nret;\n}\n"
+}
+
+skill fg_fmw_name(V, S) -> Any { return "fmw" ++ str(V) ++ (if S > 1 { "s" ++ str(S) } else { "" }) }
+skill FG_FMW() -> Any { return [[1, 1], [1, 2], [1, 4], [1, 8], [4, 1], [4, 4], [8, 1], [8, 4]] }
+
+# the matvec for a dense weight: fmw (V = 1, 4 or 8 by the vectors' count; S warps a row when there are few rows,
+# so the GPU has enough warps to hide memory latency) for its types, else fmv
+skill fg_mvw(fs, w, ty, rb, n, rows, x, y, nv, st) -> Any {
+  if ty != 0 and ty != 8 and ty != 14 and ty != 30 { return fg_mv(fs, w, ty, rb, n, rows, x, y, nv, st) }
+  let V = if nv == 1 { 1 } else if nv <= 4 { 4 } else { 8 }
+  let S = 1
+  if V == 1 {
+    while S < 8 and rows * S < 4096 { S = S * 2 }
+  } else if rows < 2048 {
+    S = 4
+  }
+  let C = 10240 // V // 256 * 256
+  return fg_go(fs, fg_fmw_name(V, S), (rows * S + 7) // 8, 256, [w, x, y, 0, n, rows, ty, rb, nv, 1, 1], st, 4 * ((V - 1) * C + min(n, C)))
+}
+
+# slotmap: thread k < n: expert E[k] of layer L -> its cache slot (SOM: int32 a key, kept by the host in mapped
+# memory, written only when a miss moves an expert) -> the slot's address and its three parts into TAB (gate at k,
+# up at n + k, down at 2n + k). The host no longer sends the table: one driver call fewer a layer.
+skill fg_k_slotmap() -> Any {
+  let s = ge_kern("slotmap", ["pE", "pSOM", "pTAB", "pPA", "pPB"], ["pL", "pn", "pNA", "pSA", "pSB", "pbg", "pbu"])
+  s = s ++ "setp.ge.u32 %p1, %r90, %r2;\n@%p1 bra DONE;\n" ++ ge_at("%rd10", "%rd1", "%r90") ++ "ld.global.f64 %fd1, [%rd10];\ncvt.rzi.u32.f64 %r10, %fd1;\nmad.lo.u32 %r11, %r1, 512, %r10;\n" ++ ge_at4("%rd11", "%rd2", "%r11") ++ "ld.global.u32 %r12, [%rd11];\nsetp.lt.u32 %p2, %r12, %r3;\n@%p2 bra PA;\nsub.u32 %r13, %r12, %r3;\nmul.wide.u32 %rd12, %r13, %r5;\nadd.u64 %rd13, %rd5, %rd12;\nbra GO;\nPA:\nmul.wide.u32 %rd12, %r12, %r4;\nadd.u64 %rd13, %rd4, %rd12;\nGO:\n"
+  s = s ++ ge_at("%rd14", "%rd3", "%r90") ++ "st.global.u64 [%rd14], %rd13;\ncvt.u64.u32 %rd15, %r6;\nadd.u64 %rd16, %rd13, %rd15;\nadd.u32 %r14, %r90, %r2;\n" ++ ge_at("%rd17", "%rd3", "%r14") ++ "st.global.u64 [%rd17], %rd16;\ncvt.u64.u32 %rd18, %r7;\nadd.u64 %rd16, %rd16, %rd18;\nadd.u32 %r14, %r14, %r2;\n" ++ ge_at("%rd17", "%rd3", "%r14") ++ "st.global.u64 [%rd17], %rd16;\nDONE:\nret;\n}\n"
+  return s
+}
+
+# ---- device-position variants: the whole decode pass as graphs ----------------------------------------------------
+# A kernel whose launch carries the position cannot be recorded once and replayed. Its variant name_d takes one more
+# pointer (after its own pointers) to a GPU word holding the position, reads it first, and sets from it the
+# registers the position decides (inj: PTX with %DP for that pointer's register).
+skill fg_dpv(k, name, nptr, inj) -> Any {
+  let a = split(k, ".visible .entry " ++ name ++ "(")
+  let q = split(a[1], ")\n{\n")
+  let ps = split(q[0], ", ")
+  let out = []
+  let ins = false
+  for x in ps {
+    if not ins and slice(x, 0, 11) == ".param .u32" {
+      out ++= [".param .u64 pDP"]
+      ins = true
+    }
+    out ++= [x]
+  }
+  if not ins { out ++= [".param .u64 pDP"] }
+  let rest = join(slice(q, 1, len(q)), ")\n{\n")
+  let r = split(rest, "mov.u32 %r93, %ntid.x;\n")
+  let p = "%rd" ++ str(nptr + 1)
+  let pre = "mov.u32 %r93, %ntid.x;\nld.param.u64 " ++ p ++ ", [pDP];\ncvta.to.global.u64 " ++ p ++ ", " ++ p ++ ";\n" ++ join(split(inj, "%DP"), p)
+  return ".visible .entry " ++ name ++ "_d(" ++ join(out, ", ") ++ ")\n{\n" ++ r[0] ++ pre ++ join(slice(r, 1, len(r)), "mov.u32 %r93, %ntid.x;\n")
+}
+
+skill fg_k_dpvs() -> Any {
+  // qkrope: pos0 and the rope row RT + 512 pos; attn: pos0, NB = (pos + 1) / 4, dense below 513 blocks; the QSA
+  // kernels: pos0 / NB, and nothing to do while attention is dense; qsapool: only when a block of 4 completes
+  let s = fg_dpv(fg_k_qkrope(), "qkrope", 9, "ld.global.u32 %r1, [%DP];\nmul.wide.u32 %rd79, %r1, 512;\nadd.u64 %rd9, %rd9, %rd79;\n")
+  s = s ++ fg_dpv(fg_k_attn(), "attn", 7, "ld.global.u32 %r1, [%DP];\nadd.u32 %r3, %r1, 1;\nshr.u32 %r3, %r3, 2;\nsetp.le.u32 %p19, %r3, 512;\n@%p19 mov.u64 %rd7, 0;\n")
+  s = s ++ fg_dpv(fg_k_qsaq(), "qsaq", 4, "ld.global.u32 %r1, [%DP];\n")
+  s = s ++ fg_dpv(fg_k_qsapool(), "qsapool", 4, "ld.global.u32 %r99, [%DP];\nadd.u32 %r98, %r99, 1;\nand.b32 %r98, %r98, 3;\nsetp.ne.u32 %p19, %r98, 0;\n@%p19 ret;\nshr.u32 %r1, %r99, 2;\n")
+  s = s ++ fg_dpv(fg_k_qsascore(), "qsascore", 3, "ld.global.u32 %r2, [%DP];\nadd.u32 %r1, %r2, 1;\nshr.u32 %r1, %r1, 2;\nsetp.le.u32 %p19, %r1, 512;\n@%p19 ret;\nmov.u32 %r3, 1;\n")
+  s = s ++ fg_dpv(fg_k_qsasel(), "qsasel", 2, "ld.global.u32 %r99, [%DP];\nadd.u32 %r1, %r99, 1;\nshr.u32 %r1, %r1, 2;\nsetp.le.u32 %p19, %r1, 512;\n@%p19 ret;\n")
+  // posget: the position the host wrote in mapped memory -> the GPU word the _d kernels read
+  s = s ++ ge_kern("posget", ["pH", "pD"], []) ++ "setp.ne.u32 %p1, %r90, 0;\n@%p1 bra DONE;\nld.global.u32 %r1, [%rd1];\nst.global.u32 [%rd2], %r1;\nDONE:\nret;\n}\n"
+  // ikput_d: the indexer key of this token (128 doubles) -> IK row pos
+  s = s ++ ge_kern("ikput_d", ["pS", "pIK", "pDP"], []) ++ "ld.global.u32 %r1, [%rd3];\nsetp.ge.u32 %p1, %r90, 128;\n@%p1 bra DONE;\n" ++ ge_at("%rd10", "%rd1", "%r90") ++ "ld.global.f64 %fd1, [%rd10];\nshl.b32 %r2, %r1, 7;\nadd.u32 %r2, %r2, %r90;\n" ++ ge_at("%rd11", "%rd2", "%r2") ++ "st.global.f64 [%rd11], %fd1;\nDONE:\nret;\n}\n"
+  return s
+}
+
+skill FG_DPV_NAMES() -> Any { return ["qkrope_d", "attn_d", "qsaq_d", "qsapool_d", "qsascore_d", "qsasel_d", "posget", "ikput_d"] }
+
+skill fg_ptx() -> Any {
+  return ".version 7.0\n.target sm_80\n.address_size 64\n.global .align 4 .u32 ggrid[512] = {" ++ fg_grid() ++ "};\n.global .align 4 .s32 gkv[16] = {" ++ fg_kv() ++ "};\n.extern .shared .align 16 .f32 fxs[];\n.shared .align 4 .u32 sgrid[512];\n.shared .align 4 .s32 skv[16];\n" ++ fg_k_fmv() ++ fg_k_fmv_g(true) ++ fg_k_hcnorm() ++ fg_k_fmws() ++ fg_k_dpvs() ++ fg_k_slotmap() ++ fg_k_hcnormi() ++ fg_k_embq8() ++ fg_k_pleiq4() ++ fg_k_act() ++ fg_k_hcmix() ++ fg_k_hccomb() ++ fg_k_qkrope() ++ fg_k_attn() ++ fg_k_dnconv() ++ fg_k_dnstep() ++ fg_k_dngnorm() ++ fg_k_route() ++ fg_k_moesum() ++ fg_k_plegate() ++ fg_k_pleconv() ++ fg_k_amax() ++ fg_k_qsaq() ++ fg_k_qsapool() ++ fg_k_qsascore() ++ fg_k_qsasel()
+}
+
+skill fg_NAMES() -> Any { return ["fmv", "fmvt", "hcnorm", "hcnormi", "embq8", "pleiq4", "act", "hcmix", "hccomb", "qkrope", "attn", "dnconv", "dnstep", "dngnorm", "route", "moesum", "plegate", "pleconv", "amax", "qsaq", "qsapool", "qsascore", "qsasel"] }
+
+skill fg_k_fmws() -> Any {
+  let s = ""
+  for vs in FG_FMW() { s = s ++ fg_k_fmw(vs[0], vs[1]) }
+  return s
+}
+
+skill fg_kernels() -> Any {
+  let mod = rt_gpu_module(fg_ptx())
+  if mod < 0 { return "flash kernels failed to load " ++ str(mod) }
+  let fs = {}
+  let names = fg_NAMES()
+  for vs in FG_FMW() { names ++= [fg_fmw_name(vs[0], vs[1])] }
+  names = names ++ FG_DPV_NAMES() ++ ["slotmap"]
+  for nm in names {
+    let f = rt_gpu_fn(mod, nm)
+    if f < 0 { return "kernel " ++ nm ++ " not found " ++ str(f) }
+    fs[nm] = f
+  }
+  return fs
+}
+
+# rows 0 .. rows of the matrix at w (type ty, rb bytes a row) times nv vectors of n doubles at x -> y, queued on st
+# (fxs, the staged input, is dynamic shared memory sized per launch: a static 40 KB let only ~2 blocks onto an SM)
+skill fg_go(fs, name, g, b, ps, st, sm) -> Any {
+  let rc = rt_gpu_gosm(fs[name], g, b, ps, st, sm)
+  if rc != 0 { do fail("launch of " ++ name ++ " failed " ++ str(rc)) }
+  return rc
+}
+
+skill fg_mv(fs, w, ty, rb, n, rows, x, y, nv, st) -> Any {
+  return fg_go(fs, "fmv", (rows + 7) // 8, 256, [w, x, y, 0, n, rows, ty, rb, nv, 1, 1], st, 4 * n)
+}
+
+# the experts in a slot table: rpe rows each, slots of them; input vector (slot / xd) of x -> y[slot * rpe + r]
+# (in table mode pnv is the slots of one matrix: slot s reads vector (s mod pnv) / xd, so the gate and up matrices
+# of the same experts -- next to each other in TAB -- run as one launch of 2 n slots)
+skill fg_mvx(fs, tab, ty, rb, n, rpe, slots, x, xd, y, st) -> Any { return fg_mvx2(fs, tab, ty, rb, n, rpe, slots, slots, x, xd, y, st) }
+
+skill fg_mvx2(fs, tab, ty, rb, n, rpe, slots, per, x, xd, y, st) -> Any {
+  if n <= 1024 and rpe % 32 == 0 { return fg_go(fs, "fmvt", (rpe * slots + 31) // 32, 256, [0, x, y, tab, n, rpe * slots, ty, rb, per, rpe, xd], st, 4 * n) }
+  return fg_go(fs, "fmv", (rpe * slots + 7) // 8, 256, [0, x, y, tab, n, rpe * slots, ty, rb, per, rpe, xd], st, 4 * n)
+}
+
+# a row's bytes in a quant type, for n inputs
+skill fg_rowbytes(ty, n) -> Any {
+  if ty == 0 { return 4 * n }
+  if ty == 30 { return 2 * n }
+  if ty == 8 { return n // 32 * 34 }
+  if ty == 20 { return n // 32 * 18 }
+  if ty == 21 { return n // 256 * 110 }
+  if ty == 14 { return n // 256 * 210 }
+  if ty == 23 { return n // 256 * 136 }
+  return 0 - 1
+}

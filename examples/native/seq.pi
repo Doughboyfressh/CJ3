@@ -1,0 +1,30 @@
+# The sequence solver's test, importing the solver core. It is Pi's own solver (not a port of the interpreter's
+# synthesis search); checked by correct next terms on known sequences, and by native == interpreter on this file.
+import "seqlib.pi"
+
+skill check(terms, kind, want) -> Any {
+  let r = seq(terms)
+  if r["status"] != "found" { return "0" }
+  if r["kind"] != kind { return "0" }
+  if r["next"] != want { return "0" }
+  return "1"
+}
+
+skill main() -> Any {
+  let out = check([2, 4, 6, 8], "polynomial", [10, 12, 14])
+  let out = out ++ check([10, 7, 4, 1], "polynomial", [-2, -5, -8])
+  let out = out ++ check([1, 4, 9, 16, 25], "polynomial", [36, 49, 64])
+  let out = out ++ check([1, 8, 27, 64, 125], "polynomial", [216, 343, 512])
+  let out = out ++ check([2, 5, 10, 17, 26], "polynomial", [37, 50, 65])
+  let out = out ++ check([5, 5, 5, 5], "polynomial", [5, 5, 5])
+  let out = out ++ check([0, 1, 8, 27, 64, 125], "polynomial", [216, 343, 512])
+  let out = out ++ check([3, 6, 12, 24, 48], "geometric", [96, 192, 384])
+  let out = out ++ check([1, 2, 4, 8, 16], "geometric", [32, 64, 128])
+  let out = out ++ check([1, 3, 9, 27], "geometric", [81, 243, 729])
+  let out = out ++ check([1, 1, 2, 3, 5, 8], "recurrence", [13, 21, 34])
+  let out = out ++ check([2, 1, 3, 4, 7, 11], "recurrence", [18, 29, 47])
+  let out = out ++ check([0, 1, 3, 7, 15, 31], "recurrence", [63, 127, 255])
+  let r = seq([2, 3, 5, 7, 11, 13])
+  if r["status"] == "found" { let out = out ++ "?" } else { let out = out ++ "1" }
+  return out
+}

@@ -1,0 +1,49 @@
+# The reasoning engine, checked: chaining (ancestors), inheritance with an exception (penguins), arithmetic by
+# recursion (factorial), and list relations run forwards and backwards (append, member). Self-checking: 1s.
+import "logic.pi"
+
+skill F(h) -> Any { return [h, []] }
+skill R(h, body) -> Any { return [h, body] }
+
+skill kb() -> Any {
+  return [
+    F(["parent", "tom", "bob"]), F(["parent", "bob", "ann"]), F(["parent", "bob", "pat"]), F(["parent", "pat", "jim"]),
+    R(["ancestor", "?x", "?y"], [["parent", "?x", "?y"]]),
+    R(["ancestor", "?x", "?y"], [["parent", "?x", "?z"], ["ancestor", "?z", "?y"]]),
+    F(["is_a", "canary", "bird"]), F(["is_a", "penguin", "bird"]), F(["is_a", "bird", "animal"]),
+    F(["is_a", "fish", "animal"]), F(["is_a", "salmon", "fish"]),
+    R(["kind_of", "?x", "?y"], [["is_a", "?x", "?y"]]),
+    R(["kind_of", "?x", "?y"], [["is_a", "?x", "?z"], ["kind_of", "?z", "?y"]]),
+    F(["has", "animal", "skin"]), F(["has", "bird", "wings"]), F(["has", "bird", "feathers"]), F(["has", "fish", "gills"]),
+    F(["cannot", "penguin", "fly"]),
+    R(["property", "?x", "?p"], [["has", "?x", "?p"]]),
+    R(["property", "?x", "?p"], [["kind_of", "?x", "?y"], ["has", "?y", "?p"]]),
+    R(["flies", "?x"], [["kind_of", "?x", "bird"], ["not", ["cannot", "?x", "fly"]]]),
+    F(["fact", 0, 1]),
+    R(["fact", "?n", "?f"], [["lt", 0, "?n"], ["sub", "?n", 1, "?m"], ["fact", "?m", "?g"], ["mul", "?n", "?g", "?f"]]),
+    F(["append", "nil", "?l", "?l"]),
+    R(["append", ["cons", "?h", "?t"], "?l", ["cons", "?h", "?r"]], [["append", "?t", "?l", "?r"]]),
+    F(["member", "?x", ["cons", "?x", "?u"]]),
+    R(["member", "?x", ["cons", "?v", "?t"]], [["member", "?x", "?t"]])
+  ]
+}
+
+skill B(b) -> Any {
+  if b { return "1" }
+  return "0"
+}
+
+skill main() -> Any {
+  let k = kb()
+  let out = B(holds(k, ["ancestor", "tom", "jim"])) ++ B(holds(k, ["ancestor", "jim", "tom"]) == false)
+  let out = out ++ B(values_of(k, ["ancestor", "tom", "?w"], "?w") == ["bob", "ann", "pat", "jim"])
+  let out = out ++ B(holds(k, ["property", "canary", "skin"])) ++ B(holds(k, ["property", "salmon", "wings"]) == false)
+  let out = out ++ B(values_of(k, ["property", "canary", "?p"], "?p") == ["wings", "feathers", "skin"])
+  let out = out ++ B(holds(k, ["flies", "canary"])) ++ B(holds(k, ["flies", "penguin"]) == false)
+  let out = out ++ B(ask(k, ["fact", 5, "?f"], 1) == [["fact", 5, 120]])
+  let l12 = ["cons", 1, ["cons", 2, "nil"]]
+  let out = out ++ B(values_of(k, ["append", l12, ["cons", 3, "nil"], "?r"], "?r") == [["cons", 1, ["cons", 2, ["cons", 3, "nil"]]]])
+  let out = out ++ B(len(ask(k, ["append", "?a", "?b", l12], 10)) == 3)
+  let out = out ++ B(values_of(k, ["member", "?m", ["cons", "a", ["cons", "b", ["cons", "c", "nil"]]]], "?m") == ["a", "b", "c"])
+  return out
+}

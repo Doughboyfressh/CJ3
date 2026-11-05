@@ -1,0 +1,206 @@
+# The library of Pi browsing (browse.pi, research.pi): fetch a page (https), understand it (title, headings, paragraphs, list items, links), follow
+# links by their text. No outside parser: HTML is read here, byte by byte.
+#   out\browse.exe <url>                      what the page says, and its links
+#   out\browse.exe <url> follow "<link text>" go where that link leads, and read it
+# Requests carry no personal data (user agent "Pi/1").
+import "senses.pi"
+
+skill lowc(c) -> Any {
+  if c >= 65 and c <= 90 { return c + 32 }
+  return c
+}
+
+# does the page have the (lower-case) word w at position i, ignoring case?
+skill at_word(p, i, w) -> Any {
+  let n = len(w)
+  if i + n > len(p) { return false }
+  for k in range(0, n) {
+    if lowc(ord(slice(p, i + k, i + k + 1))) != ord(slice(w, k, k + 1)) { return false }
+  }
+  return true
+}
+
+skill find_from(p, i, w) -> Any {
+  let n = len(p)
+  let j = i
+  while j < n {
+    if at_word(p, j, w) { return j }
+    let j = j + 1
+  }
+  return n
+}
+
+# &amp; &lt; &gt; &quot; &#39; &nbsp; &#NNN; (ASCII only) -> characters; whitespace runs -> one space
+skill clean(s) -> Any {
+  let parts = []
+  let n = len(s)
+  let i = 0
+  let a = 0
+  while i < n {
+    let c = ord(slice(s, i, i + 1))
+    if c == 38 {
+      let e = i + 1
+      while e < n and e < i + 10 and slice(s, e, e + 1) != ";" { let e = e + 1 }
+      if e < n and slice(s, e, e + 1) == ";" {
+        let name = slice(s, i + 1, e)
+        let rep = null
+        if name == "amp" { let rep = "&" }
+        if name == "lt" { let rep = "<" }
+        if name == "gt" { let rep = ">" }
+        if name == "quot" { let rep = "\"" }
+        if name == "nbsp" { let rep = " " }
+        if name == "#39" or name == "apos" { let rep = "'" }
+        if slice(name, 0, 1) == "#" and rep == null {
+          let v = num(slice(name, 1, len(name)))
+          if v != null {
+            if v >= 32 and v < 127 { let rep = slice(" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~", v - 32, v - 31) }
+          }
+        }
+        if rep != null {
+          let parts = append(parts, slice(s, a, i))
+          let parts = append(parts, rep)
+          let i = e + 1
+          let a = i
+        } else { let i = i + 1 }
+      } else { let i = i + 1 }
+    } else {
+      if c == 10 or c == 13 or c == 9 {
+        let parts = append(parts, slice(s, a, i))
+        let parts = append(parts, " ")
+        let i = i + 1
+        let a = i
+      } else { let i = i + 1 }
+    }
+  }
+  let parts = append(parts, slice(s, a, n))
+  let ws = split(join(parts, ""), " ")
+  let keep = []
+  for w in ws {
+    if w != "" { let keep = append(keep, w) }
+  }
+  return join(keep, " ")
+}
+
+# the value of attribute name in a tag's text (href="..." or href='...')
+skill attr(tag, name) -> Any {
+  let i = find_from(tag, 0, name ++ "=")
+  if i >= len(tag) { return null }
+  let j = i + len(name) + 1
+  let q = slice(tag, j, j + 1)
+  if q == "\"" or q == "'" {
+    let e = j + 1
+    while e < len(tag) and slice(tag, e, e + 1) != q { let e = e + 1 }
+    return slice(tag, j + 1, e)
+  }
+  let e = j
+  while e < len(tag) and slice(tag, e, e + 1) != " " and slice(tag, e, e + 1) != ">" { let e = e + 1 }
+  return slice(tag, j, e)
+}
+
+skill v_push(g, x) -> Any {
+  let cur = append(g[1], x)
+  if len(cur) >= 64 { return [append(g[0], cur), []] }
+  return [g[0], cur]
+}
+
+skill v_items(g) -> Any {
+  let out = []
+  for c in g[0] { let out = out ++ c }
+  return out ++ g[1]
+}
+
+# -> [title, blocks [[kind, text]], links [[text, href]]]
+skill parse_html(p) -> Any {
+  let n = len(p)
+  let title = ""
+  let blocks = [[], []]
+  let links = [[], []]
+  let i = 0
+  let kind = ""
+  let buf = []
+  let href = null
+  let abuf = []
+  while i < n {
+    let c = slice(p, i, i + 1)
+    if c == "<" {
+      let e = i + 1
+      while e < n and slice(p, e, e + 1) != ">" { let e = e + 1 }
+      let tag = slice(p, i + 1, e)
+      let lt = lower(tag)
+      let tn = lt
+      let sp = split(lt, " ")
+      if len(sp) > 0 { let tn = sp[0] }
+      # scripts, styles and the like are skipped whole
+      if tn == "script" or tn == "style" or tn == "noscript" or tn == "svg" {
+        let i = find_from(p, e, "</" ++ tn)
+        let i = find_from(p, i, ">") + 1
+      } else {
+        if tn == "title" {
+          let te = find_from(p, e + 1, "</title")
+          let title = clean(slice(p, e + 1, te))
+        }
+        let opens = tn == "p" or tn == "h1" or tn == "h2" or tn == "h3" or tn == "li"
+        let closes = tn == "/p" or tn == "/h1" or tn == "/h2" or tn == "/h3" or tn == "/li"
+        if opens or closes {
+          if kind != "" {
+            let t = clean(join(buf, ""))
+            if len(t) > 0 { let blocks = v_push(blocks, [kind, t]) }
+          }
+          let buf = []
+          let kind = ""
+          if opens { let kind = tn }
+        }
+        if tn == "a" {
+          let href = attr(tag, "href")
+          let abuf = []
+        }
+        if tn == "/a" {
+          if href != null {
+            let t = clean(join(abuf, ""))
+            if len(t) > 0 { let links = v_push(links, [t, href]) }
+          }
+          let href = null
+        }
+        let i = e + 1
+      }
+    } else {
+      let e = i
+      while e < n and slice(p, e, e + 1) != "<" { let e = e + 1 }
+      let piece = slice(p, i, e)
+      if kind != "" { let buf = append(buf, piece) }
+      if href != null { let abuf = append(abuf, piece) }
+      let i = e
+    }
+  }
+  return [title, v_items(blocks), v_items(links)]
+}
+
+# a link's full address, from the page it is on
+skill resolve(base, href) -> Any {
+  if slice(href, 0, 4) == "http" { return href }
+  let scheme = split(base, "//")[0]
+  if slice(href, 0, 2) == "//" { return scheme ++ href }
+  let rest = slice(base, len(scheme) + 2, len(base))
+  let host = split(rest, "/")[0]
+  if slice(href, 0, 1) == "/" { return scheme ++ "//" ++ host ++ href }
+  if slice(href, 0, 1) == "#" { return split(base, "#")[0] ++ href }
+  let parts = split(base, "/")
+  return join(slice(parts, 0, len(parts) - 1), "/") ++ "/" ++ href
+}
+
+skill show_page(url, pg, nblocks) -> Any {
+  let out = "page: " ++ url ++ "\ntitle: " ++ pg[0] ++ "\n"
+  let k = 0
+  # what a reader looks at first: headings and real paragraphs (menus are list items and short)
+  for b in pg[1] {
+    let main = b[0] == "h1" or b[0] == "h2" or (b[0] == "p" and len(b[1]) >= 60)
+    if k < nblocks and main {
+      let t = b[1]
+      if len(t) > 300 { let t = slice(t, 0, 300) ++ "..." }
+      let out = out ++ "  [" ++ b[0] ++ "] " ++ t ++ "\n"
+      let k = k + 1
+    }
+  }
+  return out ++ "  (" ++ str(len(pg[1])) ++ " blocks of text, " ++ str(len(pg[2])) ++ " links)\n"
+}
+

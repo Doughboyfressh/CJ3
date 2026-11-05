@@ -1,0 +1,167 @@
+# Pi compiling itself to the metal: a compiler written in Pi that turns a small program (here fib(N)) into
+# native x86-64 machine code and writes a real Windows .exe -- no Rust in the produced program. The program
+# to compile is built as Pi data (an AST); the code generator walks it, a two-pass scheme fixes every jump and
+# call offset, and the bytes are laid out as a PE64 that imports ExitProcess and exits with fib(N).
+#
+#   pi run examples/compiler.pi --skill compile --allow write --world
+#
+# Verify: out/fib.exe runs natively; its exit code (PowerShell $LASTEXITCODE) is fib(N).
+
+reach { folders "out" }
+
+# -- little-endian byte encodings (Pi has no bit ops; // and % do the splitting) --
+skill le16(n) -> Any { return [n % 256, (n // 256) % 256] }
+skill le32(n) -> Any { return [n % 256, (n // 256) % 256, (n // 65536) % 256, (n // 16777216) % 256] }
+skill le32s(n) -> Any { if n < 0 { return le32(n + 4294967296) } return le32(n) }
+skill le64(n) -> Any { return le32(n) ++ le32(n // 4294967296) }
+skill zeros(k) -> Any {
+  let xs = []
+  let i = 0
+  while i < k { let xs = xs ++ [0]  let i = i + 1 }
+  return xs
+}
+
+# -- the assembler state is a map {code, labels, nl, p2}, threaded functionally --
+skill emit(st, bs) -> Any { return put(st, "code", st["code"] ++ bs) }
+skill lbldef(st, name) -> Any { return put(st, "labels", put(st["labels"], name, len(st["code"]))) }
+skill rel(st, name) -> Any {
+  let pos = len(st["code"])
+  if st["p2"] { return emit(st, le32s(st["labels"][name] - (pos + 4))) }
+  return emit(st, [0, 0, 0, 0])
+}
+
+# -- code generator: each node leaves its value in RAX; n is kept at [rbp-8] --
+skill genexpr(st, a) -> Any {
+  let t = a["t"]
+  if t == "lit" { return emit(st, [72, 199, 192] ++ le32(a["k"])) }     # mov rax, imm32
+  if t == "var" { return emit(st, [72, 139, 69, 248]) }                 # mov rax, [rbp-8]
+  if t == "sub" {
+    let st = genexpr(st, a["a"])
+    let st = emit(st, [80])                                             # push rax
+    let st = genexpr(st, a["b"])
+    return emit(st, [72, 137, 193, 88, 72, 41, 200])                    # mov rcx,rax; pop rax; sub rax,rcx
+  }
+  if t == "add" {
+    let st = genexpr(st, a["a"])
+    let st = emit(st, [80])
+    let st = genexpr(st, a["b"])
+    return emit(st, [72, 137, 193, 88, 72, 1, 200])                     # mov rcx,rax; pop rax; add rax,rcx
+  }
+  if t == "call" {
+    let st = genexpr(st, a["a"])
+    let st = emit(st, [72, 137, 193, 232])                              # mov rcx,rax; call fib
+    return rel(st, "fib")
+  }
+  if t == "iflt" {
+    let nl = st["nl"]
+    let els = "L" ++ str(nl)
+    let end = "L" ++ str(nl + 1)
+    let st = put(st, "nl", nl + 2)
+    let st = genexpr(st, a["a"])
+    let st = emit(st, [80])
+    let st = genexpr(st, a["b"])
+    let st = emit(st, [72, 137, 193, 88, 72, 57, 200, 15, 141])         # mov rcx,rax; pop rax; cmp rax,rcx; jge
+    let st = rel(st, els)
+    let st = genexpr(st, a["then"])
+    let st = emit(st, [233])                                            # jmp end
+    let st = rel(st, end)
+    let st = lbldef(st, els)
+    let st = genexpr(st, a["els"])
+    return lbldef(st, end)
+  }
+  return st
+}
+
+# the whole program's code: entry (_start) then fib. Run once to fix labels, once to emit real offsets.
+skill build_code(p2, labels, n, body) -> Any {
+  let st = {"code": [], "labels": labels, "nl": 0, "p2": p2}
+  let st = emit(st, [72, 199, 193] ++ le32(n))         # mov rcx, N
+  let st = emit(st, [232])                             # call fib
+  let st = rel(st, "fib")
+  let st = emit(st, [72, 137, 193])                    # mov rcx, rax
+  let st = emit(st, [72, 131, 236, 40])                # sub rsp, 0x28
+  let st = emit(st, [255, 21])                         # call [rip + ExitProcess]
+  let st = rel(st, "@IAT0")
+  let st = emit(st, [195])                             # ret (unreached)
+  let st = lbldef(st, "fib")
+  let st = emit(st, [85, 72, 137, 229, 72, 131, 236, 16, 72, 137, 77, 248])  # prologue + save n
+  let st = genexpr(st, body)
+  return emit(st, [72, 137, 236, 93, 195])             # mov rsp,rbp; pop rbp; ret
+}
+
+skill align(x, a) -> Any { return ((x + a - 1) // a) * a }
+
+skill build(n) -> Any {
+  let v = {"t": "var"}
+  let body = {"t": "iflt", "a": v, "b": {"t": "lit", "k": 2}, "then": v,
+    "els": {"t": "add",
+      "a": {"t": "call", "a": {"t": "sub", "a": v, "b": {"t": "lit", "k": 1}}},
+      "b": {"t": "call", "a": {"t": "sub", "a": v, "b": {"t": "lit", "k": 2}}}}}
+  # pass 1: offsets of every label; pass 2: real jump/call displacements
+  let st1 = build_code(false, {}, n, body)
+  let codelen = len(st1["code"])
+  let pad = (8 - (codelen % 8)) % 8
+  let iat_off = codelen + pad
+  let labels = put(st1["labels"], "@IAT0", iat_off)
+  let st2 = build_code(true, labels, n, body)
+  let code = st2["code"] ++ zeros(pad)
+
+  # the import table, laid out right after the code in one section at RVA 4096
+  let rva = 4096
+  let ilt_off = iat_off + 16
+  let desc_off = ilt_off + 16
+  let hintname_off = desc_off + 40
+  let dllname_off = hintname_off + 14
+  let hintname_rva = rva + hintname_off
+  let iat = le64(hintname_rva) ++ le64(0)
+  let ilt = le64(hintname_rva) ++ le64(0)
+  let desc = le32(rva + ilt_off) ++ le32(0) ++ le32(0) ++ le32(rva + dllname_off) ++ le32(rva + iat_off) ++ zeros(20)
+  let hintname = [0, 0, 69, 120, 105, 116, 80, 114, 111, 99, 101, 115, 115, 0]   # hint + "ExitProcess\0"
+  let dllname = [107, 101, 114, 110, 101, 108, 51, 50, 46, 100, 108, 108, 0]     # "kernel32.dll\0"
+  let section = code ++ iat ++ ilt ++ desc ++ hintname ++ dllname
+  let vsize = len(section)
+  let rawpad = (512 - (vsize % 512)) % 512
+  let raw = section ++ zeros(rawpad)
+
+  # the 16 data directories; only the import table (1) and the IAT (12) are set
+  let dirs = []
+  let i = 0
+  while i < 16 {
+    if i == 1 { let dirs = dirs ++ le32(rva + desc_off) ++ le32(40) }
+    else { if i == 12 { let dirs = dirs ++ le32(rva + iat_off) ++ le32(16) }
+      else { let dirs = dirs ++ [0, 0, 0, 0, 0, 0, 0, 0] } }
+    let i = i + 1
+  }
+  let opt = le16(523) ++ [0, 0]
+    ++ le32(iat_off) ++ le32(0) ++ le32(0)        # sizes of code / init / uninit data
+    ++ le32(rva) ++ le32(rva)                     # entry point, base of code
+    ++ le64(4194304)                              # image base 0x400000
+    ++ le32(4096) ++ le32(512)                    # section / file alignment
+    ++ le16(6) ++ le16(0) ++ le16(0) ++ le16(0) ++ le16(6) ++ le16(0)   # os / image / subsystem versions
+    ++ le32(0)                                    # win32 version
+    ++ le32(align(rva + vsize, 4096))             # size of image
+    ++ le32(512)                                  # size of headers
+    ++ le32(0)                                    # checksum
+    ++ le16(3) ++ le16(0)                         # subsystem CONSOLE, dll characteristics
+    ++ le64(1048576) ++ le64(4096)                # stack reserve / commit
+    ++ le64(1048576) ++ le64(4096)                # heap reserve / commit
+    ++ le32(0) ++ le32(16)                        # loader flags, number of dirs
+    ++ dirs
+  let coff = le16(34404) ++ le16(1) ++ le32(0) ++ le32(0) ++ le32(0) ++ le16(len(opt)) ++ le16(34)
+  let sechdr = [46, 116, 101, 120, 116, 0, 0, 0]  # ".text\0\0\0"
+    ++ le32(vsize) ++ le32(rva) ++ le32(len(raw)) ++ le32(512)
+    ++ le32(0) ++ le32(0) ++ le16(0) ++ le16(0)
+    ++ le32(3758096480)                           # RWX, code+initialised-data
+  let dos = [77, 90] ++ zeros(58) ++ le32(64)     # "MZ", e_lfanew = 64
+  let headers = dos ++ [80, 69, 0, 0] ++ coff ++ opt ++ sechdr
+  let headers = headers ++ zeros((512 - (len(headers) % 512)) % 512)
+  return headers ++ raw
+}
+
+# compile fib(n) and write the executable; returns what was produced
+skill compile_n(n) -> Any {
+  let exe = build(n)
+  return {"wrote": write_file("out/fib.exe", exe), "bytes": len(exe), "n": n}
+}
+
+skill compile() -> Any { return compile_n(20) }

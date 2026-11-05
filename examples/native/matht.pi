@@ -1,0 +1,19 @@
+# transcendental words as Pi series. Each is checked by tolerance (so both interpreter and native print 1),
+# since they are not bit-identical to the interpreter's libm.
+skill B(b) -> Any {
+  if b { return "1" }
+  return "0"
+}
+skill near(a, b) -> Any { return abs(a - b) < 0.000001 }
+skill main() -> Any {
+  let out = B(near(exp(0), 1)) ++ B(near(exp(1), 2.718281828459045)) ++ B(near(exp(0 - 2), 0.1353352832366127))
+  let out = out ++ B(near(log(1), 0)) ++ B(near(log(2.718281828459045), 1)) ++ B(near(log(10), 2.302585092994046))
+  let out = out ++ B(near(log10(1000), 3)) ++ B(near(log2(8), 3))
+  let out = out ++ B(near(exp(log(5)), 5)) ++ B(near(log(exp(3.5)), 3.5))
+  let out = out ++ B(near(sin(0), 0)) ++ B(near(cos(0), 1)) ++ B(near(sin(1.5707963267948966), 1))
+  let out = out ++ B(near(cos(3.141592653589793), 0 - 1)) ++ B(near(sin(1), 0.8414709848078965))
+  let out = out ++ B(near(cos(1), 0.5403023058681398)) ++ B(near(tan(0.7853981633974483), 1))
+  let out = out ++ B(near(atan(1), 0.7853981633974483)) ++ B(near(atan(0), 0)) ++ B(near(atan(5), 1.373400766945016))
+  let out = out ++ B(near(sin(10), 0 - 0.5440211108893698)) ++ B(near(exp(5), 148.4131591025766))
+  return out
+}

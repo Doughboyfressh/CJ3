@@ -1,0 +1,347 @@
+# Pi reads Wikidata itself (its own gzip decompressor, inflate.pi), keeps the facts between entities as integers,
+# learns rules from chains of facts, and is tested on facts held back from it (it must infer them; no lookup).
+#
+#   facts:  ["Q31","diplomatic_relation","Q142",...] -> (31, relation id, 142): 24 bytes a fact, in in-place arrays
+#   rules:  r1(X,Y) and r2(Y,Z) => r3(X,Z), kept at >= 20 cases and >= 40% (Wikidata ids make the joins exact:
+#           no "same thing under two names")
+#   test:   one fact in ten (by hash) is held back; Pi infers it from the rest with its rules; scored against Wikidata,
+#           beside the baseline "the most common value of that relation"
+#
+#   out\kbwd.exe [how many parts, spread over the 55,038]
+import "inflate.pi"
+
+skill DIR() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\knowledge\\wikidata_stream_v2\\" }
+skill NPARTS() -> Any { return 55038 }
+skill MAXF() -> Any { return 6000000 }
+skill TBL() -> Any { return 4194304 }
+
+skill part_path(i) -> Any {
+  let s = str(i)
+  while len(s) < 6 { let s = "0" ++ s }
+  return DIR() ++ "part_" ++ s ++ ".jsonl.gz"
+}
+
+# ---- integer hash tables on in-place arrays ---------------------------------------------------------------------
+skill new_table() -> Any { return {"keys": arr(TBL()), "vals": arr(TBL())} }
+skill slot_of(tab, key) -> Any {
+  let ks = tab["keys"]
+  let i = key % TBL()
+  let probes = 0
+  while probes < TBL() {
+    let k = aget(ks, i)
+    if k == 0 or k == key { return i }
+    let i = (i + 1) % TBL()
+    let probes = probes + 1
+  }
+  # a full table is a clean failure, never an endless loop
+  do fail("hash table full")
+  return 0
+}
+skill bump(tab, key, by) -> Any {
+  let i = slot_of(tab, key)
+  if aget(tab["keys"], i) == 0 { do aset(tab["keys"], i, key) }
+  do aset(tab["vals"], i, aget(tab["vals"], i) + by)
+  return aget(tab["vals"], i)
+}
+skill get_val(tab, key) -> Any {
+  let i = slot_of(tab, key)
+  if aget(tab["keys"], i) == 0 { return 0 }
+  return aget(tab["vals"], i)
+}
+skill set_val(tab, key, v) -> Any {
+  let i = slot_of(tab, key)
+  do aset(tab["keys"], i, key)
+  do aset(tab["vals"], i, v)
+  return v
+}
+skill strhash(s) -> Any {
+  let h1 = 7
+  let h2 = 13
+  for c in chars(s) {
+    let h1 = (h1 * 1000003 + ord(c) + 1) % 1073741789
+    let h2 = (h2 * 999983 + ord(c) + 7) % 1073741783
+  }
+  return h1 * 1073741783 + h2 + 1
+}
+skill fkey(s, r, v) -> Any { return ((s * 1000003 + r) * 1000033 + v) % 2305843009213693951 + 1 }
+skill gl_push(g, x) -> Any {
+  let cur = append(g[1], x)
+  if len(cur) >= 256 { return [append(g[0], cur), []] }
+  return [g[0], cur]
+}
+skill fget(g, i) -> Any {
+  let c = i // 256
+  if c < len(g[0]) { return g[0][c][i % 256] }
+  return g[1][i % 256]
+}
+
+skill qnum(s) -> Any {
+  if len(s) < 2 { return 0 - 1 }
+  if slice(s, 0, 1) != "Q" { return 0 - 1 }
+  for c in chars(slice(s, 1, len(s))) {
+    if contains("0123456789", c) == false { return 0 - 1 }
+  }
+  return num(slice(s, 1, len(s)))
+}
+
+skill main() -> Any {
+  let parts = 200
+  if arg(1) != null { let parts = num(arg(1)) }
+  let fs = arr(MAXF())
+  let fr = arr(MAXF())
+  let fv = arr(MAXF())
+  let nf = 0
+  let relid = new_table()
+  let seenf = new_table()
+  let relnames = []
+  let labels = new_table()
+  let labtxt = [[], []]
+  let nlab = 0
+  let lines_read = 0
+  # 1. read and decompress parts spread over the whole stream
+  for k in range(0, parts) {
+    let pi = k * (NPARTS() // parts)
+    let m = mark()
+    let newrel = []
+    let newlab = []
+    let added = 0
+    let nl = 0
+    # the whole file: a cut-off read loses the gzip trailer (whose size field would then be garbage)
+    let want = 4000000
+    let b = read_bytes(part_path(pi), 0, want)
+    while b != null and len(b) == want {
+      let want = want * 2
+      let b = read_bytes(part_path(pi), 0, want)
+    }
+    if b != null {
+      let g = gunzip(b)
+      if g != null {
+        for line in split(arr_text(g[0], 0, g[1]), "\n") {
+          let nl = nl + 1
+          let ts = split(line, "\"")
+          if len(ts) >= 6 {
+            let s = qnum(ts[1])
+            if s >= 0 {
+              if ts[3] == "label" {
+                let newlab = append(newlab, [s, ts[5]])
+              } else {
+                let v = qnum(ts[5])
+                # each fact once (a duplicate would be counted twice in a rule and could push it past 100%)
+                let dupk = 0
+                if v >= 0 { let dupk = bump(seenf, fkey(s, strhash(ts[3]) % 1000003, v), 1) }
+                if v >= 0 and dupk == 1 and nf + added < MAXF() - 1 {
+                  let rk = strhash(ts[3])
+                  let r = get_val(relid, rk)
+                  if r == 0 {
+                    let r = len(relnames) + len(newrel) + 1
+                    do set_val(relid, rk, r)
+                    let newrel = append(newrel, ts[3])
+                  }
+                  do aset(fs, nf + added, s)
+                  do aset(fr, nf + added, r)
+                  do aset(fv, nf + added, v)
+                  let added = added + 1
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    let kept = release(m, [newrel, newlab, added, nl])
+    let relnames = relnames ++ kept[0]
+    for lb in kept[1] {
+      if get_val(labels, lb[0] + 1) == 0 {
+        let labtxt = gl_push(labtxt, lb[1])
+        let nlab = nlab + 1
+        do set_val(labels, lb[0] + 1, nlab)
+      }
+    }
+    let nf = nf + kept[2]
+    let lines_read = lines_read + kept[3]
+    if k % 25 == 0 { do print("part " ++ str(k + 1) ++ " of " ++ str(parts) ++ ": " ++ str(nf) ++ " entity facts, " ++ str(len(relnames)) ++ " relations, heap " ++ str(memused() // 1000000) ++ " MB") }
+  }
+  # 2. hold back one fact in ten; index the rest by subject
+  let held = arr(MAXF())
+  let nh = 0
+  let head = new_table()
+  let next = arr(MAXF())
+  let deg = new_table()
+  let known = new_table()
+  for i in range(0, nf) {
+    if fkey(aget(fs, i), aget(fr, i), aget(fv, i)) % 10 == 0 {
+      do aset(held, nh, i)
+      let nh = nh + 1
+    } else {
+      let sk = aget(fs, i) + 1
+      do aset(next, i, get_val(head, sk))
+      do set_val(head, sk, i + 1)
+      do bump(deg, sk, 1)
+      do set_val(known, fkey(aget(fs, i), aget(fr, i), aget(fv, i)), 1)
+    }
+  }
+  let out = "Pi decompressed " ++ str(parts) ++ " Wikidata parts itself (" ++ str(lines_read) ++ " lines) and kept " ++ str(nf) ++ " facts between entities (" ++ str(len(relnames)) ++ " relations); " ++ str(nh) ++ " held back.\n"
+  do print(out)
+  # 3. rules from chains x -r1-> y -r2-> z (middle entities with at most 400 facts: hubs make chains about everything)
+  let NR = 4096
+  let body = new_table()
+  let trip = new_table()
+  let rules = [[], []]
+  let nrules = 0
+  for i in range(0, nf) {
+    if fkey(aget(fs, i), aget(fr, i), aget(fv, i)) % 10 != 0 {
+      let x = aget(fs, i)
+      let r1 = aget(fr, i)
+      let y = aget(fv, i)
+      if y != x and get_val(deg, y + 1) <= 400 {
+        let j = get_val(head, y + 1)
+        while j > 0 {
+          let r2 = aget(fr, j - 1)
+          let z = aget(fv, j - 1)
+          if z != x {
+            do bump(body, r1 * NR + r2 + 1, 1)
+            let k = get_val(head, x + 1)
+            while k > 0 {
+              if aget(fv, k - 1) == z and k - 1 != i {
+                let r3 = aget(fr, k - 1)
+                if bump(trip, (r1 * NR + r2) * NR + r3 + 1, 1) == 1 {
+                  let rules = gl_push(rules, [r1, r2, r3])
+                  let nrules = nrules + 1
+                }
+              }
+              let k = aget(next, k - 1)
+            }
+          }
+          let j = aget(next, j - 1)
+        }
+      }
+    }
+  }
+  let found = []
+  for q in range(0, nrules) {
+    let r = fget(rules, q)
+    let s = get_val(trip, (r[0] * NR + r[1]) * NR + r[2] + 1)
+    let bc = get_val(body, r[0] * NR + r[1] + 1)
+    if s >= 20 and s * 10 >= bc * 4 { let found = append(found, [r[0], r[1], r[2], s, s * 100 // bc]) }
+  }
+  let out = out ++ "Pi learned " ++ str(len(found)) ++ " rules (>= 20 cases, >= 40%). The best supported:\n"
+  let order = []
+  for r in found { let order = append(order, r[3]) }
+  let order = reverse(sort(order))
+  let shown = 0
+  let cut = 0
+  if len(order) > 0 { let cut = order[min(14, len(order) - 1)] }
+  for r in found {
+    if r[3] >= cut and shown < 15 {
+      let out = out ++ "  " ++ relnames[r[2] - 1] ++ "(X, Z)  <=  " ++ relnames[r[0] - 1] ++ "(X, Y) and " ++ relnames[r[1] - 1] ++ "(Y, Z)   [" ++ str(r[3]) ++ " cases, " ++ str(r[4]) ++ "%]\n"
+      let shown = shown + 1
+    }
+  }
+  # baseline: the most common value of each relation
+  let vcount = new_table()
+  let bestc = arr(NR)
+  let bestv = arr(NR)
+  for i in range(0, nf) {
+    if fkey(aget(fs, i), aget(fr, i), aget(fv, i)) % 10 != 0 {
+      let r = aget(fr, i)
+      let c = bump(vcount, r * 200000000 + aget(fv, i) + 1, 1)
+      if c > aget(bestc, r) {
+        do aset(bestc, r, c)
+        do aset(bestv, r, aget(fv, i))
+      }
+    }
+  }
+  # 4. the test
+  let byhead = {}
+  for r in found {
+    let key = str(r[2])
+    let rs = byhead[key]
+    if rs == null { let rs = [] }
+    let byhead = put(byhead, key, append(rs, r))
+  }
+  let askable = 0
+  let answered = 0
+  let right = 0
+  let base = 0
+  let shows = []
+  let hybrid = 0
+  for h in range(0, nh) {
+    let i = aget(held, h)
+    let x = aget(fs, i)
+    let r3 = aget(fr, i)
+    let z = aget(fv, i)
+    let rs = byhead[str(r3)]
+    if rs != null {
+      let askable = askable + 1
+      if aget(bestv, r3) == z { let base = base + 1 }
+      let m = mark()
+      let votes = {}
+      let why = {}
+      let k = get_val(head, x + 1)
+      while k > 0 {
+        let r1 = aget(fr, k - 1)
+        let y = aget(fv, k - 1)
+        for r in rs {
+          # only rules that hold at least 60% of the time get a vote
+          if r[0] == r1 and r[4] >= 60 and get_val(deg, y + 1) <= 400 {
+            let j = get_val(head, y + 1)
+            while j > 0 {
+              if aget(fr, j - 1) == r[1] {
+                let zz = str(aget(fv, j - 1))
+                let v = votes[zz]
+                if v == null { let v = 0 }
+                let votes = put(votes, zz, v + r[4])
+                if why[zz] == null { let why = put(why, zz, [r[0], y, r[1]]) }
+              }
+              let j = aget(next, j - 1)
+            }
+          }
+        }
+        let k = aget(next, k - 1)
+      }
+      let best = null
+      let bv = 0
+      let second = 0
+      for kk in keys(votes) {
+        if votes[kk] > bv {
+          let second = bv
+          let best = kk
+          let bv = votes[kk]
+        } else {
+          if votes[kk] > second { let second = votes[kk] }
+        }
+      }
+      # answer only when sure: the best must clearly beat the runner-up (uncertainty decides, as in the brain's
+      # arbitration between systems); otherwise abstain -- and the hybrid falls back on the common value
+      if best != null and bv < 2 * second { let best = null }
+      let res = [0, 0, null, 0]
+      if best != null {
+        let res = [1, 0, null, 0]
+        if num(best) == z { let res = [1, 1, [x, r3, z, why[best]], 1] }
+      } else {
+        if aget(bestv, r3) == z { let res = [0, 0, null, 1] }
+      }
+      let res = release(m, res)
+      let answered = answered + res[0]
+      let right = right + res[1]
+      let hybrid = hybrid + res[3]
+      if res[2] != null and len(shows) < 10 { let shows = append(shows, res[2]) }
+    }
+  }
+  let out = out ++ "\nTEST: " ++ str(nh) ++ " facts held back; " ++ str(askable) ++ " of a relation some rule concludes.\n"
+  let out = out ++ "  Pi inferred an answer for " ++ str(answered) ++ " (" ++ str(answered * 100 // max(1, askable)) ++ "% of the askable); right (= Wikidata): " ++ str(right) ++ " (" ++ str(right * 100 // max(1, answered)) ++ "% of its answers)\n"
+  let out = out ++ "  baseline (the most common value of the relation): " ++ str(base) ++ " right (" ++ str(base * 100 // max(1, askable)) ++ "% of the askable)\n"
+  let out = out ++ "  Pi's rules when sure, else the common value: " ++ str(hybrid) ++ " right (" ++ str(hybrid * 100 // max(1, askable)) ++ "% of the askable)\n"
+  let out = out ++ "\nfacts Pi was not given, inferred correctly:\n"
+  for e in shows {
+    let w = e[3]
+    let out = out ++ "  " ++ relnames[e[1] - 1] ++ "(" ++ name_of(e[0], labels, labtxt) ++ ", " ++ name_of(e[2], labels, labtxt) ++ ")   because " ++ relnames[w[0] - 1] ++ "(" ++ name_of(e[0], labels, labtxt) ++ ", " ++ name_of(w[1], labels, labtxt) ++ ") and " ++ relnames[w[2] - 1] ++ "(" ++ name_of(w[1], labels, labtxt) ++ ", " ++ name_of(e[2], labels, labtxt) ++ ")\n"
+  }
+  return out
+}
+
+skill name_of(q, labels, labtxt) -> Any {
+  let i = get_val(labels, q + 1)
+  if i == 0 { return "Q" ++ str(q) }
+  return fget(labtxt, i - 1)
+}

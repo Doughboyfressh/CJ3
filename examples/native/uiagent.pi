@@ -1,0 +1,258 @@
+# Pi as an agent in an app it has never seen: look -> decide -> click -> look again (verify) -> remember.
+# The app (simulated here, so no real desktop is driven) has 7 screens joined by buttons; it draws each screen with the
+# real font engine, and decides what a click hits from the click's position alone. Pi gets only pixels and may only
+# click points. Goal: reach the screen titled "Done" (shortest route: 4 clicks; Pi is not told it).
+#   decide: a route in memory to the goal -> its next step; else curiosity: an untried button here; else the way to the
+#           nearest screen that still has untried buttons
+#   memory: every click remembered as (screen, button, screen it led to) -- a map of the app, built by acting
+# Episodes: the first explores from nothing; later ones use the memory, one of them in fonts Pi has not used here.
+import "actlib.pi"
+
+skill app() -> Any {
+  return [["Home", [["Settings", 1], ["Help", 2], ["Open", 3]]],
+    ["Settings", [["Back", 0], ["Advanced", 4], ["Apply", 0]]],
+    ["Help", [["Back", 0], ["About", 2]]],
+    ["Open", [["Back", 0], ["Recent", 3]]],
+    ["Advanced", [["Back", 1], ["Reset", 4], ["Export", 5]]],
+    ["Export", [["Back", 4], ["Start", 6]]],
+    ["Done", [["Close", 0]]]]
+}
+
+skill btn_box(i) -> Any { return [60 + i * 95, 220, 149 + i * 95, 247] }
+
+skill draw_screen(st, font, size) -> Any {
+  let s = app()[st]
+  let w = 480
+  let h = 300
+  let p = arr(w * h)
+  do fill(p, w, 0, 0, w - 1, h - 1, 3101307)
+  do fill(p, w, 40, 56, 439, 269, 15790320)
+  do fill(p, w, 40, 30, 439, 55, 2109536)
+  do put_text(p, w, [40, 30, 439, 55], s[0], size + 2, font, 2109536, 16777215)
+  let bs = s[1]
+  for i in range(0, len(bs)) {
+    let b = btn_box(i)
+    do fill(p, w, b[0], b[1], b[2], b[3], 13421772)
+    do put_text(p, w, b, bs[i][0], size, font, 13421772, 1052688)
+  }
+  return [w, h, p]
+}
+
+# the app's side: which button (if any) holds the point -> the next screen
+skill app_click(st, x, y) -> Any {
+  let bs = app()[st][1]
+  for i in range(0, len(bs)) {
+    let b = btn_box(i)
+    if x >= b[0] and x <= b[2] and y >= b[1] and y <= b[3] { return bs[i][1] }
+  }
+  return st
+}
+
+# Pi's side: the title (the bar's text) and the buttons it reads -> [title, [[label, x, y]]]
+skill perceive(img, temps, lex) -> Any {
+  let u = understand(img[0], img[1], img[2], 1)
+  let title = ""
+  let btns = []
+  for o in u[9] {
+    let t = read_box(img, [o[1], o[2], o[3], o[4]], temps, lex)
+    if o[0] == "bar" { let title = t } else { let btns = append(btns, [t, (o[1] + o[3]) // 2, (o[2] + o[4]) // 2]) }
+  }
+  return [title, btns]
+}
+
+skill sig_of(p) -> Any {
+  let ls = []
+  for b in p[1] { let ls = append(ls, lower(b[0])) }
+  return lower(p[0]) ++ " | " ++ join(sort(ls), " ")
+}
+
+# a screen is recognised, not spelled: a reading within a quarter of a known screen's (edit distance) is that screen
+# (the same screen read in another font, or with a letter misread, is still the same place)
+skill canon(known, sig) -> Any {
+  let best = sig
+  let bd = len(sig) // 4 + 1
+  for k in known {
+    let d = edits(k[0], sig)
+    if d < bd {
+      let bd = d
+      let best = k[0]
+    }
+  }
+  return best
+}
+
+# the latest experience wins: for each (screen, button) only the most recent outcome counts
+skill latest(mem) -> Any {
+  let out = []
+  let i = len(mem) - 1
+  while i >= 0 {
+    let t = mem[i]
+    let dup = false
+    for o in out {
+      if o[0] == t[0] and o[1] == t[1] { let dup = true }
+    }
+    if dup == false { let out = append(out, t) }
+    let i = i - 1
+  }
+  return out
+}
+
+skill tried(mem, sig, label) -> Any {
+  for t in mem {
+    if t[0] == sig {
+      if t[1] == label or edits(t[1], label) * 3 <= max(len(t[1]), len(label)) { return true }
+    }
+  }
+  return false
+}
+
+# breadth-first over the remembered map: the first label of a route from sig to a screen satisfying want
+# (want "goal": the title reads done; want "frontier": a screen with an untried button) -> label or null
+skill route(mem0, known, sig, want) -> Any {
+  let mem = latest(mem0)
+  let seen = [sig]
+  let queue = [[sig, ""]]
+  let qi = 0
+  while qi < len(queue) {
+    let cur = queue[qi]
+    let qi = qi + 1
+    let hit = false
+    if want == "goal" and slice(cur[0], 0, 4) == "done" { let hit = true }
+    if want == "frontier" and cur[1] != "" {
+      for k in known {
+        if k[0] == cur[0] {
+          for l in k[1] {
+            if tried(mem, cur[0], l) == false { let hit = true }
+          }
+        }
+      }
+    }
+    if hit and cur[1] != "" { return cur[1] }
+    for t in mem {
+      if t[0] == cur[0] and t[2] != cur[0] {
+        let dup = false
+        for s in seen {
+          if s == t[2] { let dup = true }
+        }
+        if dup == false {
+          let seen = append(seen, t[2])
+          let first = cur[1]
+          if first == "" { let first = t[1] }
+          let queue = append(queue, [t[2], first])
+        }
+      }
+    }
+  }
+  return null
+}
+
+# one episode from Home -> [reached, steps, memory, known, the labels clicked]
+skill episode(mem, known, font, size, temps, lex) -> Any {
+  let st = 0
+  let steps = 0
+  let path = []
+  let p = perceive(draw_screen(st, font, size), temps, lex)
+  while steps < 40 {
+    let sig = canon(known, sig_of(p))
+    let labels = []
+    for b in p[1] { let labels = append(labels, lower(b[0])) }
+    let has = false
+    for k in known {
+      if k[0] == sig { let has = true }
+    }
+    if has == false { let known = append(known, [sig, labels]) }
+    if slice(sig, 0, 4) == "done" { return [true, steps, mem, known, path] }
+    let choice = route(mem, known, sig, "goal")
+    if choice == null {
+      for l in labels {
+        if choice == null and tried(mem, sig, l) == false { let choice = l }
+      }
+    }
+    if choice == null { let choice = route(mem, known, sig, "frontier") }
+    if choice == null and len(labels) > 0 { let choice = labels[0] }
+    if choice == null { return [false, steps, mem, known, path] }
+    if arg(1) == "trace" and steps < 24 { do print("  at [" ++ sig ++ "] -> " ++ choice) }
+    # find the chosen button where Pi saw it, and click there
+    # the button whose reading is closest to the chosen label (memory may hold it in another font's reading)
+    let x = 0
+    let y = 0
+    let bd = 0 - 1
+    for b in p[1] {
+      let d = edits(lower(b[0]), choice)
+      if bd < 0 or d < bd {
+        let bd = d
+        let x = b[1]
+        let y = b[2]
+      }
+    }
+    let st = app_click(st, x, y)
+    let steps = steps + 1
+    let path = append(path, choice)
+    # look again: what did the click do? remember it
+    let p = perceive(draw_screen(st, font, size), temps, lex)
+    let mem = append(mem, [sig, choice, canon(known, sig_of(p))])
+  }
+  return [false, steps, mem, known, path]
+}
+
+skill main() -> Any {
+  let lex = load_lex("out\\lexicon.txt")
+  let temps = learn_set(["Segoe UI", "Verdana", "Tahoma", "Arial"], [13, 15, 17])
+  if arg(1) == "see" {
+    let font = "Segoe UI"
+    let size = 15
+    if arg(3) != null { let font = arg(3) }
+    if arg(4) != null { let size = num(arg(4)) }
+    let img = draw_screen(num(arg(2)), font, size)
+    let u = understand(img[0], img[1], img[2], 1)
+    let o = u[0]
+    for e in u[9] { let o = o ++ "  " ++ e[0] ++ " " ++ str([e[1], e[2], e[3], e[4]]) ++ " reads \"" ++ read_box(img, [e[1], e[2], e[3], e[4]], temps, lex) ++ "\"\n" }
+    do bmp_write("out\\uiagent_see.bmp", img[0], img[1], annotate(img[0], img[1], img[2], u[7]))
+    return o
+  }
+  let mem = []
+  let known = []
+  let out = "goal: reach the screen titled Done, in an app Pi has never seen (shortest route: 4 clicks)\n"
+  let runs = [["Segoe UI", 15], ["Segoe UI", 15], ["Verdana", 13], ["Tahoma", 15]]
+  # resume: the map Pi made in an earlier run (another process, another day), and one episode in a font never used
+  if arg(1) == "resume" {
+    let loaded = load_memory()
+    let mem = loaded[0]
+    let known = loaded[1]
+    let out = "remembered from an earlier run: " ++ str(len(mem)) ++ " clicks, " ++ str(len(known)) ++ " screens\n"
+    let runs = [["Arial", 14]]
+  }
+  let e = 0
+  for r in runs {
+    let e = e + 1
+    let res = episode(mem, known, r[0], r[1], temps, lex)
+    let mem = res[2]
+    let known = res[3]
+    let verdict = "did not reach it"
+    if res[0] { let verdict = "reached Done" }
+    let out = out ++ "episode " ++ str(e) ++ " (" ++ r[0] ++ " " ++ str(r[1]) ++ "px): " ++ verdict ++ " in " ++ str(res[1]) ++ " clicks: " ++ join(res[4], " > ") ++ "\n"
+  }
+  do save_memory(mem, known)
+  return out ++ "memory: " ++ str(len(mem)) ++ " clicks remembered, " ++ str(len(known)) ++ " screens known (out\\uiagent.mem)"
+}
+
+# the map on disk: "click ::: screen ::: button ::: screen" and "screen ::: screen ::: button, button, ..."
+skill save_memory(mem, known) -> Any {
+  let lines = []
+  for t in mem { let lines = append(lines, "click ::: " ++ t[0] ++ " ::: " ++ t[1] ++ " ::: " ++ t[2]) }
+  for k in known { let lines = append(lines, "screen ::: " ++ k[0] ++ " ::: " ++ join(k[1], ", ")) }
+  return write_file("out\\uiagent.mem", join(lines, "\n"))
+}
+
+skill load_memory() -> Any {
+  let mem = []
+  let known = []
+  let t = read_file("out\\uiagent.mem")
+  if t == null { return [mem, known] }
+  for line in split(t, "\n") {
+    let p = split(line, " ::: ")
+    if len(p) == 4 and p[0] == "click" { let mem = append(mem, [p[1], p[2], p[3]]) }
+    if len(p) == 3 and p[0] == "screen" { let known = append(known, [p[1], split(p[2], ", ")]) }
+  }
+  return [mem, known]
+}

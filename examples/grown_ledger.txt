@@ -1,0 +1,2 @@
+# grown_ledger: every rule langgrow.pi decided, with its numbers (ADOPTED / REJECTED | signature | rule | ...)
+ADOPTED | a map key must be quoted text, got X | { $id1 :  =>  { "$id1" : ; , $id1 :  =>  , "$id1" : | support 2/1, 6 of 6 logged failures fixed, golden grown_1, test.cmd ALL PASS

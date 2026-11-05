@@ -1,0 +1,12 @@
+# music SCORE OUT.wav [hall 0..1] [instruments.pis]: a score -> a recording. See audio.pi for the score's format.
+import "audio.pi"
+
+skill main() -> Any {
+  if arg(1) == null or arg(2) == null { return "music SCORE OUT.wav [hall 0..1] [instruments.pis]" }
+  let score = read_file(arg(1))
+  if score == null { return "cannot read " ++ arg(1) }
+  let wet = if arg(3) != null { au_milli(arg(3)) } else { 320 }
+  let src = if arg(4) != null { read_file(arg(4)) } else { "" }
+  au_render(score, src, arg(2), wet)
+  return 0
+}

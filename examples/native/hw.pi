@@ -1,0 +1,108 @@
+# Pi on the whole machine, each part measured:
+#   RAM   -- an array past the old 4 GB heap (the heap now reserves 24 GB and commits as it grows)
+#   SSD   -- a 120 MB file memory-mapped (fmap / fbyte) and scanned byte by byte
+#   CPU   -- all cores: the same work split over worker processes (each its own memory: Pi's heap is per process), timed
+#            against one worker. 8 workers at most (the machine runs hot past that)
+#   GPU   -- integer matrix multiply on the GPU (gpu_mm: Pi's own PTX through the NVIDIA driver), checked exactly
+#            against Pi's CPU answer, then timed large
+#   out\hw.exe            (worker mode, used by the CPU part: out\hw.exe count <from> <to> <out file>)
+
+skill count_primes(a, b) -> Any {
+  let n = 0
+  let x = max(2, a)
+  while x < b {
+    let p = true
+    let d = 2
+    while p and d * d <= x {
+      if x % d == 0 { let p = false }
+      let d = d + 1
+    }
+    if p { let n = n + 1 }
+    let x = x + 1
+  }
+  return n
+}
+
+# split [0, top) into k parts, run them as k worker processes at once, and add their answers -> [total, ms]
+skill parallel_primes(top, k) -> Any {
+  let t0 = ticks()
+  let hs = []
+  for i in range(0, k) {
+    let a = top * i // k
+    let b = top * (i + 1) // k
+    let hs = append(hs, spawn(arg(0) ++ " count " ++ str(a) ++ " " ++ str(b) ++ " out\\hw_w" ++ str(i) ++ ".txt"))
+  }
+  for h in hs { do wait(h, 600000) }
+  let total = 0
+  for i in range(0, k) { let total = total + num(trim(read_file("out\\hw_w" ++ str(i) ++ ".txt"))) }
+  return [total, ticks() - t0]
+}
+
+skill main() -> Any {
+  if arg(1) == "count" {
+    do write_file(arg(4), str(count_primes(num(arg(2)), num(arg(3)))))
+    return "done"
+  }
+  let out = ""
+  # RAM
+  let t0 = ticks()
+  let m = mark()
+  let a = arr(700000000)
+  do aset(a, 699999999, 7)
+  let used = memused()
+  do release(m, 0)
+  let out = out ++ "RAM: one array of 700,000,000 cells (5.6 GB), past the old 4 GB heap, in " ++ str(ticks() - t0) ++ " ms (heap in use then: " ++ str(used // 1000000) ++ " MB)\n"
+  # SSD
+  let t0 = ticks()
+  let fm = fmap("out\\facts.txt")
+  if fm == null { let out = out ++ "SSD: out\\facts.txt not found\n" } else {
+    let lines = 0
+    let i = 0
+    while i < fm[1] {
+      if fbyte(fm, i) == 10 { let lines = lines + 1 }
+      let i = i + 1
+    }
+    let ms = max(1, ticks() - t0)
+    let out = out ++ "SSD: out\\facts.txt memory-mapped (" ++ str(fm[1] // 1000000) ++ " MB), every byte scanned: " ++ str(lines + 1) ++ " lines in " ++ str(ms) ++ " ms (" ++ str(fm[1] // ms // 1000) ++ " MB/s)\n"
+  }
+  # CPU
+  let top = 2000000
+  let one = parallel_primes(top, 1)
+  let eight = parallel_primes(top, 8)
+  let out = out ++ "CPU: primes below " ++ str(top) ++ ": 1 worker " ++ str(one[0]) ++ " in " ++ str(one[1]) ++ " ms; 8 workers " ++ str(eight[0]) ++ " in " ++ str(eight[1]) ++ " ms (" ++ str(one[1] * 10 // max(1, eight[1])) ++ "/10 x faster)\n"
+  # GPU: exact check against the CPU at 256, then timed at 2048
+  let n = 256
+  let A = arr(n * n)
+  let B = arr(n * n)
+  for i in range(0, n * n) {
+    do aset(A, i, i % 7 - 3)
+    do aset(B, i, i % 5 - 2)
+  }
+  let t0 = ticks()
+  let C = gpu_mm(A, B, n)
+  let gms = ticks() - t0
+  if typeof(C) == "int" { return out ++ "GPU: the driver refused (code " ++ str(C) ++ ")" }
+  let t0 = ticks()
+  let bad = 0
+  for r in range(0, n) {
+    for c in range(0, n) {
+      let s = 0
+      for k in range(0, n) { let s = s + aget(A, r * n + k) * aget(B, k * n + c) }
+      if s != aget(C, r * n + c) { let bad = bad + 1 }
+    }
+  }
+  let cms = ticks() - t0
+  let out = out ++ "GPU: 256x256 integer matrix product: GPU " ++ str(gms) ++ " ms (all included: start, copy, run, copy back), Pi's CPU " ++ str(cms) ++ " ms; " ++ str(n * n - bad) ++ " of " ++ str(n * n) ++ " cells equal\n"
+  let n = 2048
+  let A = arr(n * n)
+  let B = arr(n * n)
+  for i in range(0, n * n) {
+    do aset(A, i, i % 7 - 3)
+    do aset(B, i, i % 5 - 2)
+  }
+  let t0 = ticks()
+  let C = gpu_mm(A, B, n)
+  let gms = max(1, ticks() - t0)
+  let ops = 2 * n * n * n
+  return out ++ "GPU: 2048x2048 integer matrix product (" ++ str(ops // 1000000000) ++ " billion operations) in " ++ str(gms) ++ " ms all included = " ++ str(ops // gms // 1000000) ++ " billion operations per second; C[0] = " ++ str(aget(C, 0))
+}

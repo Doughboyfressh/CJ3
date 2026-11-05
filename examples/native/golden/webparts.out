@@ -1,0 +1,10 @@
+Ada ["x", "y z"] 43 5 1 null 9
+{"name":"Ada","tags":["x","y z"],"n":42,"r":2.5,"ok":1,"none":null,"q":"say \"hi\"\n"}
+[1,"two",{"k":[3]},null] [] {}
+a b c/dé {"x":"1","msg":"hello world","e":"=","flag":""}
+A é 2 ☺ 4
+out\site\index.html out\site\data\notes.json null null null
+HTTP/1.1 200 OK Content-Type: text/html; charset=utf-8 Content-Length: 11
+Content-Type: application/json {"a":1}
+HTTP/1.1 404 Not Found HTTP/1.1 404 Not Found
+ok

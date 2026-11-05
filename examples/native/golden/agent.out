@@ -1,0 +1,30 @@
+Noted: Tom is Bob's parent.
+Noted: Bob is Ann's parent.
+Noted: Bob is Pat's parent.
+Noted: Pat is Jim's parent.
+Ann and Pat are Bob's children.
+Bob is Ann's parent.
+Tom is an ancestor of Bob, Ann, Pat and Jim.
+Pat, Tom and Bob are Jim's ancestors.
+Pat is Ann's sibling.
+Noted: A canary is a bird.
+Noted: A penguin is a bird.
+Noted: A bird is an animal.
+Noted: An animal has skin.
+Noted: A bird has wings.
+Noted: A bird has a beak.
+Noted: A bird can fly.
+Noted: A penguin cannot fly.
+Yes, a canary is an animal.
+Not as far as I know.
+Yes, a canary has wings.
+Yes, a penguin has skin.
+Yes, a canary can fly.
+No, a penguin cannot fly.
+I don't know whether a canary can swim.
+A canary is a bird.
+A canary has wings, a beak and skin.
+I already knew that: Tom is Bob's parent.
+That contradicts what I know: A penguin cannot fly.
+I don't understand that yet.
+Goodbye. I know 12 facts.

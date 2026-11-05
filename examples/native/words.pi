@@ -1,0 +1,32 @@
+# the words moved out of Rust into Pi (rt.pi), each checked against the interpreter's own word: every result is
+# folded into one text, so a single mismatch anywhere shows. Values are written canonically (L for a list, B for a
+# truth value) so both sides render them alike -- str() of a container differs by design (Python-style there).
+skill S(x) -> Any { return str(x) ++ "|" }
+skill L(xs) -> Any { return "[" ++ join(xs, ",") ++ "]|" }
+skill B(b) -> Any {
+  if b { return "T|" }
+  return "F|"
+}
+
+skill main() -> Any {
+  let m = {"b": 2, "a": 1, "c": 3}
+  let out = L(keys(m)) ++ L(values(m)) ++ B(has(null)) ++ B(has(0)) ++ B(has([]))
+  let out = out ++ S(get(m, "a")) ++ S(get(m, "zz")) ++ S(get([10, 20, 30], -1)) ++ S(get([1], 5)) ++ S(get("abc", 0))
+  let out = out ++ S(lower("Hello, World!")) ++ S(upper("mixed Case 42")) ++ S(trim("  \t padded text \n "))
+  let out = out ++ S(trim("")) ++ S(trim("   "))
+  let out = out ++ L(split("a,b,,c", ",")) ++ L(split("one  two\tthree\n", null)) ++ L(split("  lead and trail  "))
+  let out = out ++ L(split("x--y--", "--")) ++ L(split("", ",")) ++ L(split("", null)) ++ L(split("abc", "abcd"))
+  let out = out ++ S(join(["a", "b", "c"], "-")) ++ S(join([1, 2, 3])) ++ S(join([], ",")) ++ S(join(["solo"], ", "))
+  let out = out ++ L(reverse([1, 2, 3])) ++ S(reverse("stressed")) ++ L(reverse([]))
+  let out = out ++ S(sum([1, 2, 3, 4])) ++ S(sum([])) ++ S(sum([5, "x", -2]))
+  let out = out ++ S(abs(-7)) ++ S(abs(7)) ++ S(abs(0))
+  let out = out ++ L(sort([5, 3, 9, 1, 3, -4])) ++ L(sort(["pear", "apple", "fig", "apple"])) ++ L(sort([]))
+  let out = out ++ L(map(sort([[2, "b"], [1, "a"], [1, "0"]]), fn(p) => join(p, ":"))) ++ L(sort(["b10", "b9", "B1"]))
+  let out = out ++ S(min(4, 2, 8)) ++ S(max(4, 2, 8)) ++ S(min(3)) ++ S(max(-1, -5)) ++ S(min("x", 7)) ++ S(min([1, 2]))
+  let out = out ++ S(format("{} has {} apples", "Ann", 3)) ++ S(format("no slots")) ++ S(format("{}-{}-{}", 1))
+  let out = out ++ S(format("{}{}", "a", "b", "extra")) ++ S(format("{ } and {}", 7))
+  let out = out ++ L(range(5)) ++ L(range(2, 6)) ++ L(range(4, 1)) ++ L(range(-2, 1)) ++ S(len(range(0)))
+  let k = 100
+  let out = out ++ S(apply(fn() => 42, [])) ++ S(apply(fn(a, b) => a * b + k, [6, 7])) ++ S(apply(fn(s) => upper(s), ["hi"]))
+  return out
+}

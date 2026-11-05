@@ -1,0 +1,56 @@
+# How well does Pi read? Sentences it never saw as wholes, drawn by the font engine, read back from pixels.
+#   eyes only    -- templates of that font and size, letter by letter
+#   + words      -- the same, each word settled by Pi's vocabulary (out\lexicon.txt, counted from its own Wikipedia)
+#   any font     -- + words, with templates of every font and size Pi learned (it must also tell the fonts apart)
+# Score: character accuracy = 1 - edit distance / length (spaces count).
+import "ocr.pi"
+
+skill pct(e, n) -> Any { return str(100 - 100 * e // n) ++ "%" }
+
+skill main() -> Any {
+  let fonts = ["Arial", "Segoe UI", "Consolas", "Times New Roman", "Verdana"]
+  let sizes = [16, 22, 30]
+  let sents = ["The quick brown fox jumps over the lazy dog.", "Pi reads 1234567890 and (math) + [code] = {ok}!", "Hello, world: is this text readable? Yes; mostly.", "ARC-AGI-3 scores rose in 2026, says the report.", "Send 45 apples to Room #12 by 9:30 at night.", "A language can learn; a mind can grow & change.", "Vision, audio, video and agents: all built in Pi.", "Zebras quickly vexed my jolly wolf pack."]
+  let lex = load_lex("out\\lexicon.txt")
+  if lex == null { return "no out\\lexicon.txt: run out\\lexicon.exe first" }
+  let all = []
+  let per = []
+  for f in fonts {
+    for s in sizes {
+      let t = learn_font(s, f)
+      let per = append(per, [f, s, t])
+      let all = all ++ t
+    }
+  }
+  let out = "Pi learned " ++ str(len(all)) ++ " letter templates (" ++ str(len(fonts)) ++ " fonts x " ++ str(len(sizes)) ++ " sizes, drawn one letter at a time)\n"
+  let t0 = 0
+  let t1 = 0
+  let t2 = 0
+  let tl = 0
+  for p in per {
+    let e0 = 0
+    let e1 = 0
+    let e2 = 0
+    let ln = 0
+    let sample = ""
+    for sent in sents {
+      let mm = mark()
+      let img = render(sent, p[1], p[0])
+      let rs = release(mm, [read_image(img, p[2]), read_image_lex(img, p[2], lex), read_image_lex(img, all, lex)])
+      let r0 = rs[0]
+      let r1 = rs[1]
+      let r2 = rs[2]
+      let e0 = e0 + edits(r0, sent)
+      let e1 = e1 + edits(r1, sent)
+      let e2 = e2 + edits(r2, sent)
+      let ln = ln + len(sent)
+      if sample == "" { let sample = r1 }
+    }
+    let t0 = t0 + e0
+    let t1 = t1 + e1
+    let t2 = t2 + e2
+    let tl = tl + ln
+    let out = out ++ "  " ++ p[0] ++ " " ++ str(p[1]) ++ "px: eyes " ++ pct(e0, ln) ++ ", + words " ++ pct(e1, ln) ++ ", any font + words " ++ pct(e2, ln) ++ "   e.g. \"" ++ sample ++ "\"\n"
+  }
+  return out ++ "ALL: eyes only " ++ pct(t0, tl) ++ " of characters right, + words " ++ pct(t1, tl) ++ ", any font + words " ++ pct(t2, tl)
+}

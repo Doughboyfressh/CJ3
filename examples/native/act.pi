@@ -1,0 +1,59 @@
+# Pi acts on what it sees: find a button by its label, and click it.
+#   out\act.exe                   test: random windows whose button labels are drawn by the real font engine; Pi must
+#                                 find a named button (right only if the point is inside that button)
+#   out\act.exe find "Label"      the real screen: where Pi would click
+#   out\act.exe click "Label" act the real screen: click it (only with the word act -- Pi's hands are off otherwise)
+import "actlib.pi"
+
+skill main() -> Any {
+  let lex = load_lex("out\\lexicon.txt")
+  if arg(1) == "find" or arg(1) == "click" {
+    let temps = learn_set(["Segoe UI Variable Text@ct", "Segoe UI@ct", "Consolas@ct"], [12, 13, 14, 15, 16])
+    let img = see(1)
+    let r = find_label(img, arg(2), temps, lex)
+    if r == null { return "not found on the screen: " ++ arg(2) }
+    let out = "found \"" ++ arg(2) ++ "\" as a " ++ r[2] ++ " reading \"" ++ r[3] ++ "\" at " ++ str(r[0]) ++ "," ++ str(r[1])
+    if arg(1) == "click" {
+      do click(r[0], r[1])
+      if act_ok() { let out = out ++ " -- clicked" }
+    }
+    return out
+  }
+  let fonts = ["Segoe UI", "Arial", "Verdana", "Tahoma"]
+  let temps = learn_set(fonts, [12, 14, 16, 18])
+  if arg(1) == "debug" {
+    let sc = compose(2026 + 7 * num(arg(2)), fonts)
+    let img = sc[0]
+    let u = understand(img[0], img[1], img[2], 1)
+    let out = u[0] ++ "buttons drawn: " ++ str(sc[1]) ++ " in " ++ sc[3] ++ " " ++ str(sc[4]) ++ "px\n"
+    for o in u[9] { let out = out ++ "  " ++ o[0] ++ " " ++ str([o[1], o[2], o[3], o[4]]) ++ " reads \"" ++ read_box(img, [o[1], o[2], o[3], o[4]], temps, lex) ++ "\"\n" }
+    for l in u[8] { let out = out ++ "  line " ++ str(l) ++ " reads \"" ++ read_box(img, [max(0, l[0] - 2), max(0, l[1] - 2), min(img[0] - 1, l[2] + 2), min(img[1] - 1, l[3] + 2)], temps, lex) ++ "\"\n" }
+    do bmp_write("out\\act_debug.bmp", img[0], img[1], annotate(img[0], img[1], img[2], u[7]))
+    return out
+  }
+  let right = 0
+  let tries = 0
+  let seed = 2026
+  let misses = []
+  for k in range(0, 40) {
+    let mm = mark()
+    let sc = compose(seed + 7 * k, fonts)
+    let btns = sc[1]
+    let target = btns[sc[2] // 65536 % len(btns)]
+    let r = find_label(sc[0], target[0], temps, lex)
+    let ok = false
+    if r != null {
+      if r[0] >= target[1] and r[0] <= target[3] and r[1] >= target[2] and r[1] <= target[4] { let ok = true }
+    }
+    let note = ""
+    if ok == false {
+      let got = "nothing"
+      if r != null { let got = r[2] ++ " \"" ++ r[3] ++ "\"" }
+      let note = "  missed \"" ++ target[0] ++ "\" (" ++ sc[3] ++ " " ++ str(sc[4]) ++ "px): found " ++ got
+    }
+    let kept = release(mm, [ok, note])
+    let tries = tries + 1
+    if kept[0] { let right = right + 1 } else { let misses = append(misses, kept[1]) }
+  }
+  return "find the button by its label: " ++ str(right) ++ " of " ++ str(tries) ++ " right\n" ++ join(slice(misses, 0, min(10, len(misses))), "\n")
+}

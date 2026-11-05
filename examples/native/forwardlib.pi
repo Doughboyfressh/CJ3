@@ -1,0 +1,1239 @@
+# Pi's own forward pass for Ornith (the brain's engine), as a library: the GGUF reader, the exact CPU path, the GPU
+# engine with every activation on the GPU, generation, and the hooks for looking into and editing the weights.
+# piforward.pi (checks and experiments) and brain.pi (think) import it.
+# Pi's own forward pass, piece 1: the embedding lookup and one layer's expert block (mixture of experts), computed by
+# Pi from the model file (its own reader and exact dequantizer). Checked against an independent reference outside Pi.
+#   out\piforward.exe moe TOKEN LAYER   -> F(x) = experts(rmsnorm(x) * post_attention_norm), x = the token's embedding
+# The block: router softmax over 256 experts, the top 8 renormalised, each expert down(silu(gate.x) * (up.x)); plus the
+# shared expert scaled by sigmoid(shared_gate.x).
+import "ggufl.pi"
+import "gpuengine.pi"
+
+skill MODEL() -> Any { return "C:\\Users\\Dough\\Desktop\\Ornith-1.5-35B-A3B-GGUF\\Ornith-1.5-35B-Q4_K_M.gguf" }
+skill EPS() -> Any { return 0.000001 }
+
+# a real -> an integer x 2^k (Pi has no real -> integer conversion: through its text)
+skill r2i(x, k) -> Any {
+  let v = x * (pow2(k) * 1.0)
+  let neg = v < 0.0
+  if neg { let v = 0.0 - v }
+  let s = split(str(v), ".")[0]
+  let n = rd_int(s)
+  if neg { return 0 - n }
+  return n
+}
+
+# a float32 tensor as a list of reals
+skill f32_vec(m, name, n) -> Any {
+  if len(m) > 5 {
+    let c = m[5][name]
+    if c != null {
+      if len(c) == n { return c }
+    }
+  }
+  let t = tensor(m, name)
+  let b = read_bytes(m[3], m[1] + t[3], 4 * n)
+  let out = []
+  for i in range(0, n) { let out = append(out, f32s(b, 4 * i, 24) * 1.0 / 16777216.0) }
+  return out
+}
+
+# every 1-D float32 tensor (norm weights, biases, decays) read once -> name -> list of reals (kept as m[5])
+skill f32_cache(m) -> Any {
+  let c = {}
+  for t in m[0] {
+    if t[2] == 0 and len(t[1]) == 1 { let c = put(c, t[0], f32_vec(m, t[0], t[1][0])) }
+  }
+  return c
+}
+
+# one decoded row (Q4_K, Q6_K or F32) as integers x 2^24
+skill wrow(m, t, r) -> Any {
+  let n = t[1][0]
+  if t[2] == 0 {
+    let b = read_bytes(m[3], m[1] + t[3] + 4 * n * r, 4 * n)
+    let out = arr(n)
+    for i in range(0, n) { do aset(out, i, f32s(b, 4 * i, 24)) }
+    return out
+  }
+  if t[2] == 12 {
+    let nb = n // 256
+    let b = read_bytes(m[3], m[1] + t[3] + r * nb * 144, nb * 144)
+    let out = arr(n)
+    do deq_q4k_fast(b, 0, nb, out, 0)
+    return out
+  }
+  return row(m, t, r)
+}
+
+# rows r0 .. r0+count of a matrix times x (x as integers x 2^20) -> reals
+skill matvec(m, t, r0, count, xi) -> Any {
+  let n = t[1][0]
+  let out = []
+  for r in range(r0, r0 + count) {
+    let mm = mark()
+    let w = wrow(m, t, r)
+    let s = 0
+    let i = 0
+    while i < n {
+      let s = s + aget(w, i) * aget(xi, i)
+      let i = i + 1
+    }
+    let v = release(mm, s * 1.0 / 17592186044416.0)
+    let out = append(out, v)
+  }
+  return out
+}
+
+skill to_ints(xs, k) -> Any {
+  let a = arr(len(xs))
+  for i in range(0, len(xs)) { do aset(a, i, r2i(xs[i], k)) }
+  return a
+}
+
+# every matrix-vector product goes through these: on the GPU engine when it is open (m[4]), else Pi's exact CPU path
+skill mv(m, t, r0, count, x) -> Any {
+  if len(m) > 4 { return ge_mv(m[4], t, r0, count, [x])[0] }
+  return matvec(m, t, r0, count, to_ints(x, 20))
+}
+
+skill mv_multi(m, t, r0, count, xs) -> Any {
+  if len(m) > 4 { return ge_mv(m[4], t, r0, count, xs) }
+  let xis = []
+  for x in xs { let xis = append(xis, to_ints(x, 20)) }
+  return matvec_multi(m, t, r0, count, xis)
+}
+
+skill rmsnorm(x, w) -> Any {
+  let s = 0.0
+  for v in x { let s = s + v * v }
+  let r = 1.0 / sqrt(s / (len(x) * 1.0) + EPS())
+  let out = []
+  for i in range(0, len(x)) { let out = append(out, x[i] * r * w[i]) }
+  return out
+}
+
+skill silu(v) -> Any { return v / (1.0 + exp(0.0 - v)) }
+skill sigmoid(v) -> Any { return 1.0 / (1.0 + exp(0.0 - v)) }
+
+# one expert (or the shared one): down(silu(gate.x) * (up.x)); gate/up rows g0.., down rows d0.. of length nh
+skill expert(m, tg, tu, td, g0, d0, nh, n, x) -> Any {
+  let g = mv(m, tg, g0, nh, x)
+  let u = mv(m, tu, g0, nh, x)
+  let h = []
+  for j in range(0, nh) { let h = append(h, silu(g[j]) * u[j]) }
+  return mv(m, td, d0, n, h)
+}
+
+skill moe(m, x, layer) -> Any {
+  let L = "blk." ++ str(layer) ++ "."
+  let n = len(x)
+  let xn = rmsnorm(x, f32_vec(m, L ++ "post_attention_norm.weight", n))
+  # the router
+  let logits = mv(m, tensor(m, L ++ "ffn_gate_inp.weight"), 0, 256, xn)
+  let mx = logits[0]
+  for v in logits {
+    if v > mx { let mx = v }
+  }
+  let ps = []
+  let z = 0.0
+  for v in logits {
+    let e = exp(v - mx)
+    let ps = append(ps, e)
+    let z = z + e
+  }
+  let top = []
+  for k in range(0, 8) {
+    let bi = 0 - 1
+    for e in range(0, 256) {
+      let taken = false
+      for t in top {
+        if t == e { let taken = true }
+      }
+      if taken == false {
+        if bi < 0 { let bi = e } else {
+          if ps[e] > ps[bi] { let bi = e }
+        }
+      }
+    }
+    let top = append(top, bi)
+  }
+  let wsum = 0.0
+  for e in top { let wsum = wsum + ps[e] / z }
+  let tg = tensor(m, L ++ "ffn_gate_exps.weight")
+  let tu = tensor(m, L ++ "ffn_up_exps.weight")
+  let td = tensor(m, L ++ "ffn_down_exps.weight")
+  let y = []
+  for i in range(0, n) { let y = append(y, 0.0) }
+  let ws = []
+  for e in top {
+    let w = ps[e] / z / wsum
+    let ws = append(ws, w)
+    let ye = expert(m, tg, tu, td, e * 512, e * n, 512, n, xn)
+    let y2 = []
+    for i in range(0, n) { let y2 = append(y2, y[i] + w * ye[i]) }
+    let y = y2
+  }
+  # the shared expert, gated by sigmoid
+  let sg = sigmoid(mv(m, tensor(m, L ++ "ffn_gate_inp_shexp.weight"), 0, 1, xn)[0])
+  let ys = expert(m, tensor(m, L ++ "ffn_gate_shexp.weight"), tensor(m, L ++ "ffn_up_shexp.weight"), tensor(m, L ++ "ffn_down_shexp.weight"), 0, 0, 512, n, xn)
+  let out = []
+  for i in range(0, n) { let out = append(out, y[i] + sg * ys[i]) }
+  return [out, top, ws, sg]
+}
+
+# the router's choice for one token: softmax over the 256 logits, the top 8 renormalised -> [experts, weights]
+skill route(logits) -> Any {
+  let mx = logits[0]
+  for v in logits {
+    if v > mx { let mx = v }
+  }
+  let ps = []
+  let z = 0.0
+  for v in logits {
+    let e = exp(v - mx)
+    let ps = append(ps, e)
+    let z = z + e
+  }
+  let top = []
+  for k in range(0, 8) {
+    let bi = 0 - 1
+    for e in range(0, 256) {
+      let taken = false
+      for t in top {
+        if t == e { let taken = true }
+      }
+      if taken == false {
+        if bi < 0 { let bi = e } else {
+          if ps[e] > ps[bi] { let bi = e }
+        }
+      }
+    }
+    let top = append(top, bi)
+  }
+  let wsum = 0.0
+  for e in top { let wsum = wsum + ps[e] / z }
+  let ws = []
+  for e in top { let ws = append(ws, ps[e] / z / wsum) }
+  return [top, ws]
+}
+
+# the expert block for every token at once on the GPU engine: the router and shared gate for all tokens in one launch
+# each; every chosen expert of every token in one launch per matrix (gate, up, down) through the expert table
+skill moe_all(m, hs, layer) -> Any {
+  let L = "blk." ++ str(layer) ++ "."
+  let eng = m[4]
+  let n = 2048
+  let T = len(hs)
+  let w = f32_vec(m, L ++ "post_attention_norm.weight", n)
+  let xns = []
+  for h in hs { let xns = append(xns, rmsnorm(h, w)) }
+  let lgs = mv_multi(m, tensor(m, L ++ "ffn_gate_inp.weight"), 0, 256, xns)
+  let sgl = mv_multi(m, tensor(m, L ++ "ffn_gate_inp_shexp.weight"), 0, 1, xns)
+  let ids = []
+  let wts = []
+  for t in range(0, T) {
+    let r = route(lgs[t])
+    let ids = ids ++ r[0]
+    let wts = append(wts, r[1])
+  }
+  let gs = ge_mx(eng, tensor(m, L ++ "ffn_gate_exps.weight"), 512, ids, xns, 8)
+  let us = ge_mx(eng, tensor(m, L ++ "ffn_up_exps.weight"), 512, ids, xns, 8)
+  let hx = []
+  for s in range(0, T * 8) {
+    let part = []
+    let b = s * 512
+    for j in range(0, 512) { let part = append(part, silu(gs[b + j]) * us[b + j]) }
+    let hx = append(hx, part)
+  }
+  let ds = ge_mx(eng, tensor(m, L ++ "ffn_down_exps.weight"), n, ids, hx, 1)
+  let shg = mv_multi(m, tensor(m, L ++ "ffn_gate_shexp.weight"), 0, 512, xns)
+  let shu = mv_multi(m, tensor(m, L ++ "ffn_up_shexp.weight"), 0, 512, xns)
+  let shh = []
+  for t in range(0, T) {
+    let part = []
+    for j in range(0, 512) { let part = append(part, silu(shg[t][j]) * shu[t][j]) }
+    let shh = append(shh, part)
+  }
+  let shd = mv_multi(m, tensor(m, L ++ "ffn_down_shexp.weight"), 0, n, shh)
+  let outs = []
+  for t in range(0, T) {
+    let sg = sigmoid(sgl[t][0])
+    let wt = wts[t]
+    let b0 = t * 8 * n
+    let sh = shd[t]
+    let y = []
+    for i in range(0, n) {
+      let v = 0.0
+      for k in range(0, 8) { let v = v + wt[k] * ds[b0 + k * n + i] }
+      let y = append(y, v + sg * sh[i])
+    }
+    let outs = append(outs, y)
+  }
+  return outs
+}
+
+# ---- piece 2: a full-attention layer (every 4th: 3, 7, 11 ...) -----------------------------------------------------
+# input -> rmsnorm x attn_norm; q+gate (16 heads x [256 query | 256 gate]), k and v (2 heads x 256); per-head rmsnorm
+# of q and k; rotary positions on the first 64 dims of each head (base 1e7, pairs i / i+32, text: all sections at the
+# same position); 16 query heads share 2 kv heads; causal softmax x 1/16; x sigmoid(gate); attn_output.
+skill ROPEBASE() -> Any { return 10000000.0 }
+
+skill head_norm(v, w) -> Any { return rmsnorm(v, w) }
+
+skill rope(v, pos) -> Any {
+  let out = []
+  for i in range(0, len(v)) { let out = append(out, v[i]) }
+  for i in range(0, 32) {
+    let th = (pos * 1.0) * exp(0.0 - (2.0 * i / 64.0) * log(ROPEBASE()))
+    let c = cos(th)
+    let s = sin(th)
+    let a = v[i]
+    let b = v[i + 32]
+    let out = slice(out, 0, i) ++ [a * c - b * s] ++ slice(out, i + 1, len(out))
+    let out = slice(out, 0, i + 32) ++ [b * c + a * s] ++ slice(out, i + 33, len(out))
+  }
+  return out
+}
+
+# the attention layer's output for every position of a sequence of input vectors xs
+skill attention(m, xs, layer) -> Any {
+  let L = "blk." ++ str(layer) ++ "."
+  let n = 2048
+  let wn = f32_vec(m, L ++ "attn_norm.weight", n)
+  let qn = f32_vec(m, L ++ "attn_q_norm.weight", 256)
+  let kn = f32_vec(m, L ++ "attn_k_norm.weight", 256)
+  let tq = tensor(m, L ++ "attn_q.weight")
+  let tk = tensor(m, L ++ "attn_k.weight")
+  let tv = tensor(m, L ++ "attn_v.weight")
+  let to = tensor(m, L ++ "attn_output.weight")
+  let qs = []
+  let gs = []
+  let ks = []
+  let vs = []
+  let cis = []
+  for p in range(0, len(xs)) { let cis = append(cis, rmsnorm(xs[p], wn)) }
+  let qfs = mv_multi(m, tq, 0, 8192, cis)
+  let kfs = mv_multi(m, tk, 0, 512, cis)
+  let vfs = mv_multi(m, tv, 0, 512, cis)
+  for p in range(0, len(xs)) {
+    let qf = qfs[p]
+    let kf = kfs[p]
+    let vf = vfs[p]
+    let qh = []
+    let gh = []
+    for h in range(0, 16) {
+      let qh = append(qh, rope(head_norm(slice(qf, h * 512, h * 512 + 256), qn), p))
+      let gh = append(gh, slice(qf, h * 512 + 256, h * 512 + 512))
+    }
+    let kh = []
+    let vh = []
+    for h in range(0, 2) {
+      let kh = append(kh, rope(head_norm(slice(kf, h * 256, h * 256 + 256), kn), p))
+      let vh = append(vh, slice(vf, h * 256, h * 256 + 256))
+    }
+    let qs = append(qs, qh)
+    let gs = append(gs, gh)
+    let ks = append(ks, kh)
+    let vs = append(vs, vh)
+  }
+  let atts = []
+  for p in range(0, len(xs)) {
+    let att = []
+    for h in range(0, 16) {
+      let kv = h // 8
+      let sc = []
+      let mx = 0.0 - 1000000000.0
+      for t in range(0, p + 1) {
+        let d = 0.0
+        for i in range(0, 256) { let d = d + qs[p][h][i] * ks[t][kv][i] }
+        let d = d / 16.0
+        let sc = append(sc, d)
+        if d > mx { let mx = d }
+      }
+      let z = 0.0
+      let ws = []
+      for d in sc {
+        let e = exp(d - mx)
+        let ws = append(ws, e)
+        let z = z + e
+      }
+      for i in range(0, 256) {
+        let a = 0.0
+        for t in range(0, p + 1) { let a = a + ws[t] / z * vs[t][kv][i] }
+        let att = append(att, a * sigmoid(gs[p][h][i]))
+      }
+    }
+    let atts = append(atts, att)
+  }
+  return mv_multi(m, to, 0, n, atts)
+}
+
+# rows r0..r0+count times several vectors at once (each row decoded once) -> one list of reals per vector
+skill matvec_multi(m, t, r0, count, xis) -> Any {
+  let n = t[1][0]
+  let outs = []
+  for x in xis { let outs = append(outs, []) }
+  for r in range(r0, r0 + count) {
+    let mm = mark()
+    let w = wrow(m, t, r)
+    let vals = []
+    for xi in xis {
+      let s = 0
+      let i = 0
+      while i < n {
+        let s = s + aget(w, i) * aget(xi, i)
+        let i = i + 1
+      }
+      let vals = append(vals, s * 1.0 / 17592186044416.0)
+    }
+    let vals = release(mm, vals)
+    let o2 = []
+    for k in range(0, len(xis)) { let o2 = append(o2, append(outs[k], vals[k])) }
+    let outs = o2
+  }
+  return outs
+}
+
+skill softplus(v) -> Any { return log(1.0 + exp(v)) }
+
+# the causal 4-tap convolution of the mixed projections at token t (zero history), then silu -> 8192 reals
+skill conv_silu(mixed, conv, t) -> Any {
+  let mrows = []
+  for i in range(0, 4) {
+    let tt = t - 3 + i
+    if tt >= 0 { let mrows = append(mrows, mixed[tt]) } else { let mrows = append(mrows, null) }
+  }
+  let cv = []
+  for c in range(0, 8192) {
+    let s = 0.0
+    let tap = conv[c]
+    for i in range(0, 4) {
+      if mrows[i] != null { let s = s + mrows[i][c] * tap[i] }
+    }
+    let cv = append(cv, silu(s))
+  }
+  return cv
+}
+
+# count values of an array from position p, as a list
+skill arr_slice(a, p, count) -> Any {
+  let out = []
+  for i in range(p, p + count) { let out = append(out, aget(a, i)) }
+  return out
+}
+
+skill l2norm(v) -> Any {
+  let s = 0.0
+  for x in v { let s = s + x * x }
+  let r = 1.0 / sqrt(s + EPS())
+  let out = []
+  for x in v { let out = append(out, x * r) }
+  return out
+}
+
+# ---- piece 3: a linear-attention layer (gated delta net; layers that are not every 4th) -------------------------
+# per token: cur = rmsnorm x attn_norm; mixed = attn_qkv.cur (8192 = q 16x128 | k 16x128 | v 32x128), z = attn_gate.cur
+# (32x128), beta = sigmoid(ssm_beta.cur), decay = exp(softplus(ssm_alpha.cur + dt_bias) * ssm_a) per value head;
+# causal 4-tap convolution of mixed over time (zero history), silu; q, k L2-normalised; value head j uses key head
+# j mod 16; state S (128x128 per head): S *= decay; d = beta (v - S^T k); S += k d^T; o = S^T (q / sqrt 128);
+# out = rmsnorm(o) x ssm_norm x silu(z); ssm_out.
+skill linear_attn(m, xs, layer) -> Any {
+  let L = "blk." ++ str(layer) ++ "."
+  let n = 2048
+  let wn = f32_vec(m, L ++ "attn_norm.weight", n)
+  let cis = []
+  for x in xs { let cis = append(cis, rmsnorm(x, wn)) }
+  let mixed = mv_multi(m, tensor(m, L ++ "attn_qkv.weight"), 0, 8192, cis)
+  let zs = mv_multi(m, tensor(m, L ++ "attn_gate.weight"), 0, 4096, cis)
+  let bs = mv_multi(m, tensor(m, L ++ "ssm_beta.weight"), 0, 32, cis)
+  let alps = mv_multi(m, tensor(m, L ++ "ssm_alpha.weight"), 0, 32, cis)
+  let dtb = f32_vec(m, L ++ "ssm_dt.bias", 32)
+  let sa = f32_vec(m, L ++ "ssm_a", 32)
+  let snw = f32_vec(m, L ++ "ssm_norm.weight", 128)
+  # the conv kernel: 8192 channels x 4 taps (oldest first)
+  let tc = tensor(m, L ++ "ssm_conv1d.weight")
+  let cb = read_bytes(m[3], m[1] + tc[3], 4 * 4 * 8192)
+  # (Pi's arrays hold integers only: reals live in lists; taps as 8192 lists of 4)
+  let conv = []
+  for c in range(0, 8192) {
+    let tap = []
+    for i in range(0, 4) { let tap = append(tap, f32s(cb, 4 * (c * 4 + i), 24) * 1.0 / 16777216.0) }
+    let conv = append(conv, tap)
+  }
+  # the states, one 128x128 per value head (as flat lists)
+  # the state of each value head: 128 rows (key dim a) of 128 reals (value dim b)
+  let zrow = []
+  for b in range(0, 128) { let zrow = append(zrow, 0.0) }
+  let zs0 = []
+  for a in range(0, 128) { let zs0 = append(zs0, zrow) }
+  let states = []
+  for j in range(0, 32) { let states = append(states, zs0) }
+  let finals = []
+  if len(m) > 4 {
+    # the GPU engine: Pi prepares q, k, v, beta and decay per token; the recurrence runs on the GPU's kept state
+    let qs = []
+    let ks = []
+    let vs = []
+    let bd = []
+    for t in range(0, len(xs)) {
+      let cv = conv_silu(mixed, conv, t)
+      let qh = []
+      let kh = []
+      for h in range(0, 16) {
+        let qh = append(qh, l2norm(slice(cv, h * 128, h * 128 + 128)))
+        let kh = append(kh, l2norm(slice(cv, 2048 + h * 128, 2048 + h * 128 + 128)))
+      }
+      let vh = []
+      let row = []
+      for j in range(0, 32) {
+        let vh = append(vh, slice(cv, 4096 + j * 128, 4096 + j * 128 + 128))
+        let row = append(row, [sigmoid(bs[t][j]), exp(softplus(alps[t][j] + dtb[j]) * sa[j])])
+      }
+      let qs = append(qs, qh)
+      let ks = append(ks, kh)
+      let vs = append(vs, vh)
+      let bd = append(bd, row)
+    }
+    let os = ge_dnet_run(m[4], layer, qs, ks, vs, bd)
+    for t in range(0, len(xs)) {
+      let outh = []
+      for j in range(0, 32) {
+        let on = rmsnorm(slice(os[t], j * 128, j * 128 + 128), snw)
+        let part = []
+        for b in range(0, 128) { let part = append(part, on[b] * silu(zs[t][j * 128 + b])) }
+        let outh = outh ++ part
+      }
+      let finals = append(finals, outh)
+    }
+    return mv_multi(m, tensor(m, L ++ "ssm_out.weight"), 0, n, finals)
+  }
+  for t in range(0, len(xs)) {
+    # convolution + silu
+    let mrows = []
+    for i in range(0, 4) {
+      let tt = t - 3 + i
+      if tt >= 0 { let mrows = append(mrows, mixed[tt]) } else { let mrows = append(mrows, null) }
+    }
+    let cv = []
+    for c in range(0, 8192) {
+      let s = 0.0
+      let tap = conv[c]
+      for i in range(0, 4) {
+        if mrows[i] != null { let s = s + mrows[i][c] * tap[i] }
+      }
+      let cv = append(cv, silu(s))
+    }
+    let outh = []
+    for j in range(0, 32) {
+      let kh = j % 16
+      let q = l2norm(slice(cv, kh * 128, kh * 128 + 128))
+      let k = l2norm(slice(cv, 2048 + kh * 128, 2048 + kh * 128 + 128))
+      let v = slice(cv, 4096 + j * 128, 4096 + j * 128 + 128)
+      let beta = sigmoid(bs[t][j])
+      let decay = exp(softplus(alps[t][j] + dtb[j]) * sa[j])
+      let mh = mark()
+      let old = states[j]
+      # decay, then sk[b] = sum_a S[a][b] k[a]; d = beta (v - sk); S[a][b] += k[a] d[b]; o[b] = sum_a S[a][b] q[a]
+      let sk = []
+      for b in range(0, 128) { let sk = append(sk, 0.0) }
+      let dec = []
+      for a in range(0, 128) {
+        let row = []
+        for x in old[a] { let row = append(row, x * decay) }
+        let dec = append(dec, row)
+      }
+      let skl = []
+      for b in range(0, 128) {
+        let s = 0.0
+        for a in range(0, 128) { let s = s + dec[a][b] * k[a] }
+        let skl = append(skl, s)
+      }
+      let d = []
+      for b in range(0, 128) { let d = append(d, beta * (v[b] - skl[b])) }
+      let nst = []
+      for a in range(0, 128) {
+        let row = []
+        let ka = k[a]
+        let ra = dec[a]
+        for b in range(0, 128) { let row = append(row, ra[b] + ka * d[b]) }
+        let nst = append(nst, row)
+      }
+      let o = []
+      for b in range(0, 128) {
+        let s = 0.0
+        for a in range(0, 128) { let s = s + nst[a][b] * q[a] }
+        let o = append(o, s / sqrt(128.0))
+      }
+      let kept = release(mh, [nst, o])
+      let states = slice(states, 0, j) ++ [kept[0]] ++ slice(states, j + 1, 32)
+      let o = kept[1]
+      let on = rmsnorm(o, snw)
+      for b in range(0, 128) { let outh = append(outh, on[b] * silu(zs[t][j * 128 + b])) }
+    }
+    let finals = append(finals, outh)
+  }
+  return mv_multi(m, tensor(m, L ++ "ssm_out.weight"), 0, n, finals)
+}
+
+# ---- piece 4: the whole model -----------------------------------------------------------------------------------
+# a token by its text: "The" or, with the byte-level space marker (bytes 196 160) in front, " capital"
+skill find_token(m, word, spaced) -> Any {
+  let nv = tensor(m, "token_embd.weight")[1][1]
+  for i in range(0, nv) {
+    let t = token(m, i)
+    if spaced {
+      if len(t) == len(word) + 2 {
+        if ord(slice(t, 0, 1)) == 196 and ord(slice(t, 1, 2)) == 160 and slice(t, 2, len(t)) == word { return i }
+      }
+    } else {
+      if t == word { return i }
+    }
+  }
+  return 0 - 1
+}
+
+# faster Q6_K for one row: the scale fixed once per 16 weights (same numbers as deq_q6k)
+skill deq_q6k_row(b, nb, out) -> Any {
+  for bl in range(0, nb) {
+    let base = 210 * bl
+    let d = f16(b, base + 208)
+    let k = d[1] + S()
+    let pw = pow2(abs(k))
+    for half in range(0, 2) {
+      let ql = base + 64 * half
+      let qh = base + 128 + 32 * half
+      let sc = base + 192 + 8 * half
+      let y = 256 * bl + 128 * half
+      for l in range(0, 32) {
+        let is = l // 16
+        let h = aget(b, qh + l)
+        let qs = [aget(b, ql + l) % 16 + 16 * (h % 4) - 32, aget(b, ql + l + 32) % 16 + 16 * ((h // 4) % 4) - 32, aget(b, ql + l) // 16 + 16 * ((h // 16) % 4) - 32, aget(b, ql + l + 32) // 16 + 16 * ((h // 64) % 4) - 32]
+        for g in range(0, 4) {
+          let v = d[0] * s8(aget(b, sc + is + 2 * g)) * qs[g]
+          if k >= 0 { let v = v * pw } else { let v = (v + pw // 2) // pw }
+          do aset(out, y + l + 32 * g, v)
+        }
+      }
+    }
+  }
+  return out
+}
+
+# the final norm and the output head over the whole vocabulary -> the best k [logit, token id]
+skill head(m, x, k) -> Any {
+  let t = tensor(m, "output.weight")
+  let nv = t[1][1]
+  if len(m) > 4 {
+    let lgs = mv(m, t, 0, nv, rmsnorm(x, f32_vec(m, "output_norm.weight", 2048)))
+    let best = []
+    for r in range(0, nv) {
+      let lg = lgs[r]
+      if len(best) < k or lg > best[len(best) - 1][0] { let best = ins_sorted(best, [lg, r], k) }
+    }
+    return best
+  }
+  let xi = to_ints(rmsnorm(x, f32_vec(m, "output_norm.weight", 2048)), 20)
+  let nb = 8
+  let rowb = nb * 210
+  let best = []
+  let r = 0
+  while r < nv {
+    let mm = mark()
+    let b = read_bytes(m[3], m[1] + t[3] + r * rowb, rowb)
+    let w = arr(2048)
+    do deq_q6k_row(b, nb, w)
+    let s = 0
+    let i = 0
+    while i < 2048 {
+      let s = s + aget(w, i) * aget(xi, i)
+      let i = i + 1
+    }
+    do release(mm, 0)
+    let lg = s * 1.0 / 17592186044416.0
+    if len(best) < k or lg > best[len(best) - 1][0] { let best = ins_sorted(best, [lg, r], k) }
+    let r = r + 1
+  }
+  return best
+}
+
+# ---- generation: one pass per new token, every layer's memory kept (GPU engine) ----------------------------------
+# caches: one entry per layer. An attention layer keeps [keys, values] of every position so far (per position: its 2
+# heads x 256, after norm and rope). A linear layer keeps [the last 3 mixed projections (the convolution's history),
+# its conv taps]; its delta-net state stays on the GPU between passes.
+skill conv_taps(m, layer) -> Any {
+  let tc = tensor(m, "blk." ++ str(layer) ++ ".ssm_conv1d.weight")
+  let cb = read_bytes(m[3], m[1] + tc[3], 4 * 4 * 8192)
+  let conv = []
+  for c in range(0, 8192) {
+    let tap = []
+    for i in range(0, 4) { let tap = append(tap, f32s(cb, 4 * (c * 4 + i), 24) * 1.0 / 16777216.0) }
+    let conv = append(conv, tap)
+  }
+  return conv
+}
+
+skill new_caches(m) -> Any {
+  let cs = []
+  for il in range(0, NLAYER()) {
+    if (il + 1) % 4 == 0 { let cs = append(cs, [[], []]) } else { let cs = append(cs, [[], conv_taps(m, il)]) }
+  }
+  return cs
+}
+
+# the attention layer for new positions pos0.. given the keys and values before them -> [outs, keys, values]
+skill attn_step(m, xs, layer, kc, vc, pos0) -> Any {
+  let L = "blk." ++ str(layer) ++ "."
+  let n = 2048
+  let wn = f32_vec(m, L ++ "attn_norm.weight", n)
+  let qn = f32_vec(m, L ++ "attn_q_norm.weight", 256)
+  let kn = f32_vec(m, L ++ "attn_k_norm.weight", 256)
+  let cis = []
+  for x in xs { let cis = append(cis, rmsnorm(x, wn)) }
+  let qfs = mv_multi(m, tensor(m, L ++ "attn_q.weight"), 0, 8192, cis)
+  let kfs = mv_multi(m, tensor(m, L ++ "attn_k.weight"), 0, 512, cis)
+  let vfs = mv_multi(m, tensor(m, L ++ "attn_v.weight"), 0, 512, cis)
+  let ks = kc
+  let vs = vc
+  let qs = []
+  let gs = []
+  for p in range(0, len(xs)) {
+    let qf = qfs[p]
+    let qh = []
+    let gh = []
+    for h in range(0, 16) {
+      let qh = append(qh, rope(head_norm(slice(qf, h * 512, h * 512 + 256), qn), pos0 + p))
+      let gh = append(gh, slice(qf, h * 512 + 256, h * 512 + 512))
+    }
+    let kh = []
+    let vh = []
+    for h in range(0, 2) {
+      let kh = append(kh, rope(head_norm(slice(kfs[p], h * 256, h * 256 + 256), kn), pos0 + p))
+      let vh = append(vh, slice(vfs[p], h * 256, h * 256 + 256))
+    }
+    let qs = append(qs, qh)
+    let gs = append(gs, gh)
+    let ks = append(ks, kh)
+    let vs = append(vs, vh)
+  }
+  let atts = []
+  for p in range(0, len(xs)) {
+    let last = pos0 + p
+    let att = []
+    for h in range(0, 16) {
+      let kv = h // 8
+      let q = qs[p][h]
+      let sc = []
+      let mx = 0.0 - 1000000000.0
+      for t in range(0, last + 1) {
+        let k = ks[t][kv]
+        let d = 0.0
+        for i in range(0, 256) { let d = d + q[i] * k[i] }
+        let d = d / 16.0
+        let sc = append(sc, d)
+        if d > mx { let mx = d }
+      }
+      let z = 0.0
+      let ws = []
+      for d in sc {
+        let e = exp(d - mx)
+        let ws = append(ws, e)
+        let z = z + e
+      }
+      let g = gs[p][h]
+      for i in range(0, 256) {
+        let a = 0.0
+        for t in range(0, last + 1) { let a = a + ws[t] / z * vs[t][kv][i] }
+        let att = append(att, a * sigmoid(g[i]))
+      }
+    }
+    let atts = append(atts, att)
+  }
+  return [mv_multi(m, tensor(m, L ++ "attn_output.weight"), 0, n, atts), ks, vs]
+}
+
+# the linear-attention layer for new tokens, given the convolution's history and taps -> [outs, history]
+skill lin_step(m, xs, layer, hist, conv) -> Any {
+  let L = "blk." ++ str(layer) ++ "."
+  let n = 2048
+  let wn = f32_vec(m, L ++ "attn_norm.weight", n)
+  let cis = []
+  for x in xs { let cis = append(cis, rmsnorm(x, wn)) }
+  let mixed = mv_multi(m, tensor(m, L ++ "attn_qkv.weight"), 0, 8192, cis)
+  let zs = mv_multi(m, tensor(m, L ++ "attn_gate.weight"), 0, 4096, cis)
+  let bs = mv_multi(m, tensor(m, L ++ "ssm_beta.weight"), 0, 32, cis)
+  let alps = mv_multi(m, tensor(m, L ++ "ssm_alpha.weight"), 0, 32, cis)
+  let dtb = f32_vec(m, L ++ "ssm_dt.bias", 32)
+  let sa = f32_vec(m, L ++ "ssm_a", 32)
+  let snw = f32_vec(m, L ++ "ssm_norm.weight", 128)
+  let allm = hist ++ mixed
+  let h0 = len(hist)
+  let qs = []
+  let ks = []
+  let vs = []
+  let bd = []
+  for t in range(0, len(xs)) {
+    let cv = conv_silu(allm, conv, h0 + t)
+    let qh = []
+    let kh = []
+    for h in range(0, 16) {
+      let qh = append(qh, l2norm(slice(cv, h * 128, h * 128 + 128)))
+      let kh = append(kh, l2norm(slice(cv, 2048 + h * 128, 2048 + h * 128 + 128)))
+    }
+    let vh = []
+    let row = []
+    for j in range(0, 32) {
+      let vh = append(vh, slice(cv, 4096 + j * 128, 4096 + j * 128 + 128))
+      let row = append(row, [sigmoid(bs[t][j]), exp(softplus(alps[t][j] + dtb[j]) * sa[j])])
+    }
+    let qs = append(qs, qh)
+    let ks = append(ks, kh)
+    let vs = append(vs, vh)
+    let bd = append(bd, row)
+  }
+  let os = ge_dnet_run(m[4], layer, qs, ks, vs, bd)
+  let finals = []
+  for t in range(0, len(xs)) {
+    let outh = []
+    for j in range(0, 32) {
+      let on = rmsnorm(slice(os[t], j * 128, j * 128 + 128), snw)
+      let part = []
+      for b in range(0, 128) { let part = append(part, on[b] * silu(zs[t][j * 128 + b])) }
+      let outh = outh ++ part
+    }
+    let finals = append(finals, outh)
+  }
+  let keep = len(allm) - 3
+  if keep < 0 { let keep = 0 }
+  return [mv_multi(m, tensor(m, L ++ "ssm_out.weight"), 0, n, finals), slice(allm, keep, len(allm))]
+}
+
+# new tokens' input vectors through all 40 layers, from position pos0 -> [their output vectors, the caches]
+skill step(m, xs, caches, pos0) -> Any { return step_n(m, xs, caches, pos0, NLAYER()) }
+
+# ---- the pass with every activation on the GPU -------------------------------------------------------------------
+# m[6] = [kernels, the activation space, each layer's tensors by short name, output.weight]. dstep queues every
+# layer's kernels for the new tokens (positions pos0 ..) without waiting; the hidden states stay in ws X.
+skill layer_tables(m) -> Any {
+  let out = []
+  for il in range(0, NLAYER()) {
+    let pre = "blk." ++ str(il) ++ "."
+    let n = len(pre)
+    let mp = {}
+    for t in m[0] {
+      if slice(t[0], 0, n) == pre { let mp = put(mp, slice(t[0], n, len(t[0])), t) }
+    }
+    let out = append(out, mp)
+  }
+  return out
+}
+
+# the GPU engine, its activation kernels and space, the per-layer tables -> m with [4] engine, [5] f32 cache, [6]
+skill dev_open(m) -> Any {
+  let eng = ge_open(m)
+  if len(eng) == 1 { return eng[0] }
+  let fs = ge_kernels()
+  if len(fs) == 1 { return fs[0] }
+  let ws = ge_space()
+  if len(ws) == 1 { return ws[0] }
+  return append(append(append(m, eng), f32_cache(m)), [fs, ws, layer_tables(m), tensor(m, "output.weight")])
+}
+
+# the engine's memory after the first pos positions (delta-net states, convolution histories, the attention layers'
+# keys and values for those positions) copied aside on the GPU, so a prompt fed once can be restored in a moment
+# -> [states, histories, keys, values, pos]
+skill dev_snapshot(m, pos) -> Any {
+  let ws = m[6][1]
+  let st = rt_gpu_alloc(40 * ge_STATE())
+  let hi = rt_gpu_alloc(40 * 3 * 8192 * 8)
+  let kb = 10 * pos * 512 * 4
+  let kc = rt_gpu_alloc(kb + 8)
+  let vc = rt_gpu_alloc(kb + 8)
+  do rt_gpu_copy(st, m[4][10], 40 * ge_STATE())
+  do rt_gpu_copy(hi, ws["HIST"], 40 * 3 * 8192 * 8)
+  for ai in range(0, 10) {
+    do rt_gpu_copy(kc + ai * pos * 2048, ws["KC"] + ai * ge_MAXPOS() * 512 * 8, pos * 2048)
+    do rt_gpu_copy(vc + ai * pos * 2048, ws["VC"] + ai * ge_MAXPOS() * 512 * 8, pos * 2048)
+  }
+  return [st, hi, kc, vc, pos]
+}
+
+skill dev_free(sn) -> Any {
+  for i in range(0, 4) { do rt_gpu_free(sn[i]) }
+  return 0
+}
+
+skill dev_restore(m, sn) -> Any {
+  let ws = m[6][1]
+  let pos = sn[4]
+  do rt_gpu_copy(m[4][10], sn[0], 40 * ge_STATE())
+  do rt_gpu_copy(ws["HIST"], sn[1], 40 * 3 * 8192 * 8)
+  for ai in range(0, 10) {
+    do rt_gpu_copy(ws["KC"] + ai * ge_MAXPOS() * 512 * 8, sn[2] + ai * pos * 2048, pos * 2048)
+    do rt_gpu_copy(ws["VC"] + ai * ge_MAXPOS() * 512 * 8, sn[3] + ai * pos * 2048, pos * 2048)
+  }
+  return pos
+}
+
+# a new sequence: the delta-net states and the convolution histories back to zero
+skill dev_reset(m) -> Any {
+  do ge_reset(m[4])
+  return rt_gpu_zero(m[6][1]["HIST"], 40 * 3 * 8192 * 8)
+}
+
+skill dstep(m, ids, pos0, nl) -> Any {
+  do dstep_in(m, ids, pos0)
+  return dstep_go(m, len(ids), nl, 0)
+}
+
+# the new tokens at the start of a pass: their ids into TOKS[pos0 ..] and the start position go up in two copies, and
+# tokinT decodes their embedding rows and rope angles on the GPU (Pi used to do both per token on the host: ~89 ms
+# of a 531 ms 256-token pass). dstep_in_host is the old way, kept as the reference.
+skill dstep_in(m, ids, pos0) -> Any {
+  let ws = m[6][1]
+  let T = len(ids)
+  let dv = []
+  for t in range(0, T) { let dv = append(dv, ids[t] * 1.0) }
+  do rt_gpu_put(ws["TOKS"] + 8 * pos0, dv)
+  do rt_gpu_put(ws["POS"], [pos0 * 1.0])
+  let te = tensor(m, "token_embd.weight")
+  return ge_go(m[6][0], "tokinT", T, 256, [ws["AMAX"], ws["POS"], ws["TOKS"], m[4][0] + te[3], ws["X"], ws["ROPE"], ge_rowbytes(te), te[2]], 0)
+}
+
+skill dstep_in_host(m, ids, pos0) -> Any {
+  let ws = m[6][1]
+  let T = len(ids)
+  for t in range(0, T) { do rt_gpu_put(ws["X"] + 16384 * t, embed(m, ids[t])) }
+  let rp = []
+  for t in range(0, T) {
+    for i in range(0, 32) {
+      let th = ((pos0 + t) * 1.0) * exp(0.0 - (2.0 * i / 64.0) * log(ROPEBASE()))
+      let rp = append(rp, cos(th))
+      let rp = append(rp, sin(th))
+    }
+  }
+  do rt_gpu_put(ws["ROPE"], rp)
+  return rt_gpu_put(ws["POS"], [pos0 * 1.0])
+}
+
+# every layer's kernels for T tokens, queued on stream st
+skill dstep_go(m, T, nl, st) -> Any {
+  let eng = m[4]
+  let fs = m[6][0]
+  let ws = m[6][1]
+  let lt = m[6][2]
+  let b = eng[0]
+  let nt = (T * 2048 + 63) // 64
+  for il in range(0, nl) {
+    let L = lt[il]
+    if (il + 1) % 4 == 0 {
+      let ai = il // 4
+      let kc = ws["KC"] + ai * ge_MAXPOS() * 512 * 8
+      let vc = ws["VC"] + ai * ge_MAXPOS() * 512 * 8
+      do ge_mseg(eng, fs, ws["X"], b + L["attn_norm.weight"][3], 0, 0, 0, [[L["attn_q.weight"], ws["QF"], 0], [L["attn_k.weight"], ws["KF"], 0], [L["attn_v.weight"], ws["VF"], 0]], 2048, T, 1, st)
+      do ge_go(fs, "qkprep", T * 18, 256, [ws["QF"], ws["KF"], ws["VF"], b + L["attn_q_norm.weight"][3], b + L["attn_k_norm.weight"][3], ws["ROPE"], ws["Q"], kc, vc, ws["POS"], 0], st)
+      do ge_go(fs, "attn2", T * 16 * ge_SPLITS(), 256, [ws["Q"], kc, vc, ws["POS"], ws["PM"], ws["PL"], ws["PO"], ge_SPLITS()], st)
+      do ge_go(fs, "acomb", T * 16, 256, [ws["PM"], ws["PL"], ws["PO"], ws["QF"], ws["ATT"], ge_SPLITS()], st)
+      do ge_mseg(eng, fs, ws["ATT"], 0, 0, 0, 0, [[L["attn_output.weight"], ws["H"], ws["X"]]], 4096, T, 0, st)
+    } else {
+      do ge_mseg(eng, fs, ws["X"], b + L["attn_norm.weight"][3], 0, 0, 0, [[L["attn_qkv.weight"], ws["MIX"], 0], [L["attn_gate.weight"], ws["Z"], 0], [L["ssm_beta.weight"], ws["B"], 0], [L["ssm_alpha.weight"], ws["A"], 0]], 2048, T, 1, st)
+      do ge_go(fs, "conv", 128, 64, [ws["MIX"], ws["HIST"] + il * 3 * 8192 * 8, b + L["ssm_conv1d.weight"][3], ws["CV"], T], st)
+      do ge_go(fs, "dnet4", 512, 32, [eng[10] + il * ge_STATE(), ws["CV"], ws["B"], ws["A"], b + L["ssm_dt.bias"][3], b + L["ssm_a"][3], ws["FIN"], T], st)
+      do ge_mseg(eng, fs, ws["FIN"], 0, 0, ws["Z"], b + L["ssm_norm.weight"][3], [[L["ssm_out.weight"], ws["H"], ws["X"]]], 4096, T, 2, st)
+    }
+    do ge_mseg(eng, fs, ws["H"], b + L["post_attention_norm.weight"][3], ws["XN"], 0, 0, [[L["ffn_gate_inp.weight"], ws["LG"], 0], [L["ffn_gate_inp_shexp.weight"], ws["SG"], 0]], 2048, T, 1, st)
+    do ge_go(fs, "route", T, 256, [ws["LG"], ws["E"], ws["W"]], st)
+    do ge_mgu(eng, fs, L["ffn_gate_exps.weight"], L["ffn_up_exps.weight"], 512, ws["E"], T * 8, ws["XN"], 8, ws["HX"], st)
+    do ge_mgu(eng, fs, L["ffn_gate_shexp.weight"], L["ffn_up_shexp.weight"], 512, ws["ZEROS"], T, ws["XN"], 1, ws["SHH"], st)
+    do ge_mxd(eng, L["ffn_down_exps.weight"], 2048, ws["E"], T * 8, ws["HX"], 1, ws["D"], st)
+    do ge_mseg(eng, fs, ws["SHH"], 0, 0, 0, 0, [[L["ffn_down_shexp.weight"], ws["SHD"], 0]], 512, T, 0, st)
+    do ge_go(fs, "combine", nt, 64, [ws["H"], ws["D"], ws["W"], ws["SG"], ws["SHD"], ws["X"], T], st)
+    # edits and looking: m[6][4] = {"abl": 40 entries of 0 or [direction on the GPU, percent], "cap": [buffer, stride, bytes a layer]}
+    if len(m[6]) > 4 {
+      let hk = m[6][4]
+      let ab = hk["abl"]
+      if ab != null {
+        let a = ab[il]
+        if a != 0 { do ge_go(fs, "ablate", T, 256, [ws["X"], ws["H"], a[0], T, a[1]], st) }
+      }
+      let ac = hk["acc"]
+      if ac != null { do ge_go(fs, "accum", T, 256, [ws["X"], ws["H"], ws["MASK"], ac + il * 4 * 2048 * 8, T], st) }
+      let cp = hk["cap"]
+      if cp != null { do ge_go(fs, "capd", T, 256, [ws["X"], ws["H"], cp[0] + il * cp[2], T, cp[1]], st) }
+    }
+  }
+  return T
+}
+
+# the final norm and the output head on the GPU for the token at row tl of X: k = 1 -> the best [logit, id] found
+# on the GPU (only 2 numbers come back); otherwise all logits come back for Pi's top k
+skill dhead(m, tl, k) -> Any {
+  let ws = m[6][1]
+  let to = m[6][3]
+  do dhead_go(m, tl, 0)
+  if k == 1 {
+    let r = rt_gpu_get(ws["AMAX"], 2)
+    return [[r[0], r2i(r[1], 0)]]
+  }
+  let lgs = rt_gpu_get(ws["LOGITS"], to[1][1])
+  let best = []
+  for r in range(0, to[1][1]) {
+    let lg = lgs[r]
+    if len(best) < k or lg > best[len(best) - 1][0] { let best = ins_sorted(best, [lg, r], k) }
+  }
+  return best
+}
+
+# the head's kernels on stream st: the final norm, all 248,320 logits, the best one (AMAX)
+skill dhead_go(m, tl, st) -> Any {
+  let eng = m[4]
+  let fs = m[6][0]
+  let ws = m[6][1]
+  let to = m[6][3]
+  do ge_mseg(eng, fs, ws["X"] + 16384 * tl, eng[0] + tensor(m, "output_norm.weight")[3], 0, 0, 0, [[to, ws["LOGITS"], 0]], 2048, 1, 1, st)
+  return ge_go(fs, "amax", 1, 1024, [ws["LOGITS"], ws["AMAX"], to[1][1]], st)
+}
+
+# one launch of a kernel kind with a decode token's shapes (for timing)
+skill prof_one(m, nm, st) -> Any {
+  let eng = m[4]
+  let fs = m[6][0]
+  let ws = m[6][1]
+  let L = m[6][2][0]
+  let L3 = m[6][2][3]
+  let b = eng[0]
+  if nm == "dnet2" { return ge_go(fs, "dnet4", 512, 32, [eng[10], ws["CV"], ws["B"], ws["A"], b + L["ssm_dt.bias"][3], b + L["ssm_a"][3], ws["FIN"], 1], st) }
+  if nm == "gnorm" { return ge_go(fs, "gnorm", 32, 128, [ws["Z"], b + L["ssm_norm.weight"][3], ws["FIN"]], st) }
+  if nm == "attn" { return ge_go(fs, "attn2", 16 * ge_SPLITS(), 256, [ws["Q"], ws["KC"], ws["VC"], ws["POS"], ws["PM"], ws["PL"], ws["PO"], ge_SPLITS()], st) }
+  if nm == "acomb" { return ge_go(fs, "acomb", 16, 256, [ws["PM"], ws["PL"], ws["PO"], ws["QF"], ws["ATT"], ge_SPLITS()], st) }
+  if nm == "head" { return ge_mvd(eng, m[6][3], m[6][3][1][1], ws["XN"], ws["LOGITS"], 1, st) }
+  if nm == "qkv" { return ge_mvd(eng, L["attn_qkv.weight"], 8192, ws["XN"], ws["MIX"], 1, st) }
+  if nm == "gate" { return ge_mvd(eng, L["attn_gate.weight"], 4096, ws["XN"], ws["Z"], 1, st) }
+  if nm == "beta" { return ge_mvd(eng, L["ssm_beta.weight"], 32, ws["XN"], ws["B"], 1, st) }
+  if nm == "ssmout" { return ge_mvd(eng, L["ssm_out.weight"], 2048, ws["FIN"], ws["OUT"], 1, st) }
+  if nm == "aq" { return ge_mvd(eng, L3["attn_q.weight"], 8192, ws["XN"], ws["QF"], 1, st) }
+  if nm == "egate" { return ge_mxd(eng, L["ffn_gate_exps.weight"], 512, ws["E"], 8, ws["XN"], 8, ws["G"], st) }
+  if nm == "edown" { return ge_mxd(eng, L["ffn_down_exps.weight"], 2048, ws["E"], 8, ws["HX"], 1, ws["D"], st) }
+  if nm == "route" { return ge_go(fs, "route", 1, 256, [ws["LG"], ws["E"], ws["W"]], st) }
+  if nm == "rmsn" { return ge_go(fs, "rmsn", 1, 256, [ws["X"], b + L["attn_norm.weight"][3], ws["XN"], 2048], st) }
+  if nm == "conv" { return ge_go(fs, "conv", 128, 64, [ws["MIX"], ws["HIST"], b + L["ssm_conv1d.weight"][3], ws["CV"], 1], st) }
+  if nm == "combine" { return ge_go(fs, "combine", 32, 64, [ws["H"], ws["D"], ws["W"], ws["SG"], ws["SHD"], ws["X"], 1], st) }
+  if nm == "router" { return ge_mvd(eng, L["ffn_gate_inp.weight"], 256, ws["XN"], ws["LG"], 1, st) }
+  if nm == "silumul" { return ge_go(fs, "silumul", 64, 64, [ws["G"], ws["U"], ws["HX"], 4096], st) }
+  if nm == "vadd" { return ge_go(fs, "vadd", 32, 64, [ws["X"], ws["OUT"], ws["H"], 2048], st) }
+  if nm == "qkprep" { return ge_go(fs, "qkprep", 18, 256, [ws["QF"], ws["KF"], ws["VF"], b + L3["attn_q_norm.weight"][3], b + L3["attn_k_norm.weight"][3], ws["ROPE"], ws["Q"], ws["KC"], ws["VC"], ws["POS"], 0], st) }
+  if nm == "mq" { return ge_mseg(eng, fs, ws["X"], b + L["attn_norm.weight"][3], 0, 0, 0, [[L["attn_qkv.weight"], ws["MIX"], 0], [L["attn_gate.weight"], ws["Z"], 0], [L["ssm_beta.weight"], ws["B"], 0], [L["ssm_alpha.weight"], ws["A"], 0]], 2048, 1, 1, st) }
+  if nm == "mo" { return ge_mseg(eng, fs, ws["FIN"], 0, 0, ws["Z"], b + L["ssm_norm.weight"][3], [[L["ssm_out.weight"], ws["H"], ws["X"]]], 4096, 1, 2, st) }
+  if nm == "ma" { return ge_mseg(eng, fs, ws["X"], b + L3["attn_norm.weight"][3], 0, 0, 0, [[L3["attn_q.weight"], ws["QF"], 0], [L3["attn_k.weight"], ws["KF"], 0], [L3["attn_v.weight"], ws["VF"], 0]], 2048, 1, 1, st) }
+  if nm == "mao" { return ge_mseg(eng, fs, ws["ATT"], 0, 0, 0, 0, [[L3["attn_output.weight"], ws["H"], ws["X"]]], 4096, 1, 0, st) }
+  if nm == "mr" { return ge_mseg(eng, fs, ws["H"], b + L["post_attention_norm.weight"][3], ws["XN"], 0, 0, [[L["ffn_gate_inp.weight"], ws["LG"], 0], [L["ffn_gate_inp_shexp.weight"], ws["SG"], 0]], 2048, 1, 1, st) }
+  if nm == "mgr" { return ge_mgu(eng, fs, L["ffn_gate_exps.weight"], L["ffn_up_exps.weight"], 512, ws["E"], 8, ws["XN"], 8, ws["HX"], st) }
+  if nm == "mgs" { return ge_mgu(eng, fs, L["ffn_gate_shexp.weight"], L["ffn_up_shexp.weight"], 512, ws["ZEROS"], 1, ws["XN"], 1, ws["SHH"], st) }
+  if nm == "msd" { return ge_mseg(eng, fs, ws["SHH"], 0, 0, 0, 0, [[L["ffn_down_shexp.weight"], ws["SHD"], 0]], 512, 1, 0, st) }
+  if nm == "mh" { return ge_mseg(eng, fs, ws["X"], b + tensor(m, "output_norm.weight")[3], 0, 0, 0, [[m[6][3], ws["LOGITS"], 0]], 2048, 1, 1, st) }
+  if nm == "shexp" { return ge_mvd(eng, L["ffn_gate_shexp.weight"], 512, ws["XN"], ws["SHG"], 1, st) }
+  return 0
+}
+
+# one token's whole pass -- every layer, the head, the choice -- recorded once as a graph on its own stream; each
+# token after that is: copy its embedding, rope angles and position in, replay the graph, read back 2 numbers
+skill dgraph(m) -> Any {
+  let st = rt_gpu_stream()
+  if st < 0 { return ["stream failed " ++ str(st)] }
+  let rc = rt_gpu_capture(st)
+  if rc != 0 { return ["capture failed " ++ str(rc)] }
+  do dstep_go(m, 1, NLAYER(), st)
+  do dhead_go(m, 0, st)
+  let g = rt_gpu_capture_end(st)
+  if g < 0 { return ["graph failed " ++ str(g)] }
+  return [st, g]
+}
+
+# the whole generation step on the GPU: tokin (the last choice -> its embedding, rope, position), every layer, the
+# head and the next choice -- recorded once; replaying it N times generates N tokens with no host work between them
+skill dgraph2(m) -> Any {
+  let eng = m[4]
+  let ws = m[6][1]
+  let te = tensor(m, "token_embd.weight")
+  if te[2] != 12 and te[2] != 14 { return ["token_embd type " ++ str(te[2]) ++ " not decoded on the GPU"] }
+  let st = rt_gpu_stream()
+  if st < 0 { return ["stream failed " ++ str(st)] }
+  let rc = rt_gpu_capture(st)
+  if rc != 0 { return ["capture failed " ++ str(rc)] }
+  do ge_go(m[6][0], "tokin", 1, 256, [ws["AMAX"], ws["POS"], ws["TOKS"], eng[0] + te[3], ws["X"], ws["ROPE"], ge_rowbytes(te), te[2]], st)
+  do dstep_go(m, 1, NLAYER(), st)
+  do dhead_go(m, 0, st)
+  let g = rt_gpu_capture_end(st)
+  if g < 0 { return ["graph failed " ++ str(g)] }
+  return [st, g]
+}
+
+# m with hooks for looking and editing (m[6][4]): {"abl": 40 entries, "cap": [buffer, stride, bytes a layer] or null}
+skill with_hooks(m, hk) -> Any { return slice(m, 0, 6) ++ [slice(m[6], 0, 4) ++ [hk]] }
+
+# an edits file: lines "layer percent direction.bin" (2048 doubles, unit length) -> m whose passes remove that much of
+# each direction from those layers' expert-block outputs (runtime: the model file is never touched)
+skill with_edits(m, path) -> Any {
+  let abl = []
+  for il in range(0, NLAYER()) { let abl = append(abl, 0) }
+  for ln in split(read_file(path), "\n") {
+    let ps = split(trim(ln), " ")
+    if len(ps) == 3 {
+      let il = rd_int(ps[0])
+      let d = rt_gpu_alloc(16384)
+      do rt_gpu_file(d, ps[2], 0, 16384)
+      let abl = slice(abl, 0, il) ++ [[d, rd_int(ps[1])]] ++ slice(abl, il + 1, NLAYER())
+    }
+  }
+  return with_hooks(m, {"abl": abl, "cap": null})
+}
+
+# one prompt (token ids) from a fresh state, then generation until <|im_end|> / <|endoftext|> or maxt tokens -> the
+# generated ids (the stop token included)
+skill drun(m, g2, ids, maxt) -> Any {
+  let ws = m[6][1]
+  let T = len(ids)
+  let lim = ge_MAXPOS() - T - 40
+  if maxt > lim { let maxt = lim }
+  do dev_reset(m)
+  let p = 0
+  let last = 0
+  while p < T {
+    let e = p + ge_TMAX()
+    if e > T { let e = T }
+    do dstep(m, slice(ids, p, e), p, NLAYER())
+    let last = e - p - 1
+    let p = e
+  }
+  do dhead(m, last, 1)
+  do rt_gpu_put(ws["POS"] + 8, [T * 1.0])
+  let out = []
+  let n = 0
+  let stop = false
+  while stop == false and n < maxt {
+    let k = 32
+    if maxt - n < k { let k = maxt - n }
+    for i in range(0, k) { do rt_gpu_graph_go(g2[1], g2[0]) }
+    let got = rt_gpu_get(ws["TOKS"] + 8 * (T + n), k)
+    for v in got {
+      if stop == false {
+        let id = r2i(v, 0)
+        let out = append(out, id)
+        if id == 248046 or id == 248044 { let stop = true }
+      }
+    }
+    let n = n + k
+  }
+  return out
+}
+
+skill step_n(m, xs, caches, pos0, nl) -> Any {
+  let cs2 = []
+  for il in range(0, nl) {
+    let c = caches[il]
+    let a = null
+    if (il + 1) % 4 == 0 {
+      let r = attn_step(m, xs, il, c[0], c[1], pos0)
+      let a = r[0]
+      let cs2 = append(cs2, [r[1], r[2]])
+    } else {
+      let r = lin_step(m, xs, il, c[0], c[1])
+      let a = r[0]
+      let cs2 = append(cs2, [r[1], c[1]])
+    }
+    let hs = []
+    for t in range(0, len(xs)) {
+      let h = []
+      for j in range(0, 2048) { let h = append(h, xs[t][j] + a[t][j]) }
+      let hs = append(hs, h)
+    }
+    let ys = moe_all(m, hs, il)
+    let xs2 = []
+    for t in range(0, len(xs)) {
+      let o = []
+      for j in range(0, 2048) { let o = append(o, hs[t][j] + ys[t][j]) }
+      let xs2 = append(xs2, o)
+    }
+    let xs = xs2
+  }
+  return [xs, cs2]
+}
+
+skill embed(m, id) -> Any {
+  let e = wrow(m, tensor(m, "token_embd.weight"), id)
+  let x = []
+  for j in range(0, 2048) { let x = append(x, aget(e, j) * 1.0 / 16777216.0) }
+  return x
+}
+
+# a token as display text. The vocabulary is byte-level: every byte is written as one character -- the printable
+# ones (33-126, 161-172, 174-255) as themselves, the other 68 (0-32, 127-160, 173, in order) as code points 256..323.
+# Each character (UTF-8: 1 or 2 bytes here) goes back to its byte; the bytes are the real text (UTF-8 again).
+skill show(t) -> Any {
+  let n = len(t)
+  let out = arr(n + 1)
+  let k = 0
+  let i = 0
+  while i < n {
+    let c = ord(slice(t, i, i + 1))
+    let cp = c
+    let step = 1
+    if c >= 192 and c < 224 and i + 1 < n {
+      let cp = (c - 192) * 64 + ord(slice(t, i + 1, i + 2)) - 128
+      let step = 2
+    }
+    let b = cp
+    if cp >= 256 {
+      let j = cp - 256
+      if j <= 32 { let b = j } else {
+        if j <= 66 { let b = 127 + j - 33 } else { let b = 173 }
+      }
+    }
+    do aset(out, k, b)
+    let k = k + 1
+    let i = i + step
+  }
+  return arr_text(out, 0, k)
+}
+
+# every layer: x += attention or linear attention (every 4th is full attention), then x += experts.
+# 40 layers: block 40 is the next-token-prediction helper (nextn.*, nextn_predict_layers = 1), not part of the pass
+skill NLAYER() -> Any { return 40 }
+
+skill forward(m, ids) -> Any {
+  if len(m) > 4 { do ge_reset(m[4]) }
+  let xs = []
+  for id in ids {
+    let e = wrow(m, tensor(m, "token_embd.weight"), id)
+    let x = []
+    for j in range(0, 2048) { let x = append(x, aget(e, j) * 1.0 / 16777216.0) }
+    let xs = append(xs, x)
+  }
+  for il in range(0, NLAYER()) {
+    let tl = ticks()
+    let mm = mark()
+    let a = []
+    if (il + 1) % 4 == 0 { let a = attention(m, xs, il) } else { let a = linear_attn(m, xs, il) }
+    let hs = []
+    for t in range(0, len(xs)) {
+      let h = []
+      for j in range(0, 2048) { let h = append(h, xs[t][j] + a[t][j]) }
+      let hs = append(hs, h)
+    }
+    let ys = []
+    if len(m) > 4 { let ys = moe_all(m, hs, il) } else {
+      for h in hs { let ys = append(ys, moe(m, h, il)[0]) }
+    }
+    let xs2 = []
+    for t in range(0, len(xs)) {
+      let o = []
+      for j in range(0, 2048) { let o = append(o, hs[t][j] + ys[t][j]) }
+      let xs2 = append(xs2, o)
+    }
+    let xs = release(mm, xs2)
+    let kind = "linear"
+    if (il + 1) % 4 == 0 { let kind = "attention" }
+    do print("  layer " ++ str(il) ++ " (" ++ kind ++ ") " ++ str(ticks() - tl) ++ " ms")
+  }
+  return xs
+}

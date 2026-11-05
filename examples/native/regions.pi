@@ -1,0 +1,59 @@
+# Region memory, checked. The same allocation-heavy loop runs twice: once releasing each iteration's region
+# (keeping only a small summary), once without. Each iteration builds 200 texts, lists and maps and keeps a summary
+# holding text, a list, a map, a real and a function that captures a variable -- all made inside the region, so
+# release must deep-copy and relocate every kind correctly. Both runs must give the same results, and the kept
+# function must still work after its region is gone. Self-checking: prints 1s, then the memory each run kept.
+
+skill work(k) -> Any {
+  let items = []
+  let total = 0
+  for i in range(0, 200) {
+    let t = str(i * k)
+    let items = append(items, [t, i, {"i": i, "t": t}])
+    let total = total + len(t) + i
+  }
+  return {"sum": total, "label": "it" ++ str(k), "parts": [items[0][1], items[199][1]], "f": fn(x) => x + k, "r": k / 4, "keep": items[5][0], "m": items[7][2]}
+}
+
+skill digest(v, k) -> Any {
+  let f = v["f"]
+  let d = v["sum"] + len(v["label"]) + v["parts"][0] + v["parts"][1] + f(1) + v["m"]["i"]
+  if floor(v["r"] * 4) != k { let d = d + 1000000 }
+  if v["keep"] != str(5 * k) { let d = d + 2000000 }
+  if v["m"]["t"] != str(7 * k) { let d = d + 4000000 }
+  return d
+}
+
+skill B(b) -> Any {
+  if b { return "1" }
+  return "0"
+}
+
+skill main() -> Any {
+  let n = 300
+  let m0 = memused()
+  let a = 0
+  for k in range(0, n) {
+    let m = mark()
+    let v = work(k)
+    let v = release(m, v)
+    let a = a + digest(v, k)
+  }
+  let with = memused() - m0
+  let m1 = memused()
+  let b = 0
+  for k in range(0, n) {
+    let v = work(k)
+    let b = b + digest(v, k)
+  }
+  let without = memused() - m1
+  # a value kept by release and used long after its region was reused by later iterations
+  let m = mark()
+  let early = release(m, work(3))
+  for k in range(0, 50) {
+    let m = mark()
+    let junk = release(m, work(k))
+  }
+  let survived = digest(early, 3) == digest(work(3), 3)
+  return B(a == b) ++ B(survived) ++ B(with * 20 < without) ++ " kept with regions " ++ str(with // 1024) ++ " KB, without " ++ str(without // 1024) ++ " KB"
+}

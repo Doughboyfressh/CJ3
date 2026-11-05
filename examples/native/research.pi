@@ -1,0 +1,2538 @@
+# Pi researches: a question -> search -> read -> the answer, with its evidence, kept in Pi's knowledge.
+#   1 the question: its key terms (question words and filler dropped) and the kind of answer wanted
+#     (when -> a year; how many / a measure -> a number; who -> a name; what / where / which -> a name or thing)
+#   2 search: Wikipedia's full-text search, the top 3 articles
+#   3 read: Pi's own HTML reader (browselib.pi), paragraphs split into sentences, references [1] removed
+#   4 answer: sentences scored by the key terms they share; candidates of the wanted kind vote, weighted by their
+#     sentence's score (a candidate that is only the question's own words cannot vote)
+#   5 remember: out\research.kb  (question ||| answer ||| source ||| evidence); asked again -> from memory
+#   out\research.exe "question"     out\research.exe test   (20 questions; an answer key used only to score)
+import "browselib.pi"
+import "slots.pi"
+import "readmodel.pi"
+
+skill stop() -> Any { return ["what", "who", "whom", "when", "where", "which", "why", "how", "is", "was", "were", "are", "the", "a", "an", "of", "in", "on", "for", "to", "did", "does", "do", "by", "and", "at", "first", "many", "much", "there", "that", "it", "its", "be", "been", "with", "from", "as", "into", "this", "has", "have", "had"] }
+
+skill is_alnum(c) -> Any { return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) }
+
+skill words_of(s) -> Any {
+  let out = []
+  let n = len(s)
+  let i = 0
+  while i < n {
+    while i < n and is_alnum(ord(slice(s, i, i + 1))) == false { let i = i + 1 }
+    let a = i
+    while i < n and is_alnum(ord(slice(s, i, i + 1))) { let i = i + 1 }
+    if i > a { let out = append(out, slice(s, a, i)) }
+  }
+  return out
+}
+
+skill terms_of(q) -> Any {
+  let out = []
+  for w in words_of(q) {
+    let lw = lower(w)
+    let skip = false
+    for s in stop() {
+      if s == lw { let skip = true }
+    }
+    if skip == false { let out = append(out, lw) }
+  }
+  return out
+}
+
+skill kind_of(q) -> Any {
+  let l = lower(q)
+  let ws = words_of(l)
+  for w in ws {
+    if w == "when" or w == "year" { return "year" }
+  }
+  if find_from(l, 0, "how many") < len(l) or find_from(l, 0, "how much") < len(l) { return "number" }
+  for w in ws {
+    if w == "speed" or w == "population" or w == "height" or w == "length" or w == "distance" or w == "mass" or w == "temperature" { return "number" }
+  }
+  if ws[0] == "who" { return "person" }
+  return "thing"
+}
+
+skill stem(w) -> Any { return slice(lower(w), 0, 5) }
+
+skill has_arg(w) -> Any {
+  let k = 1
+  while arg(k) != null {
+    if arg(k) == w { return true }
+    let k = k + 1
+  }
+  return false
+}
+
+skill urlenc(s) -> Any { return join(words_of(s), "%20") }
+
+# a polite fetch: every page is cached on disk (asked again -> no request), a real request waits about a second
+# first, and a "too many requests" answer is waited out and tried once more
+skill url_key(u) -> Any {
+  let h = 7
+  for i in range(0, len(u)) { let h = (h * 131 + ord(slice(u, i, i + 1))) % 1000000007 }
+  return "out\\wc_" ++ str(h) ++ ".html"
+}
+
+skill pause1() -> Any {
+  let h = spawn("ping -n 2 127.0.0.1")
+  if h == null { return null }
+  return wait(h, 10000)
+}
+
+skill polite(url) -> Any {
+  let key = url_key(url)
+  let c = read_file(key)
+  if c != null { return c }
+  do pause1()
+  let p = fetch(url)
+  let tries = 0
+  # sealed final 3 lost 15 of 167 questions to failed requests (no retry on a failed fetch)
+  while tries < 3 and (p == null or limited(p)) {
+    let tries = tries + 1
+    for k in range(0, 2 * tries) { do pause1() }
+    let p = fetch(url)
+  }
+  if p == null { return null }
+  if limited(p) { return null }
+  do write_file(key, p)
+  return p
+}
+
+skill limited(p) -> Any { return find_from(p, 0, "too many requests") < len(p) or find_from(p, 0, "ratelimited") < len(p) }
+
+# a JSON string starting just after its opening quote at i -> [text, index after the closing quote]; \n becomes a
+# paragraph mark "\n", \" \\ \/ unescaped, \uXXXX kept when it is ASCII (else a space)
+skill json_str(p, i) -> Any {
+  let parts = []
+  let a = i
+  let j = i
+  let n = len(p)
+  while j < n {
+    let c = slice(p, j, j + 1)
+    if c == "\"" { return [join(append(parts, slice(p, a, j)), ""), j + 1] }
+    if c == "\\" and j + 1 < n {
+      let parts = append(parts, slice(p, a, j))
+      let e = slice(p, j + 1, j + 2)
+      let rep = e
+      let skip = 2
+      if e == "n" { let rep = "\n" }
+      if e == "t" { let rep = " " }
+      if e == "u" and j + 6 <= n {
+        let hx = lower(slice(p, j + 2, j + 6))
+        let v = 0
+        for k in range(0, 4) {
+          let d = ord(slice(hx, k, k + 1))
+          if d >= 97 { let v = v * 16 + d - 87 } else { let v = v * 16 + d - 48 }
+        }
+        let rep = " "
+        if v >= 32 and v < 127 { let rep = slice(" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~", v - 32, v - 31) }
+        let skip = 6
+      }
+      let parts = append(parts, rep)
+      let j = j + skip
+      let a = j
+    } else { let j = j + 1 }
+  }
+  return [join(append(parts, slice(p, a, n)), ""), n]
+}
+
+# one request: search, and the top 3 articles' opening sections -> [[title, [[sentence, paragraph]]]] in rank order
+skill fast_docs(terms) -> Any {
+  let page = polite("https://en.wikipedia.org/w/api.php?action=query&format=json&generator=search&gsrlimit=3&prop=extracts&exintro=1&explaintext=1&exlimit=3&gsrsearch=" ++ urlenc(join(terms, " ")))
+  if page == null { return [] }
+  let docs = []
+  let ranks = []
+  for chunk in slice(split(page, "\"pageid\":"), 1, 10) {
+    let title = ""
+    let ti = split(chunk, "\"title\":\"")
+    if len(ti) > 1 { let title = json_str(ti[1], 0)[0] }
+    let rank = 9
+    let ix = split(chunk, "\"index\":")
+    if len(ix) > 1 { let rank = num(split(split(ix[1], ",")[0], "}")[0]) }
+    let ex = split(chunk, "\"extract\":\"")
+    let ss = []
+    if len(ex) > 1 {
+      let text = json_str(ex[1], 0)[0]
+      let k = 0
+      for para in split(text, "\n") {
+        if len(para) >= 60 {
+          let k = k + 1
+          for sn in split(strip_refs(para), ". ") {
+            if len(sn) > 20 { let ss = append(ss, [sn, k]) }
+          }
+        }
+      }
+    }
+    if title != "" {
+      let docs = append(docs, [title, ss])
+      let ranks = append(ranks, rank)
+    }
+  }
+  # in search rank order
+  let out = []
+  for r in range(1, 10) {
+    for i in range(0, len(docs)) {
+      if ranks[i] == r { let out = append(out, docs[i]) }
+    }
+  }
+  return out
+}
+
+# Wikipedia's full-text search -> article titles
+skill search(terms) -> Any {
+  let page = polite("https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=3&srsearch=" ++ urlenc(join(terms, " ")))
+  if page == null { return [] }
+  let out = []
+  let parts = split(page, "\"title\":\"")
+  for i in range(1, len(parts)) { let out = append(out, split(parts[i], "\"")[0]) }
+  return out
+}
+
+skill title_url(t) -> Any { return "https://en.wikipedia.org/wiki/" ++ join(split(t, " "), "_") }
+
+# drop reference marks like [1] or [note 2]
+skill strip_refs(s) -> Any {
+  let out = []
+  let n = len(s)
+  let i = 0
+  let a = 0
+  while i < n {
+    if slice(s, i, i + 1) == "[" {
+      let e = i
+      while e < n and e < i + 14 and slice(s, e, e + 1) != "]" { let e = e + 1 }
+      if e < n and slice(s, e, e + 1) == "]" {
+        let out = append(out, slice(s, a, i))
+        let i = e + 1
+        let a = i
+      } else { let i = i + 1 }
+    } else { let i = i + 1 }
+  }
+  let out = append(out, slice(s, a, n))
+  return join(out, "")
+}
+
+# the sentences of an article's paragraphs (the first 60) -> [[sentence, paragraph number]]
+skill sentences_of(url) -> Any {
+  let page = polite(url)
+  if page == null { return [] }
+  let pg = parse_html(page)
+  let out = []
+  let k = 0
+  for b in pg[1] {
+    if b[0] == "p" and k < 60 and len(b[1]) >= 60 {
+      let k = k + 1
+      for s in split(strip_refs(b[1]), ". ") {
+        if len(s) > 20 { let out = append(out, [s, k]) }
+      }
+    }
+  }
+  return out
+}
+
+skill score_sent(s, terms) -> Any {
+  let ws = []
+  for w in words_of(s) { let ws = append(ws, stem(w)) }
+  let n = 0
+  for t in terms {
+    let hit = false
+    for w in ws {
+      if w == stem(t) { let hit = true }
+    }
+    if hit { let n = n + 1 }
+  }
+  return n
+}
+
+skill function_words() -> Any { return ["the", "a", "an", "in", "on", "at", "of", "to", "for", "from", "by", "with", "as", "it", "its", "this", "these", "those", "that", "his", "her", "their", "our", "he", "she", "they", "we", "i", "after", "before", "during", "however", "although", "while", "when", "where", "since", "there", "here", "some", "many", "most", "other", "both", "each", "all", "one", "two", "three", "but", "and", "or", "if", "then", "also", "according", "today", "later", "early", "between", "under", "over", "about", "around", "unlike", "like", "following", "despite", "because", "although", "though", "until"] }
+
+skill is_function(w) -> Any {
+  for f in function_words() {
+    if f == lower(w) { return true }
+  }
+  return false
+}
+
+skill is_cap(w) -> Any {
+  let c = ord(slice(w, 0, 1))
+  if c >= 65 and c <= 90 { return true }
+  if len(w) >= 2 {
+    let c2 = ord(slice(w, 1, 2))
+    if c >= 97 and c <= 122 and c2 >= 65 and c2 <= 90 { return true }
+  }
+  return false
+}
+
+# the question's own names (capitalised runs, as in candidates), lower-cased
+skill q_runs(q) -> Any {
+  let ws = words_of(q)
+  let out = []
+  let i = 1
+  while i < len(ws) {
+    if is_cap(ws[i]) {
+      let run = [ws[i]]
+      let j = i + 1
+      while j < len(ws) and is_cap(ws[j]) {
+        let run = append(run, ws[j])
+        let j = j + 1
+      }
+      let out = append(out, lower(join(run, " ")))
+      let i = j
+    } else { let i = i + 1 }
+  }
+  return out
+}
+
+skill is_digits(w) -> Any {
+  for i in range(0, len(w)) {
+    let c = ord(slice(w, i, i + 1))
+    if c < 48 or c > 57 { return false }
+  }
+  return len(w) > 0
+}
+
+# the candidates of a kind in one sentence
+skill candidates(s, kind, qterms, qruns) -> Any {
+  let out = []
+  if kind == "year" {
+    for w in words_of(s) {
+      if is_digits(w) and len(w) == 4 {
+        let v = num(w)
+        if v >= 1000 and v <= 2099 { let out = append(out, w) }
+      }
+    }
+    return out
+  }
+  if kind == "number" {
+    for t in split(s, " ") {
+      # digits with thousands commas or a decimal point; trailing punctuation dropped
+      let core = ""
+      let ok = true
+      for i in range(0, len(t)) {
+        let c = ord(slice(t, i, i + 1))
+        if (c >= 48 and c <= 57) or c == 44 or c == 46 { let core = core ++ slice(t, i, i + 1) } else {
+          if len(core) > 0 { let ok = false }
+        }
+      }
+      while len(core) > 0 and (slice(core, len(core) - 1, len(core)) == "," or slice(core, len(core) - 1, len(core)) == ".") { let core = slice(core, 0, len(core) - 1) }
+      if len(core) > 0 and ok { let out = append(out, core) }
+    }
+    return out
+  }
+  # names: runs of capitalised words (with da / de / van / von / of inside), minus the question's own words
+  let ws = words_of(s)
+  let i = 0
+  while i < len(ws) {
+    if is_cap(ws[i]) {
+      let run = [ws[i]]
+      let j = i + 1
+      let going = true
+      while going and j < len(ws) {
+        if is_cap(ws[j]) {
+          let run = append(run, ws[j])
+          let j = j + 1
+        } else {
+          let lw = ws[j]
+          if (lw == "da" or lw == "de" or lw == "van" or lw == "von" or lw == "of" or lw == "la" or lw == "del" or lw == "du" or lw == "di" or lw == "der" or lw == "den" or lw == "al" or lw == "y" or lw == "the") and j + 1 < len(ws) {
+            if is_cap(ws[j + 1]) {
+              let run = append(run, lw)
+              let j = j + 1
+            } else { let going = false }
+          } else { let going = false }
+        }
+      }
+      let keep = []
+      for w in run {
+        let inq = false
+        for t in qterms {
+          if stem(t) == stem(w) { let inq = true }
+        }
+        # a capital that only starts a sentence is no name: The, In, His, However...
+        for f in function_words() {
+          if f == lower(w) { let inq = true }
+        }
+        if inq == false { let keep = append(keep, w) }
+      }
+      if len(keep) > 0 and len(keep) <= 4 { let out = append(out, join(keep, " ")) }
+      # the answer can be part of the question's own name (capital of York County -> York; who made Lancia Appia ->
+      # Lancia): the whole name is a candidate too, unless it is exactly one of the question's names
+      # the whole name loses its function words at the ends ("In", "The") and is never just the question's own words
+      # ("Gold" for "...symbol for gold") -- both were seen on the spent final exam, and are wrong on any question
+      let wr = run
+      while len(wr) > 0 and is_function(wr[0]) { let wr = slice(wr, 1, len(wr)) }
+      while len(wr) > 0 and is_function(wr[len(wr) - 1]) { let wr = slice(wr, 0, len(wr) - 1) }
+      let whole = join(wr, " ")
+      if len(wr) > 0 and len(wr) <= 5 and whole != join(keep, " ") {
+        let echo = false
+        for qr in qruns {
+          if qr == lower(whole) { let echo = true }
+        }
+        let allq = true
+        for w in wr {
+          let inq = false
+          for t in qterms {
+            if lower(t) == lower(w) { let inq = true }
+          }
+          if inq == false { let allq = false }
+        }
+        if allq and len(wr) == 1 { let echo = true }
+        if echo == false { let out = append(out, whole) }
+      }
+      let i = j
+    } else { let i = i + 1 }
+  }
+  return out
+}
+
+# ---- who did what: the question's action, and the name that does it in a sentence ------------------------------
+# irregular forms (a verb's past and participle do not share its first letters)
+skill irregular() -> Any { return [["wrote", "write", "written", "writer"], ["drew", "draw", "drawn"], ["sang", "sing", "sung", "singer"], ["built", "build", "builder"], ["led", "lead", "leader"], ["won", "win", "winner"], ["made", "make", "maker"], ["took", "take", "taken"], ["gave", "give", "given"], ["found", "find"], ["began", "begin", "begun"], ["flew", "fly", "flown"], ["ran", "run"], ["held", "hold"], ["taught", "teach", "teacher"], ["thought", "think"], ["brought", "bring"], ["bought", "buy"], ["sold", "sell"], ["told", "tell"], ["spoke", "speak", "spoken"], ["chose", "choose", "chosen"], ["rode", "ride", "ridden"], ["saw", "see", "seen"]] }
+
+skill verb_forms(v) -> Any {
+  for g in irregular() {
+    for f in g {
+      if f == v { return g }
+    }
+  }
+  return [v]
+}
+
+skill verb_hit(w, forms) -> Any {
+  let lw = lower(w)
+  for f in forms {
+    if lw == f or (len(f) >= 4 and stem(lw) == stem(f)) { return true }
+  }
+  return false
+}
+
+# the action of a who-question: the first word after "who" that is not filler ("who was the first person to walk"
+# -> walk); null for other questions
+skill q_verb(q) -> Any {
+  let ws = words_of(lower(q))
+  if len(ws) == 0 { return null }
+  if ws[0] != "who" { return null }
+  let filler = ["who", "was", "is", "were", "are", "did", "does", "do", "the", "a", "an", "first", "person", "people", "man", "woman", "to", "has", "had", "have", "originally", "actually"]
+  for w in ws {
+    let f = false
+    for x in filler {
+      if x == w { let f = true }
+    }
+    if f == false { return w }
+  }
+  return null
+}
+
+skill not_name(w, qterms) -> Any {
+  for t in qterms {
+    if stem(t) == stem(w) { return true }
+  }
+  for f in function_words() {
+    if f == lower(w) { return true }
+  }
+  return false
+}
+
+# the name starting at i (going right) or ending at i (going left): capitalised words, with da / de / van / von / of
+skill name_right(ws, i, qterms) -> Any {
+  let run = []
+  let j = i
+  let going = true
+  while going and j < len(ws) {
+    if is_cap(ws[j]) and not_name(ws[j], qterms) == false {
+      let run = append(run, ws[j])
+      let j = j + 1
+    } else {
+      if len(run) > 0 and (ws[j] == "da" or ws[j] == "de" or ws[j] == "van" or ws[j] == "von") and j + 1 < len(ws) {
+        let run = append(run, ws[j])
+        let j = j + 1
+      } else { let going = false }
+    }
+  }
+  if len(run) > 0 {
+    let last = run[len(run) - 1]
+    if last == "da" or last == "de" or last == "van" or last == "von" { let run = slice(run, 0, len(run) - 1) }
+  }
+  return join(run, " ")
+}
+
+skill name_left(ws, i, qterms) -> Any {
+  let run = []
+  let j = i
+  let going = true
+  while going and j >= 0 {
+    if is_cap(ws[j]) and not_name(ws[j], qterms) == false {
+      let run = [ws[j]] ++ run
+      let j = j - 1
+    } else {
+      if len(run) > 0 and (ws[j] == "da" or ws[j] == "de" or ws[j] == "van" or ws[j] == "von") and j - 1 >= 0 {
+        let run = [ws[j]] ++ run
+        let j = j - 1
+      } else { let going = false }
+    }
+  }
+  return join(run, " ")
+}
+
+skill has_term(ws, a, b, qterms) -> Any {
+  let i = max(0, a)
+  while i < min(len(ws), b) {
+    for t in qterms {
+      if stem(t) == stem(ws[i]) { return true }
+    }
+    let i = i + 1
+  }
+  return false
+}
+
+# the answers the sentence's structure points at: the doer of the question's action (by X / X verb), or the name on
+# the other side of is / was / are from the question's terms
+skill structural(s, verb, qterms) -> Any {
+  let ws = words_of(s)
+  let out = []
+  if verb != null {
+    let forms = verb_forms(verb)
+    for i in range(0, len(ws)) {
+      if verb_hit(ws[i], forms) {
+        if i + 2 < len(ws) and lower(ws[i + 1]) == "by" {
+          let n = name_right(ws, i + 2, qterms)
+          if n != "" { let out = append(out, n) }
+        }
+        let k = i - 1
+        if k >= 0 {
+          let lk = lower(ws[k])
+          if lk == "was" or lk == "had" or lk == "first" or lk == "also" or lk == "who" { let k = k - 1 }
+        }
+        if k >= 0 {
+          let n = name_left(ws, k, qterms)
+          if n != "" { let out = append(out, n) }
+        }
+      }
+    }
+    return out
+  }
+  for i in range(0, len(ws)) {
+    let lw = lower(ws[i])
+    if lw == "is" or lw == "was" or lw == "are" {
+      if has_term(ws, i + 1, i + 7, qterms) and i >= 1 {
+        let n = name_left(ws, i - 1, qterms)
+        if n != "" { let out = append(out, n) }
+      }
+      if has_term(ws, i - 6, i, qterms) and i + 1 < len(ws) {
+        let n = name_right(ws, i + 1, qterms)
+        if n != "" { let out = append(out, n) }
+      }
+    }
+  }
+  return out
+}
+
+# ---- what the question is about: its subject's own article comes first -----------------------------------------
+skill cap1(s) -> Any {
+  if len(s) == 0 { return s }
+  return upper(slice(s, 0, 1)) ++ slice(s, 1, len(s))
+}
+
+# -> phrases that may be the subject's article title: capitalised names in the question (joined by and / of / the),
+# "X of Y" phrases, and what follows a who-question's action
+skill subject_phrases(q) -> Any {
+  let ws = words_of(q)
+  let out = []
+  # names: capitalised runs after the first word
+  let i = 1
+  while i < len(ws) {
+    if is_cap(ws[i]) {
+      let run = [ws[i]]
+      let j = i + 1
+      let going = true
+      while going and j < len(ws) {
+        if is_cap(ws[j]) {
+          let run = append(run, ws[j])
+          let j = j + 1
+        } else {
+          if (ws[j] == "and" or ws[j] == "of" or ws[j] == "the") and j + 1 < len(ws) {
+            if is_cap(ws[j + 1]) {
+              let run = append(run, ws[j])
+              let j = j + 1
+            } else { let going = false }
+          } else { let going = false }
+        }
+      }
+      let out = append(out, join(run, " "))
+      let i = j
+    } else { let i = i + 1 }
+  }
+  # X of Y: the word before "of" and the words after it, up to a preposition
+  let lw = []
+  for w in ws { let lw = append(lw, lower(w)) }
+  for k in range(1, len(lw)) {
+    if lw[k] == "of" and k + 1 < len(lw) {
+      let ph = [lw[k - 1], "of"]
+      let j = k + 1
+      while j < len(lw) and lw[j] != "in" and lw[j] != "per" and lw[j] != "on" and lw[j] != "for" and lw[j] != "at" {
+        let ph = append(ph, lw[j])
+        let j = j + 1
+      }
+      if len(ph) >= 3 { let out = append(out, cap1(join(ph, " "))) }
+    }
+  }
+  # who did it to what: the words after the action (without a leading "the")
+  let v = q_verb(q)
+  if v != null {
+    let k = 0
+    while k < len(lw) and lw[k] != v { let k = k + 1 }
+    let rest = []
+    for j in range(k + 1, len(lw)) {
+      if len(rest) > 0 or lw[j] != "the" { let rest = append(rest, ws[j]) }
+    }
+    if len(rest) > 0 { let out = append(out, cap1(join(rest, " "))) }
+  }
+  return out
+}
+
+# the subject articles that exist (at most 2): a missing title is a page saying so
+skill subject_titles(q) -> Any {
+  let out = []
+  for ph in subject_phrases(q) {
+    if len(out) < 2 {
+      let page = polite(title_url(ph))
+      if page != null {
+        if find_from(page, 0, "does not have an article with this exact name") >= len(page) {
+          let dup = false
+          for o in out {
+            if lower(o) == lower(ph) { let dup = true }
+          }
+          if dup == false { let out = append(out, ph) }
+        }
+      }
+    }
+  }
+  return out
+}
+
+# ---- what kind of thing a name is, from Pi's facts: people and places ------------------------------------------
+skill name_key(s) -> Any {
+  let h = 7
+  let l = lower(s)
+  for i in range(0, len(l)) { let h = (h * 131 + ord(slice(l, i, i + 1))) % 2147483647 }
+  return h
+}
+
+skill last_word(s) -> Any {
+  let ws = split(s, " ")
+  return ws[len(ws) - 1]
+}
+
+# -> [people, places, people's last names] as hash sets
+skill name_types(facts) -> Any {
+  let people = hset(4194304)
+  let places = hset(4194304)
+  let lasts = hset(4194304)
+  let orgs = hset(4194304)
+  for line in facts {
+    let ml = mark()
+    let p = split(line, " ||| ")
+    if len(p) == 3 {
+      let r = p[1]
+      if r == "date_of_birth" or r == "date_of_death" {
+        do hset_add(people, name_key(p[0]))
+        do hset_add(lasts, name_key(last_word(p[0])))
+      }
+      if r == "author" or r == "director" or r == "founder" or r == "composer" or r == "performer" or r == "discoverer_or_inventor" or r == "architect" or r == "producer" {
+        do hset_add(people, name_key(p[2]))
+        do hset_add(lasts, name_key(last_word(p[2])))
+      }
+      if r == "country" or r == "located_in_the_administrative_territorial_entity" or r == "shares_border_with" { do hset_add(places, name_key(p[0])) }
+      # organisations: things with headquarters, a founding date or a founder; who developed / published / released
+      if r == "headquarters_location" or r == "inception" or r == "founder" { do hset_add(orgs, name_key(p[0])) }
+      if r == "developer" or r == "publisher" or r == "record_label" or r == "manufacturer" or r == "operator" or r == "owned_by" { do hset_add(orgs, name_key(p[2])) }
+      if r == "capital" or r == "place_of_birth" or r == "place_of_death" or r == "headquarters_location" or r == "located_in_the_administrative_territorial_entity" or r == "country" { do hset_add(places, name_key(p[2])) }
+    }
+    do release(ml, 0)
+  }
+  return [people, places, lasts, orgs]
+}
+
+# the kind a question wants, by its words: "person", "place" or null
+skill wants(q) -> Any {
+  let ws = words_of(lower(q))
+  if len(ws) == 0 { return null }
+  if ws[0] == "who" { return "person" }
+  if ws[0] == "where" { return "place" }
+  for w in ws {
+    if w == "capital" or w == "city" or w == "headquarters" { return "place" }
+  }
+  return null
+}
+
+# x4 for a name Pi knows is of the wanted kind, x2 for a known person's last name, else x1
+skill type_weight(c, want, types) -> Any {
+  if types == null or want == null { return 1 }
+  if want == "person" {
+    # "who" may be a person or an organisation (a company develops a game)
+    if hset_has(types[0], name_key(c)) or hset_has(types[3], name_key(c)) { return 4 }
+    # a known person's last name counts only for a one-word candidate ("Swift"), not inside other names
+    if len(split(c, " ")) == 1 and hset_has(types[2], name_key(c)) { return 2 }
+  }
+  if want == "place" {
+    # a place, or a name that begins with one ("Portland Oregon United States")
+    let ws = split(c, " ")
+    let k = len(ws)
+    while k >= 1 {
+      if hset_has(types[1], name_key(join(slice(ws, 0, k), " "))) { return 4 }
+      let k = k - 1
+    }
+  }
+  return 1
+}
+
+# ---- sentence reading with learned cues (out\cues.txt, from cues.pi): how each relation is said ------------------
+skill load_cues() -> Any {
+  let t = read_file("out\\cues.txt")
+  if t == null { return [] }
+  let out = []
+  for line in split(t, "\n") {
+    let p = split(line, " ")
+    if len(p) == 3 { let out = append(out, [p[0], p[1], num(p[2])]) }
+  }
+  return out
+}
+
+# the relation a question asks about: the one whose cue words the question's words carry most strongly
+skill rel_of(q, cues) -> Any {
+  let qw = words_of(lower(q))
+  let names = []
+  let score = []
+  for c in cues {
+    let hitw = false
+    for w in qw {
+      if w == c[1] { let hitw = true }
+    }
+    if hitw {
+      let k = 0 - 1
+      for i in range(0, len(names)) {
+        if names[i] == c[0] { let k = i }
+      }
+      if k < 0 {
+        let names = append(names, c[0])
+        let score = append(score, c[2])
+      } else { let score = slice(score, 0, k) ++ [score[k] + c[2]] ++ slice(score, k + 1, len(score)) }
+    }
+  }
+  let bi = 0 - 1
+  for i in range(0, len(names)) {
+    if bi < 0 or score[i] > score[bi] { let bi = i }
+  }
+  if bi < 0 { return null }
+  return names[bi]
+}
+
+skill cue_list(rel, cues) -> Any {
+  let out = []
+  for c in cues {
+    if c[0] == rel { let out = append(out, [c[1], c[2]]) }
+  }
+  return out
+}
+
+# x1..x4 by the strongest cue of the question's relation within 6 words of the candidate (x2 from 3x likelier, x3 from
+# 10x, x4 from 30x)
+skill cue_mult(s, c, cl) -> Any {
+  if cl == null { return 1 }
+  if len(cl) == 0 { return 1 }
+  let ws = []
+  for w in words_of(s) { let ws = append(ws, lower(w)) }
+  let cw = []
+  for w in words_of(c) { let cw = append(cw, lower(w)) }
+  let at = 0 - 1
+  let i = 0
+  while at < 0 and i + len(cw) <= len(ws) {
+    let ok = true
+    for k in range(0, len(cw)) {
+      if ws[i + k] != cw[k] { let ok = false }
+    }
+    if ok { let at = i }
+    let i = i + 1
+  }
+  if at < 0 { return 1 }
+  let best = 0
+  let j = max(0, at - 6)
+  while j < min(len(ws), at + len(cw) + 6) {
+    for x in cl {
+      if x[0] == ws[j] and x[1] > best { let best = x[1] }
+    }
+    let j = j + 1
+  }
+  if best >= 3000 { return 4 }
+  if best >= 1000 { return 3 }
+  if best >= 300 { return 2 }
+  return 1
+}
+
+skill answer(q) -> Any { return answer_t(q, null) }
+
+# -> [answer, votes, evidence sentence, source url]; types: Pi's people and places (or null)
+skill answer_t(q, types) -> Any {
+  let want = wants(q)
+  # cues ride along as types[4] (with the word "cued"): the question's relation and how it is said
+  let cl = null
+  if types != null {
+    if len(types) > 4 {
+      let rel = rel_of(q, types[4])
+      if rel != null { let cl = cue_list(rel, types[4]) }
+      if has_arg("why") { do print("  relation asked: " ++ str(rel)) }
+    }
+  }
+  let terms = terms_of(q)
+  let kind = kind_of(q)
+  let qruns = q_runs(q)
+  let rterms = []
+  let qw0 = words_of(q)
+  for i in range(1, len(qw0)) {
+    let w = qw0[i]
+    if lower(w) == w {
+      for t in terms {
+        if t == w { let rterms = append(rterms, stem(w)) }
+      }
+    }
+  }
+  let sm = null
+  let sri = 0 - 1
+  if types != null {
+    if len(types) > 5 {
+      let sm = types[5]
+      let sri = sl_rel(q)
+    }
+  }
+  let rmod = null
+  let rri = rm_rel_ix(rel_name(q))
+  if types != null and rri >= 0 {
+    if len(types) > 6 { let rmod = types[6] }
+  }
+  let rsubj = ""
+  if len(qruns) > 0 { let rsubj = split(qruns[0], " ")[0] }
+  let rtop = []
+  if has_arg("rdebug") { do print("rdebug: types " ++ str(len(types)) ++ " sri " ++ str(sri) ++ " rmod null? " ++ str(rmod == null)) }
+  let verb = q_verb(q)
+  # fast (the word "fast"): one request gives the top 3 articles' opening sections; otherwise search + whole pages
+  let fdocs = []
+  let found = []
+  if has_arg("fast") {
+    let fdocs = docs_q(q, terms)
+    for d in fdocs { let found = append(found, d[0]) }
+  } else { let found = search(terms) }
+  # the subject's own articles first (with the word "subject"), then the search's, each article once. Measured on the
+  # 20 questions: web 11 -> 11, with knowledge 12 -> 11 (fixed Canberra and Beethoven, broke Bell and 1945: the right
+  # article gives the vote more names and years to choose from) -- so it is off by default
+  let subj = []
+  if has_arg("subject") { let subj = subject_titles(q) }
+  let titles = subj
+  let nf = 3
+  if has_arg("local") { let nf = 5 }
+  for t in slice(found, 0, min(nf, len(found))) {
+    let dup = false
+    for o in titles {
+      if lower(o) == lower(t) { let dup = true }
+    }
+    if dup == false { let titles = append(titles, t) }
+  }
+  let feats = []
+  let cand = []
+  let votes = []
+  let ev = []
+  let src = []
+  let NF = 18
+  # the sentence finder: the one sentence that best states the fact, and its answer
+  let fbest = 0 - 1
+  let fpick = ""
+  let qsub = []
+  for r in qruns {
+    for w in split(r, " ") { let qsub = append(qsub, stem(w)) }
+  }
+  let MAXC = 30000
+  let chs = 65536
+  let ck = arr(chs)
+  let cv = arr(chs)
+  let va = arr(MAXC)
+  let fa = arr(MAXC * NF)
+  let rank = 0
+  for t in slice(titles, 0, min(nf + 1, len(titles))) {
+    let rank = rank + 1
+    let rak = 0
+    let rsi = 0
+    let url = title_url(t)
+    # a subject's own article weighs three times
+    let sw = 1
+    for o in subj {
+      if o == t { let sw = 3 }
+    }
+    # an article weighs by its search rank and by how many of the question's terms its title has
+    # measured on the same cached pages: weighting by article rank and title, and tripling the lead paragraphs, scored
+    # 9 of 20 against 11 plain (it fixed 2 answers and broke 4) -- so it is only on with the word "weighted"
+    let tw = 1
+    if has_arg("weighted") { let tw = (4 - rank) * (1 + score_sent(t, terms)) }
+    let ss = []
+    if has_arg("fast") {
+      for d in fdocs {
+        if d[0] == t { let ss = d[1] }
+      }
+    } else {
+      let mk = mark()
+      let ss = release(mk, sentences_of(url))
+    }
+    for sp in ss {
+      let msp = mark()
+      let s = sp[0]
+      let rsi = rsi + 1
+      let sc = score_sent(s, terms)
+      if sc >= 1 {
+        let cs = candidates(s, kind, terms, qruns)
+        # what the sentence's structure points at (the doer of the action; the other side of "is") votes 8 times
+        let st = []
+        if (kind == "person" or kind == "thing") and has_arg("plain") == false { let st = structural(s, verb, terms) }
+        let nplain = len(cs)
+        let cs = cs ++ st
+        let sscore = []
+        let sbest = 0 - 1
+        if sm != null and sri >= 0 {
+          let sscore = sl_sentence(sm, sri, s, cs, terms)
+          for i in range(0, len(sscore)) {
+            if sscore[i] != null {
+              if sbest < 0 { let sbest = i } else {
+                if sscore[i] > sscore[sbest] { let sbest = i }
+              }
+            }
+          }
+        }
+        # where the relation words are in this sentence (stems)
+        let sws = []
+        for w in words_of(s) { let sws = append(sws, stem(w)) }
+        let rpos = []
+        for i in range(0, len(sws)) {
+          for r in rterms {
+            if sws[i] == r { let rpos = append(rpos, i) }
+          }
+        }
+        # how well this sentence STATES the fact: the relation word (+4), the subject's words (+2 each, 2 at most), the
+        # opening paragraph (+1); its answer = the grammar slot's best, else the name nearest the relation word
+        if len(cs) > 0 {
+          let sh = 0
+          for x in sws {
+            for y in qsub {
+              if x == y { let sh = sh + 1 }
+            }
+          }
+          if sh > 2 { let sh = 2 }
+          let fs = 2 * sh
+          if len(rpos) > 0 { let fs = fs + 4 }
+          if sp[1] <= 1 { let fs = fs + 1 }
+          if fs > fbest {
+            let pick = cs[0]
+            if sbest >= 0 { let pick = cs[sbest] } else {
+              if len(rpos) > 0 {
+                let bd = 1000
+                for c in cs {
+                  let c0 = stem(split(c, " ")[0])
+                  for i in range(0, len(sws)) {
+                    if sws[i] == c0 {
+                      for rp in rpos {
+                        let dd = rp - i
+                        if dd < 0 { let dd = 0 - dd }
+                        if dd < bd {
+                          let bd = dd
+                          let pick = c
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            let fbest = fs
+            let fpick = pick
+          }
+        }
+        let rsent = 0.0
+        if rmod != null { let rsent = rm_sent(rmod, rri, sl_words(s), sp[1], rsi - 1, rsubj) }
+        let first = true
+        # an article's opening paragraphs define it: their sentences weigh three times
+        let lead = 1
+        if sp[1] <= 3 and has_arg("weighted") { let lead = 3 }
+        let ci = 0
+        for c in cs {
+          # the first candidate of a sentence weighs most (the answer tends to come first)
+          let w = sc * sc * lead * tw * sw
+          if first { let w = w * 2 }
+          if ci >= nplain { let w = sc * sc * 8 * sw }
+          # a name Pi knows is of the kind the question wants weighs more (x4; a known person's last name x2)
+          let ty = type_weight(c, want, types)
+          let w = w * ty
+          # the sentence says the question's relation near this candidate (learned cues) -> x2..x4
+          let cu = cue_mult(s, c, cl)
+          if has_arg("cued") { let w = w * cu }
+          let isst = 0
+          if ci >= nplain { let isst = 1 }
+          let isfirst = 0
+          if first { let isfirst = 1 }
+          let ci = ci + 1
+          let mw = 0
+          if len(split(c, " ")) >= 2 { let mw = 1 }
+          if kind == "person" and mw == 1 { let w = w * 2 }
+          let first = false
+          let islead = 0
+          if sp[1] <= 3 { let islead = 1 }
+          # what this one sighting says about the candidate (features Pi learns to weigh: learn.pi-style)
+          let swin = 0
+          let spos = 0
+          if sbest >= 0 {
+            if ci - 1 == sbest { let swin = 1 }
+            if sscore[ci - 1] != null {
+              if sscore[ci - 1] > 0 { let spos = 1 }
+            }
+          }
+          let relw = 0
+          if len(rpos) > 0 { let relw = 1 }
+          let reln = 0
+          if len(rpos) > 0 {
+            let c0 = stem(split(c, " ")[0])
+            for i in range(0, len(sws)) {
+              if sws[i] == c0 {
+                for rp in rpos {
+                  if rp - i <= 6 and i - rp <= 6 { let reln = 1 }
+                }
+              }
+            }
+          }
+          if rmod != null {
+            let rak = rak + 1
+            let slv = 0.0
+            if len(sscore) >= ci {
+              if sscore[ci - 1] != null { let slv = sscore[ci - 1] }
+            }
+            let rtop = rtop_add(rtop, rm_cand(rmod, rri, rsent, slv, rak, ci), c)
+          }
+          let occ = [w, 1, sc, sc, isst, islead, isfirst, cu - 1, ty, mw, 4 - rank, swin, spos, relw, reln, 0, 0, 0]
+          let key = sl_key(c)
+          let hsl = key % chs
+          while aget(ck, hsl) != 0 and aget(ck, hsl) != key { let hsl = (hsl + 1) % chs }
+          let found = aget(cv, hsl) - 1
+          if aget(ck, hsl) != key { let found = 0 - 1 }
+          if found < 0 and len(cand) < MAXC {
+            do aset(ck, hsl, key)
+            do aset(cv, hsl, len(cand) + 1)
+            let b0 = len(cand) * NF
+            do aset(va, len(cand), w)
+            for k in range(0, NF) { do aset(fa, b0 + k, occ[k]) }
+            let cand = append(cand, c)
+            let ev = append(ev, s)
+            let src = append(src, url)
+          }
+          if found >= 0 {
+            do aset(va, found, aget(va, found) + w)
+            let b0 = found * NF
+            # sums, except: best terms, cue, type, rank = the best sighting; full name = fixed
+            for k in [0, 2, 4, 5, 6, 11, 12, 13, 14] { do aset(fa, b0 + k, aget(fa, b0 + k) + occ[k]) }
+            do aset(fa, b0 + 1, aget(fa, b0 + 1) + 1)
+            for k in [3, 7, 8, 10] {
+              if occ[k] > aget(fa, b0 + k) { do aset(fa, b0 + k, occ[k]) }
+            }
+          }
+        }
+      }
+      # each sentence's scratch memory is freed here (a long article's garbage held to the end of a question
+      # was several GB: 8 workers ran out of memory); only the new candidates and the finder's pick are kept
+      let keep = release(msp, [cand, ev, src, fpick, rtop])
+      let rtop = keep[4]
+      let cand = keep[0]
+      let ev = keep[1]
+      let src = keep[2]
+      let fpick = keep[3]
+    }
+  }
+  # the reading model's best candidate (feature 16) and its top three (feature 17)
+  if has_arg("rdebug") and rmod != null {
+    do print("rdebug w: " ++ str(rmod[8][0]) ++ " " ++ str(rmod[8][1]) ++ " tots " ++ str(rmod[4][sri]) ++ " " ++ str(rmod[6][sri]))
+  }
+  if has_arg("rdebug") {
+    for x in rtop { do print("rdebug top: " ++ x[1] ++ " " ++ str(x[0])) }
+  }
+  for ti in range(0, len(rtop)) {
+    let key = sl_key(rtop[ti][1])
+    let hsl = key % chs
+    while aget(ck, hsl) != 0 and aget(ck, hsl) != key { let hsl = (hsl + 1) % chs }
+    if aget(ck, hsl) == key {
+      if ti == 0 { do aset(fa, (aget(cv, hsl) - 1) * NF + 16, 1) }
+      do aset(fa, (aget(cv, hsl) - 1) * NF + 17, 1)
+    }
+  }
+  if fpick != "" {
+    let key = sl_key(fpick)
+    let hsl = key % chs
+    while aget(ck, hsl) != 0 and aget(ck, hsl) != key { let hsl = (hsl + 1) % chs }
+    if aget(ck, hsl) == key { do aset(fa, (aget(cv, hsl) - 1) * NF + 15, 1) }
+  }
+  for i in range(0, len(cand)) {
+    let votes = append(votes, aget(va, i))
+    let f = []
+    for k in range(0, NF) { let f = append(f, aget(fa, i * NF + k)) }
+    let feats = append(feats, f)
+  }
+  if len(cand) == 0 { return [null, 0, "", ""] }
+  if has_arg("why") {
+    let order = []
+    for i in range(0, len(cand)) { let order = append(order, i) }
+    let shown = 0
+    let used = []
+    while shown < 6 and shown < len(cand) {
+      let b = 0 - 1
+      for i in range(0, len(cand)) {
+        let u = false
+        for x in used {
+          if x == i { let u = true }
+        }
+        if u == false {
+          if b < 0 or votes[i] > votes[b] { let b = i }
+        }
+      }
+      let used = append(used, b)
+      do print("    " ++ cand[b] ++ ": " ++ str(votes[b]) ++ " (type x" ++ str(type_weight(cand[b], want, types)) ++ ")")
+      let shown = shown + 1
+    }
+  }
+  let bi = 0
+  for i in range(0, len(cand)) {
+    if votes[i] > votes[bi] { let bi = i }
+  }
+  return [cand[bi], votes[bi], ev[bi], src[bi], cand, feats]
+}
+
+# ---- Pi's own knowledge (out\facts.txt, from its aligned Wikidata x Wikipedia data) ----------------------------
+# which relations a question's action or noun names (a relation's own words count too: "capital" -> capital)
+skill rel_words() -> Any { return [["wrote", "author"], ["write", "author"], ["written", "author"], ["discovered", "discoverer_or_inventor"], ["invented", "discoverer_or_inventor"], ["painted", "creator"], ["composed", "composer"], ["developed", "developer"], ["founded", "founder"], ["directed", "director"], ["designed", "architect"], ["built", "architect"], ["born", "place_of_birth"], ["died", "place_of_death"]] }
+
+skill rel_fits(rel, qterms, verb) -> Any {
+  let rws = split(rel, "_")
+  for t in qterms {
+    for r in rws {
+      if len(r) >= 4 and stem(r) == stem(t) { return true }
+    }
+    for p in rel_words() {
+      if p[0] == t and p[1] == rel { return true }
+    }
+  }
+  return false
+}
+
+# -> the facts whose subject the question names and whose relation the question asks for: [[subject, relation, value]]
+skill knowledge(q, facts) -> Any {
+  if facts == null { return [] }
+  let lq = " " ++ join(words_of(lower(q)), " ") ++ " "
+  let terms = terms_of(q)
+  let verb = q_verb(q)
+  let out = []
+  let qws = words_of(lower(q))
+  for line in facts {
+    # quick test first: the fact's subject must begin with a word the question has
+    let e = 0
+    while e < len(line) and e < 30 and slice(line, e, e + 1) != " " { let e = e + 1 }
+    let fw = lower(slice(line, 0, e))
+    let near = false
+    for w in qws {
+      if w == fw { let near = true }
+    }
+    let p = []
+    if near { let p = split(line, " ||| ") }
+    if len(p) == 3 {
+      let subj = " " ++ join(words_of(lower(p[0])), " ") ++ " "
+      if len(subj) >= 5 and find_from(lq, 0, subj) < len(lq) {
+        if rel_fits(p[1], terms, verb) { let out = append(out, p) }
+      }
+    }
+  }
+  return out
+}
+
+# ---- the practice exam: questions Pi writes from its own facts (answers known), to develop answer selection on;
+# the 20 final questions stay a final exam (their subjects are kept out of the practice)
+skill templates() -> Any { return [["capital", "What is the capital of ", "?"], ["author", "Who wrote ", "?"], ["director", "Who directed ", "?"], ["founder", "Who founded ", "?"], ["discoverer_or_inventor", "Who discovered ", "?"], ["composer", "Who composed ", "?"], ["developer", "Who developed ", "?"], ["performer", "Who performed ", "?"], ["architect", "Who designed ", "?"], ["date_of_birth", "When was ", " born?"], ["inception", "When was ", " founded?"], ["place_of_birth", "Where was ", " born?"], ["headquarters_location", "Where is the headquarters of ", "?"], ["place_of_death", "Where did ", " die?"], ["date_of_death", "When did ", " die?"], ["country", "What country is ", " in?"], ["record_label", "What record label released ", "?"], ["publisher", "Who published ", "?"], ["producer", "Who produced ", "?"], ["spouse", "Who was ", " married to?"], ["named_after", "What is ", " named after?"], ["educated_at", "Where did ", " study?"], ["creator", "Who created ", "?"], ["mountain_range", "What mountain range is ", " in?"], ["member_of_political_party", "What party does ", " belong to?"], ["manufacturer", "Who manufactured ", "?"], ["owned_by", "Who owns ", "?"], ["constellation", "What constellation is ", " in?"]] }
+
+skill plain_ascii(s) -> Any {
+  for i in range(0, len(s)) {
+    let c = ord(slice(s, i, i + 1))
+    if c < 32 or c > 126 { return false }
+  }
+  return true
+}
+
+skill final_subjects() -> Any { return ["australia", "penicillin", "eiffel tower", "pride and prejudice", "solar system", "berlin wall", "mona lisa", "gold", "human body", "moon", "canada", "declaration of independence", "general relativity", "africa", "soccer", "telephone", "world war ii", "diamond", "moonlight sonata", "speed of light", "light"] }
+
+# -> [[question, answer key, relation]]: round robin over the relations, every 997th fit fact of each
+skill make_exam(facts, n) -> Any {
+  let ts = templates()
+  let per = n // len(ts) + 1
+  let got = []
+  for t in ts { let got = append(got, []) }
+  let seen = arr(len(ts))
+  for line in facts {
+    let ml = mark()
+    let changed = false
+    let p = split(line, " ||| ")
+    if len(p) == 3 {
+      let ti = 0 - 1
+      for k in range(0, len(ts)) {
+        if ts[k][0] == p[1] { let ti = k }
+      }
+      if ti >= 0 {
+        if len(got[ti]) < per {
+          let ok = plain_ascii(p[0]) and plain_ascii(p[2]) and len(p[0]) >= 3 and len(p[0]) <= 40 and len(p[2]) >= 2 and len(p[2]) <= 40
+          if ok {
+            if lower(p[0]) == lower(p[2]) or find_from(lower(p[2]), 0, lower(p[0])) < len(p[2]) { let ok = false }
+          }
+          if ok {
+            for f in final_subjects() {
+              if find_from(lower(p[0]), 0, f) < len(p[0]) { let ok = false }
+            }
+          }
+          if ok {
+            do aset(seen, ti, aget(seen, ti) + 1)
+            if aget(seen, ti) % 97 == 1 {
+              let key = p[2]
+              if p[1] == "date_of_birth" or p[1] == "inception" or p[1] == "date_of_death" { let key = slice(p[2], 0, 4) }
+              let got = slice(got, 0, ti) ++ [append(got[ti], [ts[ti][1] ++ p[0] ++ ts[ti][2], key, p[1], p[0]])] ++ slice(got, ti + 1, len(got))
+              let changed = true
+            }
+          }
+        }
+      }
+    }
+    # a line that added nothing frees its scratch (2.2M lines of garbage otherwise)
+    if changed == false { do release(ml, 0) }
+  }
+  # interleave the relations, n at most
+  let out = []
+  for r in range(0, per) {
+    for g in got {
+      if r < len(g) and len(out) < n { let out = append(out, g[r]) }
+    }
+  }
+  return out
+}
+
+# ---- what Pi knows about a relation's answers: how often a name is the value of that relation in its facts ----------
+# (the question's own fact -- same subject -- is left out, so the prior never holds the answer it is asked for)
+skill rel_name(q) -> Any {
+  let ws = words_of(lower(q))
+  if len(ws) == 0 { return null }
+  let f = ws[0]
+  if sl_has(ws, "born") {
+    if f == "when" { return "date_of_birth" }
+    return "place_of_birth"
+  }
+  if sl_has(ws, "die") or sl_has(ws, "died") {
+    if f == "when" { return "date_of_death" }
+    return "place_of_death"
+  }
+  if sl_has(ws, "founded") {
+    if f == "when" { return "inception" }
+    return "founder"
+  }
+  let pairs = [["capital", "capital"], ["headquarters", "headquarters_location"], ["wrote", "author"], ["directed", "director"], ["discovered", "discoverer_or_inventor"], ["invented", "discoverer_or_inventor"], ["composed", "composer"], ["developed", "developer"], ["performed", "performer"], ["designed", "architect"], ["label", "record_label"], ["published", "publisher"], ["produced", "producer"], ["married", "spouse"], ["named", "named_after"], ["study", "educated_at"], ["created", "creator"], ["mountain", "mountain_range"], ["party", "member_of_political_party"], ["manufactured", "manufacturer"], ["owns", "owned_by"], ["constellation", "constellation"], ["country", "country"]]
+  for pr in pairs {
+    if sl_has(ws, pr[0]) { return pr[1] }
+  }
+  return null
+}
+
+skill nrm(s) -> Any { return join(words_of(lower(s)), " ") }
+
+skill h_add(hk, hc, hsz, key) -> Any {
+  let s = key % hsz
+  while aget(hk, s) != 0 and aget(hk, s) != key { let s = (s + 1) % hsz }
+  do aset(hk, s, key)
+  do aset(hc, s, aget(hc, s) + 1)
+  return 0
+}
+
+skill h_get(hk, hc, hsz, key) -> Any {
+  let s = key % hsz
+  while aget(hk, s) != 0 {
+    if aget(hk, s) == key { return aget(hc, s) }
+    let s = (s + 1) % hsz
+  }
+  return 0
+}
+
+skill prior_build(fl) -> Any {
+  let hsz = 8388608
+  let hk = arr(hsz)
+  let hc = arr(hsz)
+  let sk = arr(hsz)
+  let sc = arr(hsz)
+  for line in fl {
+    let ml = mark()
+    let p = split(line, " ||| ")
+    if len(p) == 3 {
+      let v = nrm(p[2])
+      if p[1] == "date_of_birth" or p[1] == "date_of_death" or p[1] == "inception" { let v = slice(v, 0, 4) }
+      do h_add(hk, hc, hsz, sl_key(p[1] ++ "|" ++ v))
+      do h_add(sk, sc, hsz, sl_key(nrm(p[0]) ++ "|" ++ p[1] ++ "|" ++ v))
+    }
+    do release(ml, 0)
+  }
+  return [hk, hc, hsz, sk, sc]
+}
+
+# each candidate's features + [how often it is the relation's value in Pi's facts, other subjects only]
+skill with_prior(cs, fs, rel, subj, pri) -> Any {
+  let out = []
+  for i in range(0, len(cs)) {
+    let n = 0
+    if rel != null {
+      let v = nrm(cs[i])
+      let n = h_get(pri[0], pri[1], pri[2], sl_key(rel ++ "|" ++ v))
+      if subj != null { let n = n - h_get(pri[3], pri[4], pri[2], sl_key(nrm(subj) ++ "|" ++ rel ++ "|" ++ v)) }
+      if n < 0 { let n = 0 }
+    }
+    let out = append(out, append(fs[i], n))
+  }
+  return out
+}
+
+# the practice exam's candidates and features, kept (out\\learn_data.txt) so choosing can be relearned in seconds
+skill save_data(data) -> Any {
+  let lines = []
+  for d in data {
+    let cl = []
+    for i in range(0, len(d[0])) { let cl = append(cl, d[0][i] ++ " ## " ++ join(map_str(d[1][i]), ",")) }
+    let it = "0"
+    if d[3] { let it = "1" }
+    let lines = append(lines, d[2] ++ " ||| " ++ it ++ " ||| " ++ join(cl, " ;; "))
+  }
+  return write_file("out\\learn_data.txt", join(lines, "\n"))
+}
+
+skill load_data() -> Any {
+  let t = read_file("out\\learn_data.txt")
+  if t == null { return [] }
+  let out = []
+  for line in split(t, "\n") {
+    let p = split(line, " ||| ")
+    let cs = []
+    let fs = []
+    if len(p) == 3 and len(p[2]) > 0 {
+      for c in split(p[2], " ;; ") {
+        let q = split(c, " ## ")
+        if len(q) == 2 {
+          let cs = append(cs, q[0])
+          let f = []
+          for x in split(q[1], ",") { let f = append(f, num(x)) }
+          let fs = append(fs, f)
+        }
+      }
+    }
+    let out = append(out, [cs, fs, p[0], p[1] == "1"])
+  }
+  return out
+}
+
+# ---- Pi learns how to choose answers: weights over each candidate's features, fitted on its own practice exam ----
+# features: 0 votes (the hand rule), 1 sentences, 2 shared terms (sum), 3 best sentence's terms, 4 structure hits,
+# 5 opening-paragraph hits, 6 first-in-sentence hits, 7 best cue (0..3), 8 type (1/2/4), 9 several words, 10 rank
+skill feat_names() -> Any { return ["votes", "sentences", "terms", "best terms", "structure", "opening", "first", "cue", "type", "full name", "rank", "slot win", "slot positive", "relation word", "near relation word", "sentence finder", "reader pick", "reader top 3", "prior"] }
+
+skill lg(x) -> Any {
+  let b = 0
+  let v = x
+  while v > 0 {
+    let v = v // 2
+    let b = b + 1
+  }
+  return b
+}
+
+skill wscore(f, wts) -> Any {
+  let s = 0
+  for i in range(0, len(wts)) { let s = s + wts[i] * lg(f[i]) }
+  return s
+}
+
+# each feature relative to the strongest candidate of the same question (0..8): "12 sentences" means one thing for a
+# famous subject and another for an obscure one -- what matters is how a candidate compares with its rivals
+skill relative(feats) -> Any {
+  if len(feats) == 0 { return feats }
+  let mx = []
+  for k in range(0, len(feats[0])) { let mx = append(mx, 1) }
+  for f in feats {
+    let mx2 = []
+    for k in range(0, len(f)) { let mx2 = append(mx2, max(mx[k], f[k])) }
+    let mx = mx2
+  }
+  let out = []
+  for f in feats {
+    let r = []
+    for k in range(0, len(f)) { let r = append(r, 8 * f[k] // mx[k]) }
+    let out = append(out, r)
+  }
+  return out
+}
+
+# the candidate the weights choose -> its index (ties go to the hand rule's votes)
+skill choose(feats, wts) -> Any {
+  let fs = feats
+  let bi = 0 - 1
+  for i in range(0, len(fs)) {
+    if bi < 0 { let bi = i } else {
+      let a = wscore(fs[i], wts)
+      let b = wscore(fs[bi], wts)
+      if a > b or (a == b and feats[i][0] > feats[bi][0]) { let bi = i }
+    }
+  }
+  return bi
+}
+
+# strictly right: exactly the key's words (no more, no fewer; case and punctuation aside)
+skill exact(a, key) -> Any {
+  if a == null or key == null { return false }
+  return join(words_of(lower(a)), " ") == join(words_of(lower(key)), " ")
+}
+
+skill accuracy_exact(data, wts) -> Any {
+  let n = 0
+  for d in data {
+    if len(d[0]) > 0 {
+      if exact(d[0][choose(d[1], wts)], d[2]) { let n = n + 1 }
+    }
+  }
+  return n
+}
+
+# how many questions of a set the weights answer right; data: [[cands, feats, key]]
+skill accuracy(data, wts) -> Any {
+  let n = 0
+  for d in data {
+    if len(d[0]) > 0 {
+      let i = choose(d[1], wts)
+      if hit(d[0][i], d[2]) { let n = n + 1 }
+    }
+  }
+  return n
+}
+
+# coordinate ascent: one weight at a time over {0,1,2,4,8,16}, keeping what answers the most training questions
+skill fit(train, start) -> Any {
+  let wts = start
+  let best = accuracy(train, wts)
+  for pass in range(0, 4) {
+    for k in range(0, len(wts)) {
+      for v in [0, 1, 2, 4, 8, 16] {
+        let trial = slice(wts, 0, k) ++ [v] ++ slice(wts, k + 1, len(wts))
+        let a = accuracy(train, trial)
+        if a > best {
+          let best = a
+          let wts = trial
+        }
+      }
+    }
+  }
+  return wts
+}
+
+# an averaged perceptron over the same bits-features: wherever the weights choose a wrong candidate, move them toward
+# the right one (exactly the key's words if present, else a fair hit); the average over all steps is kept (steadier)
+skill perc(train, nf, epochs) -> Any {
+  let w = arr(nf)
+  let acc = arr(nf)
+  let steps = 0
+  for e in range(0, epochs) {
+    for d in train {
+      let g = 0 - 1
+      for i in range(0, len(d[0])) {
+        if g < 0 and exact(d[0][i], d[2]) { let g = i }
+      }
+      for i in range(0, len(d[0])) {
+        if g < 0 and hit(d[0][i], d[2]) { let g = i }
+      }
+      if g >= 0 {
+        let wl = []
+        for k in range(0, nf) { let wl = append(wl, aget(w, k)) }
+        let px = choose(d[1], wl)
+        if hit(d[0][px], d[2]) == false {
+          for k in range(0, nf) { do aset(w, k, aget(w, k) + lg(d[1][g][k]) - lg(d[1][px][k])) }
+        }
+      }
+      for k in range(0, nf) { do aset(acc, k, aget(acc, k) + aget(w, k)) }
+      let steps = steps + 1
+    }
+  }
+  let out = []
+  for k in range(0, nf) { let out = append(out, aget(acc, k)) }
+  return out
+}
+
+skill map_str(xs) -> Any {
+  let out = []
+  for x in xs { let out = append(out, str(x)) }
+  return out
+}
+
+skill load_weights() -> Any {
+  let t = read_file("out\\weights.txt")
+  if t == null { return null }
+  let out = []
+  for x in split(trim(t), " ") { let out = append(out, num(x)) }
+  return out
+}
+
+# right: the answer holds the key -- as text, or word for word ignoring punctuation and order ("Adelson Velsky" holds
+# "Georgy Adelson-Velsky"? no: Georgy is missing; "Tsao McKown Architects" holds "Tsao & McKown Architects": yes)
+skill hit(a, key) -> Any {
+  if a == null or key == null { return false }
+  if find_from(lower(a), 0, lower(key)) < len(a) { return true }
+  let aw = words_of(lower(a))
+  let kw = words_of(lower(key))
+  if len(kw) == 0 { return false }
+  for k in kw {
+    let found = false
+    for w in aw {
+      if w == k { let found = true }
+    }
+    if found == false { return false }
+  }
+  return true
+}
+
+# is the key anywhere in the text Pi read for a question (cached: no request)? -> retrieval reached it or not
+skill key_in_docs(docs, key) -> Any {
+  let kw = words_of(lower(key))
+  for d in docs {
+    for sp in d[1] {
+      if hit(sp[0], key) { return true }
+    }
+  }
+  return false
+}
+
+# the full text of one article as plain text (one API request) -> [[sentence, paragraph]]
+skill full_text(title) -> Any {
+  let page = polite("https://en.wikipedia.org/w/api.php?action=query&format=json&prop=extracts&explaintext=1&titles=" ++ urlenc(title))
+  if page == null { return [] }
+  let ex = split(page, "\"extract\":\"")
+  if len(ex) < 2 { return [] }
+  let text = json_str(ex[1], 0)[0]
+  let ss = []
+  let k = 0
+  for para in split(text, "\n") {
+    if len(para) >= 60 {
+      let k = k + 1
+      for sn in split(strip_refs(para), ". ") {
+        if len(sn) > 20 { let ss = append(ss, [sn, k]) }
+      }
+    }
+  }
+  return ss
+}
+
+# ---- Pi's local Wikipedia (6.4M articles on the SSD; wikiindex.exe): whole articles, no request, no rate limit ----
+skill wl_two(i) -> Any {
+  if i < 10 { return "0" ++ str(i) }
+  return str(i)
+}
+
+# a title -> [piece, offset, length] or null (out\wikiidx\s<k>.txt: lower-case title ||| piece ||| offset ||| length)
+skill wl_find(title) -> Any {
+  let lt = lower(title)
+  let t = read_file("out\\wikiidx\\s" ++ str(sl_key(lt) % 256) ++ ".txt")
+  if t == null { return null }
+  let want = lt ++ " ||| "
+  let parts = split(t, "\n" ++ want)
+  if len(parts) < 2 {
+    if slice(t, 0, len(want)) != want { return null }
+    let line = split(t, "\n")[0]
+    let p = split(line, " ||| ")
+    return [p[1], num(p[2]), num(p[3])]
+  }
+  let p = split(split(parts[1], "\n")[0], " ||| ")
+  return [p[0], num(p[1]), num(p[2])]
+}
+
+# the whole article as [[sentence, paragraph]] (as full_text), or [] when Pi has no such article
+skill wl_sentences(title) -> Any {
+  let at = wl_find(title)
+  if at == null { return [] }
+  let b = read_bytes("out\\wiki\\" ++ at[0] ++ ".txt", at[1], at[2])
+  if b == null { return [] }
+  let text = arr_text(b, 0, len(b))
+  let ss = []
+  let k = 0
+  for para in split(text, "\n") {
+    if len(para) >= 60 {
+      let k = k + 1
+      for sn in split(para, ". ") {
+        if len(sn) > 20 { let ss = append(ss, [sn, k]) }
+      }
+    }
+  }
+  return ss
+}
+
+# the question's documents with the word "local": the subject's own articles (from the question's names, found in the
+# local index) first, then the search's articles -- each read WHOLE from the SSD when Pi has it
+skill docs_q(q, terms) -> Any {
+  let docs = docs_for(terms)
+  if has_arg("local") == false { return docs }
+  let out = []
+  for ph in subject_phrases(q) {
+    if len(out) < 2 {
+      let dup = false
+      for o in out {
+        if lower(o[0]) == lower(ph) { let dup = true }
+      }
+      if dup == false {
+        let ss = wl_sentences(ph)
+        if len(ss) > 0 { let out = append(out, [ph, ss]) }
+      }
+    }
+  }
+  for d in docs {
+    let dup = false
+    for o in out {
+      if lower(o[0]) == lower(d[0]) { let dup = true }
+    }
+    if dup == false {
+      let ss = wl_sentences(d[0])
+      if len(ss) > 0 { let out = append(out, [d[0], ss]) } else { let out = append(out, d) }
+    }
+  }
+  return out
+}
+
+# the documents for a question: fast (opening sections of the top 3) and, with "deep", the top article in full
+skill docs_for(terms) -> Any {
+  let docs = fast_docs(terms)
+  if has_arg("deep") and len(docs) > 0 {
+    let full = full_text(docs[0][0])
+    if len(full) > 0 { let docs = [[docs[0][0], full]] ++ slice(docs, 1, len(docs)) }
+  }
+  return docs
+}
+
+skill recall(q) -> Any {
+  let t = read_file("out\\research.kb")
+  if t == null { return null }
+  for line in split(t, "\n") {
+    let p = split(line, " ||| ")
+    if len(p) == 4 and lower(p[0]) == lower(q) { return p }
+  }
+  return null
+}
+
+skill remember(q, a) -> Any {
+  let old = read_file("out\\research.kb")
+  let line = q ++ " ||| " ++ a[0] ++ " ||| " ++ a[3] ++ " ||| " ++ a[2]
+  if old == null { return write_file("out\\research.kb", line) }
+  return write_file("out\\research.kb", old ++ "\n" ++ line)
+}
+
+skill ask(q) -> Any {
+  let m = recall(q)
+  if m != null { return [m[1], "from memory", m[3], m[2]] }
+  let a = answer(q)
+  if a[0] != null { do remember(q, a) }
+  return [a[0], str(a[1]) ++ " votes", a[2], a[3]]
+}
+
+# ---- the sealed final (2026-11-02): part A written by Pi from facts the practice never used -- per relation 2 subjects
+# with a long local article (famous, 40,000+ bytes) and 2 with a short one (obscure, under 4,000); part B written
+# independently (out\\final_b.txt). Lines: question ||| key ||| subject ||| group
+skill make_final(fl) -> Any {
+  let ts = templates()
+  let practice = make_exam(fl, 420)
+  let ps = hset(65536)
+  for qa in practice { do hset_add(ps, name_key(lower(qa[3]))) }
+  let fam = []
+  let obs = []
+  let seen = []
+  let looked = []
+  for t in ts {
+    let fam = append(fam, 0)
+    let obs = append(obs, 0)
+    let seen = append(seen, 0)
+    let looked = append(looked, 0)
+  }
+  let out = []
+  let sc = arr(len(ts))
+  for line in fl {
+    let ml = mark()
+    let p = release(ml, split(line, " ||| "))
+    if len(p) == 3 {
+      let ti = 0 - 1
+      for k in range(0, len(ts)) {
+        if ts[k][0] == p[1] { let ti = k }
+      }
+      if ti >= 0 {
+        do aset(sc, ti, aget(sc, ti) + 1)
+        let want = (fam[ti] < 2 or obs[ti] < 2) and looked[ti] < 1500 and aget(sc, ti) % 7 == 3
+        let ok = want and plain_ascii(p[0]) and plain_ascii(p[2]) and len(p[0]) >= 3 and len(p[0]) <= 40 and len(p[2]) >= 2 and len(p[2]) <= 40
+        if ok {
+          if lower(p[0]) == lower(p[2]) or find_from(lower(p[2]), 0, lower(p[0])) < len(p[2]) { let ok = false }
+        }
+        if ok {
+          if hset_has(ps, name_key(lower(p[0]))) { let ok = false }
+        }
+        if ok {
+          for f in final_subjects() {
+            if find_from(lower(p[0]), 0, f) < len(p[0]) { let ok = false }
+          }
+        }
+        if ok {
+          let looked = slice(looked, 0, ti) ++ [looked[ti] + 1] ++ slice(looked, ti + 1, len(looked))
+          let mw = mark()
+          let at = release(mw, wl_find(p[0]))
+          if at != null {
+            let key = p[2]
+            if p[1] == "date_of_birth" or p[1] == "inception" or p[1] == "date_of_death" { let key = slice(p[2], 0, 4) }
+            let q = ts[ti][1] ++ p[0] ++ ts[ti][2]
+            if at[2] >= 40000 and fam[ti] < 2 {
+              let out = append(out, q ++ " ||| " ++ key ++ " ||| " ++ p[0] ++ " ||| A famous")
+              let fam = slice(fam, 0, ti) ++ [fam[ti] + 1] ++ slice(fam, ti + 1, len(fam))
+            }
+            if at[2] < 4000 and obs[ti] < 2 {
+              let out = append(out, q ++ " ||| " ++ key ++ " ||| " ++ p[0] ++ " ||| A obscure")
+              let obs = slice(obs, 0, ti) ++ [obs[ti] + 1] ++ slice(obs, ti + 1, len(obs))
+            }
+          }
+        }
+      }
+    }
+  }
+  do write_file("out\\final_exam.txt", join(out, "\n"))
+  let nf = 0
+  for x in fam { let nf = nf + x }
+  return "part A sealed: " ++ str(len(out)) ++ " questions (" ++ str(nf) ++ " famous, " ++ str(len(out) - nf) ++ " obscure) -> out\\final_exam.txt (not shown)"
+}
+
+# every title whose local article is 30,000+ bytes, in one pass over the 256 index shards -> a set (name_key)
+skill long_titles() -> Any {
+  let hs = hset(1048576)
+  for k in range(0, 256) {
+    let m = mark()
+    let t = read_file("out\\wikiidx\\s" ++ str(k) ++ ".txt")
+    let keep = []
+    if t != null {
+      for line in split(t, "\n") {
+        let e = len(line)
+        let b = e
+        while b > 0 and slice(line, b - 1, b) != " " { let b = b - 1 }
+        if e - b >= 5 {
+          if num(slice(line, b, e)) >= 30000 { let keep = append(keep, split(line, " ||| ")[0]) }
+        }
+      }
+    }
+    let keep = release(m, keep)
+    for x in keep { do hset_add(hs, name_key(x)) }
+  }
+  return hs
+}
+
+skill title_sets() -> Any {
+  let longs = hset(1048576)
+  let shorts = hset(16777216)
+  for k in range(0, 256) {
+    let m = mark()
+    let t = read_file("out\\wikiidx\\s" ++ str(k) ++ ".txt")
+    if t != null {
+      for line in split(t, "\n") {
+        let ml = mark()
+        let e = len(line)
+        let b = e
+        while b > 0 and slice(line, b - 1, b) != " " { let b = b - 1 }
+        let n = int_of(slice(line, b, e))
+        if n >= 30000 { do hset_add(longs, name_key(split(line, " ||| ")[0])) }
+        if n < 4000 and n > 0 { do hset_add(shorts, name_key(split(line, " ||| ")[0])) }
+        do release(ml, 0)
+      }
+    }
+    do release(m, 0)
+  }
+  return [longs, shorts]
+}
+
+# sealed final 3: Pi's part from facts no practice, famous practice or earlier final used; per relation 2 famous
+# (long article, exactly one fact of the relation) and 2 obscure (short article) -> out\final3_exam.txt
+skill make_final3(fl) -> Any {
+  let ts = templates()
+  let ex = hset(65536)
+  for qa in make_exam(fl, 420) { do hset_add(ex, name_key(lower(qa[3]))) }
+  for qa in make_famous(fl, 8) { do hset_add(ex, name_key(lower(qa[3]))) }
+  for f in ["out\\final_exam.txt", "out\\final_b.txt"] {
+    let t = read_file(f)
+    if t != null {
+      for l in split(t, "\n") {
+        let p = split(l, " ||| ")
+        if len(p) >= 3 { do hset_add(ex, name_key(lower(trim(p[2])))) }
+      }
+    }
+  }
+  let hk = arr(4194304)
+  let hc = arr(4194304)
+  for line in fl {
+    let ml = mark()
+    let p = split(line, " ||| ")
+    if len(p) == 3 { do h_add(hk, hc, 4194304, sl_key(lower(p[0]) ++ "|" ++ p[1])) }
+    do release(ml, 0)
+  }
+  let tsets = title_sets()
+  let fam = arr(len(ts))
+  let obs = arr(len(ts))
+  let sc = arr(len(ts))
+  let out = []
+  for line in fl {
+    let ml = mark()
+    let changed = false
+    let p = split(line, " ||| ")
+    if len(p) == 3 {
+      let ti = 0 - 1
+      for k in range(0, len(ts)) {
+        if ts[k][0] == p[1] { let ti = k }
+      }
+      if ti >= 0 {
+        do aset(sc, ti, aget(sc, ti) + 1)
+        let ok = (aget(fam, ti) < 2 or aget(obs, ti) < 2) and aget(sc, ti) % 11 == 6 and plain_ascii(p[0]) and plain_ascii(p[2]) and len(p[0]) >= 3 and len(p[0]) <= 40 and len(p[2]) >= 2 and len(p[2]) <= 40
+        if ok {
+          if lower(p[0]) == lower(p[2]) or find_from(lower(p[2]), 0, lower(p[0])) < len(p[2]) { let ok = false }
+        }
+        if ok {
+          if hset_has(ex, name_key(lower(p[0]))) { let ok = false }
+        }
+        if ok {
+          for f in final_subjects() {
+            if find_from(lower(p[0]), 0, f) < len(p[0]) { let ok = false }
+          }
+        }
+        if ok {
+          let key = p[2]
+          if p[1] == "date_of_birth" or p[1] == "inception" or p[1] == "date_of_death" { let key = slice(p[2], 0, 4) }
+          let q = ts[ti][1] ++ p[0] ++ ts[ti][2]
+          let nk = name_key(lower(p[0]))
+          if aget(fam, ti) < 2 and hset_has(tsets[0], nk) and h_get(hk, hc, 4194304, sl_key(lower(p[0]) ++ "|" ++ p[1])) == 1 {
+            let out = append(out, q ++ " ||| " ++ key ++ " ||| " ++ p[0] ++ " ||| A famous")
+            do aset(fam, ti, aget(fam, ti) + 1)
+            let changed = true
+          } else {
+            if aget(obs, ti) < 2 and hset_has(tsets[1], nk) {
+              let out = append(out, q ++ " ||| " ++ key ++ " ||| " ++ p[0] ++ " ||| A obscure")
+              do aset(obs, ti, aget(obs, ti) + 1)
+              let changed = true
+            }
+          }
+        }
+      }
+    }
+    if changed == false { do release(ml, 0) }
+  }
+  do write_file("out\\final3_exam.txt", join(out, "\n"))
+  let nf = 0
+  for i in range(0, len(ts)) { let nf = nf + aget(fam, i) }
+  return "final 3 part A sealed: " ++ str(len(out)) ++ " questions (" ++ str(nf) ++ " famous, " ++ str(len(out) - nf) ++ " obscure) -> out\\final3_exam.txt (not shown)"
+}
+
+# famous practice: a subject with a LONG local article (30,000+ bytes) and exactly ONE fact of the asked relation
+# (fact counts alone picked ambiguous names: "Who wrote Fire?", "Who published Dune?"); never a practice or final
+# subject; per relation up to 8, interleaved by relation like the practice exam
+skill make_famous(fl, per) -> Any {
+  let ts = templates()
+  let cnt = hset(4194304)
+  let hk = arr(4194304)
+  let hc = arr(4194304)
+  for line in fl {
+    let ml = mark()
+    let p = release(ml, split(line, " ||| "))
+    if len(p) == 3 { do h_add(hk, hc, 4194304, sl_key(lower(p[0]) ++ "|" ++ p[1])) }
+  }
+  let looked = arr(len(ts))
+  let longs = long_titles()
+  let ex = hset(65536)
+  for qa in make_exam(fl, 420) { do hset_add(ex, name_key(lower(qa[3]))) }
+  let ft = read_file("out\\final_exam.txt")
+  if ft != null {
+    for l in split(ft, "\n") {
+      let p = split(l, " ||| ")
+      if len(p) == 4 { do hset_add(ex, name_key(lower(p[2]))) }
+    }
+  }
+  let tb = read_file("out\\final_b.txt")
+  if tb != null {
+    for l in split(tb, "\n") {
+      let p = split(l, " ||| ")
+      if len(p) == 3 { do hset_add(ex, name_key(lower(trim(p[2])))) }
+    }
+  }
+  let got = []
+  for t in ts { let got = append(got, []) }
+  let sc = arr(len(ts))
+  for line in fl {
+    let ml = mark()
+    let p = release(ml, split(line, " ||| "))
+    if len(p) == 3 {
+      let ti = 0 - 1
+      for k in range(0, len(ts)) {
+        if ts[k][0] == p[1] { let ti = k }
+      }
+      if ti >= 0 {
+        do aset(sc, ti, aget(sc, ti) + 1)
+        let ok = len(got[ti]) < per and aget(sc, ti) % 3 == 2 and plain_ascii(p[0]) and plain_ascii(p[2]) and len(p[0]) >= 3 and len(p[0]) <= 40 and len(p[2]) >= 2 and len(p[2]) <= 40
+        if ok {
+          if h_get(hk, hc, 4194304, sl_key(lower(p[0]) ++ "|" ++ p[1])) != 1 { let ok = false }
+        }
+        if ok {
+          if lower(p[0]) == lower(p[2]) or find_from(lower(p[2]), 0, lower(p[0])) < len(p[2]) { let ok = false }
+        }
+        if ok {
+          if hset_has(ex, name_key(lower(p[0]))) { let ok = false }
+        }
+        if ok {
+          for f in final_subjects() {
+            if find_from(lower(p[0]), 0, f) < len(p[0]) { let ok = false }
+          }
+        }
+        if ok {
+          if aget(looked, ti) >= 600 { let ok = false }
+        }
+        if ok {
+          if hset_has(longs, name_key(lower(p[0]))) == false { let ok = false }
+        }
+        if ok {
+          let key = p[2]
+          if p[1] == "date_of_birth" or p[1] == "inception" or p[1] == "date_of_death" { let key = slice(p[2], 0, 4) }
+          let got = slice(got, 0, ti) ++ [append(got[ti], [ts[ti][1] ++ p[0] ++ ts[ti][2], key, p[1], p[0]])] ++ slice(got, ti + 1, len(got))
+        }
+      }
+    }
+  }
+  let out = []
+  for r in range(0, per) {
+    for g in got {
+      if r < len(g) { let out = append(out, g[r]) }
+    }
+  }
+  return out
+}
+
+# run the sealed final once: local whole articles + slots + prior + the perceptron's weights; per group right/strict
+skill run_final(fl) -> Any { return run_final_n(fl, "final") }
+
+skill run_final_n(fl, tag) -> Any {
+  if read_file("out\\" ++ tag ++ "_done.txt") != null and has_arg("again") == false { return "the final was already run (out\\" ++ tag ++ "_done.txt)" }
+  let lines = split(read_file("out\\" ++ tag ++ "_exam.txt"), "\n")
+  let tb = read_file("out\\" ++ tag ++ "_b.txt")
+  if tb != null {
+    for l in split(trim(tb), "\n") {
+      let p = split(trim(l), " ||| ")
+      if len(p) == 3 {
+        let grp = "B famous"
+        if len(lines) >= 0 { let grp = "B famous" }
+        let lines = append(lines, trim(l) ++ " ||| B")
+      }
+    }
+  }
+  let types = append(append(name_types(fl), load_cues()), sl_load())
+  if has_arg("reader") { let types = append(types, rm_load()) }
+  let pri = prior_build(fl)
+  let w = []
+  let wf = "out\\weights_perc.txt"
+  if tag != "final" { let wf = "out\\weights_" ++ tag ++ ".txt" }
+  for x in split(trim(read_file(wf)), " ") { let w = append(w, num(x)) }
+  let groups = ["A famous", "A obscure", "B famous", "B less famous"]
+  let right = [0, 0, 0, 0]
+  let vright = [0, 0, 0, 0]
+  let strict = [0, 0, 0, 0]
+  let total = [0, 0, 0, 0]
+  let nb = 0
+  let detail = []
+  for l in lines {
+    let p = split(l, " ||| ")
+    if len(p) == 4 {
+      let gi = 0
+      for k in range(0, 4) {
+        if groups[k] == p[3] { let gi = k }
+      }
+      if p[3] == "B" {
+        let nb = nb + 1
+        let gi = 2
+        if nb > 40 { let gi = 3 }
+      }
+      let mk = mark()
+      let a = answer_t(p[0], types)
+      let pick = a[0]
+      if len(a) > 4 {
+        if len(a[4]) > 0 {
+          let fs = with_prior(a[4], a[5], rel_name(p[0]), p[2], pri)
+          let pick = a[4][choose(fs, w)]
+        }
+      }
+      let vpick = a[0]
+      let r = release(mk, [pick, vpick])
+      let ok = 0
+      if hit(r[0], p[1]) { let ok = 1 }
+      let ex = 0
+      if exact(r[0], p[1]) { let ex = 1 }
+      let vnote = ""
+      if has_arg("diag") {
+        let vok = 0
+        if hit(r[1], p[1]) { let vok = 1 }
+        let vright = slice(vright, 0, gi) ++ [vright[gi] + vok] ++ slice(vright, gi + 1, 4)
+        let vnote = "   (votes: " ++ str(r[1]) ++ ")"
+      }
+      let right = slice(right, 0, gi) ++ [right[gi] + ok] ++ slice(right, gi + 1, 4)
+      let strict = slice(strict, 0, gi) ++ [strict[gi] + ex] ++ slice(strict, gi + 1, 4)
+      let total = slice(total, 0, gi) ++ [total[gi] + 1] ++ slice(total, gi + 1, 4)
+      let verdict = "wrong"
+      if ok == 1 { let verdict = "right" }
+      let detail = append(detail, groups[gi] ++ "  " ++ verdict ++ "  " ++ p[0] ++ " -> " ++ str(r[0]) ++ "   [key: " ++ p[1] ++ "]" ++ vnote)
+    }
+  }
+  do write_file("out\\" ++ tag ++ "_result.txt", join(detail, "\n"))
+  do write_file("out\\" ++ tag ++ "_done.txt", "run 2026-11-02")
+  let out = "SEALED FINAL (run once):\n"
+  let tr = 0
+  let tn = 0
+  for k in range(0, 4) {
+    let out = out ++ "  " ++ groups[k] ++ ": " ++ str(right[k]) ++ " of " ++ str(total[k]) ++ " right (exactly the key: " ++ str(strict[k]) ++ ")"
+    if has_arg("diag") { let out = out ++ "   hand rule (votes): " ++ str(vright[k]) }
+    let out = out ++ "\n"
+    let tr = tr + right[k]
+    let tn = tn + total[k]
+  }
+  return out ++ "  all: " ++ str(tr) ++ " of " ++ str(tn) ++ "  (details: out\\" ++ tag ++ "_result.txt)"
+}
+
+# the three best [score, name] so far (distinct names), best first
+skill rtop_add(top, sc, c) -> Any {
+  let all = append(top, [sc, c])
+  let res = []
+  let going = true
+  while going and len(res) < 3 {
+    let bi = 0 - 1
+    for i in range(0, len(all)) {
+      let used = false
+      for y in res {
+        if y[1] == all[i][1] { let used = true }
+      }
+      if used == false {
+        if bi < 0 { let bi = i } else {
+          if all[i][0] > all[bi][0] { let bi = i }
+        }
+      }
+    }
+    if bi < 0 { let going = false } else { let res = append(res, all[bi]) }
+  }
+  return res
+}
+
+skill q_data(qa, types, pri) -> Any {
+  let mk = mark()
+  let a = answer_t(qa[0], types)
+  let cs = []
+  let fs = []
+  if len(a) > 4 {
+    let cs = a[4]
+    let fs = a[5]
+  }
+  if pri != null { let fs = with_prior(cs, fs, rel_name(qa[0]), qa[3], pri) }
+  if has_arg("relative") { let fs = relative(fs) }
+  let intext = false
+  if has_arg("fast") { let intext = key_in_docs(docs_q(qa[0], terms_of(qa[0])), qa[1]) }
+  return release(mk, [cs, fs, qa[1], intext])
+}
+
+skill data_line(d) -> Any {
+  let cl = []
+  for i in range(0, len(d[0])) { let cl = append(cl, d[0][i] ++ " ## " ++ join(map_str(d[1][i]), ",")) }
+  let it = "0"
+  if d[3] { let it = "1" }
+  return d[2] ++ " ||| " ++ it ++ " ||| " ++ join(cl, " ;; ")
+}
+
+# the practice exam and everything a question needs -> [facts, exam, types, prior, number of regular questions]
+skill learn_setup(n) -> Any {
+  let fl = split(read_file("out\\facts.txt"), "\n")
+  let exam = make_exam(fl, n)
+  let nreg = len(exam)
+  if has_arg("famous") { let exam = exam ++ make_famous(fl, 8) }
+  let types = append(name_types(fl), load_cues())
+  if has_arg("slots") { let types = append(types, sl_load()) }
+  if has_arg("reader") { let types = append(types, rm_load()) }
+  let pri = null
+  if has_arg("prior") { let pri = prior_build(fl) }
+  return [fl, exam, types, pri, nreg]
+}
+
+skill flags() -> Any {
+  let out = []
+  for f in ["fast", "slots", "local", "prior", "famous", "typed", "cued", "relative", "subject", "weighted", "plain", "reader"] {
+    if has_arg(f) { let out = append(out, f) }
+  }
+  return join(out, " ")
+}
+
+skill main() -> Any {
+  # a worker: questions i with i % k == w -> out\ld_w<w>.txt ("i ### data line")
+  if arg(1) == "learnpart" {
+    let w = int_of(arg(2))
+    let k = int_of(arg(3))
+    let su = learn_setup(num(arg(4)))
+    let lines = []
+    let i = 0
+    for qa in su[1] {
+      if i % k == w { let lines = append(lines, str(i) ++ " ### " ++ data_line(q_data(qa, su[2], su[3]))) }
+      let i = i + 1
+    }
+    do write_file("out\\ld_w" ++ str(w) ++ ".txt", join(lines, "\n"))
+    return "worker " ++ str(w) ++ ": " ++ str(len(lines)) ++ " questions"
+  }
+  if arg(1) == "famouslist" {
+    let out = []
+    for qa in make_famous(split(read_file("out\\facts.txt"), "\n"), 8) { let out = append(out, qa[0] ++ "  [key: " ++ qa[1] ++ "]") }
+    return join(out, "\n")
+  }
+  # every subject a practice exam or a final asks about -> out\\heldout_subjects.txt (the reader never learns them)
+  if arg(1) == "heldout" {
+    let fl = split(read_file("out\\facts.txt"), "\n")
+    let out = []
+    for qa in make_exam(fl, 420) { let out = append(out, lower(qa[3])) }
+    for qa in make_famous(fl, 8) { let out = append(out, lower(qa[3])) }
+    for f in ["out\\final_exam.txt", "out\\final_b.txt", "out\\final3_exam.txt", "out\\final3_b.txt"] {
+      let t = read_file(f)
+      if t != null {
+        for l in split(t, "\n") {
+          let p = split(l, " ||| ")
+          if len(p) >= 3 { let out = append(out, lower(trim(p[2]))) }
+        }
+      }
+    }
+    do write_file("out\\heldout_subjects.txt", join(out, "\n"))
+    return str(len(out)) ++ " held-out subjects -> out\\heldout_subjects.txt"
+  }
+  if arg(1) == "makefinal3" { return make_final3(split(read_file("out\\facts.txt"), "\n")) }
+  if arg(1) == "final3" { return run_final_n(split(read_file("out\\facts.txt"), "\n"), "final3") }
+  if arg(1) == "makefinal" { return make_final(split(read_file("out\\facts.txt"), "\n")) }
+  if arg(1) == "final" { return run_final(split(read_file("out\\facts.txt"), "\n")) }
+  if arg(1) == "learn" {
+    let n = 130
+    if arg(2) != null { let n = num(arg(2)) }
+    let ft = read_file("out\\facts.txt")
+    if ft == null { return "no out\\facts.txt" }
+    let fl = split(ft, "\n")
+    let exam = make_exam(fl, n)
+    let nreg = len(exam)
+    if has_arg("famous") {
+      let fam = make_famous(fl, 8)
+      do print("famous practice: " ++ str(len(fam)) ++ " questions (subjects with 25+ facts)")
+      let exam = exam ++ fam
+    }
+    let types = null
+    if has_arg("workers") == false { let types = append(name_types(fl), load_cues()) }
+    if has_arg("slots") and has_arg("workers") == false {
+      let sm = sl_load()
+      if sm == null { return "no out\\slots.txt (grammar3.exe save)" }
+      let types = append(types, sm)
+      if has_arg("reader") { let types = append(types, rm_load()) }
+    }
+    let pri = null
+    if has_arg("prior") and has_arg("workers") == false {
+      let t0 = ticks()
+      let pri = prior_build(fl)
+      do print("prior from " ++ str(len(fl)) ++ " facts in " ++ str((ticks() - t0) // 1000) ++ " s")
+    }
+    # with "workers": 8 worker processes compute the questions in parallel; merged in order into learn_data.txt
+    if has_arg("workers") and has_arg("cached") == false {
+      let t0 = ticks()
+      let hs = []
+      # 6 workers: each peaks near 4.8 GB (facts, types, prior, slots in memory), 6 x 4.8 fits in 31 GB
+      # 6 workers (4.8 GB each); 5 with the reading model loaded (+0.4 GB each) to stay inside 31 GB
+      let nw = 6
+      if has_arg("reader") { let nw = 5 }
+      for w in range(0, nw) { let hs = append(hs, spawn(arg(0) ++ " learnpart " ++ str(w) ++ " " ++ str(nw) ++ " " ++ str(n) ++ " " ++ flags())) }
+      for h in hs { do wait(h, 36000000) }
+      let slots_ = []
+      for i in range(0, len(exam)) { let slots_ = append(slots_, "") }
+      for w in range(0, nw) {
+        let t = read_file("out\\ld_w" ++ str(w) ++ ".txt")
+        if t != null {
+          for l in split(t, "\n") {
+            let p = split(l, " ### ")
+            if len(p) == 2 {
+              let qi = int_of(p[0])
+              if qi < len(slots_) { let slots_ = slice(slots_, 0, qi) ++ [p[1]] ++ slice(slots_, qi + 1, len(slots_)) }
+            }
+          }
+        }
+      }
+      do write_file("out\\learn_data.txt", join(slots_, "\n"))
+      do print(str(nw) ++ " workers computed " ++ str(len(exam)) ++ " questions in " ++ str((ticks() - t0) // 1000) ++ " s")
+    }
+    let data = []
+    if has_arg("cached") or has_arg("workers") { let data = load_data() }
+    # "regime": every feature twice -- once always, once only for long-article questions (200+ candidates), so
+    # the learner can weigh evidence differently where there are many plausible names
+    if has_arg("regime") {
+      let d2 = []
+      for d in data {
+        let long = len(d[0]) >= 200
+        let fs2 = []
+        for f in d[1] {
+          let z = []
+          for x in f {
+            if long { let z = append(z, x) } else { let z = append(z, 0) }
+          }
+          let fs2 = append(fs2, f ++ z)
+        }
+        let d2 = append(d2, [d[0], fs2, d[2], d[3]])
+      }
+      let data = d2
+    }
+    let ncached = len(data)
+    let qi = 0
+    for qa in exam {
+     let qi = qi + 1
+     if qi > ncached {
+      let mk = mark()
+      let a = answer_t(qa[0], types)
+      let cs = []
+      let fs = []
+      if len(a) > 4 {
+        let cs = a[4]
+        let fs = a[5]
+      }
+      if pri != null { let fs = with_prior(cs, fs, rel_name(qa[0]), qa[3], pri) }
+      # relative features are computed once per question here (rebuilding them inside the search ran out of heap)
+      if has_arg("relative") { let fs = relative(fs) }
+      # was the key anywhere in the text read? (the documents are cached: no request)
+      let intext = false
+      if has_arg("fast") { let intext = key_in_docs(docs_q(qa[0], terms_of(qa[0])), qa[1]) }
+      let data = append(data, release(mk, [cs, fs, qa[1], intext]))
+     }
+    }
+    if has_arg("cached") == false or len(data) > ncached { do save_data(data) }
+    # learn on every other question, check on the rest
+    let train = []
+    let val = []
+    # by round, so every relation is in both halves (i % 2 split them BY RELATION: 28 relations interleave, so the
+    # even questions were always the same 14 relations -- earlier "held-out" numbers were held-out relations)
+    let nrel = len(templates())
+    for i in range(0, len(data)) {
+      if (i // nrel) % 2 == 0 { let train = append(train, data[i]) } else { let val = append(val, data[i]) }
+    }
+    let nfeat = 13
+    for d in data {
+      if len(d[1]) > 0 { let nfeat = len(d[1][0]) }
+    }
+    let rule = [1]
+    while len(rule) < nfeat { let rule = append(rule, 0) }
+    # the ceiling: questions whose right answer is among the candidates at all (no weighting can do better)
+    let reach = 0
+    let reachv = 0
+    for i in range(0, len(data)) {
+      let d = data[i]
+      let has = false
+      for c in d[0] {
+        if hit(c, d[2]) { let has = true }
+      }
+      if has {
+        if (i // len(templates())) % 2 == 0 { let reach = reach + 1 } else { let reachv = reachv + 1 }
+      }
+    }
+    do print("ceiling: the right answer is among the candidates for " ++ str(reach) ++ " of " ++ str(len(train)) ++ " (learn half), " ++ str(reachv) ++ " of " ++ str(len(val)) ++ " (check half)")
+    # several starts (the hand rule, everything equal, no votes): the best on the learn half wins
+    # text reached / candidates reached, over all questions
+    let nt = 0
+    let nc = 0
+    for d in data {
+      if d[3] { let nt = nt + 1 }
+      let has = false
+      for c in d[0] {
+        if hit(c, d[2]) { let has = true }
+      }
+      if has { let nc = nc + 1 }
+    }
+    do print("the answer is in the text Pi read for " ++ str(nt) ++ " of " ++ str(len(data)) ++ " questions, among its candidates for " ++ str(nc))
+    # the extraction gap, listed: in the text, not a candidate
+    let gap = []
+    for i in range(0, len(data)) {
+      let d = data[i]
+      let has = false
+      for c in d[0] {
+        if hit(c, d[2]) { let has = true }
+      }
+      if d[3] and has == false { let gap = append(gap, exam[i][0] ++ "  [key: " ++ d[2] ++ "]  kind " ++ kind_of(exam[i][0])) }
+    }
+    do write_file("out\\gap.txt", join(gap, "\n"))
+    # learn only where learning is possible: training questions whose answer is among the candidates
+    let trainr = []
+    for d in train {
+      let has = false
+      for c in d[0] {
+        if hit(c, d[2]) { let has = true }
+      }
+      if has { let trainr = append(trainr, d) }
+    }
+    let train = trainr
+    # what the slots alone are worth: over reachable questions whose relation the slots cover, and the rest
+    if has_arg("slots") and has_arg("diag") {
+      let cov = []
+      let unc = []
+      for i in range(0, len(data)) {
+        let d = data[i]
+        let has = false
+        for c in d[0] {
+          if hit(c, d[2]) { let has = true }
+        }
+        if has and len(d[0]) >= 2 {
+          if sl_rel(exam[i][0]) >= 0 { let cov = append(cov, d) } else { let unc = append(unc, d) }
+        }
+      }
+      for nw in [["votes", rule], ["slot win", [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]], ["slot positive", [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]], ["votes+slot win", [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]], ["votes+2 slot win", [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0]], ["v1 weights", [16, 0, 0, 8, 0, 0, 0, 0, 16, 0, 0, 0, 0]], ["v1+slot win 8", [16, 0, 0, 8, 0, 0, 0, 0, 16, 0, 0, 8, 0]]] {
+        do print("  " ++ nw[0] ++ ": covered " ++ str(accuracy(cov, nw[1])) ++ " of " ++ str(len(cov)) ++ ", uncovered " ++ str(accuracy(unc, nw[1])) ++ " of " ++ str(len(unc)))
+      }
+    }
+    # one weight, chosen on the learn half only: votes + k x slot win (k in 0..16), then checked on the other half
+    if has_arg("slots") and has_arg("diag") {
+      let bk = 0
+      let ba = 0 - 1
+      for k in [0, 1, 2, 3, 4, 6, 8, 16] {
+        let wk = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, k, 0]
+        let a = accuracy(train, wk)
+        do print("  votes + " ++ str(k) ++ " x slot win: learn half " ++ str(a) ++ " of " ++ str(len(train)) ++ ", check half " ++ str(accuracy(val, wk)) ++ " (strict " ++ str(accuracy_exact(val, wk)) ++ ") of " ++ str(len(val)))
+        if a > ba {
+          let ba = a
+          let bk = k
+        }
+      }
+      let wk = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, bk, 0]
+      do print("  CHOSEN ON THE LEARN HALF: k=" ++ str(bk) ++ " -> check half " ++ str(accuracy(val, wk)) ++ ", strict " ++ str(accuracy_exact(val, wk)) ++ " of " ++ str(len(val)))
+      let wv = [16, 0, 0, 8, 0, 0, 0, 0, 16, 0, 0, 0, 0]
+      let bk2 = 0
+      let ba2 = 0 - 1
+      for k in [0, 4, 8, 16, 32, 64] {
+        let a = accuracy(train, [16, 0, 0, 8, 0, 0, 0, 0, 16, 0, 0, k, 0])
+        if a > ba2 {
+          let ba2 = a
+          let bk2 = k
+        }
+      }
+      let wk2 = [16, 0, 0, 8, 0, 0, 0, 0, 16, 0, 0, bk2, 0]
+      # per relation (all reachable questions): the hand rule vs votes + 2 x slot win
+      let ts = templates()
+      for t in ts {
+        let rd = []
+        for i in range(0, len(data)) {
+          if exam[i][2] == t[0] { let rd = append(rd, data[i]) }
+        }
+        let a0 = accuracy(rd, rule)
+        let a2 = accuracy(rd, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0])
+        if a0 != a2 { do print("    " ++ t[0] ++ ": " ++ str(a0) ++ " -> " ++ str(a2) ++ " of " ++ str(len(rd))) }
+      }
+      # a fair split: by round (every relation in both halves), k chosen on rounds 0, 2, 4..., checked on 1, 3, 5...
+      let ra = []
+      let rb = []
+      for i in range(0, len(data)) {
+        if (i // len(ts)) % 2 == 0 { let ra = append(ra, data[i]) } else { let rb = append(rb, data[i]) }
+      }
+      let bk3 = 0
+      let ba3 = 0 - 1
+      for k in [0, 1, 2, 3, 4, 6, 8] {
+        let a = accuracy(ra, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, k, 0])
+        if a > ba3 {
+          let ba3 = a
+          let bk3 = k
+        }
+      }
+      let wk3 = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, bk3, 0]
+      do print("  FAIR SPLIT (by round): votes " ++ str(accuracy(ra, rule)) ++ " / " ++ str(accuracy(rb, rule)) ++ " (strict " ++ str(accuracy_exact(rb, rule)) ++ ") of " ++ str(len(ra)) ++ " / " ++ str(len(rb)) ++ "; k=" ++ str(bk3) ++ " chosen on the first -> " ++ str(ba3) ++ " / " ++ str(accuracy(rb, wk3)) ++ " (strict " ++ str(accuracy_exact(rb, wk3)) ++ ")")
+      do print("  v1 weights: check half " ++ str(accuracy(val, wv)) ++ ", strict " ++ str(accuracy_exact(val, wv)) ++ "; v1 + slot win (k=" ++ str(bk2) ++ ", chosen on the learn half): check half " ++ str(accuracy(val, wk2)) ++ ", strict " ++ str(accuracy_exact(val, wk2)))
+    }
+    let wts = rule
+    if has_arg("perc") == false or has_arg("diag") { let wts = fit(train, rule) }
+    let starts = [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0], [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0], [0, 2, 1, 2, 4, 1, 1, 1, 2, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 1], [16, 0, 0, 8, 0, 0, 0, 0, 16, 0, 0, 8, 2]]
+    let s2 = []
+    for st in starts {
+      let x = st
+      while len(x) < nfeat { let x = append(x, 0) }
+      let s2 = append(s2, x)
+    }
+    let starts = s2
+    if has_arg("prior") {
+      # what the prior alone and with the votes is worth, on the check half
+      for pw in [[0, 1], [1, 1], [1, 2], [1, 4]] {
+        let w = [pw[0]]
+        while len(w) < nfeat - 1 { let w = append(w, 0) }
+        let w = append(w, pw[1])
+        do print("  votes " ++ str(w[0]) ++ " + prior " ++ str(w[nfeat - 1]) ++ ": learn " ++ str(accuracy(train, w)) ++ ", check " ++ str(accuracy(val, w)) ++ " (strict " ++ str(accuracy_exact(val, w)) ++ ")")
+      }
+    }
+    if has_arg("perc") and has_arg("diag") == false { let starts = [] }
+    for st in starts {
+      let w2 = fit(train, st)
+      if accuracy(train, w2) > accuracy(train, wts) { let wts = w2 }
+    }
+    if has_arg("perc") {
+      let nf = len(rule)
+      let eps = [10]
+      if has_arg("diag") { let eps = [5, 10, 20] }
+      for ep in eps {
+        let wp = perc(train, nf, ep)
+        do print("  perceptron " ++ str(ep) ++ " epochs: learn " ++ str(accuracy(train, wp)) ++ ", check " ++ str(accuracy(val, wp)) ++ " (strict " ++ str(accuracy_exact(val, wp)) ++ ")  w " ++ join(map_str(wp), " "))
+      }
+      # Pi's learner from here on: the averaged perceptron, 10 epochs (check half 108 / strict 96 vs coordinate
+      # ascent 101 / 93 on the same cached features; equal on the learn half)
+      let wts = perc(train, nf, 10)
+      # famous vs the rest, on the check half: learned without famous practice vs with it
+      if len(data) > nreg {
+        let trr = []
+        let vf = []
+        let vr = []
+        for i in range(0, len(data)) {
+          if (i // nrel) % 2 == 1 {
+            if i >= nreg { let vf = append(vf, data[i]) } else { let vr = append(vr, data[i]) }
+          }
+        }
+        for d in train {
+          let isreg = false
+          for i in range(0, nreg) {
+            if isreg == false {
+              if d[2] == data[i][2] and len(d[0]) == len(data[i][0]) { let isreg = true }
+            }
+          }
+          if isreg { let trr = append(trr, d) }
+        }
+        let wr = perc(trr, nf, 10)
+        do print("  FAMOUS check questions: " ++ str(len(vf)) ++ " -- learned without famous practice " ++ str(accuracy(vf, wr)) ++ " (strict " ++ str(accuracy_exact(vf, wr)) ++ "), with it " ++ str(accuracy(vf, wts)) ++ " (strict " ++ str(accuracy_exact(vf, wts)) ++ ")")
+        let wf = [1]
+        while len(wf) < nf { let wf = append(wf, 0) }
+        let wf = slice(wf, 0, 15) ++ [64] ++ slice(wf, 16, nf)
+        do print("  SENTENCE FINDER alone (ties by votes): famous " ++ str(accuracy(vf, wf)) ++ " of " ++ str(len(vf)) ++ ", regular " ++ str(accuracy(vr, wf)) ++ " of " ++ str(len(vr)))
+        do print("  regular check questions: " ++ str(len(vr)) ++ " -- without " ++ str(accuracy(vr, wr)) ++ ", with " ++ str(accuracy(vr, wts)))
+      }
+    }
+    do write_file("out\\weights.txt", join(map_str(wts), " "))
+    let out = "practice exam: " ++ str(len(data)) ++ " questions written by Pi; learned on " ++ str(len(train)) ++ ", checked on " ++ str(len(val)) ++ " it did not learn on\n"
+    let out = out ++ "  hand rule:       learn half " ++ str(accuracy(train, rule)) ++ " of " ++ str(len(train)) ++ ", check half " ++ str(accuracy(val, rule)) ++ " of " ++ str(len(val)) ++ "\n"
+    let out = out ++ "  learned weights: learn half " ++ str(accuracy(train, wts)) ++ " of " ++ str(len(train)) ++ ", check half " ++ str(accuracy(val, wts)) ++ " of " ++ str(len(val)) ++ "\n"
+    let out = out ++ "  strictly (exactly the key's words), check half: hand rule " ++ str(accuracy_exact(val, rule)) ++ ", learned " ++ str(accuracy_exact(val, wts)) ++ " of " ++ str(len(val)) ++ "\n"
+    # Pi's own record of where research loses points (self.pi reads it): over all questions, with the learned weights
+    let chosen = accuracy(data, wts)
+    let strict = accuracy_exact(data, wts)
+    do write_file("out\\research_diag.txt", "questions " ++ str(len(data)) ++ "\nin_text " ++ str(nt) ++ "\ncandidates " ++ str(nc) ++ "\nchosen " ++ str(chosen) ++ "\nstrict " ++ str(strict) ++ "\n")
+    let names = feat_names()
+    let ws = []
+    for i in range(0, len(wts)) {
+      if wts[i] > 0 { let ws = append(ws, names[i] ++ " " ++ str(wts[i])) }
+    }
+    return out ++ "  weights Pi chose: " ++ join(ws, ", ") ++ "  (out\\weights.txt)"
+  }
+  if arg(1) == "practice" {
+    let n = 65
+    if arg(2) != null and arg(2) != "plain" and arg(2) != "typed" { let n = num(arg(2)) }
+    let ft = read_file("out\\facts.txt")
+    if ft == null { return "no out\\facts.txt" }
+    let fl = split(ft, "\n")
+    let exam = make_exam(fl, n)
+    let types = null
+    if has_arg("typed") { let types = name_types(fl) }
+    if has_arg("cued") and types != null { let types = append(types, load_cues()) }
+    let right = 0
+    let out = ""
+    for qa in exam {
+      let mk = mark()
+      let a = release(mk, answer_t(qa[0], types))
+      let ok = hit(a[0], qa[1])
+      if ok { let right = right + 1 }
+      let tag = "  wrong"
+      if ok { let tag = "  right" }
+      let out = out ++ tag ++ "  " ++ qa[0] ++ " -> " ++ str(a[0]) ++ "   [key: " ++ qa[1] ++ "]\n"
+    }
+    do write_file("out\\practice.txt", out)
+    return "practice exam (written by Pi from its facts; web answers only): " ++ str(right) ++ " of " ++ str(len(exam)) ++ " right (out\\practice.txt)"
+  }
+  if arg(1) == "test" {
+    let qs = [["What is the capital of Australia?", "Canberra"], ["Who discovered penicillin?", "Fleming"], ["When was the Eiffel Tower completed?", "1889"], ["Who wrote Pride and Prejudice?", "Austen"], ["What is the largest planet in the Solar System?", "Jupiter"], ["When did the Berlin Wall fall?", "1989"], ["Who painted the Mona Lisa?", "Leonardo"], ["What is the chemical symbol for gold?", "Au"], ["How many bones are in the adult human body?", "206"], ["Who was the first person to walk on the Moon?", "Armstrong"], ["What is the capital of Canada?", "Ottawa"], ["When was the Declaration of Independence signed?", "1776"], ["Who developed the theory of general relativity?", "Einstein"], ["What is the longest river in Africa?", "Nile"], ["How many players does a soccer team have on the field?", "11"], ["Who invented the telephone?", "Bell"], ["When did World War II end?", "1945"], ["What is the hardest natural substance?", "Diamond"], ["Who composed the Moonlight Sonata?", "Beethoven"], ["What is the speed of light in kilometres per second?", "299,792"]]
+    let ft = read_file("out\\facts.txt")
+    let facts = null
+    if ft != null { let facts = split(ft, "\n") }
+    let types = null
+    if has_arg("typed") and facts != null { let types = name_types(facts) }
+    if has_arg("cued") and types != null { let types = append(types, load_cues()) }
+    let rw = 0
+    let rk = 0
+    let nk = 0
+    let rc = 0
+    let agree = 0
+    let out = ""
+    for qa in qs {
+      let mk = mark()
+      let a = answer_t(qa[0], types)
+      let kn = knowledge(qa[0], facts)
+      # with the word "learned": the weights Pi fitted on its practice exam choose among the candidates
+      let pick = a[0]
+      if has_arg("learned") and len(a) > 4 {
+        let lw = load_weights()
+        if lw != null and len(a[4]) > 0 { let pick = a[4][choose(a[5], lw)] }
+      }
+      let r = release(mk, [pick, kn])
+      let web = r[0]
+      let kv = null
+      if len(r[1]) > 0 { let kv = r[1][0][2] }
+      let both = web
+      if kv != null { let both = kv }
+      let okw = hit(web, qa[1])
+      let okk = hit(kv, qa[1])
+      let okc = hit(both, qa[1])
+      if okw { let rw = rw + 1 }
+      if kv != null { let nk = nk + 1 }
+      if okk { let rk = rk + 1 }
+      if okc { let rc = rc + 1 }
+      let note = ""
+      if kv != null and web != null {
+        if hit(web, kv) or hit(kv, web) {
+          let agree = agree + 1
+          let note = "  (web and knowledge agree)"
+        } else { let note = "  (web says " ++ web ++ ", knowledge says " ++ kv ++ ")" }
+      }
+      let tag = "  wrong"
+      if okc { let tag = "  right" }
+      let out = out ++ tag ++ "  " ++ qa[0] ++ " -> " ++ str(both) ++ note ++ "\n"
+    }
+    let out = out ++ "web only: " ++ str(rw) ++ " of " ++ str(len(qs)) ++ " right\n"
+    let out = out ++ "Pi's knowledge: had a fact for " ++ str(nk) ++ " questions, " ++ str(rk) ++ " right\n"
+    let out = out ++ "together (knowledge first, else web): " ++ str(rc) ++ " of " ++ str(len(qs)) ++ " right; web and knowledge agreed on " ++ str(agree)
+    return out ++ "\n(answer key used only to score)"
+  }
+  let q = arg(1)
+  if q == null { return "usage: research.exe \"question\" | test" }
+  if has_arg("why") {
+    let types = null
+    if has_arg("typed") {
+      let ft = read_file("out\\facts.txt")
+      let types = name_types(split(ft, "\n"))
+      if has_arg("cued") { let types = append(types, load_cues()) }
+    }
+    let a = answer_t(q, types)
+    return "answer: " ++ str(a[0])
+  }
+  let a = ask(q)
+  if a[0] == null { return "Pi could not find an answer to: " ++ q }
+  let ev = a[2]
+  if len(ev) > 260 { let ev = slice(ev, 0, 260) ++ "..." }
+  return "Q: " ++ q ++ "\nA: " ++ a[0] ++ "   (" ++ a[1] ++ ")\nevidence: " ++ ev ++ "\nsource: " ++ a[3]
+}
+
+# digits -> an integer (num gives a real, which cannot index an array)
+skill int_of(s) -> Any {
+  let v = 0
+  for i in range(0, len(s)) {
+    let c = ord(slice(s, i, i + 1))
+    if c >= 48 and c <= 57 { let v = v * 10 + (c - 48) }
+  }
+  return v
+}

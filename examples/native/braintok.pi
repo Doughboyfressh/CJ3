@@ -1,0 +1,350 @@
+# The brain's tokenizer, in Pi: Ornith's byte-level BPE read from its own GGUF file -- 248,320 tokens, 247,587 merge
+# rules, and the qwen35 pre-tokenizer pattern written out as a scanner (no regex engine, no outside library).
+#   tk = tk_load(path)      -> [byte -> token id, merge table keys, ranks, results]   (~2 s)
+#   tk_encode(tk, text)     -> token ids
+# Merges live in an open-addressing hash table over integers: key id(a) x 2^18 + id(b) -> (rank, id(ab)), so encoding
+# never compares strings. Pre-tokenizing follows the pattern's alternatives in order:
+#   's 't 're 've 'm 'll 'd | [^\r\n L N]?[L M]+ | N | " "?[^\s L M N]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+import "ggufl.pi"
+
+skill tk_H() -> Any { return 524288 }
+
+skill tk_hash_bytes(a, p, n) -> Any {
+  let h = 7
+  let i = 0
+  while i < n {
+    let h = (h * 131 + aget(a, p + i)) % 2147483647
+    let i = i + 1
+  }
+  return h
+}
+
+# the token whose text is the bytes qa[qp .. qp+qn) (texts in hb at tpos / tlen) -> id, or -1
+skill tk_find(tt, tpos, tlen, hb, qa, qp, qn) -> Any {
+  let H = tk_H()
+  let i = tk_hash_bytes(qa, qp, qn) % H
+  while true {
+    let v = aget(tt, i)
+    if v == 0 { return 0 - 1 }
+    let id = v - 1
+    if aget(tlen, id) == qn {
+      let tq = aget(tpos, id)
+      let k = 0
+      let same = true
+      while same and k < qn {
+        if aget(hb, tq + k) != aget(qa, qp + k) { let same = false }
+        let k = k + 1
+      }
+      if same { return id }
+    }
+    let i = (i + 1) % H
+  }
+  return 0 - 1
+}
+
+# byte-level BPE writes every byte as one character: printable bytes as themselves, the other 68 as 256 ...
+skill tk_byte_cp(v) -> Any {
+  if (v >= 33 and v <= 126) or (v >= 161 and v <= 172) or (v >= 174 and v <= 255) { return v }
+  if v <= 32 { return 256 + v }
+  if v <= 160 { return 256 + 33 + v - 127 }
+  return 256 + 67
+}
+
+skill tk_load(path) -> Any {
+  let H = tk_H()
+  let bid = arr(256)
+  let mk = arr(H)
+  let mr = arr(H)
+  let mi = arr(H)
+  let mm = mark()
+  let b = read_bytes(path, 0, 64000000)
+  let nkv = u64(b, 16)
+  let p = 24
+  let tp = 0
+  let ntok = 0
+  let mp = 0
+  let nmer = 0
+  for i in range(0, nkv) {
+    let kl = u64(b, p)
+    let key = arr_text(b, p + 8, p + 8 + kl)
+    let vt = u32(b, p + 8 + kl)
+    if key == "tokenizer.ggml.tokens" {
+      let tp = p + 24 + kl
+      let ntok = u64(b, p + 16 + kl)
+    }
+    if key == "tokenizer.ggml.merges" {
+      let mp = p + 24 + kl
+      let nmer = u64(b, p + 16 + kl)
+    }
+    let p = value(b, p + 12 + kl, vt)[1]
+  }
+  # every token's text by its hash
+  let tpos = arr(ntok)
+  let tlen = arr(ntok)
+  let tt = arr(H)
+  let q = tp
+  let id = 0
+  while id < ntok {
+    let sl = u64(b, q)
+    do aset(tpos, id, q + 8)
+    do aset(tlen, id, sl)
+    let i = tk_hash_bytes(b, q + 8, sl) % H
+    while aget(tt, i) != 0 { let i = (i + 1) % H }
+    do aset(tt, i, id + 1)
+    let q = q + 8 + sl
+    let id = id + 1
+  }
+  # the byte tokens
+  let qa = arr(4)
+  for v in range(0, 256) {
+    let cp = tk_byte_cp(v)
+    let n = 1
+    if cp < 128 { do aset(qa, 0, cp) } else {
+      do aset(qa, 0, 192 + cp // 64)
+      do aset(qa, 1, 128 + cp % 64)
+      let n = 2
+    }
+    do aset(bid, v, tk_find(tt, tpos, tlen, b, qa, 0, n))
+  }
+  # the merges "a b" -> (rank, id of ab), keyed by the two ids
+  let tmp = arr(4096)
+  let q = mp
+  let r = 0
+  while r < nmer {
+    let sl = u64(b, q)
+    let s0 = q + 8
+    let sp = 0
+    while sp < sl and aget(b, s0 + sp) != 32 { let sp = sp + 1 }
+    if sp < sl and sl < 4096 {
+      let ia = tk_find(tt, tpos, tlen, b, b, s0, sp)
+      let ib = tk_find(tt, tpos, tlen, b, b, s0 + sp + 1, sl - sp - 1)
+      let k = 0
+      while k < sp {
+        do aset(tmp, k, aget(b, s0 + k))
+        let k = k + 1
+      }
+      let k = 0
+      while k < sl - sp - 1 {
+        do aset(tmp, sp + k, aget(b, s0 + sp + 1 + k))
+        let k = k + 1
+      }
+      let iab = tk_find(tt, tpos, tlen, b, tmp, 0, sl - 1)
+      if ia >= 0 and ib >= 0 and iab >= 0 {
+        let key = ia * 262144 + ib
+        let i = (key * 40503) % H
+        while aget(mk, i) != 0 { let i = (i + 1) % H }
+        do aset(mk, i, key + 1)
+        do aset(mr, i, r)
+        do aset(mi, i, iab)
+      }
+    }
+    let q = q + 8 + sl
+    let r = r + 1
+  }
+  do release(mm, 0)
+  return [bid, mk, mr, mi]
+}
+
+# merging tokens a and b -> [rank, id of ab], or null
+skill tk_merge(tk, a, b) -> Any {
+  let H = tk_H()
+  let key = a * 262144 + b
+  let i = (key * 40503) % H
+  while true {
+    let v = aget(tk[1], i)
+    if v == 0 { return null }
+    if v == key + 1 { return [aget(tk[2], i), aget(tk[3], i)] }
+    let i = (i + 1) % H
+  }
+  return null
+}
+
+# ---- the pre-tokenizer: character classes (1 letter, 2 mark, 3 number, 4 space, 5 \r or \n, 6 anything else) ----
+skill tk_in(cp, a, b) -> Any { return cp >= a and cp <= b }
+
+skill tk_cls(cp) -> Any {
+  if cp < 128 {
+    if tk_in(cp, 65, 90) or tk_in(cp, 97, 122) { return 1 }
+    if tk_in(cp, 48, 57) { return 3 }
+    if cp == 10 or cp == 13 { return 5 }
+    if cp == 32 or tk_in(cp, 9, 12) { return 4 }
+    return 6
+  }
+  if cp == 133 or cp == 160 or cp == 5760 or tk_in(cp, 8192, 8202) or cp == 8232 or cp == 8233 or cp == 8239 or cp == 8287 or cp == 12288 { return 4 }
+  if cp == 170 or cp == 181 or cp == 186 { return 1 }
+  if cp == 178 or cp == 179 or cp == 185 or tk_in(cp, 188, 190) { return 3 }
+  if tk_in(cp, 192, 591) and cp != 215 and cp != 247 { return 1 }
+  if tk_in(cp, 592, 705) or tk_in(cp, 710, 721) or tk_in(cp, 736, 740) or cp == 748 or cp == 750 { return 1 }
+  if tk_in(cp, 768, 879) { return 2 }
+  if tk_in(cp, 880, 1023) and cp != 894 and cp != 903 and cp != 885 and cp != 900 and cp != 901 { return 1 }
+  if tk_in(cp, 1155, 1161) { return 2 }
+  if tk_in(cp, 1024, 1327) and cp != 1154 { return 1 }
+  if tk_in(cp, 1329, 1415) { return 1 }
+  if tk_in(cp, 1425, 1479) { return 2 }
+  if tk_in(cp, 1488, 1522) { return 1 }
+  if tk_in(cp, 1552, 1562) or tk_in(cp, 1611, 1631) { return 2 }
+  if tk_in(cp, 1632, 1641) or tk_in(cp, 1776, 1785) { return 3 }
+  if tk_in(cp, 1568, 1791) { return 1 }
+  if tk_in(cp, 2304, 3583) or tk_in(cp, 3584, 3711) or tk_in(cp, 4256, 4607) { return 1 }
+  if tk_in(cp, 7680, 8188) { return 1 }
+  if cp == 8304 or tk_in(cp, 8308, 8313) or tk_in(cp, 8320, 8329) { return 3 }
+  if cp == 8305 or cp == 8319 or tk_in(cp, 8336, 8348) { return 1 }
+  if cp == 8450 or cp == 8455 or tk_in(cp, 8458, 8467) or cp == 8469 or tk_in(cp, 8473, 8477) or cp == 8484 or cp == 8486 or cp == 8488 or tk_in(cp, 8490, 8493) or tk_in(cp, 8495, 8505) { return 1 }
+  if tk_in(cp, 8528, 8585) or tk_in(cp, 9312, 9371) or tk_in(cp, 9450, 9471) { return 3 }
+  if tk_in(cp, 11264, 11775) { return 1 }
+  if cp == 12295 { return 3 }
+  if cp == 12293 or cp == 12294 { return 1 }
+  if cp == 12441 or cp == 12442 { return 2 }
+  if tk_in(cp, 12353, 12438) or tk_in(cp, 12445, 12447) or tk_in(cp, 12449, 12538) or tk_in(cp, 12540, 12543) { return 1 }
+  if tk_in(cp, 12549, 12591) or tk_in(cp, 12593, 12686) or tk_in(cp, 13312, 19903) or tk_in(cp, 19968, 40959) { return 1 }
+  if tk_in(cp, 40960, 42124) or tk_in(cp, 44032, 55203) or tk_in(cp, 63744, 64255) { return 1 }
+  if tk_in(cp, 64256, 64262) or tk_in(cp, 64285, 65023) or tk_in(cp, 65136, 65276) { return 1 }
+  if tk_in(cp, 65296, 65305) { return 3 }
+  if tk_in(cp, 65313, 65338) or tk_in(cp, 65345, 65370) or tk_in(cp, 65382, 65500) { return 1 }
+  if tk_in(cp, 120782, 120831) { return 3 }
+  if tk_in(cp, 119808, 120781) or tk_in(cp, 131072, 262143) { return 1 }
+  return 6
+}
+
+# the text's bytes as an integer array
+skill tk_bytes(s) -> Any {
+  let n = len(s)
+  let a = arr(n + 1)
+  let i = 0
+  while i < n {
+    do aset(a, i, ord(slice(s, i, i + 1)))
+    let i = i + 1
+  }
+  return a
+}
+
+# UTF-8 bytes -> [code points, their byte offsets (one more at the end), classes, count]
+skill tk_chars(a, nb) -> Any {
+  let cps = arr(nb + 1)
+  let off = arr(nb + 2)
+  let cls = arr(nb + 1)
+  let i = 0
+  let n = 0
+  while i < nb {
+    let c = aget(a, i)
+    let cp = c
+    let w = 1
+    if c >= 240 and i + 3 < nb {
+      let cp = (c - 240) * 262144 + (aget(a, i + 1) - 128) * 4096 + (aget(a, i + 2) - 128) * 64 + aget(a, i + 3) - 128
+      let w = 4
+    } else {
+      if c >= 224 and i + 2 < nb {
+        let cp = (c - 224) * 4096 + (aget(a, i + 1) - 128) * 64 + aget(a, i + 2) - 128
+        let w = 3
+      } else {
+        if c >= 192 and i + 1 < nb {
+          let cp = (c - 192) * 64 + aget(a, i + 1) - 128
+          let w = 2
+        }
+      }
+    }
+    do aset(cps, n, cp)
+    do aset(off, n, i)
+    do aset(cls, n, tk_cls(cp))
+    let n = n + 1
+    let i = i + w
+  }
+  do aset(off, n, nb)
+  return [cps, off, cls, n]
+}
+
+skill tk_low(cp) -> Any {
+  if tk_in(cp, 65, 90) { return cp + 32 }
+  return cp
+}
+
+# the end (in characters) of the pre-token that starts at character j
+skill tk_next(d, j) -> Any {
+  let cps = d[0]
+  let cls = d[2]
+  let n = d[3]
+  let c = aget(cls, j)
+  let cp = aget(cps, j)
+  # 's 't 're 've 'm 'll 'd
+  if cp == 39 and j + 1 < n {
+    let x = tk_low(aget(cps, j + 1))
+    if x == 115 or x == 116 or x == 109 or x == 100 { return j + 2 }
+    if j + 2 < n {
+      let y = tk_low(aget(cps, j + 2))
+      if (x == 114 and y == 101) or (x == 118 and y == 101) or (x == 108 and y == 108) { return j + 3 }
+    }
+  }
+  # [^\r\n L N]? [L M]+
+  let lead = c != 5 and c != 1 and c != 3
+  if (lead and j + 1 < n and (aget(cls, j + 1) == 1 or aget(cls, j + 1) == 2)) or c == 1 or c == 2 {
+    let e = j + 1
+    while e < n and (aget(cls, e) == 1 or aget(cls, e) == 2) { let e = e + 1 }
+    return e
+  }
+  # a number: one character
+  if c == 3 { return j + 1 }
+  # " "? [^\s L M N]+ [\r\n]*
+  let k = j
+  if cp == 32 and j + 1 < n and aget(cls, j + 1) == 6 { let k = j + 1 }
+  if aget(cls, k) == 6 {
+    let e = k
+    while e < n and aget(cls, e) == 6 { let e = e + 1 }
+    while e < n and aget(cls, e) == 5 { let e = e + 1 }
+    return e
+  }
+  # whitespace: up to the last \r / \n of the run; else the run (leaving its last space to the next word)
+  let e = j
+  let lastnl = 0 - 1
+  while e < n and (aget(cls, e) == 4 or aget(cls, e) == 5) {
+    if aget(cls, e) == 5 { let lastnl = e }
+    let e = e + 1
+  }
+  if lastnl >= 0 { return lastnl + 1 }
+  if e == n { return e }
+  if e - j >= 2 { return e - 1 }
+  return e
+}
+
+# one pre-token's bytes a[bp .. be) -> token ids (merge the lowest-ranked pair until none applies)
+skill tk_bpe(tk, a, bp, be) -> Any {
+  let ids = []
+  let k = bp
+  while k < be {
+    let ids = append(ids, aget(tk[0], aget(a, k)))
+    let k = k + 1
+  }
+  let done = false
+  while done == false and len(ids) > 1 {
+    let best = 0 - 1
+    let bestr = 0
+    let bestid = 0
+    let k = 0
+    while k < len(ids) - 1 {
+      let f = tk_merge(tk, ids[k], ids[k + 1])
+      if f != null {
+        if best < 0 or f[0] < bestr {
+          let best = k
+          let bestr = f[0]
+          let bestid = f[1]
+        }
+      }
+      let k = k + 1
+    }
+    if best < 0 { let done = true } else { let ids = slice(ids, 0, best) ++ [bestid] ++ slice(ids, best + 2, len(ids)) }
+  }
+  return ids
+}
+
+skill tk_encode(tk, s) -> Any {
+  let a = tk_bytes(s)
+  let d = tk_chars(a, len(s))
+  let off = d[1]
+  let out = []
+  let j = 0
+  while j < d[3] {
+    let e = tk_next(d, j)
+    let out = out ++ tk_bpe(tk, a, aget(off, j), aget(off, e))
+    let j = e
+  }
+  return out
+}

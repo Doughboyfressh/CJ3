@@ -1,0 +1,42 @@
+# nerfcheck: proof that the differentiable volume renderer's gradients are correct. Random per-sample density+colour
+# logits -> composited pixels -> MSE to a random target; every analytic gradient is checked against finite differences.
+import "grad.pi"
+
+skill set_at(xs, i, v) -> Any { return slice(xs, 0, i) ++ [v] ++ slice(xs, i + 1, len(xs)) }
+
+skill main() -> Any {
+  let G = g_open()
+  let st = arr(1)
+  aset(st, 0, 99)
+  let Nr = 5
+  let M = 6
+  let delta = 0.15
+  let bg = 1.0
+  let dbuf = g_const_delta(Nr, delta)
+  let raw = g_param(G, Nr * M, 4)
+  g_randn(raw, st, 0.8)
+  let tgt = g_set(g_tensor(Nr, 3), g_randn_list(st, Nr * 3, 0.3))
+
+  let eps = 0.003
+  let worst = 0.0
+  for idx in [0, 1, 2, 3, 4, 7, 13, 40, 41, 83, 100, 117] {
+    g_zero_grad(G)
+    do g_mse(G, g_volrender(G, raw, M, dbuf, bg), tgt)
+    g_backward(G)
+    let g = g_get(raw, 1)[idx]
+    let base = g_get(raw, 0)
+    g_set(raw, set_at(base, idx, base[idx] + eps))
+    g_zero_grad(G)
+    let lp = g_mse(G, g_volrender(G, raw, M, dbuf, bg), tgt)
+    g_set(raw, set_at(base, idx, base[idx] - eps))
+    g_zero_grad(G)
+    let lm = g_mse(G, g_volrender(G, raw, M, dbuf, bg), tgt)
+    g_set(raw, base)
+    let fd = (lp - lm) / (2.0 * eps)
+    let rel = abs(fd - g) / (abs(g) + 0.001)
+    if rel > worst { worst = rel }
+    print("  idx " ++ str(idx) ++ "  analytic " ++ format("{:.5f}", g) ++ "  numeric " ++ format("{:.5f}", fd) ++ "  rel.err " ++ format("{:.4f}", rel))
+  }
+  print("worst relative error: " ++ format("{:.4f}", worst) ++ (if worst < 0.05 { "  VOLUME-RENDER GRADIENTS OK" } else { "  BAD" }))
+  return 0
+}

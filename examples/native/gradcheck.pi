@@ -1,0 +1,79 @@
+# gradcheck: proof that Pi's GPU autograd is correct. A 2-layer SIREN; every analytic gradient is checked against a
+# finite-difference estimate (they must agree), then the net is trained to fit a known function and the loss must fall.
+import "grad.pi"
+
+skill set_at(xs, i, v) -> Any { return slice(xs, 0, i) ++ [v] ++ slice(xs, i + 1, len(xs)) }
+
+skill fwd(G, P, x) -> Any {
+  let h = g_dense(G, x, P[0], P[1], "sin", 6.0)
+  return g_dense(G, h, P[2], P[3], "", 0.0)
+}
+
+skill target(x0, x1) -> Any { return 0.5 * sin(3.0 * x0) + 0.3 * x1 * x1 - 0.2 }
+
+skill main() -> Any {
+  let G = g_open()
+  let st = arr(1)
+  aset(st, 0, 20260104)
+  let din = 2
+  let hid = 24
+  let B = 12
+  let w1 = g_param(G, din, hid)
+  let b1 = g_param(G, 1, hid)
+  let w2 = g_param(G, hid, 1)
+  let b2 = g_param(G, 1, 1)
+  g_randn(w1, st, 0.7)
+  g_randn(b1, st, 0.1)
+  g_randn(w2, st, 0.5)
+  g_randn(b2, st, 0.1)
+  let P = [w1, b1, w2, b2]
+
+  # fixed inputs and their targets
+  let xs = g_randn_list(st, B * din, 0.6)
+  let x = g_set(g_tensor(B, din), xs)
+  let ys = []
+  for r in range(0, B) { ys = append(ys, target(xs[r * din], xs[r * din + 1])) }
+  let tgt = g_set(g_tensor(B, 1), ys)
+
+  g_zero_grad(G)
+  let L0 = g_mse(G, fwd(G, P, x), tgt)
+  g_backward(G)
+  print("loss at start: " ++ format("{:.6f}", L0))
+
+  # finite-difference check on a spread of entries of w1, w2, b1, b2. The analytic gradient is recomputed fresh for
+  # each pick (a forward+backward), because the FD estimate itself runs forward passes that clear the gradients.
+  let eps = 0.004
+  let worst = 0.0
+  for pick in [[w1, 0], [w1, 7], [w1, 23], [w1, 40], [w2, 0], [w2, 11], [b1, 3], [b2, 0]] {
+    let t = pick[0]
+    let idx = pick[1]
+    g_zero_grad(G)
+    do g_mse(G, fwd(G, P, x), tgt)
+    g_backward(G)
+    let g = g_get(t, 1)[idx]
+    let base = g_get(t, 0)
+    g_set(t, set_at(base, idx, base[idx] + eps))
+    g_zero_grad(G)
+    let lp = g_mse(G, fwd(G, P, x), tgt)
+    g_set(t, set_at(base, idx, base[idx] - eps))
+    g_zero_grad(G)
+    let lm = g_mse(G, fwd(G, P, x), tgt)
+    g_set(t, base)
+    let fd = (lp - lm) / (2.0 * eps)
+    let rel = abs(fd - g) / (abs(g) + 0.001)
+    if rel > worst { worst = rel }
+    print("  analytic " ++ format("{:.5f}", g) ++ "  numeric " ++ format("{:.5f}", fd) ++ "  rel.err " ++ format("{:.4f}", rel))
+  }
+  print("worst relative error: " ++ format("{:.4f}", worst) ++ (if worst < 0.05 { "  GRADIENTS OK" } else { "  BAD" }))
+
+  # train it to fit the function
+  let opt = g_opt(G, 0.02)
+  for step in range(0, 1201) {
+    g_zero_grad(G)
+    let L = g_mse(G, fwd(G, P, x), tgt)
+    g_backward(G)
+    g_step(G, opt)
+    if step % 200 == 0 { print("step " ++ str(step) ++ "  loss " ++ format("{:.6f}", L)) }
+  }
+  return 0
+}

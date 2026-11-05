@@ -1,0 +1,27 @@
+# several parameters, * // % with Pi's floor semantics on negatives, and / or / not
+skill gcd(a, b) -> Any {
+  if b == 0 { return a }
+  return gcd(b, a % b)
+}
+
+skill fact(n) -> Any {
+  let r = 1
+  for i in range(2, n + 1) { let r = r * i }
+  return r
+}
+
+skill collatz(n) -> Any {
+  let steps = 0
+  while n != 1 {
+    if n % 2 == 0 { let n = n // 2 } else { let n = 3 * n + 1 }
+    let steps = steps + 1
+  }
+  return steps
+}
+
+skill main() -> Any {
+  let flags = 0
+  if gcd(12, 18) == 6 and not (fact(3) == 7) { let flags = flags + 1 }
+  if 1 > 2 or 3 < 4 { let flags = flags + 1 }
+  return gcd(1071, 462) * 1000000 + fact(10) % 1000 * 1000 + collatz(27) + (0 - 7) // 2 + (0 - 7) % 3 + flags
+}

@@ -1,0 +1,61 @@
+# The hardware in the language itself (pic desugars these; no worker code, no regions, no chunking by hand):
+#   par for x in xs -> v { B }   all cores: worker processes take the items, v comes back as a list in order
+#   for x in xs free { B }       each pass is its own memory region (RAM stays flat however long the loop)
+#   for line in lines(path) { }  the file streamed from the SSD 8 MB at a time
+#   out\hwlang.exe
+
+skill count_primes(a, b) -> Any {
+  let c = 0
+  let n = a
+  while n < b {
+    if n >= 2 {
+      let isp = true
+      let d = 2
+      while d * d <= n and isp {
+        if n % d == 0 { let isp = false }
+        let d = d + 1
+      }
+      if isp { let c = c + 1 }
+    }
+    let n = n + 1
+  }
+  return c
+}
+
+skill main() -> Any {
+  let out = []
+  # 1. par for (first: a worker re-runs the program up to its loop, so loops come before slow setup): primes below 4,000,000 in 40 ranges -- serial, then on all workers
+  let rs = []
+  for k in range(0, 40) { let rs = append(rs, [k * 100000, (k + 1) * 100000]) }
+  let tp = ticks()
+  par for r in rs -> c {
+    let c = count_primes(r[0], r[1])
+  }
+  let par_ms = ticks() - tp
+  let tq = ticks()
+  let ser = 0
+  for r in rs { let ser = ser + count_primes(r[0], r[1]) }
+  let ser_ms = ticks() - tq
+  let tot = 0
+  for x in c { let tot = tot + x }
+  let out = append(out, "par for: primes below 4M serial " ++ str(ser) ++ " in " ++ str(ser_ms) ++ " ms, par " ++ str(tot) ++ " in " ++ str(par_ms) ++ " ms (" ++ str(par_workers()) ++ " workers), same answer: " ++ str(ser == tot))
+  # 2. streaming: every line of facts.txt, never all in memory
+  let t0 = ticks()
+  let m0 = memused()
+  let n = 0
+  let chars = 0
+  for line in lines("out\\facts.txt") {
+    let n = n + 1
+    let chars = chars + len(line)
+  }
+  let out = append(out, "lines(): " ++ str(n) ++ " lines, " ++ str(chars) ++ " chars in " ++ str(ticks() - t0) ++ " ms, memory grew " ++ str((memused() - m0) // 1000000) ++ " MB")
+  # 3. free: a million passes that each build text; with free the memory does not grow
+  let m1 = memused()
+  let total = 0
+  for i in range(0, 1000000) free {
+    let s = "item " ++ str(i) ++ " of a long loop"
+    let total = total + len(s)
+  }
+  let out = append(out, "free: 1,000,000 passes, total " ++ str(total) ++ ", memory grew " ++ str((memused() - m1) // 1000000) ++ " MB")
+  return join(out, "\n")
+}

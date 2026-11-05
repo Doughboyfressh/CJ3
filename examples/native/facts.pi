@@ -1,0 +1,79 @@
+# Pi's fact store, from its own aligned data (data\pairs\wikipedia_pairs.jsonl: Wikidata facts each matched to the
+# Wikipedia sentence that states them) -> out\facts.txt, one "subject ||| relation ||| value" per line, each fact once.
+#   out\facts.exe [megabytes]
+# Bytes are read raw; per line the three fields are cut out by their keys; a hash on flat arrays drops repeats.
+
+skill SRC() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\pairs\\wikipedia_pairs.jsonl" }
+
+# the value after a key ("key": "text" or "key": number) inside one line's text, or null
+skill field(t, key) -> Any {
+  let parts = split(t, "\"" ++ key ++ "\": ")
+  if len(parts) < 2 { return null }
+  let r = parts[1]
+  if slice(r, 0, 1) == "\"" {
+    let e = 1
+    while e < len(r) {
+      if slice(r, e, e + 1) == "\"" and slice(r, e - 1, e) != "\\" { return slice(r, 1, e) }
+      let e = e + 1
+    }
+    return null
+  }
+  if slice(r, 0, 4) == "null" { return null }
+  return split(split(r, ",")[0], "}")[0]
+}
+
+skill main() -> Any {
+  let mb = 1300
+  if arg(1) != null { let mb = num(arg(1)) }
+  let hsz = 8388608
+  let seen = arr(hsz)
+  let chunk = 8000000
+  let off = 0
+  let lines = 0
+  let kept = 0
+  let carry = ""
+  let outs = []
+  while off < mb * 1000000 {
+    let m = mark()
+    let b = read_bytes(SRC(), off, chunk)
+    let n = 0
+    if b != null { let n = len(b) }
+    let text = carry ++ arr_text(b, 0, n)
+    let ls = split(text, "\n")
+    let got = []
+    for i in range(0, len(ls) - 1) {
+      let t = ls[i]
+      let s = field(t, "subject_label")
+      let r = field(t, "relation")
+      let v = field(t, "value")
+      if s != null and r != null and v != null {
+        let line = s ++ " ||| " ++ r ++ " ||| " ++ v
+        let h = 7
+        for k in range(0, len(line)) { let h = (h * 131 + ord(slice(line, k, k + 1))) % 2147483647 }
+        let slot = h % hsz
+        let going = true
+        let fresh = false
+        while going {
+          let have = aget(seen, slot)
+          if have == 0 {
+            do aset(seen, slot, h + 1)
+            let fresh = true
+            let going = false
+          } else {
+            if have == h + 1 { let going = false } else { let slot = (slot + 1) % hsz }
+          }
+        }
+        if fresh { let got = append(got, line) }
+      }
+    }
+    let kept_now = len(got)
+    let keep = release(m, [join(got, "\n"), ls[len(ls) - 1], len(ls) - 1])
+    let carry = keep[1]
+    let lines = lines + keep[2]
+    let kept = kept + kept_now
+    if len(keep[0]) > 0 { let outs = append(outs, keep[0]) }
+    if n < chunk { let off = mb * 1000000 } else { let off = off + chunk }
+  }
+  do write_file("out\\facts.txt", join(outs, "\n"))
+  return "read " ++ str(lines) ++ " aligned facts; kept " ++ str(kept) ++ " distinct -> out\\facts.txt"
+}

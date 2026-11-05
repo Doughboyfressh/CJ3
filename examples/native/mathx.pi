@@ -1,0 +1,14 @@
+# exact math words on reals: sqrt floor ceil round abs and ^ (integer exponent). Checked against the interpreter.
+skill S(x) -> Any { return str(x) ++ "|" }
+skill B(b) -> Any {
+  if b { return "1" }
+  return "0"
+}
+skill main() -> Any {
+  let out = S(sqrt(16)) ++ S(sqrt(0)) ++ S(sqrt(2.25)) ++ B(sqrt(2) > 1.414) ++ B(sqrt(2) < 1.415) ++ B(sqrt(0 - 1) == null)
+  let out = out ++ S(floor(3.7)) ++ S(floor(0 - 3.2)) ++ S(floor(5)) ++ S(ceil(3.2)) ++ S(ceil(0 - 3.7)) ++ S(ceil(4))
+  let out = out ++ S(round(2.5)) ++ S(round(3.5)) ++ S(round(0.5)) ++ S(round(2.4)) ++ S(round(2.6)) ++ S(round(0 - 2.5)) ++ S(round(0 - 3.5))
+  let out = out ++ S(abs(0 - 3.5)) ++ S(abs(3.5)) ++ S(abs(0 - 7)) ++ S(abs(7))
+  let out = out ++ S(2 ^ 10) ++ S(3 ^ 3) ++ S(5 ^ 0) ++ S(10 ^ 1) ++ S(2 ^ (0 - 3)) ++ B(2 ^ (0 - 1) == 0.5)
+  return out
+}

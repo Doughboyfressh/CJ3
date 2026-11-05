@@ -1,0 +1,44 @@
+# ask QUESTION...   (or: ask --fast QUESTION... to answer without thinking): Pi asks its brain
+import "brain.pi"
+
+skill main() -> Any {
+  let fast = arg(1) == "--fast"
+  let hands = arg(1) == "--hands"
+  let cc = arg(1) == "--cachecheck"
+  let words = []
+  let i = 1
+  if fast or hands or cc { let i = 2 }
+  while arg(i) != null {
+    let words = append(words, arg(i))
+    let i = i + 1
+  }
+  let q = join(words, " ")
+  let t0 = ticks()
+  let br = brain_open()
+  if typeof(br) == "text" { return br }
+  let t1 = ticks()
+  # --cachecheck QUESTION: the same question from a full re-read of the prompt and twice from the kept prompt state;
+  # all three must think exactly the same
+  if arg(1) == "--cachecheck" {
+    do dev_reset(br[0])
+    let full = "<|im_start|>system\n" ++ hands_system() ++ "<|im_end|>\n<|im_start|>user\n" ++ with_notes(q) ++ "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    let ta = ticks()
+    let a = hloop(br, brain_feed(br, brain_ids(br, full), 0), 400)
+    let tb = ticks()
+    let b = hthink(br, q, 400)
+    let tc = ticks()
+    let c = hthink(br, q, 400)
+    return "full re-read == kept state: " ++ str(a[6] == slice(b[5], len(b[5]) - len(a[6]), len(b[5]))) ++ "; kept state twice equal: " ++ str(b[5] == c[5]) ++ "\n(full re-read " ++ str(tb - ta) ++ " ms, from the kept state " ++ str(tc - tb) ++ " ms; " ++ str(a[3]) ++ " tokens each)"
+  }
+  if fast {
+    let a = say(br, q, 2000)
+    return a ++ "\n\n(brain ready in " ++ str(t1 - t0) ++ " ms; answered in " ++ str(ticks() - t1) ++ " ms)"
+  }
+  if hands {
+    let r = hthink(br, q, 8000)
+    do write_file("out\\hands_last.txt", r[5])
+    return r[1] ++ "\n\n(brain ready in " ++ str(t1 - t0) ++ " ms; " ++ str(r[2]) ++ " tokens, " ++ str(r[4]) ++ " programs run, " ++ str(ticks() - t1) ++ " ms; the whole thought: out\\hands_last.txt)"
+  }
+  let r = think(br, q, 8000)
+  return r[1] ++ "\n\n(brain ready in " ++ str(t1 - t0) ++ " ms; thought for " ++ str(r[2]) ++ " tokens in " ++ str(ticks() - t1) ++ " ms)"
+}

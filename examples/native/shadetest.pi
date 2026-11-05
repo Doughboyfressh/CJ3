@@ -1,0 +1,34 @@
+# shadetest: the parts of shade.pi and audio.pi that need no GPU: numbers as GPU code spells them, a scene compiled, the
+# messages a mistake gets, the score's arithmetic. (The driver and the pictures are checked by rendering, not here.)
+import "audio.pi"
+
+skill main() -> Any {
+  // exact float32 bit patterns
+  print(sh_f32(1.5))
+  print(sh_f32(0.1))
+  print(sh_f32(0.0 - 2.0))
+  print(sh_f32(0.0))
+  print(sh_f32(100000.0))
+  print(sh_real("2.5e3"))
+  print(sh_real("1.25"))
+  // a scene compiles to functions for each combination of argument types
+  let p = sh_compile("skill scene(p) { return length(p) - 1.0 }\nskill twice(x) { return x + x }\nskill albedo(p, n, id) { return twice(p) * twice(0.5) }")
+  print(len(split(p, ".func (.param .align 4 .b8 func_retval0[12]) f_twice_v (")) - 1)
+  print(len(split(p, ".func (.param .align 4 .b8 func_retval0[4]) f_twice_f (")) - 1)
+  print(contains(p, ".entry pi_render"))
+  print(contains(p, ".entry pi_tone"))
+  // a variable that starts as an integer and later holds a real is a real everywhere
+  let q = sh_compile("skill helper(k) {\n  let x = 0\n  for i in range(0, k) { x = x + 0.5 }\n  return x\n}\nskill emission(p, n, id) { return [helper(3), 0.0, 0.0] }")
+  print(contains(q, "f_helper_i"))
+  print(contains(q, "cvt.rn.f32.s32"))
+  // the score's numbers
+  print(au_milli("1.5"))
+  print(au_milli("0.25"))
+  print(au_milli("-0.18"))
+  print(au_midi_mhz(69))
+  print(au_midi_mhz(60))
+  let n = au_parse("# a comment\n1.0 0.5 69 0.8 piano -0.5\n0.0 2.0 60 0.5 strings\n", 48000)
+  print(n)
+  print(fl_streaminfo(4096, 1000))
+  return 0
+}

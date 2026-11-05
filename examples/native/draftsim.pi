@@ -1,0 +1,94 @@
+# draftsim LOG [k]: how much Pi's drafts (pidraft.pi) would save on a real brain conversation, by replay. The log's
+# own tokens are the truth (greedy decoding gives them again): at each step the draft is checked against them, the
+# agreeing prefix is kept plus the one token the verifying pass gives anyway. Tool responses and the user's lines are
+# fed (prefill), not scored.
+import "braintok.pi"
+import "forwardlib.pi"
+import "pidraft.pi"
+
+# the log as [text, scored] pieces: tool responses and "=== turn" lines are not the brain's words
+skill ds_pieces(text) -> Any {
+  let out = []
+  let parts = split(text, "<tool_response>")
+  for pi_ in range(0, len(parts)) {
+    let brain = parts[pi_]
+    if pi_ > 0 {
+      let rr = split(parts[pi_], "</tool_response>")
+      out ++= [["<tool_response>" ++ rr[0] ++ "</tool_response>", false]]
+      brain = join(slice(rr, 1, len(rr)), "</tool_response>")
+    }
+    // the user's lines ("=== turn N: ...") are fed, not scored
+    let lines = split(brain, "\n")
+    let cur = ""
+    for li in range(0, len(lines)) {
+      let ln = lines[li] ++ (if li < len(lines) - 1 { "\n" } else { "" })
+      if slice(ln, 0, 8) == "=== turn" {
+        if len(cur) > 0 { out ++= [[cur, true]] }
+        cur = ""
+        out ++= [[ln, false]]
+      } else {
+        cur = cur ++ ln
+      }
+    }
+    if len(cur) > 0 { out ++= [[cur, true]] }
+  }
+  return out
+}
+
+skill main() -> Any {
+  let path = if arg(1) != null { arg(1) } else { "out\\flash_chat_log.txt" }
+  let k = if arg(2) != null { int(arg(2)) } else { 4 }
+  let tk = tk_load(MODEL())
+  let ids = []
+  let sc = []
+  for pc in ds_pieces(read_file(path)) {
+    for t in tk_encode(tk, pc[0]) {
+      ids ++= [t]
+      sc ++= [pc[1]]
+    }
+  }
+  let pd = pd_new()
+  let seq = []
+  let i = 0
+  let scored = 0
+  let passes = 0
+  let drafted = 0
+  let acc = 0
+  let hist = arr(k + 2)
+  while i < len(ids) {
+    if not sc[i] {
+      seq ++= [ids[i]]
+      pd_push(pd, seq)
+      i += 1
+    } else {
+      let d = pd_draft(pd, seq, k)
+      let a = 0
+      while a < len(d) and i + a < len(ids) and sc[i + a] and d[a] == ids[i + a] { a += 1 }
+      if len(d) > 0 { drafted += 1 }
+      acc += a
+      aset(hist, a, aget(hist, a) + 1)
+      passes += 1
+      // the accepted tokens and the pass's own next token
+      let take = min(a + 1, len(ids) - i)
+      for j in range(0, take) {
+        seq ++= [ids[i + j]]
+        pd_push(pd, seq)
+        if sc[i + j] { scored += 1 }
+      }
+      i += take
+    }
+  }
+  print("tokens " ++ str(len(ids)) ++ ", the brain's own " ++ str(scored) ++ "; draft length up to " ++ str(k))
+  print("passes " ++ str(passes) ++ " -> " ++ format("{:.2f}", scored * 1.0 / max(passes, 1)) ++ " tokens a pass; a draft offered in " ++ str(drafted) ++ " passes, " ++ str(acc) ++ " draft tokens accepted (" ++ format("{:.2f}", acc * 1.0 / max(drafted, 1)) ++ " a draft)")
+  let hs = []
+  for a in range(0, k + 1) { hs ++= [str(a) ++ ":" ++ str(aget(hist, a))] }
+  print("accepted per pass: " ++ join(hs, " "))
+  // a verify pass of T tokens measured at about 1 + 0.45 (T - 1) one-token passes (no expert grouping yet)
+  let row = "minimum match " ++ str(pd[3]) ++ ": speedup if a verify pass of T costs 1 + s (T - 1):"
+  for sl in [0.45, 0.25, 0.1] {
+    let cost = (passes - drafted) * 1.0 + drafted * (1.0 + sl * k)
+    row = row ++ "  s " ++ str(sl) ++ " -> " ++ format("{:.2f}", scored / cost) ++ "x"
+  }
+  print(row)
+  return 0
+}

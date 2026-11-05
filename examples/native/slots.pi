@@ -1,0 +1,250 @@
+# Grammar step 3 inside the research agent. The answer slots Pi learned from its aligned facts (grammar3.exe save ->
+# out\slots.txt: for each relation, how often a word-before / two-words-before / word-after / place-from-the-subject
+# marked the answer, and how often another name) score WHERE a candidate sits in a sentence, for the relation the
+# question asks about. Nothing here is hand-written grammar: only which question words name which relation.
+
+skill sl_rels() -> Any { return ["place_of_birth", "place_of_death", "date_of_birth", "date_of_death", "director", "author", "founder", "composer", "performer", "producer", "publisher", "developer", "record_label", "country", "capital", "headquarters_location", "spouse", "educated_at", "member_of_political_party", "inception", "creator", "manufacturer", "located_in_the_administrative_territorial_entity", "member_of_sports_team"] }
+
+skill sl_key(w) -> Any {
+  let h = 0
+  for i in range(0, len(w)) { let h = (h * 31 + ord(slice(w, i, i + 1))) % 1000000007 }
+  return h * 64 + len(w) + 1
+}
+
+skill sl_alnum(c) -> Any { return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) }
+
+skill sl_words(s) -> Any {
+  let out = []
+  let n = len(s)
+  let i = 0
+  while i < n {
+    while i < n and sl_alnum(ord(slice(s, i, i + 1))) == false { let i = i + 1 }
+    let a = i
+    while i < n and sl_alnum(ord(slice(s, i, i + 1))) { let i = i + 1 }
+    if i > a { let out = append(out, slice(s, a, i)) }
+  }
+  return out
+}
+
+skill sl_cap(w) -> Any {
+  let c = ord(slice(w, 0, 1))
+  return c >= 65 and c <= 90
+}
+
+skill sl_year(w) -> Any {
+  if len(w) != 4 { return false }
+  for i in range(0, 4) {
+    let c = ord(slice(w, i, i + 1))
+    if c < 48 or c > 57 { return false }
+  }
+  return true
+}
+
+# the vocabulary and its 256 classes (grammar steps 1-2)
+skill sl_tab() -> Any {
+  let vt = read_file("out\\vocab.txt")
+  let ct = read_file("out\\classes.txt")
+  if vt == null or ct == null { return null }
+  let vocab = split(vt, "\n")
+  let cls = arr(len(vocab))
+  let cl = split(ct, "\n")
+  for i in range(0, len(cl)) {
+    let p = split(cl[i], " ")
+    if len(p) == 2 { do aset(cls, i, num(p[1])) }
+  }
+  let hsz = 131072
+  let hk = arr(hsz)
+  let hv = arr(hsz)
+  for i in range(0, len(vocab)) {
+    let k = sl_key(vocab[i])
+    let s = k % hsz
+    while aget(hk, s) != 0 { let s = (s + 1) % hsz }
+    do aset(hk, s, k)
+    do aset(hv, s, i + 1)
+  }
+  return [hk, hv, hsz, cls]
+}
+
+skill sl_wid(tab, w) -> Any {
+  let k = sl_key(lower(w))
+  let s = k % tab[2]
+  while aget(tab[0], s) != 0 {
+    if aget(tab[0], s) == k { return aget(tab[1], s) - 1 }
+    let s = (s + 1) % tab[2]
+  }
+  return 0 - 1
+}
+
+skill sl_tok(tab, w) -> Any {
+  if sl_year(w) { return "Y" }
+  let id = sl_wid(tab, w)
+  if id >= 0 and id < 500 { return "w" ++ lower(w) }
+  if id >= 0 { return "c" ++ str(aget(tab[3], id)) }
+  if sl_cap(w) { return "N" }
+  return "r"
+}
+
+# -> the model [keys, for, against, size, totals for, totals against, vocabulary] or null
+skill sl_load() -> Any {
+  let t = read_file("out\\slots.txt")
+  if t == null { return null }
+  let tab = sl_tab()
+  if tab == null { return null }
+  let ls = split(t, "\n")
+  let nr = len(sl_rels())
+  let totp = arr(nr)
+  let totn = arr(nr)
+  let a = split(ls[0], " ")
+  let b = split(ls[1], " ")
+  for i in range(0, nr) {
+    do aset(totp, i, num(a[i]))
+    do aset(totn, i, num(b[i]))
+  }
+  let hsz = 8388608
+  let hk = arr(hsz)
+  let hp = arr(hsz)
+  let hn = arr(hsz)
+  let i = 2
+  while i < len(ls) {
+    let p = split(ls[i], " ||| ")
+    if len(p) == 3 {
+      let k = sl_key(p[0])
+      let s = k % hsz
+      while aget(hk, s) != 0 and aget(hk, s) != k { let s = (s + 1) % hsz }
+      do aset(hk, s, k)
+      do aset(hp, s, num(p[1]))
+      do aset(hn, s, num(p[2]))
+    }
+    let i = i + 1
+  }
+  return [hk, hp, hn, hsz, totp, totn, tab]
+}
+
+skill sl_has(ws, w) -> Any {
+  for x in ws {
+    if x == w { return true }
+  }
+  return false
+}
+
+# the relation a question asks about, by its words -> index into sl_rels(), or -1
+skill sl_rel(q) -> Any {
+  let ws = sl_words(lower(q))
+  if len(ws) == 0 { return 0 - 1 }
+  let f = ws[0]
+  if sl_has(ws, "born") {
+    if f == "when" { return 2 }
+    return 0
+  }
+  if sl_has(ws, "die") or sl_has(ws, "died") {
+    if f == "when" { return 3 }
+    return 1
+  }
+  if sl_has(ws, "founded") {
+    if f == "when" { return 19 }
+    return 6
+  }
+  if sl_has(ws, "capital") { return 14 }
+  if sl_has(ws, "headquarters") { return 15 }
+  if sl_has(ws, "wrote") or sl_has(ws, "written") or sl_has(ws, "author") { return 5 }
+  if sl_has(ws, "directed") or sl_has(ws, "director") { return 4 }
+  if sl_has(ws, "composed") or sl_has(ws, "composer") { return 7 }
+  if sl_has(ws, "performed") or sl_has(ws, "sang") { return 8 }
+  if sl_has(ws, "produced") or sl_has(ws, "producer") { return 9 }
+  if sl_has(ws, "published") or sl_has(ws, "publisher") { return 10 }
+  if sl_has(ws, "developed") or sl_has(ws, "developer") { return 11 }
+  if sl_has(ws, "label") { return 12 }
+  if sl_has(ws, "married") or sl_has(ws, "wife") or sl_has(ws, "husband") or sl_has(ws, "spouse") { return 16 }
+  if sl_has(ws, "study") or sl_has(ws, "studied") or sl_has(ws, "educated") { return 17 }
+  if sl_has(ws, "party") { return 18 }
+  if sl_has(ws, "created") or sl_has(ws, "creator") { return 20 }
+  if sl_has(ws, "manufactured") or sl_has(ws, "manufacturer") { return 21 }
+  if sl_has(ws, "team") { return 23 }
+  if sl_has(ws, "country") { return 13 }
+  return 0 - 1
+}
+
+skill sl_bucket(d) -> Any {
+  if d <= 1 { return "1" }
+  if d <= 2 { return "2" }
+  if d <= 5 { return "5" }
+  if d <= 10 { return "10" }
+  return "far"
+}
+
+# the subject in the sentence: the longest run of words the question also has (question words other than "what",
+# "who", the relation's verb... are the subject's name) -> [a, b] or [0, 0]
+skill sl_subject(ws, qset) -> Any {
+  let best = [0, 0]
+  let i = 0
+  while i < len(ws) {
+    let j = i
+    while j < len(ws) and sl_has(qset, lower(ws[j])) { let j = j + 1 }
+    if j - i > best[1] - best[0] { let best = [i, j] }
+    if j > i { let i = j } else { let i = i + 1 }
+  }
+  return best
+}
+
+skill sl_find(ws, cw, from) -> Any {
+  let i = from
+  while i + len(cw) <= len(ws) {
+    let ok = true
+    let k = 0
+    while ok and k < len(cw) {
+      if lower(ws[i + k]) != lower(cw[k]) { let ok = false }
+      let k = k + 1
+    }
+    if ok { return i }
+    let i = i + 1
+  }
+  return 0 - 1
+}
+
+skill sl_fscore(m, ri, f) -> Any {
+  let key = sl_key(str(ri) ++ "|" ++ f)
+  let s = key % m[3]
+  while aget(m[0], s) != 0 and aget(m[0], s) != key { let s = (s + 1) % m[3] }
+  let p = 0
+  let n = 0
+  if aget(m[0], s) == key {
+    let p = aget(m[1], s)
+    let n = aget(m[2], s)
+  }
+  return log2((p + 1) * 1.0 / (aget(m[4], ri) + 1000)) - log2((n + 1) * 1.0 / (aget(m[5], ri) + 1000))
+}
+
+# the slot score of every candidate of one sentence (null where the candidate is not found in it); qset: the
+# question's lower-case words that may name its subject
+skill sl_sentence(m, ri, s, cs, qset) -> Any {
+  let ws = sl_words(s)
+  let toks = []
+  for w in ws { let toks = append(toks, sl_tok(m[6], w)) }
+  let subj = sl_subject(ws, qset)
+  let out = []
+  for c in cs {
+    let cw = sl_words(c)
+    let a = 0 - 1
+    if len(cw) > 0 { let a = sl_find(ws, cw, 0) }
+    # skip a sighting inside the subject itself
+    if a >= 0 and a < subj[1] and a + len(cw) > subj[0] and subj[1] > subj[0] { let a = sl_find(ws, cw, subj[1]) }
+    if a < 0 { let out = append(out, null) } else {
+      let b = a + len(cw)
+      let l1 = "^"
+      if a >= 1 { let l1 = toks[a - 1] }
+      let l2 = "^"
+      if a >= 2 { let l2 = toks[a - 2] }
+      let r1 = "$"
+      if b < len(toks) { let r1 = toks[b] }
+      let side = "after"
+      let d = a - subj[1]
+      if b <= subj[0] {
+        let side = "before"
+        let d = subj[0] - b
+      }
+      let sc = sl_fscore(m, ri, "L1 " ++ l1) + sl_fscore(m, ri, "L2 " ++ l2 ++ " " ++ l1) + sl_fscore(m, ri, "R1 " ++ r1) + sl_fscore(m, ri, "S " ++ side ++ " " ++ sl_bucket(d))
+      let out = append(out, sc)
+    }
+  }
+  return out
+}

@@ -1,0 +1,73 @@
+# a coast at the end of the day: cliffs, open water, the sun going down behind real clouds
+
+let MAX_STEPS = 320
+let MAX_DIST = 40000.0
+let MAX_BOUNCES = 4
+let CLOUD_STEPS = 64
+
+skill land(x, z, detail) {
+  let q = [x, 0.0, z] * 0.0011
+  let big = fbm(q, 4)
+  let r = 0.0
+  let a = 0.5
+  let f = q * 3.1
+  for i in range(0, detail) {
+    let k = 1.0 - abs(noise(f))
+    r = r + a * k * k
+    f = rot_y(f, 0.6) * 2.13 + [3.1, 0.0, 1.7]
+    a = a * 0.5
+  }
+  # a channel of open water down the middle, higher ground either side, opening to the sea ahead
+  let side = smoothstep(180.0, 900.0, abs(z + big * 500.0))
+  let open = smoothstep(9000.0, 3500.0, x)
+  return (side * open * 330.0 - 70.0) + (big * 260.0 + r * 170.0) * side * open
+}
+
+skill scene(p) {
+  # above every peak the ground is at least this far away
+  if p.y > 620.0 { return [p.y - 600.0, 1.0, 0.0] }
+  let far = length(p - cam_from())
+  let detail = if far > 6000.0 { 2 } else { if far > 1800.0 { 4 } else { 6 } }
+  let d = (p.y - land(p.x, p.z, detail)) * 0.42
+  return if d < p.y { [d, 1.0, 0.0] } else { [p.y, 2.0, 0.0] }
+}
+
+skill waves(x, z, t) {
+  let q = [x, 0.0, z]
+  let h = noise(q * 0.09 + [time * 0.11, time * 0.17, 0.0]) * 0.55 + noise(rot_y(q, 0.8) * 0.27 + [0.0, time * 0.33, time * 0.2]) * 0.2
+  if t < 2500.0 { h = h + noise(rot_y(q, 1.9) * 0.9 + [time * 0.6, time * 0.5, 0.0]) * 0.06 + noise(rot_y(q, 2.7) * 2.7 + [0.0, time * 1.1, time * 0.9]) * 0.02 }
+  return h
+}
+skill bump(p, n, id, t) {
+  if id < 1.5 { return n }
+  let e = 0.02 + t * 0.0009
+  let h = waves(p.x, p.z, t)
+  return normalize([(h - waves(p.x + e, p.z, t)) / e, 1.0, (h - waves(p.x, p.z + e, t)) / e])
+}
+
+skill rockcol(p) {
+  let band = fbm([p.y * 0.05, p.x * 0.002, p.z * 0.002], 3)
+  let c = mix([0.17, 0.13, 0.10], [0.42, 0.34, 0.27], saturate(0.5 + band * 1.6))
+  return c * (0.8 + 0.5 * fbm(p * 0.13, 4))
+}
+skill albedo(p, n, id) {
+  if id > 1.5 { return [0.004, 0.016, 0.024] }
+  let g = smoothstep(0.62, 0.84, n.y + fbm(p * 0.02, 3) * 0.25)
+  let grass = mix([0.05, 0.09, 0.02], [0.13, 0.15, 0.04], saturate(0.5 + fbm(p * 0.05, 4) * 1.5))
+  let c = mix(rockcol(p), grass, g * smoothstep(9.0, 26.0, p.y))
+  return mix([0.48, 0.42, 0.31], c, smoothstep(1.5, 8.0, p.y + fbm(p * 0.06, 2) * 5.0))
+}
+skill roughness(p, n, id) { return if id > 1.5 { 0.025 } else { 0.85 } }
+skill spec_f0(p, n, id) { return if id > 1.5 { 0.02 } else { 0.04 } }
+
+skill sun_dir() { return normalize([1.0, 0.085, 0.16]) }
+skill sun_power() { return 34.0 }
+skill sun_size() { return 0.0095 }
+skill cloud_cover() { return 0.34 }
+skill haze() { return 0.00006 }
+skill exposure() { return 0.34 }
+
+# flying low up the channel toward the sun (at time 0 this is the still)
+skill cam_from() { return [-1500.0 + time * 42.0, 58.0 + sin(time * 0.31) * 9.0, 110.0 + sin(time * 0.19) * 30.0] }
+skill cam_at() { return [1000.0 + time * 42.0, 52.0 + sin(time * 0.31 - 0.4) * 9.0, 120.0 + sin(time * 0.19 - 0.6) * 60.0] }
+skill cam_fov() { return 0.72 }

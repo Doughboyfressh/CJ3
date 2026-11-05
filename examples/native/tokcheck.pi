@@ -1,0 +1,25 @@
+# tokcheck IN OUT: Pi's own tokenizer for the brain (braintok.pi) on texts separated by "@@@TEXT@@@"; OUT gets one line
+# of token ids per text (checked from outside against Ornith's reference tokenizer)
+import "braintok.pi"
+
+skill MODELPATH() -> Any { return "C:\\Users\\Dough\\Desktop\\Ornith-1.5-35B-A3B-GGUF\\Ornith-1.5-35B-Q4_K_M.gguf" }
+
+skill main() -> Any {
+  let t0 = ticks()
+  let tk = tk_load(MODELPATH())
+  let tl = ticks() - t0
+  let texts = split(read_file(arg(1)), "@@@TEXT@@@")
+  let t1 = ticks()
+  let out = ""
+  let ntok = 0
+  for s in texts {
+    let mm = mark()
+    let ids = tk_encode(tk, s)
+    let sv = []
+    for v in ids { let sv = append(sv, str(v)) }
+    let out = release(mm, out ++ join(sv, " ") ++ "\n")
+    let ntok = ntok + len(ids)
+  }
+  do write_file(arg(2), out)
+  return "tokenizer loaded in " ++ str(tl) ++ " ms; " ++ str(len(texts)) ++ " texts, " ++ str(ntok) ++ " tokens in " ++ str(ticks() - t1) ++ " ms"
+}

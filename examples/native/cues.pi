@@ -1,0 +1,181 @@
+# How each relation is said, learned from Pi's own aligned data: every fact in data\pairs\wikipedia_pairs.jsonl comes
+# with the Wikipedia sentence that states it. Pi finds the fact's subject and value in that sentence and counts the
+# words between them (at most 8), per relation. A word is a cue for a relation when it is far more common there than
+# between the subject and value of facts in general (so "by" after a novel's title is a cue for author; "the" is not).
+#   out\cues.exe [megabytes]  -> out\cues.txt: "relation word strength" (strength = 100 x how many times likelier),
+#                                words seen 5 times or more and at least 3 times likelier
+
+skill SRC() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\pairs\\wikipedia_pairs.jsonl" }
+
+skill field(t, key) -> Any {
+  let parts = split(t, "\"" ++ key ++ "\": ")
+  if len(parts) < 2 { return null }
+  let r = parts[1]
+  if slice(r, 0, 1) == "\"" {
+    let e = 1
+    while e < len(r) {
+      if slice(r, e, e + 1) == "\"" and slice(r, e - 1, e) != "\\" { return slice(r, 1, e) }
+      let e = e + 1
+    }
+    return null
+  }
+  return null
+}
+
+skill is_alnum(c) -> Any { return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) }
+
+skill words_of(s) -> Any {
+  let out = []
+  let n = len(s)
+  let i = 0
+  while i < n {
+    while i < n and is_alnum(ord(slice(s, i, i + 1))) == false { let i = i + 1 }
+    let a = i
+    while i < n and is_alnum(ord(slice(s, i, i + 1))) { let i = i + 1 }
+    if i > a { let out = append(out, lower(slice(s, a, i))) }
+  }
+  return out
+}
+
+# where the word list b starts inside the word list a, or -1
+skill find_seq(a, b) -> Any {
+  if len(b) == 0 { return 0 - 1 }
+  let i = 0
+  while i + len(b) <= len(a) {
+    let ok = true
+    let k = 0
+    while ok and k < len(b) {
+      if a[i + k] != b[k] { let ok = false }
+      let k = k + 1
+    }
+    if ok { return i }
+    let i = i + 1
+  }
+  return 0 - 1
+}
+
+skill wkey(s) -> Any {
+  let h = 7
+  for i in range(0, len(s)) { let h = (h * 131 + ord(slice(s, i, i + 1))) % 2147483647 }
+  return h
+}
+
+# the hash table on flat arrays: (relation, word) -> count; the text of each key kept in a byte pool
+skill slot_of(hk, hsz, key) -> Any {
+  let slot = key % hsz
+  while aget(hk, slot) != 0 and aget(hk, slot) != key + 1 { let slot = (slot + 1) % hsz }
+  return slot
+}
+
+skill main() -> Any {
+  let mb = 400
+  if arg(1) != null { let mb = num(arg(1)) }
+  let hsz = 4194304
+  let hk = arr(hsz)
+  let hc = arr(hsz)
+  let hp = arr(hsz)
+  let hl = arr(hsz)
+  let pool = arr(30000000)
+  let used = 0
+  let chunk = 8000000
+  let off = 0
+  let carry = ""
+  let windows = 0
+  while off < mb * 1000000 {
+    let m = mark()
+    let b = read_bytes(SRC(), off, chunk)
+    let n = 0
+    if b != null { let n = len(b) }
+    let text = carry ++ arr_text(b, 0, n)
+    let ls = split(text, "\n")
+    let got = []
+    for i in range(0, len(ls) - 1) {
+      let t = ls[i]
+      let s = field(t, "subject_label")
+      let r = field(t, "relation")
+      let v = field(t, "value")
+      let sent = field(t, "sentence")
+      if s != null and r != null and v != null and sent != null {
+        let sw = words_of(sent)
+        let ws = words_of(s)
+        let wv = words_of(v)
+        let a = find_seq(sw, ws)
+        let bv = find_seq(sw, wv)
+        if a >= 0 and bv >= 0 {
+          let lo = a + len(ws)
+          let hi = bv
+          if bv < a {
+            let lo = bv + len(wv)
+            let hi = a
+          }
+          if hi - lo >= 0 and hi - lo <= 8 { let got = append(got, [r, slice(sw, lo, hi)]) }
+        }
+      }
+    }
+    let keep = release(m, [got, ls[len(ls) - 1]])
+    let carry = keep[1]
+    # the counting makes a little text per word: freed after each chunk (the counts live in the arrays)
+    let m2 = mark()
+    for g in keep[0] {
+      let windows = windows + 1
+      for w in g[1] {
+        for rr in [g[0], "*", g[0] ++ " #"] {
+          let rw = rr ++ " " ++ w
+          if rr == g[0] ++ " #" { let rw = rr }
+          let key = wkey(rw)
+          let slot = slot_of(hk, hsz, key)
+          if aget(hk, slot) == 0 {
+            do aset(hk, slot, key + 1)
+            do aset(hc, slot, 1)
+            if used + len(rw) < 30000000 {
+              do aset(hp, slot, used)
+              do aset(hl, slot, len(rw))
+              for q in range(0, len(rw)) { do aset(pool, used + q, ord(slice(rw, q, q + 1))) }
+              let used = used + len(rw)
+            }
+          } else { do aset(hc, slot, aget(hc, slot) + 1) }
+        }
+      }
+    }
+    do release(m2, 0)
+    if n < chunk { let off = mb * 1000000 } else { let off = off + chunk }
+  }
+  # totals: all words of all windows ("*" keys); each relation's total sits under "<relation> #"
+  let tot_all = 0
+  let nrel = 0
+  for slot in range(0, hsz) {
+    if aget(hk, slot) != 0 and aget(hl, slot) > 0 {
+      let rw = arr_text(pool, aget(hp, slot), aget(hp, slot) + aget(hl, slot))
+      if slice(rw, 0, 2) == "* " { let tot_all = tot_all + aget(hc, slot) }
+      if slice(rw, len(rw) - 2, len(rw)) == " #" { let nrel = nrel + 1 }
+    }
+  }
+  # strength of (relation, word): its share within the relation over its share overall, x100 (lines kept in chunks)
+  let g = [[], []]
+  let nl = 0
+  for slot in range(0, hsz) {
+    if aget(hk, slot) != 0 and aget(hl, slot) > 0 and aget(hc, slot) >= 5 {
+      let sp = split(arr_text(pool, aget(hp, slot), aget(hp, slot) + aget(hl, slot)), " ")
+      if sp[0] != "*" and len(sp) == 2 and sp[1] != "#" {
+        let allc = aget(hc, slot_of(hk, hsz, wkey("* " ++ sp[1])))
+        let rt = aget(hc, slot_of(hk, hsz, wkey(sp[0] ++ " #")))
+        if allc > 0 and rt > 0 {
+          let strength = 100 * aget(hc, slot) * tot_all // (rt * allc)
+          if strength >= 300 {
+            let cur = append(g[1], sp[0] ++ " " ++ sp[1] ++ " " ++ str(strength))
+            if len(cur) >= 256 { let g = [append(g[0], join(cur, "\n")), []] } else { let g = [g[0], cur] }
+            let nl = nl + 1
+          }
+        }
+      }
+    }
+  }
+  let blocks = g[0]
+  if len(g[1]) > 0 { let blocks = append(blocks, join(g[1], "\n")) }
+  let rname = []
+  for i in range(0, nrel) { let rname = append(rname, i) }
+  let lines = []
+  for i in range(0, nl) { let lines = lines }
+  do write_file("out\\cues.txt", join(blocks, "\n"))
+  return "learned from " ++ str(windows) ++ " sentences with a fact's subject and value close together: " ++ str(nl) ++ " cue words (3x likelier or more) over " ++ str(len(rname)) ++ " relations -> out\\cues.txt"
+}

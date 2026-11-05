@@ -1,0 +1,185 @@
+# Pi improves itself. Its "self" here is its genome: the settings its learning runs on (how many words a night,
+# how many dreams, how much real memory outweighs dreams, how strict homeostasis is, how deep and wide it searches,
+# whether it falls back to first principles, how many days it lives). Each round Pi changes ONE setting, lives a
+# whole life (days, nights, dreams) with it, and is scored on VALIDATION tasks it never practised; the change is kept
+# only if Pi solves strictly more of them, or the same with at least 10% less search effort.
+#
+# The checker is locked: this program writes only the genome file. The tasks, the scoring, test.cmd and the golden
+# files are code it cannot touch. And the final judge is a separate LOCKED TEST set (the other half of the
+# never-practised tasks), used exactly once, after selection, to compare the starting genome with the improved one.
+#
+#   out\improve.exe [genome-file] [rounds]          (the file is read if it exists, and the champion written back)
+import "mindcore.pi"
+
+# never-practised tasks, split: even positions validate (selection), odd positions are the locked test
+skill split_unseen(locked) -> Any {
+  let out = []
+  for d in ["numbers", "lists", "text", "grids"] {
+    let us = unseen_of(d)
+    for i in range(0, len(us)) {
+      if (i % 2 == 1) == locked { let out = append(out, [d, us[i]]) }
+    }
+  }
+  return out
+}
+
+# Pi's own exam: random programs of its basic language (no learned words), of known size 5..9, turned into tasks by
+# running them; capacity a narrower or shallower search would lose shows up here, so the exam can steer selection
+skill own_exam(per_domain) -> Any {
+  let pl = pools()
+  let out = []
+  let s = 777
+  for d in ["numbers", "lists", "text", "grids"] {
+    let xty = "I"
+    if d != "numbers" { let xty = "L" }
+    if d == "grids" { let xty = "G" }
+    let forms = forms_for([], [], xty)
+    let got = 0
+    let tries = 0
+    let seen = {}
+    while got < per_domain and tries < 400 {
+      let tries = tries + 1
+      let s = rnd(s)
+      let ty = xty
+      if pick(s, 3) == 0 { let ty = "I" }
+      let gr = gen(ty, 4, s, forms, xty, pl)
+      let s = gr[1]
+      let t = gr[0]
+      if t != null {
+        let sz = tsize(t)
+        let ok = sz >= 5 and sz <= 9 and seen[ser(t)] == null
+        if ok {
+          # it must run on every input, and not be constant or the input itself
+          let outs = []
+          for v in train_inputs(d) ++ held_inputs(d) {
+            let y = sev(t, null, v, null, [])
+            if y == null { let ok = false } else { let outs = append(outs, y) }
+          }
+          if ok {
+            let same = true
+            for y in outs {
+              if y != outs[0] { let same = false }
+            }
+            if same { let ok = false }
+          }
+        }
+        if ok {
+          let tree = t
+          let seen = put(seen, ser(t), true)
+          let out = append(out, [d, ["exam: " ++ ser(t), fn(v) => sev(tree, null, v, null, [])]])
+          let got = got + 1
+        }
+      }
+    }
+  }
+  return out
+}
+
+# a whole life on the (half) curriculum with genome g, then the given never-practised tasks; -> [solved, effort]
+skill evaluate(g, set) -> Any {
+  let m = mark()
+  let life = live(g, null, all_tasks(true))
+  let solved = 0
+  let work = life["work"]
+  for dt in set {
+    let d = dt[0]
+    let r = attempt_task_g(dt[1], d, life["lib"], life["active"][d], [life["pl"][0], life["pl"][1], life["consts"][d], life["counts"][d]], life["pre"], g)
+    let work = work + r[1]
+    if r[0] != null { let solved = solved + 1 }
+  }
+  # also: how many practice tasks this life learned (its own experience -- fair to use while selecting)
+  let learned = 0
+  for k in keys(life["episodes"]) {
+    if slice(k, 0, 6) != "dream:" { let learned = learned + 1 }
+  }
+  return release(m, [solved, work, learned])
+}
+
+# the settings and the values each may take
+skill gene_values() -> Any {
+  return {"nightwords": [1, 2, 3, 4, 5, 6], "dreams": [0, 2, 4, 6, 8], "attempts": [4, 6, 8, 10, 12],
+    "realw": [1, 2, 3, 4], "floor": [0, 2, 4, 6, 8], "maxsize": [6, 7, 8, 9],
+    "cap": [30000, 50000, 75000, 100000, 150000], "fallback": [0, 1], "days": [6, 8, 10, 12, 16], "prior": [0, 1, 2]}
+}
+
+skill index_of(xs, v) -> Any {
+  for i in range(0, len(xs)) {
+    if xs[i] == v { return i }
+  }
+  return 0
+}
+
+# one change: a setting moves one step up or down; -> [new genome, description, seed]
+skill mutate(g, s) -> Any {
+  let vals = gene_values()
+  let names = sort(keys(vals))
+  let s = rnd(s)
+  let k = names[pick(s, len(names))]
+  let vs = vals[k]
+  let i = index_of(vs, g[k])
+  let s = rnd(s)
+  let j = i + 1
+  if pick(s, 2) == 0 { let j = i - 1 }
+  if j < 0 { let j = 1 }
+  if j >= len(vs) { let j = len(vs) - 2 }
+  return [put(g, k, vs[j]), k ++ " " ++ str(g[k]) ++ " -> " ++ str(vs[j]), s]
+}
+
+skill main() -> Any {
+  let path = "out\\pi.genome"
+  if arg(1) != null { let path = arg(1) }
+  let rounds = 12
+  if arg(2) != null { let rounds = num(arg(2)) }
+  let start = genome_of(read_file(path))
+  # validation = half the hand-written never-practised tasks + Pi's own exam (the locked test stays separate)
+  let val = split_unseen(false) ++ own_exam(5)
+  let locked = split_unseen(true)
+  let best = start
+  let bs = evaluate(best, val)
+  let out = "Pi starts from:  " ++ join(split(genome_text(start), "\n"), ", ") ++ "\n"
+  let out = out ++ "validation: " ++ str(bs[0]) ++ " of " ++ str(len(val)) ++ " never-practised tasks, effort " ++ str(bs[1]) ++ "\n\n"
+  do print(out)
+  let seed = 4242
+  let kept = 0
+  let tried = {}
+  for round in range(1, rounds + 1) {
+    let mu = mutate(best, seed)
+    let seed = mu[2]
+    # never pay twice for the same genome
+    let key = genome_text(mu[0])
+    if tried[key] == null {
+      let tried = put(tried, key, true)
+      let sc = evaluate(mu[0], val)
+      # never trade away ability for speed: no loss on validation AND no loss in practice learned; then a strict gain
+      # in either, or the same with at least 10% less effort (measured: maxsize 8 -> 7 kept validation, saved 62%
+      # effort -- and lost a locked-test task)
+      let noloss = sc[0] >= bs[0] and sc[2] >= bs[2]
+      let better = noloss and (sc[0] > bs[0] or sc[2] > bs[2] or sc[1] * 10 <= bs[1] * 9)
+      let line = "round " ++ str(round) ++ ": " ++ mu[1] ++ " -> " ++ str(sc[0]) ++ " of " ++ str(len(val)) ++ ", effort " ++ str(sc[1])
+      if better {
+        let best = mu[0]
+        let bs = sc
+        let kept = kept + 1
+        let line = line ++ "   KEPT"
+      } else {
+        let line = line ++ "   rejected"
+      }
+      do print(line)
+      let out = out ++ line ++ "\n"
+    }
+  }
+  # the locked test, once: where Pi started vs what it made of itself
+  let t0 = evaluate(start, locked)
+  let t1 = evaluate(best, locked)
+  let out = out ++ "\nkept " ++ str(kept) ++ " changes. Pi is now:  " ++ join(split(genome_text(best), "\n"), ", ") ++ "\n"
+  let out = out ++ "LOCKED TEST (" ++ str(len(locked)) ++ " never-practised tasks, never used in selection):\n"
+  let out = out ++ "  starting genome: " ++ str(t0[0]) ++ " solved, effort " ++ str(t0[1]) ++ "\n"
+  let out = out ++ "  improved genome: " ++ str(t1[0]) ++ " solved, effort " ++ str(t1[1]) ++ "\n"
+  # the deployment gate (one look, after selection): an improvement that does worse on the locked test is not deployed
+  if t1[0] < t0[0] {
+    do write_file(path, genome_text(start))
+    return out ++ "NOT DEPLOYED: the change did worse on tasks it was never selected on; Pi keeps its starting genome."
+  }
+  do write_file(path, genome_text(best))
+  return out ++ "deployed: Pi will run on the improved genome (" ++ path ++ ")."
+}

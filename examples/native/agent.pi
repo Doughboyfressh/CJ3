@@ -1,0 +1,35 @@
+# Pi the agent. It runs by itself: it reads lines as they come, decides on its own whether each is something to
+# learn or a question to answer, reasons over what it knows, replies in English, checks every fact it learns by
+# saying it back and reading it again, refuses contradictions, and -- given a memory file as its first argument --
+# keeps what it learns in its own English and re-reads it the next time it starts.
+#   out\agent.exe [memory-file]
+import "english.pi"
+
+skill main() -> Any {
+  let st = new_state()
+  let mem = arg(1)
+  if mem != null {
+    let text = read_file(mem)
+    if text != null {
+      for line in split(text, "\n") {
+        let r = handle(st, line)
+        let st = r[1]
+      }
+    }
+  }
+  let going = true
+  while going {
+    let m = mark()
+    let line = input()
+    if line == null {
+      let going = false
+    } else {
+      let r = handle(st, line)
+      if r[0] != "" { do print(r[0]) }
+      let r = release(m, r)
+      let st = r[1]
+      if mem != null and r[2] { do write_file(mem, join(st["said"], "\n")) }
+    }
+  }
+  return "Goodbye. I know " ++ str(len(st["facts"])) ++ " facts."
+}

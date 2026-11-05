@@ -1,0 +1,520 @@
+# Grammar, step 1: word classes learned from text alone (no rules). Words that stand in the same places -- with the
+# same small words before and after them -- belong together ("cat"/"dog", "invented"/"discovered").
+#   vocabulary: the 10,000 most frequent words (Pi's own counts, out\lexicon.txt); the top 500 are the context words
+#   count:      for each word, which context word stands just before it and just after it, over Wikipedia
+#               (out\wiki, 410 files; the last 10 are held out), 8 worker processes
+#   classes:    k-means over each word's context profile (sparse, cosine), 64 classes -> out\classes.txt
+#   test:       held-out text, bits per word: a class model (next word through its class) against word frequency
+#   out\grammar1.exe run [files]          the whole step (files: how many of the 400 to count; default all)
+#   out\grammar1.exe count <w> <from> <to> one worker
+
+skill V() -> Any { return 30000 }
+skill C() -> Any { return 500 }
+skill K() -> Any { return 256 }
+
+# ---- the vocabulary: ids 0..C-1 are the context words (the most frequent), then the rest ---------------------------
+skill wkey2(w) -> Any {
+  let h = 0
+  for i in range(0, len(w)) { let h = (h * 31 + ord(slice(w, i, i + 1))) % 1000000007 }
+  return h * 64 + len(w) + 1
+}
+
+# lists grown in chunks of 64 (append copies the whole list: 334,000 appends ran out of 24 GB)
+skill g_push(g, x) -> Any {
+  let cur = append(g[1], x)
+  if len(cur) >= 64 { return [append(g[0], cur), []] }
+  return [g[0], cur]
+}
+
+skill g_items(g) -> Any {
+  let out = []
+  for c in g[0] { let out = out ++ c }
+  return out ++ g[1]
+}
+
+skill make_vocab() -> Any {
+  let t = read_file("out\\lexicon.txt")
+  let lines = split(t, "\n")
+  let counts = arr(len(lines))
+  for i in range(0, len(lines)) {
+    let p = split(lines[i], " ")
+    if len(p) == 2 { do aset(counts, i, num(p[1])) }
+  }
+  # the thresholds: the V-th and C-th largest counts, by a histogram of count magnitudes (no sort of 334k)
+  let thv = kth_largest(counts, V())
+  let thc = kth_largest(counts, C())
+  let ctx = [[], []]
+  let rest = [[], []]
+  let nc = 0
+  let nr = 0
+  for i in range(0, len(lines)) {
+    let c = aget(counts, i)
+    if c >= thc and nc < C() {
+      let ctx = g_push(ctx, split(lines[i], " ")[0])
+      let nc = nc + 1
+    } else {
+      if c >= thv and nr < V() - C() {
+        let rest = g_push(rest, split(lines[i], " ")[0])
+        let nr = nr + 1
+      }
+    }
+  }
+  let vocab = g_items(ctx) ++ g_items(rest)
+  do write_file("out\\vocab.txt", join(vocab, "\n"))
+  return vocab
+}
+
+# the k-th largest value of an arr of counts: binary search on the value (each probe counts how many are >= it)
+skill kth_largest(a, k) -> Any {
+  let lo = 0
+  let hi = 1
+  for i in range(0, len(a)) { let hi = max(hi, aget(a, i)) }
+  while lo < hi {
+    let mid = (lo + hi + 1) // 2
+    let n = 0
+    for i in range(0, len(a)) {
+      if aget(a, i) >= mid { let n = n + 1 }
+    }
+    if n >= k { let lo = mid } else { let hi = mid - 1 }
+  }
+  return lo
+}
+
+skill load_vocab() -> Any { return split(read_file("out\\vocab.txt"), "\n") }
+
+# word -> id: open addressing on flat arrays
+skill vocab_table(vocab) -> Any {
+  let hsz = 131072
+  let hk = arr(hsz)
+  let hv = arr(hsz)
+  for i in range(0, len(vocab)) {
+    let k = wkey2(vocab[i])
+    let s = k % hsz
+    while aget(hk, s) != 0 { let s = (s + 1) % hsz }
+    do aset(hk, s, k)
+    do aset(hv, s, i + 1)
+  }
+  return [hk, hv, hsz]
+}
+
+skill wiki_files() -> Any { return sort(listdir("out\\wiki")) }
+
+# ---- one worker: count contexts over files [a, b) -> out\ctx\w<w>_<k>.bin (4-byte counts, 1M per file) ------------
+skill count_worker(wid, a, b) -> Any {
+  let vocab = load_vocab()
+  let tab = vocab_table(vocab)
+  let hk = tab[0]
+  let hv = tab[1]
+  let hsz = tab[2]
+  let cdim = 2 * C()
+  let cnt = arr(V() * cdim)
+  let files = wiki_files()
+  let words = 0
+  for fi in range(a, b) {
+    let path = "out\\wiki\\" ++ files[fi]
+    let off = 0
+    let going = true
+    let prev = 0 - 1
+    let wh = 0
+    let wl = 0
+    while going {
+      let m = mark()
+      let bb = read_bytes(path, off, 8000000)
+      let n = 0
+      if bb != null { let n = len(bb) }
+      let i = 0
+      while i < n {
+        let c = aget(bb, i)
+        let lc = c
+        if c >= 65 and c <= 90 { let lc = c + 32 }
+        if lc >= 97 and lc <= 122 {
+          let wh = (wh * 31 + lc) % 1000000007
+          let wl = wl + 1
+        } else {
+          if wl > 0 {
+            let words = words + 1
+            let k = wh * 64 + wl + 1
+            let s = k % hsz
+            let id = 0 - 1
+            let look = true
+            while look {
+              let hkk = aget(hk, s)
+              if hkk == 0 { let look = false } else {
+                if hkk == k {
+                  let id = aget(hv, s) - 1
+                  let look = false
+                } else { let s = (s + 1) % hsz }
+              }
+            }
+            # the previous word's right context, and this word's left context
+            if prev >= 0 and id >= 0 and id < C() { do aset(cnt, prev * cdim + C() + id, aget(cnt, prev * cdim + C() + id) + 1) }
+            if id >= 0 and prev >= 0 and prev < C() { do aset(cnt, id * cdim + prev, aget(cnt, id * cdim + prev) + 1) }
+            let prev = id
+            let wh = 0
+            let wl = 0
+          }
+          # a sentence ends: no context across it
+          if c == 46 or c == 10 or c == 33 or c == 63 { let prev = 0 - 1 }
+        }
+        let i = i + 1
+      }
+      do release(m, 0)
+      if n < 8000000 { let going = false } else { let off = off + n }
+    }
+  }
+  # the counts, 1M per file, as 4-byte little-endian
+  let total = V() * cdim
+  let k = 0
+  let part = 0
+  while k < total {
+    let m = mark()
+    let e = min(total, k + 1000000)
+    let by = arr(4 * (e - k))
+    for j in range(k, e) {
+      let v = aget(cnt, j)
+      let o = 4 * (j - k)
+      do aset(by, o, v % 256)
+      do aset(by, o + 1, (v // 256) % 256)
+      do aset(by, o + 2, (v // 65536) % 256)
+      do aset(by, o + 3, v // 16777216)
+    }
+    do write_file("out\\ctx\\w" ++ str(wid) ++ "_" ++ str(part) ++ ".bin", arr_text(by, 0, 4 * (e - k)))
+    do release(m, 0)
+    let k = e
+    let part = part + 1
+  }
+  return words
+}
+
+# ---- merge the workers' counts -------------------------------------------------------------------------------------
+skill merge_counts(nw) -> Any {
+  let cdim = 2 * C()
+  let total = V() * cdim
+  let cnt = arr(total)
+  for w in range(0, nw) {
+    let part = 0
+    let k = 0
+    while k < total {
+      let m = mark()
+      let e = min(total, k + 1000000)
+      let by = read_bytes("out\\ctx\\w" ++ str(w) ++ "_" ++ str(part) ++ ".bin", 0, 4 * (e - k))
+      if by != null {
+        for j in range(k, e) {
+          let o = 4 * (j - k)
+          do aset(cnt, j, aget(cnt, j) + aget(by, o) + 256 * aget(by, o + 1) + 65536 * aget(by, o + 2) + 16777216 * aget(by, o + 3))
+        }
+      }
+      do release(m, 0)
+      let k = e
+      let part = part + 1
+    }
+  }
+  return cnt
+}
+
+# the integer square root (Newton's method on integers: Pi's sqrt gives a real)
+skill isqrt(n) -> Any {
+  if n < 2 { return n }
+  let x = n
+  let y = (x + 1) // 2
+  while y < x {
+    let x = y
+    let y = (x + n // x) // 2
+  }
+  return x
+}
+
+skill lg2(x) -> Any {
+  let b = 0
+  let v = x
+  while v > 1 {
+    let v = v // 2
+    let b = b + 1
+  }
+  return b
+}
+
+# ---- context profiles (PPMI in whole bits), unit length x1000, sparse -> [offsets, dims, vals, rowsums] -------------
+skill profiles(cnt) -> Any {
+  let cdim = 2 * C()
+  let rs = arr(V())
+  let cs = arr(cdim)
+  let n = 0
+  for t in range(0, V()) {
+    for j in range(0, cdim) {
+      let v = aget(cnt, t * cdim + j)
+      do aset(rs, t, aget(rs, t) + v)
+      do aset(cs, j, aget(cs, j) + v)
+      let n = n + v
+    }
+  }
+  let offs = arr(V() + 1)
+  let dims = arr(V() * 200)
+  let vals = arr(V() * 200)
+  let used = 0
+  for t in range(0, V()) {
+    do aset(offs, t, used)
+    let r = aget(rs, t)
+    if r >= 50 {
+      let start = used
+      let sq = 0
+      for j in range(0, cdim) {
+        let v = aget(cnt, t * cdim + j)
+        if v > 0 and used < V() * 200 {
+          let ratio = v * (n // 1000) // max(1, r * aget(cs, j) // 1000)
+          if ratio >= 2 {
+            let f = lg2(ratio)
+            do aset(dims, used, j)
+            do aset(vals, used, f)
+            let sq = sq + f * f
+            let used = used + 1
+          }
+        }
+      }
+      let norm = isqrt(sq)
+      if norm > 0 {
+        for q in range(start, used) { do aset(vals, q, aget(vals, q) * 1000 // norm) }
+      }
+    }
+  }
+  do aset(offs, V(), used)
+  return [offs, dims, vals, rs]
+}
+
+# ---- k-means, cosine, K classes, sparse words against dense centroids -> class per word (-1: no profile) ------------
+skill kmeans(pr, iters) -> Any {
+  let offs = pr[0]
+  let dims = pr[1]
+  let vals = pr[2]
+  let cdim = 2 * C()
+  let k = K()
+  let cls = arr(V())
+  # the words with a profile; the first centroids are spread over them
+  let have = [[], []]
+  let nh = 0
+  for t in range(0, V()) {
+    if aget(offs, t + 1) > aget(offs, t) {
+      let have = g_push(have, t)
+      let nh = nh + 1
+    }
+  }
+  let have = g_items(have)
+  let cent = arr(k * cdim)
+  for c in range(0, k) {
+    let t = have[c * nh // k]
+    for q in range(aget(offs, t), aget(offs, t + 1)) { do aset(cent, c * cdim + aget(dims, q), aget(vals, q)) }
+  }
+  for t in range(0, V()) { do aset(cls, t, 0 - 1) }
+  for it in range(0, iters) {
+    # the centroids' lengths
+    let cn = arr(k)
+    for c in range(0, k) {
+      let s = 0
+      for j in range(0, cdim) {
+        let v = aget(cent, c * cdim + j)
+        let s = s + v * v
+      }
+      do aset(cn, c, max(1, isqrt(s)))
+    }
+    # each word to its nearest centroid (cosine)
+    for t in have {
+      let best = 0
+      let bs = 0 - 1
+      for c in range(0, k) {
+        let d = 0
+        for q in range(aget(offs, t), aget(offs, t + 1)) { let d = d + aget(vals, q) * aget(cent, c * cdim + aget(dims, q)) }
+        let d = d * 1000 // aget(cn, c)
+        if d > bs {
+          let bs = d
+          let best = c
+        }
+      }
+      do aset(cls, t, best)
+    }
+    # the centroids: the sums of their members
+    for j in range(0, k * cdim) { do aset(cent, j, 0) }
+    for t in have {
+      let c = aget(cls, t)
+      for q in range(aget(offs, t), aget(offs, t + 1)) { do aset(cent, c * cdim + aget(dims, q), aget(cent, c * cdim + aget(dims, q)) + aget(vals, q)) }
+    }
+  }
+  return cls
+}
+
+# ---- the held-out test: bits per word, class model against word frequency ------------------------------------------
+# one pass over a file: word ids in order (sentence ends as -2), at most maxw words
+skill id_stream(path, tab, maxw) -> Any {
+  let hk = tab[0]
+  let hv = tab[1]
+  let hsz = tab[2]
+  let out = arr(maxw)
+  let n = 0
+  let bb = read_bytes(path, 0, maxw * 8)
+  let len_b = len(bb)
+  let i = 0
+  let wh = 0
+  let wl = 0
+  while i < len_b and n < maxw - 1 {
+    let c = aget(bb, i)
+    let lc = c
+    if c >= 65 and c <= 90 { let lc = c + 32 }
+    if lc >= 97 and lc <= 122 {
+      let wh = (wh * 31 + lc) % 1000000007
+      let wl = wl + 1
+    } else {
+      if wl > 0 {
+        let k = wh * 64 + wl + 1
+        let s = k % hsz
+        let id = 0 - 1
+        let look = true
+        while look {
+          let hkk = aget(hk, s)
+          if hkk == 0 { let look = false } else {
+            if hkk == k {
+              let id = aget(hv, s) - 1
+              let look = false
+            } else { let s = (s + 1) % hsz }
+          }
+        }
+        do aset(out, n, id)
+        let n = n + 1
+        let wh = 0
+        let wl = 0
+      }
+      if c == 46 or c == 10 or c == 33 or c == 63 {
+        do aset(out, n, 0 - 2)
+        let n = n + 1
+      }
+    }
+    let i = i + 1
+  }
+  return [out, n]
+}
+
+skill log2r(x) -> Any { return log2(x) }
+
+# -> [bits per word with word frequency, bits per word with classes, words scored]
+skill evaluate(cls, tab, train_path, test_path) -> Any {
+  let k = K() + 1
+  let tr = id_stream(train_path, tab, 20000000)
+  let wc = arr(V())
+  let tc = arr(k * k)
+  let clsz = arr(k)
+  let total = 0
+  let prev = 0 - 1
+  for i in range(0, tr[1]) {
+    let id = aget(tr[0], i)
+    if id >= 0 {
+      do aset(wc, id, aget(wc, id) + 1)
+      let total = total + 1
+      let c = aget(cls, id)
+      if c < 0 { let c = K() }
+      do aset(clsz, c, aget(clsz, c) + 1)
+      if prev >= 0 {
+        let cp = aget(cls, prev)
+        if cp < 0 { let cp = K() }
+        do aset(tc, cp * k + c, aget(tc, cp * k + c) + 1)
+      }
+    }
+    let prev = id
+  }
+  let rowt = arr(k)
+  for a in range(0, k) {
+    for b in range(0, k) { do aset(rowt, a, aget(rowt, a) + aget(tc, a * k + b)) }
+  }
+  let members = arr(k)
+  for t in range(0, V()) {
+    let c = aget(cls, t)
+    if c < 0 { let c = K() }
+    do aset(members, c, aget(members, c) + 1)
+  }
+  let te = id_stream(test_path, tab, 2000000)
+  let bu = 0.0
+  let bc = 0.0
+  let n = 0
+  let prev = 0 - 1
+  for i in range(0, te[1]) {
+    let id = aget(te[0], i)
+    if id >= 0 and prev >= 0 {
+      let c = aget(cls, id)
+      if c < 0 { let c = K() }
+      let cp = aget(cls, prev)
+      if cp < 0 { let cp = K() }
+      let pu = (aget(wc, id) + 1) * 1.0 / (total + V())
+      let pcc = (aget(tc, cp * k + c) + 1) * 1.0 / (aget(rowt, cp) + k)
+      let pwc = (aget(wc, id) + 1) * 1.0 / (aget(clsz, c) + aget(members, c))
+      let bu = bu - log2r(pu)
+      let bc = bc - log2r(pcc * pwc)
+      let n = n + 1
+    }
+    let prev = id
+  }
+  return [bu / n, bc / n, n]
+}
+
+skill main() -> Any {
+  if arg(1) == "count" { return str(count_worker(num(arg(2)), num(arg(3)), num(arg(4)))) }
+  # the counts already on disk (out\ctx, from the last run), clustered again -- no recounting of Wikipedia
+  if arg(1) == "recluster" {
+    let t0 = ticks()
+    let vocab = load_vocab()
+    let pr = profiles(merge_counts(8))
+    let cls = kmeans(pr, 10)
+    let lines = [[], []]
+    for t in range(0, V()) { let lines = g_push(lines, vocab[t] ++ " " ++ str(aget(cls, t))) }
+    do write_file("out\\classes.txt", join(g_items(lines), "\n"))
+    let probes = ["is", "are", "was", "were", "he", "they", "invented", "discovered", "paris", "london", "king", "queen"]
+    let pc = []
+    for p in probes {
+      for t in range(0, V()) {
+        if vocab[t] == p { let pc = append(pc, p ++ "=" ++ str(aget(cls, t))) }
+      }
+    }
+    return str(K()) ++ " classes from the saved counts in " ++ str((ticks() - t0) // 1000) ++ " s: " ++ join(pc, " ")
+  }
+  if arg(1) == "run" {
+    let nfiles = 400
+    if arg(2) != null { let nfiles = num(arg(2)) }
+    let t0 = ticks()
+    let vocab = make_vocab()
+    let hs = []
+    for w in range(0, 8) {
+      let a = nfiles * w // 8
+      let b = nfiles * (w + 1) // 8
+      let hs = append(hs, spawn(arg(0) ++ " count " ++ str(w) ++ " " ++ str(a) ++ " " ++ str(b)))
+    }
+    for h in hs { do wait(h, 36000000) }
+    let t1 = ticks()
+    let cnt = merge_counts(8)
+    let pr = profiles(cnt)
+    let t2 = ticks()
+    let cls = kmeans(pr, 10)
+    let t3 = ticks()
+    # the classes, written and shown
+    let lines = [[], []]
+    for t in range(0, V()) { let lines = g_push(lines, vocab[t] ++ " " ++ str(aget(cls, t))) }
+    do write_file("out\\classes.txt", join(g_items(lines), "\n"))
+    let files = wiki_files()
+    let ev = evaluate(cls, vocab_table(vocab), "out\\wiki\\" ++ files[0], "out\\wiki\\" ++ files[405])
+    let t4 = ticks()
+    let out = "counted " ++ str(nfiles) ++ " files with 8 workers in " ++ str((t1 - t0) // 1000) ++ " s; profiles " ++ str((t2 - t1) // 1000) ++ " s; 64 classes (10 rounds) " ++ str((t3 - t2) // 1000) ++ " s; test " ++ str((t4 - t3) // 1000) ++ " s\n"
+    let out = out ++ "held-out text (" ++ str(ev[2]) ++ " word pairs never counted): word frequency " ++ str(ev[0]) ++ " bits per word; classes " ++ str(ev[1]) ++ " bits per word\n"
+    # which words share a class
+    let probes = ["invented", "discovered", "paris", "london", "red", "blue", "he", "she", "the", "a", "king", "queen", "january", "march", "two", "three", "walked", "ran", "quickly", "slowly"]
+    let pc = []
+    for p in probes {
+      for t in range(0, V()) {
+        if vocab[t] == p { let pc = append(pc, p ++ "=" ++ str(aget(cls, t))) }
+      }
+    }
+    return out ++ "classes of some words: " ++ join(pc, " ")
+  }
+  if arg(1) == "count" { return str(count_worker(num(arg(2)), num(arg(3)), num(arg(4)))) }
+  if arg(1) == "sample" {
+    let vocab = make_vocab()
+    let t0 = ticks()
+    let words = count_worker(99, 0, 1)
+    return "one file: " ++ str(words) ++ " words counted in " ++ str(ticks() - t0) ++ " ms"
+  }
+  return "usage: grammar1.exe sample | count <w> <from> <to> | run [files]"
+}

@@ -1,0 +1,22 @@
+# askft QUESTION...: one non-interactive turn of Pi's flash brain WITH its full hands -- run_pi (compile+run Pi),
+# shell (the real terminal) and web (the real internet). Prints the answer and writes the whole transcript (every
+# thought, tool call and tool result) to out\askft_last.txt. This is fb_chat's single turn, without the chat loop.
+import "flashbrain.pi"
+
+skill main() -> Any {
+  let words = []
+  let i = 1
+  while arg(i) != null {
+    let words = append(words, arg(i))
+    let i = i + 1
+  }
+  let q = join(words, " ")
+  if q == "" { return "askft QUESTION..." }
+  let t0 = ticks()
+  let fb = fb_open(true)
+  if typeof(fb) == "text" { return fb }
+  let t1 = ticks()
+  let r = fb_turn(fb, fb["sys"], q)
+  do write_file("out\\askft_last.txt", r[2])
+  return r[1] ++ "\n\n(flash brain ready in " ++ str(t1 - t0) ++ " ms; " ++ str(r[3]) ++ " tokens, " ++ str(r[4]) ++ " tool calls, " ++ str(ticks() - t1) ++ " ms; full transcript: out\\askft_last.txt)"
+}

@@ -1,0 +1,11 @@
+# heavier work: a 3-million-step loop and fib(27)
+skill fib(n) -> Any {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+
+skill main() -> Any {
+  let s = 0
+  for i in range(0, 3000000) { let s = (s + i * i) % 1000003 }
+  return fib(27) + s
+}

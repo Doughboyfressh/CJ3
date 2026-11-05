@@ -1,0 +1,557 @@
+# Pi learns from a large REAL corpus: the OEIS (integer sequences), read and decompressed by Pi itself.
+#
+# Each sequence is a task: find the program n -> a(n). Terms 0..7 are searched, terms 8..11 are the held-out check
+# (and the answer is run again by interp.pi). One sequence in five (by its A-number) is a TEST sequence Pi never
+# practises. Practice comes in batches; after each batch Pi sleeps: words from every sequence solved so far (minimum
+# description length), replay, downscaling. At the end the test sequences are tried with Pi's words and without them --
+# the measure of whether words learned across thousands of real problems carry over to new ones.
+#
+#   out\oeis.exe [practice sequences] [test sequences]
+import "mindcore.pi"
+import "inflate.pi"
+
+skill OEIS() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\sources\\oeis\\stripped.gz" }
+
+# -> [[id, [12 terms]]] for sequences with 12 terms, all |a| <= 10^7, not constant
+skill read_oeis(limit_bytes) -> Any {
+  let b = read_bytes(OEIS(), 0, 40000000)
+  if b == null { return null }
+  let r = gunzip_prefix(b, limit_bytes)
+  if r == null { return null }
+  let out = [[], []]
+  let n = 0
+  for line in split(arr_text(r[0], 0, r[1]), "\n") {
+    if slice(line, 0, 1) == "A" {
+      let parts = split(line, " ,")
+      if len(parts) == 2 {
+        let ts = split(parts[1], ",")
+        if len(ts) >= 13 {
+          let terms = []
+          let ok = true
+          for i in range(0, 12) {
+            let t = ts[i]
+            if len(t) == 0 or len(t) > 8 { let ok = false } else {
+              let v = num(t)
+              if v == null { let ok = false } else { let terms = append(terms, v) }
+            }
+          }
+          if ok {
+            let same = true
+            for v in terms {
+              if v != terms[0] { let same = false }
+            }
+            if same == false {
+              # terms 13-20: never shown to the search; they judge the test answers afterwards (precision)
+              let extra = []
+              let k = 12
+              while k < len(ts) and k < 20 {
+                let t = ts[k]
+                if len(t) > 0 and len(t) <= 15 {
+                  let v = num(t)
+                  if v != null { let extra = append(extra, v) } else { let k = 99 }
+                } else { let k = 99 }
+                let k = k + 1
+              }
+              let out = gl_push(out, [parts[0], terms, extra])
+              let n = n + 1
+            }
+          }
+        }
+      }
+    }
+  }
+  return [out, n]
+}
+
+# the i-th item of a chunked list [full chunks, last chunk] (mindcore's gl_push makes chunks of 64)
+skill fget(g, i) -> Any {
+  let c = i // 64
+  if c < len(g[0]) { return g[0][c][i % 64] }
+  return g[1][i % 64]
+}
+
+skill seq_examples(terms, from, to) -> Any {
+  let out = []
+  for i in range(from, to) { let out = append(out, [i, terms[i]]) }
+  return out
+}
+
+skill solve_seq(terms, lib, active, pl, pre, maxsize, cap) -> Any {
+  let m = mark()
+  let r = solve(seq_examples(terms, 0, 8), seq_examples(terms, 8, 12), lib, active, pl, pre, maxsize, cap)
+  return release(m, r)
+}
+
+# does the program also predict the terms after the 12 it was judged on? (null beyond 10^15 counts as a miss)
+skill holds(tree, extra, lib) -> Any {
+  for k in range(0, len(extra)) {
+    if sev(tree, null, 12 + k, null, lib) != extra[k] { return false }
+  }
+  return true
+}
+
+skill none_awake(lib) -> Any {
+  let out = []
+  for w in lib { let out = append(out, false) }
+  return out
+}
+
+# ---- the GUIDE: Pi's intuition. A one-layer network with Hebbian weights: what a sequence LOOKS like (features of
+# its first 8 terms -- the training examples only) -> how likely each form and word is to be in its program. Weights
+# are co-occurrence counts over Pi's memories ("sequences that look like this used these words"). The search then
+# prices every form at -log2 of its predicted share for THIS task, so likely words are tried first: recognition before
+# search (DreamCoder's recognition model; intuition + search as in AlphaGo).
+skill iabs(v) -> Any {
+  if v < 0 { return 0 - v }
+  return v
+}
+
+skill diffs(a) -> Any {
+  let out = []
+  for k in range(1, len(a)) { let out = append(out, a[k] - a[k - 1]) }
+  return out
+}
+
+skill allsame(a) -> Any {
+  for v in a {
+    if v != a[0] { return false }
+  }
+  return true
+}
+
+skill seq_feats(t) -> Any {
+  let a = slice(t, 0, 8)
+  let n = len(a)
+  let fs = [0]
+  let neg = false
+  let mx = 0
+  let even = true
+  let odd = true
+  let alt = true
+  let prime = true
+  for k in range(0, n) {
+    let v = a[k]
+    if v < 0 { let neg = true }
+    if iabs(v) > mx { let mx = iabs(v) }
+    if v % 2 != 0 { let even = false }
+    if v % 2 == 0 { let odd = false }
+    if k > 0 {
+      if (v - a[k - 1]) % 2 == 0 { let alt = false }
+    }
+    if is_prime(v) == false { let prime = false }
+  }
+  if neg { let fs = append(fs, 1) }
+  let d1 = diffs(a)
+  let d2 = diffs(d1)
+  let d3 = diffs(d2)
+  if allsame(a) { let fs = append(fs, 12) } else {
+    if allsame(d1) { let fs = append(fs, 2) } else {
+      if allsame(d2) { let fs = append(fs, 3) } else {
+        if allsame(d3) { let fs = append(fs, 4) }
+      }
+    }
+  }
+  let inc = true
+  let nondec = true
+  for d in d1 {
+    if d <= 0 { let inc = false }
+    if d < 0 { let nondec = false }
+  }
+  if inc { let fs = append(fs, 5) }
+  if nondec and inc == false { let fs = append(fs, 6) }
+  # geometric: a(k+1) = r a(k)
+  let geo = false
+  for r in [2, 3, 4, 5, 6, 0 - 1, 0 - 2] {
+    let ok = a[1] != 0
+    for k in range(1, n) {
+      if a[k] != r * a[k - 1] { let ok = false }
+    }
+    if ok { let geo = true }
+  }
+  if geo { let fs = append(fs, 7) }
+  # fast growth: at least doubling from the third term on
+  let fast = mx > 0
+  for k in range(3, n) {
+    if iabs(a[k]) < 2 * iabs(a[k - 1]) { let fast = false }
+  }
+  if fast { let fs = append(fs, 8) }
+  # a small second-order linear recurrence
+  let rec = false
+  for p in [0 - 1, 0, 1, 2, 3] {
+    for q in [0 - 1, 1, 2] {
+      let ok = true
+      for k in range(2, n) {
+        if a[k] != p * a[k - 1] + q * a[k - 2] { let ok = false }
+      }
+      if ok { let rec = true }
+    }
+  }
+  if rec { let fs = append(fs, 9) }
+  if prime { let fs = append(fs, 10) }
+  # periodic with a short period, not constant
+  let per = false
+  if allsame(a) == false {
+    for pd in [2, 3, 4] {
+      let ok = true
+      for k in range(pd, n) {
+        if a[k] != a[k - pd] { let ok = false }
+      }
+      if ok { let per = true }
+    }
+  }
+  if per { let fs = append(fs, 11) }
+  if mx < 10 { let fs = append(fs, 13) } else {
+    if mx < 100 { let fs = append(fs, 14) } else {
+      if mx < 10000 { let fs = append(fs, 15) } else {
+        if mx < 100000000 { let fs = append(fs, 16) } else { let fs = append(fs, 17) }
+      }
+    }
+  }
+  if even { let fs = append(fs, 18) }
+  if odd { let fs = append(fs, 19) }
+  if alt { let fs = append(fs, 20) }
+  if a[0] == 0 { let fs = append(fs, 21) }
+  if a[0] == 1 { let fs = append(fs, 22) }
+  if mx < 10 and nondec == false { let fs = append(fs, 23) }
+  let convex = true
+  let small = true
+  for k in range(0, len(d1)) {
+    if k > 0 {
+      if d1[k] < d1[k - 1] { let convex = false }
+    }
+    if d1[k] != 0 and d1[k] != 1 { let small = false }
+  }
+  if convex { let fs = append(fs, 24) }
+  if small { let fs = append(fs, 25) }
+  let divs = true
+  for k in range(1, n) {
+    if a[k - 1] == 0 { let divs = false } else {
+      if a[k] % a[k - 1] != 0 { let divs = false }
+    }
+  }
+  if divs { let fs = append(fs, 26) }
+  return fs
+}
+
+skill guide_nfeat() -> Any { return 27 }
+
+# -> [feature counts, per feature a map form-key -> co-occurrence count]
+skill guide_train(eterms, episodes) -> Any {
+  let nf = arr(guide_nfeat())
+  let co = []
+  for f in range(0, guide_nfeat()) { let co = append(co, {}) }
+  for i in range(0, len(episodes)) {
+    let fs = seq_feats(eterms[i])
+    let ks = keys(form_counts([episodes[i]]))
+    for f in fs {
+      do aset(nf, f, aget(nf, f) + 1)
+      let m = co[f]
+      for k in ks {
+        let c = m[k]
+        if c == null { let c = 0 }
+        let m = put(m, k, c + 1)
+      }
+      let co = slice(co, 0, f) ++ [m] ++ slice(co, f + 1, len(co))
+    }
+  }
+  return [nf, co]
+}
+
+# -> per-task pseudo-counts (per mille): the average over this sequence's features of P(form | feature)
+skill guide_counts(gd, terms) -> Any {
+  let fs = seq_feats(terms)
+  let out = {}
+  let used = 0
+  for f in fs {
+    let nfv = aget(gd[0], f)
+    if nfv > 0 {
+      let used = used + 1
+      let m = gd[1][f]
+      for k in keys(m) {
+        let c = out[k]
+        if c == null { let c = 0 }
+        let out = put(out, k, c + 1000 * m[k] // nfv)
+      }
+    }
+  }
+  if used == 0 { return null }
+  let res = {}
+  for k in keys(out) { let res = put(res, k, out[k] // used) }
+  return res
+}
+
+# attention: only the k words the guide expects most for THIS task stay awake (the search budget counts candidates,
+# so every awake word widens every step; pricing alone reorders but never narrows)
+skill top_words(tc, active, k) -> Any {
+  let out = []
+  for i in range(0, len(active)) { let out = append(out, false) }
+  if tc == null { return out }
+  let picked = 0
+  while picked < k {
+    let best = 0 - 1
+    let bv = 0
+    for i in range(0, len(active)) {
+      if active[i] and out[i] == false {
+        let v = tc["w:" ++ str(i)]
+        if v != null {
+          if v > bv {
+            let best = i
+            let bv = v
+          }
+        }
+      }
+    }
+    if best < 0 { let picked = k } else {
+      let out = slice(out, 0, best) ++ [true] ++ slice(out, best + 1, len(out))
+      let picked = picked + 1
+    }
+  }
+  return out
+}
+
+# complementary minds (Taylor & Vestergaard: humans adapt as a team of differently biased searchers): the SAME total
+# budget split three ways, each mind a short turn (foraging: leave a patch early -- Barack et al.)
+#   literal  -- hypo-priors (Pellicano & Burr): no words, the data as it is
+#   guided   -- strong priors: only the guide's top words awake, learned costs
+#   explorer -- the whole vocabulary, uniform costs
+skill team_solve(terms, lib, active, gd, pl, pre, maxsize, cap, k) -> Any {
+  let part = cap // 3
+  let effort = 0
+  let r = solve_seq(terms, lib, none_awake(lib), [pl[0], pl[1], [], null], pre, maxsize, part)
+  let effort = effort + r[1]
+  if r[0] != null { return [r[0], effort, "literal"] }
+  if gd != null {
+    let tc = guide_counts(gd, terms)
+    let r = solve_seq(terms, lib, top_words(tc, active, k), [pl[0], pl[1], [], tc, 2], pre, maxsize, part)
+    let effort = effort + r[1]
+    if r[0] != null { return [r[0], effort, "guided"] }
+  }
+  let r = solve_seq(terms, lib, active, [pl[0], pl[1], [], null], pre, maxsize, part)
+  let effort = effort + r[1]
+  if r[0] != null { return [r[0], effort, "explorer"] }
+  return [null, effort, ""]
+}
+
+skill main() -> Any {
+  let npractice = 2000
+  if arg(1) != null { let npractice = num(arg(1)) }
+  let ntest = 500
+  if arg(2) != null { let ntest = num(arg(2)) }
+  let maxsize = 7
+  let cap = 10000
+  let data = read_oeis(12000000)
+  if data == null { return "cannot read " ++ OEIS() }
+  let seqs = data[0]
+  let nseq = data[1]
+  let pl = pools()
+  let pre = prelude()
+  # one in five (by position in the A-number order) is a test sequence, never practised
+  # lessons from the teacher: stepping-stone tasks (their trees only MAKE the 12 terms; Pi must find a program itself)
+  let taught = []
+  if arg(3) != null {
+    for ls in load_lessons(read_file(arg(3))) {
+      if ls[0] == "task" and ls[1] == "numbers" {
+        let terms = []
+        let ok = true
+        for k in range(0, 12) {
+          let v = sev(ls[3], null, k, null, [])
+          if v == null { let ok = false } else { let terms = append(terms, v) }
+        }
+        if ok { let taught = append(taught, ["taught: " ++ ls[2], terms, ls[3]]) }
+      }
+    }
+  }
+  # install mode (arg 4 = "install"): the teacher's programs ARE programs -- each is checked against the terms it makes
+  # and goes straight into memory, no search; nights then compress the whole corpus (library learning from given
+  # programs, as Stitch does, instead of rediscovering each one first)
+  let install = arg(4) == "install"
+  let practice = taught
+  let extra = len(taught)
+  if install {
+    let practice = []
+    let extra = 0
+  }
+  let test = []
+  for i in range(0, nseq) {
+    let sq = fget(seqs, i)
+    if i % 5 == 0 {
+      if len(test) < ntest { let test = append(test, sq) }
+    } else {
+      if len(practice) < npractice + extra { let practice = append(practice, sq) }
+    }
+  }
+  let out = str(len(taught)) ++ " taught stepping stones first. "
+  let out = out ++ "Pi decompressed the OEIS itself: " ++ str(nseq) ++ " usable sequences (12 small terms). Practice " ++ str(len(practice)) ++ ", test " ++ str(len(test)) ++ ".\n"
+  do print(out)
+  let lib = []
+  let active = []
+  let episodes = []
+  let names = []
+  let eterms = []
+  let solved = 0
+  if install and len(taught) > 0 {
+    for t in taught {
+      let episodes = append(episodes, t[2])
+      let names = append(names, t[0])
+      let eterms = append(eterms, t[1])
+    }
+    let night = 0
+    let going = true
+    while going and night < 6 {
+      let real = []
+      for e in episodes { let real = append(real, true) }
+      let l = learn_g(lib, episodes, 12, real, 2, 4)
+      let lib = l[0]
+      let replayed = l[1]
+      for wi in range(0, len(lib)) {
+        let ns = []
+        for t in replayed { let ns = append(ns, rw(t, wi, lib[wi][0])) }
+        let replayed = ns
+      }
+      let episodes = replayed
+      let nw = []
+      for a in l[2] { let nw = append(nw, "w" ++ str(a[0]) ++ " = " ++ show(lib[a[0]][0])) }
+      if len(nw) == 0 { let going = false }
+      let line = "installed " ++ str(len(taught)) ++ " taught programs, night " ++ str(night + 1) ++ ": new words: " ++ join(nw, "; ")
+      do print(line)
+      let out = out ++ line ++ "\n"
+      let night = night + 1
+    }
+    let active = awake_words(lib, episodes)
+  }
+  # usage costs (arg 5 = "usage"): every form and word costs -log2 of how often Pi's memories use it, so a big
+  # vocabulary stops widening every search -- common words are cheap, rare ones are tried late
+  let usage = arg(5) == "usage"
+  let fc = null
+  if usage { let fc = form_counts(episodes) }
+  # the guide (arg 5 = "guide"): per-task costs from Pi's intuition, retrained after every night
+  let guide = arg(5) == "guide"
+  # arg 6: the most bits a learned cost may add over uniform (none: no cap)
+  let capx = null
+  if arg(6) != null {
+    if arg(6) != "x" { let capx = num(arg(6)) }
+  }
+  # arg 7: attention -- how many words stay awake per task (the guide's top k); none: all awake words
+  let topk = null
+  if arg(7) != null { let topk = num(arg(7)) }
+  # arg 8 = "team": complementary minds (needs the guide; arg 7 is the guided mind's k, default 8)
+  let team = arg(8) == "team"
+  let tk = 8
+  if topk != null { let tk = topk }
+  let minds = {"literal": 0, "guided": 0, "explorer": 0}
+  let gd = null
+  if guide and len(episodes) > 0 { let gd = guide_train(eterms, episodes) }
+  # Pi's own algebra (arg 9 = "algebra"): laws found by experiment, rediscovered after every night (new words)
+  let usealg = arg(9) == "algebra"
+  let alg = null
+  if usealg {
+    let alg = [discover_binary(), discover_unary(lib)]
+    let line = "Pi's algebra, found by experiment:"
+    do print(line)
+    do print(algebra_text(alg, lib))
+  }
+  let batch = 250
+  let i = 0
+  while i < len(practice) {
+    let got = 0
+    for k in range(i, min(i + batch, len(practice))) {
+      let sq = practice[k]
+      # one region per sequence: the guide's map, the awake list and the search die here; only the answer leaves
+      let pm = mark()
+      let tc = fc
+      if gd != null { let tc = guide_counts(gd, sq[1]) }
+      let aw = active
+      if topk != null and gd != null { let aw = top_words(tc, active, topk) }
+      let r = null
+      if team { let r = team_solve(sq[1], lib, active, gd, pl, pre, maxsize, cap, tk) } else {
+        let r = solve_seq(sq[1], lib, aw, [pl[0], pl[1], [], tc, capx, alg], pre, maxsize, cap)
+      }
+      let r = release(pm, r)
+      if r[0] != null {
+        let episodes = append(episodes, r[0])
+        let names = append(names, sq[0])
+        let eterms = append(eterms, sq[1])
+        let got = got + 1
+      }
+    }
+    let solved = solved + got
+    # night: words from every sequence solved so far
+    let real = []
+    for e in episodes { let real = append(real, true) }
+    # more experience, more words in a night: one per 15 new memories, between 3 and 12 (mass lessons arrive at once)
+    let most = min(12, max(3, got // 15))
+    let l = learn_g(lib, episodes, most, real, 2, 4)
+    let lib = l[0]
+    let replayed = l[1]
+    for wi in range(0, len(lib)) {
+      let ns = []
+      for t in replayed { let ns = append(ns, rw(t, wi, lib[wi][0])) }
+      let replayed = ns
+    }
+    let episodes = replayed
+    let active = awake_words(lib, episodes)
+    if usage { let fc = form_counts(episodes) }
+    if guide { let gd = guide_train(eterms, episodes) }
+    if usealg { let alg = [alg[0], discover_unary(lib)] }
+    let nw = []
+    for a in l[2] { let nw = append(nw, "w" ++ str(a[0]) ++ " = " ++ show(lib[a[0]][0])) }
+    let line = "sequences " ++ str(i + 1) ++ "-" ++ str(min(i + batch, len(practice))) ++ ": " ++ str(got) ++ " solved (" ++ str(solved) ++ " in all); new words: " ++ join(nw, "; ")
+    do print(line)
+    let out = out ++ line ++ "\n"
+    let i = i + batch
+  }
+  # the test: sequences never practised, with Pi's words and without them
+  let with = 0
+  let without = 0
+  let w0 = 0
+  let w1 = 0
+  let shows = []
+  let hold0 = 0
+  let hold1 = 0
+  let wrongs = []
+  for sq in test {
+    let tm = mark()
+    let alg0 = null
+    if alg != null { let alg0 = [alg[0], []] }
+    let r0 = solve_seq(sq[1], lib, none_awake(lib), [pl[0], pl[1], [], null, null, alg0], pre, maxsize, cap)
+    let tc = fc
+    if gd != null { let tc = guide_counts(gd, sq[1]) }
+    let aw = active
+    if topk != null and gd != null { let aw = top_words(tc, active, topk) }
+    let r1 = null
+    if team { let r1 = team_solve(sq[1], lib, active, gd, pl, pre, maxsize, cap, tk) } else {
+      let r1 = solve_seq(sq[1], lib, aw, [pl[0], pl[1], [], tc, capx, alg], pre, maxsize, cap)
+    }
+    let kept = release(tm, [r0, r1])
+    let r0 = kept[0]
+    let r1 = kept[1]
+    if team and r1[0] != null {
+      let c = minds[r1[2]]
+      let minds = put(minds, r1[2], c + 1)
+    }
+    let w0 = w0 + r0[1]
+    let w1 = w1 + r1[1]
+    if r0[0] != null {
+      let without = without + 1
+      if holds(r0[0], sq[2], lib) { let hold0 = hold0 + 1 }
+    }
+    if r1[0] != null {
+      let with = with + 1
+      if holds(r1[0], sq[2], lib) { let hold1 = hold1 + 1 } else {
+        if len(wrongs) < 10 { let wrongs = append(wrongs, sq[0] ++ " " ++ join(slice(sq[1], 0, 8), ",") ++ "...  =  " ++ show(r1[0])) }
+      }
+      if r0[0] == null and len(shows) < 10 { let shows = append(shows, sq[0] ++ " " ++ join(slice(sq[1], 0, 8), ",") ++ "...  =  " ++ show(r1[0])) }
+    }
+  }
+  let out = out ++ "\nPi's vocabulary from the OEIS: " ++ str(len(lib)) ++ " words.\n"
+  for wi in range(0, len(lib)) { let out = out ++ "  w" ++ str(wi) ++ "(" ++ lib[wi][1] ++ ") = " ++ show(lib[wi][0]) ++ "\n" }
+  let out = out ++ "\nTEST: " ++ str(len(test)) ++ " sequences never practised\n"
+  let out = out ++ "  without Pi's words: " ++ str(without) ++ " solved (effort " ++ str(w0) ++ ")\n"
+  let out = out ++ "  precision -- answers that also predict terms 13-20 (never seen): without " ++ str(hold0) ++ " of " ++ str(without) ++ ", with " ++ str(hold1) ++ " of " ++ str(with) ++ "\n"
+  for x in wrongs { let out = out ++ "    did not hold: " ++ x ++ "\n" }
+  let out = out ++ "  with Pi's words:    " ++ str(with) ++ " solved (effort " ++ str(w1) ++ ")\n"
+  if team { let out = out ++ "  solved by mind: literal " ++ str(minds["literal"]) ++ ", guided " ++ str(minds["guided"]) ++ ", explorer " ++ str(minds["explorer"]) ++ "\n" }
+  let out = out ++ "\nsolved only with the words:\n"
+  for x in shows { let out = out ++ "  " ++ x ++ "\n" }
+  return out
+}

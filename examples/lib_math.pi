@@ -1,0 +1,3 @@
+# A module: imported by more.pi
+skill square(x) -> Any { return x * x }
+skill is_even(n) -> Any { return n % 2 == 0 }

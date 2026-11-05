@@ -1,0 +1,96 @@
+# (arr_text(b, from, to) takes an END position, not a length)
+# Pi reads a local LLM's file by itself (GGUF): the header, the metadata (architecture, sizes, vocabulary) and the
+# tensor table (every weight matrix: name, shape, number format, where it sits in the file). Read-only; no llama.cpp,
+# no server -- the first stage of decompiling a model into Pi.
+#   out\gguf.exe "path\model.gguf"   -> a summary, and the full tensor table in out\gguf_info.txt
+
+import "ggufl.pi"
+
+skill main() -> Any {
+  let path = arg(1)
+  if path == null { return "usage: gguf.exe model.gguf" }
+  # near N w1 w2 ...: the model's word map over its first N whole-word tokens, nearest words to each
+  if arg(2) == "near" {
+    let t0 = ticks()
+    let m = open_model(path)
+    let t1 = ticks()
+    let wm = word_map(m, rd_int(arg(3)))
+    let t2 = ticks()
+    let out = "vocabulary read in " ++ str(t1 - t0) ++ " ms; " ++ str(len(wm[0])) ++ " whole-word vectors decoded in " ++ str(t2 - t1) ++ " ms\n"
+    let i = 4
+    while arg(i) != null {
+      let out = out ++ nearest(wm, arg(i), 8) ++ "\n"
+      let i = i + 1
+    }
+    return out ++ "(" ++ str(ticks() - t2) ++ " ms for the searches)"
+  }
+  # row TENSOR R: the first 12 decoded weights of row R (checked against llama.cpp's reference reader, outside Pi)
+  if arg(2) == "row" {
+    let m = open_model(path)
+    let t = tensor(m, arg(3))
+    let r = row(m, t, rd_int(arg(4)))
+    let xs = []
+    for i in range(0, 12) { let xs = append(xs, str(aget(r, i))) }
+    return arg(3) ++ " row " ++ arg(4) ++ " (x 2^24): " ++ join(xs, " ")
+  }
+  let t0 = ticks()
+  let b = read_bytes(path, 0, 64000000)
+  if b == null { return "cannot read " ++ path }
+  if arr_text(b, 0, 4) != "GGUF" { return "not a GGUF file" }
+  let ver = u32(b, 4)
+  let nt = u64(b, 8)
+  let nkv = u64(b, 16)
+  let p = 24
+  let meta = []
+  let align = 32
+  let vocab = 0
+  for i in range(0, nkv) {
+    let kl = u64(b, p)
+    let key = arr_text(b, p + 8, p + 8 + kl)
+    let vt = u32(b, p + 8 + kl)
+    let r = value(b, p + 12 + kl, vt)
+    if key == "general.alignment" { let align = u32(b, p + 12 + kl) }
+    if key == "tokenizer.ggml.tokens" { let vocab = r[2] }
+    let meta = append(meta, key ++ " = " ++ r[0])
+    let p = r[1]
+  }
+  # the tensor table
+  let tens = []
+  let total = 0
+  let types = {}
+  for i in range(0, nt) {
+    let nl = u64(b, p)
+    let name = arr_text(b, p + 8, p + 8 + nl)
+    let q = p + 8 + nl
+    let nd = u32(b, q)
+    let dims = []
+    let ne = 1
+    for d in range(0, nd) {
+      let v = u64(b, q + 4 + 8 * d)
+      let dims = append(dims, str(v))
+      let ne = ne * v
+    }
+    let q = q + 4 + 8 * nd
+    let ty = u32(b, q)
+    let off = u64(b, q + 4)
+    let p = q + 12
+    let total = total + ne
+    let tn = tname(ty)
+    let c = types[tn]
+    if c == null { let c = 0 }
+    let types = put(types, tn, c + 1)
+    let tens = append(tens, name ++ "  [" ++ join(dims, " x ") ++ "]  " ++ tn ++ "  @" ++ str(off))
+  }
+  let data = ((p + align - 1) // align) * align
+  let ts = []
+  for k in keys(types) { let ts = append(ts, k ++ " " ++ str(types[k])) }
+  do write_file("out\\gguf_info.txt", join(meta, "\n") ++ "\n\n" ++ join(tens, "\n"))
+  let out = "GGUF v" ++ str(ver) ++ ": " ++ str(nkv) ++ " metadata entries, " ++ str(nt) ++ " tensors, " ++ str(total // 1000000) ++ "M weights, vocabulary " ++ str(vocab) ++ "; data starts at byte " ++ str(data) ++ " (read in " ++ str(ticks() - t0) ++ " ms)\n"
+  let out = out ++ "number formats: " ++ join(ts, ", ") ++ "\n"
+  for m in meta {
+    if find_any(m, ["general.architecture", "general.name", ".block_count", ".embedding_length", ".feed_forward_length", ".attention.head_count", ".expert_count", ".expert_used_count", ".context_length", "rope.dimension_count", "file_type"]) { let out = out ++ "  " ++ slice(m, 0, 160) ++ "\n" }
+  }
+  let out = out ++ "first tensors:\n"
+  for t in slice(tens, 0, imin(14, len(tens))) { let out = out ++ "  " ++ t ++ "\n" }
+  return out
+}

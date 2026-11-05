@@ -1,0 +1,191 @@
+# naudio: a neural voice. A SIREN (a network of sine neurons), trained from scratch on this PC's GPU, learns to
+# reproduce ONE real speech recording -- input a moment in time, output the sound pressure then. The trained weights
+# ARE that voice's recording: Pi captures real sound, it does not invent it. The audio analogue of nimage.
+#   naudio IN.wav OUT.wav [steps] [hidden] [w0first]
+# IN.wav must be 16-bit mono PCM (convert with: ffmpeg -i in.mp3 -ac 1 -ar 16000 -sample_fmt s16 out.wav).
+import "grad.pi"
+
+skill na_u16(b, i) -> Any { return aget(b, i) + 256 * aget(b, i + 1) }
+skill na_u32(b, i) -> Any { return aget(b, i) + 256 * aget(b, i + 1) + 65536 * aget(b, i + 2) + 16777216 * aget(b, i + 3) }
+skill na_is(b, i, a0, a1, a2, a3) -> Any { return aget(b, i) == a0 and aget(b, i + 1) == a1 and aget(b, i + 2) == a2 and aget(b, i + 3) == a3 }
+
+# read a PCM WAV -> [samplerate, channels, bits, data offset, data bytes, file bytes]
+skill na_read_wav(path) -> Any {
+  let size = rt_file_size(path)
+  if size == 0 { fail("cannot read " ++ path) }
+  let b = read_bytes(path, 0, size)
+  if not na_is(b, 0, 82, 73, 70, 70) or not na_is(b, 8, 87, 65, 86, 69) { fail(path ++ " is not a WAV") }
+  let sr = 0
+  let ch = 0
+  let bits = 0
+  let doff = 0
+  let dlen = 0
+  let i = 12
+  while i + 8 <= len(b) {
+    let clen = na_u32(b, i + 4)
+    let body = i + 8
+    if na_is(b, i, 102, 109, 116, 32) {
+      ch = na_u16(b, body + 2)
+      sr = na_u32(b, body + 4)
+      bits = na_u16(b, body + 14)
+    } else if na_is(b, i, 100, 97, 116, 97) {
+      doff = body
+      dlen = clen
+    }
+    i = body + clen + (clen % 2)
+  }
+  if bits != 16 or ch != 1 { fail("need 16-bit mono PCM; got " ++ str(bits) ++ "-bit, " ++ str(ch) ++ " channels. Convert: ffmpeg -i in -ac 1 -ar 16000 -sample_fmt s16 out.wav") }
+  return [sr, ch, bits, doff, dlen, b]
+}
+
+# the SIREN: input time -> hidden sine layers -> one output. first/hidden are the sine frequencies (w0).
+skill na_net(G, st, hid, nlayers, w0first, w0hidden) -> Any {
+  let sizes = [1]
+  for i in range(0, nlayers) { sizes = append(sizes, hid) }
+  sizes = append(sizes, 1)
+  let layers = []
+  for l in range(0, len(sizes) - 1) {
+    let fin = sizes[l]
+    let fout = sizes[l + 1]
+    let w = g_param(G, fin, fout)
+    let b = g_param(G, 1, fout)
+    if l == 0 {
+      g_uniform(w, st, 1.0 / float(fin))
+      g_uniform(b, st, 3.14159265)
+    } else if l == len(sizes) - 2 {
+      g_uniform(w, st, sqrt(6.0 / float(fin)) / w0hidden * 0.1)
+    } else {
+      g_uniform(w, st, sqrt(6.0 / float(fin)) / w0hidden)
+    }
+    layers = append(layers, [w, b, l])
+  }
+  return [layers, w0first, w0hidden]
+}
+skill na_fwd(G, net, x) -> Any {
+  let layers = net[0]
+  let n = len(layers)
+  let h = x
+  for l in range(0, n) {
+    if l == n - 1 {
+      h = g_dense(G, h, layers[l][0], layers[l][1], "", 0.0)
+    } else {
+      let w0 = if l == 0 { net[1] } else { net[2] }
+      h = g_dense(G, h, layers[l][0], layers[l][1], "sin", w0)
+    }
+  }
+  return h
+}
+
+# pred (N on the GPU) -> int16 little-endian bytes, clamped
+skill na_to_bytes(pred, n) -> Any {
+  let host = rt_host_alloc(4 * n)
+  rt_gpu_to_host(host, pred[0], 4 * n)
+  let out = arr(2 * n + 1)
+  for i in range(0, n) {
+    let v = g_bits_real(rt_g_getbits(host, i))
+    let q = int(v * 32767.0 + if v >= 0.0 { 0.5 } else { 0.0 - 0.5 })
+    if q < 0 - 32768 { q = 0 - 32768 }
+    if q > 32767 { q = 32767 }
+    if q < 0 { q = q + 65536 }
+    aset(out, 2 * i, q % 256)
+    aset(out, 2 * i + 1, q // 256)
+  }
+  rt_host_free(host)
+  return out
+}
+skill rt_na_pack(bt) -> Any {
+  let b = bt
+  let n = peek(b + 8)
+  let p = rt_alloc(n)
+  for i in range(0, n) { do pokeb(p + i, rt_untag(peek(b + 16 + 8 * i)) % 256) }
+  return rt_tag(p)
+}
+skill rt_na_wav(patht, datat, nsampt, srt) -> Any {
+  let n = rt_untag(nsampt)
+  let sr = rt_untag(srt)
+  let bytes = n * 2
+  let hd = rt_zero(rt_alloc(44), 44)
+  do rt_poke32(hd, 1179011410)
+  do rt_poke32(hd + 4, 36 + bytes)
+  do rt_poke32(hd + 8, 1163280727)
+  do rt_poke32(hd + 12, 544501094)
+  do rt_poke32(hd + 16, 16)
+  do pokeb(hd + 20, 1)
+  do pokeb(hd + 22, 1)
+  do rt_poke32(hd + 24, sr)
+  do rt_poke32(hd + 28, sr * 2)
+  do pokeb(hd + 32, 2)
+  do pokeb(hd + 34, 16)
+  do rt_poke32(hd + 36, 1635017060)
+  do rt_poke32(hd + 40, bytes)
+  let h = wcall("CreateFileA", rt_cstr(patht), 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 { return rt_tag(0) }
+  do wcall("WriteFile", h, hd, 44, gaddr(2), 0)
+  do wcall("WriteFile", h, rt_untag(datat), bytes, gaddr(2), 0)
+  do wcall("CloseHandle", h)
+  return rt_tag(bytes + 44)
+}
+
+skill main() -> Any {
+  if arg(1) == null or arg(2) == null { return "naudio IN.wav OUT.wav [steps] [hidden] [w0first]" }
+  let wav = na_read_wav(arg(1))
+  let sr = wav[0]
+  let doff = wav[3]
+  let bytes = wav[5]
+  let N = wav[4] // 2
+  let steps = if arg(3) != null { int(arg(3)) } else { 2000 }
+  let hid = if arg(4) != null { int(arg(4)) } else { 256 }
+  let w0first = if arg(5) != null { float(int(arg(5))) } else { 3000.0 }
+  print("voice " ++ str(sr) ++ " Hz, " ++ str(N) ++ " samples = " ++ format("{:.2f}", float(N) / float(sr)) ++ " s; " ++ str(hid) ++ " hidden, w0 " ++ format("{:.0f}", w0first))
+  let t0 = ticks()
+
+  let G = g_open()
+  let st = arr(1)
+  aset(st, 0, 777)
+
+  # input time in [-1, 1]
+  let x = g_tensor(N, 1)
+  let hostx = rt_host_alloc(4 * N)
+  for i in range(0, N) { rt_g_putbits(hostx, i, g_f32bits(float(i) / float(N - 1) * 2.0 - 1.0)) }
+  rt_host_to_gpu(x[0], hostx, 4 * N)
+  rt_host_free(hostx)
+
+  # target samples, normalised; also their mean square for the SNR
+  let tgt = g_tensor(N, 1)
+  let hosty = rt_host_alloc(4 * N)
+  let sumsq = 0.0
+  for i in range(0, N) {
+    let lo = aget(bytes, doff + 2 * i)
+    let hi = aget(bytes, doff + 2 * i + 1)
+    let v = lo + 256 * hi
+    if v >= 32768 { v = v - 65536 }
+    let s = float(v) / 32768.0
+    sumsq = sumsq + s * s
+    rt_g_putbits(hosty, i, g_f32bits(s))
+  }
+  rt_host_to_gpu(tgt[0], hosty, 4 * N)
+  rt_host_free(hosty)
+  let meansq = sumsq / float(N)
+  print("data ready in " ++ str(ticks() - t0) ++ " ms, signal power " ++ format("{:.5f}", meansq))
+
+  let net = na_net(G, st, hid, 4, w0first, 30.0)
+  let opt = g_opt(G, 0.0001)
+  let tt = ticks()
+  for step in range(0, steps + 1) {
+    g_zero_grad(G)
+    let L = g_mse(G, na_fwd(G, net, x), tgt)
+    g_backward(G)
+    g_step(G, opt)
+    if step % 200 == 0 {
+      let snr = 10.0 * log10(meansq / (L + 0.0000000001))
+      print("step " ++ str(step) ++ "  loss " ++ format("{:.6f}", L) ++ "  SNR " ++ format("{:.2f}", snr) ++ " dB  (" ++ str((ticks() - tt) // 1000) ++ " s)")
+    }
+  }
+
+  g_zero_grad(G)
+  let pred = na_fwd(G, net, x)
+  let bb = na_to_bytes(pred, N)
+  let size = rt_na_wav(arg(2), rt_na_pack(bb), N, sr)
+  print("wrote " ++ arg(2) ++ ", " ++ str(size) ++ " bytes, total " ++ str((ticks() - t0) // 1000) ++ " s")
+  return 0
+}

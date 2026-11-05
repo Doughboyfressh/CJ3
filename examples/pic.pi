@@ -1,0 +1,2381 @@
+# pic -- the Pi compiler, written in Pi. It reads Pi source text and compiles it to native x86-64 in a Windows
+# PE64 executable. The produced program needs no interpreter and contains no Rust: its runtime (lists, maps,
+# text, files, printing) is examples/native/rt.pi -- also Pi, compiled into every program by pic itself.
+#
+#   pi run examples/pic.pi --skill compile_file --args '["examples/native/fib.pi", "out/fib.exe"]' --allow read,write --world
+#   out/pic.exe examples/pic.pi out/pic2.exe          (pic compiled by itself, then compiling itself)
+#
+# The language it compiles is a real subset of Pi, so the same file runs on the interpreter:
+#   skill NAME(a, b, ...) -> Type { ... }    main() is the entry
+#   let x = e   if e { } else { }   while e { }   for x in range(a, b) { }   for x in list { }   return e   do e
+#   integers, text "...", [lists], {"maps": ...}, null, true, false, x[k]
+#   + - * // % (floor, as Pi)   ++ (join)   < <= > >= == !=   and or not
+#   len str num contains put append slice chars ord fail read_file write_file print arg
+#
+# Values: an integer n is the word 2n + 1; null is 0; text, lists and maps are pointers to rt.pi objects.
+# Skills named rt_* are the runtime and compile in the raw dialect (plain machine words, peek/poke/wcall).
+#
+# The code is position-independent: r15 holds the address of the data table, so a call is
+# "mov rax, [r15 + slot]; add rax, r15; call rax", text is "lea rax, [r15 + offset]", and kernel32 is
+# "call [r15 + 8i]". Jumps are computed from the lengths of the code they skip. So every skill compiles on
+# its own, in one pass, with no labels to fix up afterwards.
+
+reach { folders "out" "examples" }
+# the rules the language grew from its writers' compile failures (adopted by examples/native/grow.pi)
+import "grown.pi"
+
+# -- bytes ------------------------------------------------------------------------------------------------
+skill le16(n) -> Any { return [n % 256, (n // 256) % 256] }
+skill le32(n) -> Any {
+  if n < 0 { return le32(n + 4294967296) }
+  return [n % 256, (n // 256) % 256, (n // 65536) % 256, (n // 16777216) % 256]
+}
+skill le64(n) -> Any { return le32(n % 4294967296) ++ le32(n // 4294967296) }
+skill zeros(k) -> Any {
+  let xs = []
+  let i = 0
+  while i < k {
+    let xs = xs ++ [0]
+    let i = i + 1
+  }
+  return xs
+}
+skill align(x, a) -> Any { return (x + a - 1) // a * a }
+skill text_bytes(s) -> Any {
+  let out = []
+  for c in chars(s) { let out = out ++ [ord(c)] }
+  return out
+}
+
+# -- lexer: source text -> one token list per declaration, plus every distinct text literal ----------------
+# A token is its own source text: "skill", "42", "\"a\\n\"", "<=". Its kind is read from its first character.
+skill lex(src) -> Any {
+  let digits = "0123456789"
+  let letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+  let pairs = ["//", "==", "!=", "<=", ">=", "->", "++", "=>", "&&", "||"]
+  # other languages' spellings of and / or / not / true / false / null
+  let alias = {"&&": "and", "||": "or", "!": "not", "True": "true", "False": "false", "None": "null"}
+  let cs = chars(src)
+  let n = len(cs)
+  let chunks = []
+  let chunk = []
+  let line = []
+  let depth = 0
+  let strs = []
+  let seen = {}
+  let i = 0
+  while i < n {
+    let c = cs[i]
+    let j = i + 1
+    let tok = null
+    if c == "\n" {
+      let chunk = chunk ++ line
+      let line = []
+    } else {
+      # comments: # anywhere; // too when it opens the line (elsewhere // is floor division)
+      if c == "#" or (c == "/" and j < n and cs[j] == "/" and len(line) == 0) {
+        while j < n and cs[j] != "\n" { let j = j + 1 }
+      } else {
+        # ; ends nothing in Pi (statements end by their shape): it is skipped, so a; b and C-style lines compile
+        if c != " " and c != "\t" and c != "\r" and c != ";" {
+          if contains(digits, c) {
+            while j < n and contains(digits, cs[j]) { let j = j + 1 }
+            if j < n and cs[j] == "." {
+              let j = j + 1
+              while j < n and contains(digits, cs[j]) { let j = j + 1 }
+            }
+            if j < n and (cs[j] == "e" or cs[j] == "E") {
+              let j = j + 1
+              if j < n and (cs[j] == "+" or cs[j] == "-") { let j = j + 1 }
+              while j < n and contains(digits, cs[j]) { let j = j + 1 }
+            }
+          } else {
+            if contains(letters, c) {
+              while j < n and (contains(letters, cs[j]) or contains(digits, cs[j])) { let j = j + 1 }
+            } else {
+              if c == "'" {
+                # 'text' (as Python and C programs write it) is the same text in double quotes: " inside gets a \
+                let sq = "\""
+                while j < n and cs[j] != "'" {
+                  if cs[j] == "\\" and j + 1 < n {
+                    if cs[j + 1] == "'" {
+                      let sq = sq ++ "'"
+                    } else {
+                      let sq = sq ++ cs[j] ++ cs[j + 1]
+                    }
+                    let j = j + 2
+                  } else {
+                    if cs[j] == "\"" {
+                      let sq = sq ++ "\\\""
+                    } else {
+                      let sq = sq ++ cs[j]
+                    }
+                    let j = j + 1
+                  }
+                }
+                if j >= n { do fail("pic: a text literal is not closed") }
+                let j = j + 1
+                let sq = sq ++ "\""
+              }
+              if c == "\"" {
+                while j < n and cs[j] != "\"" {
+                  if cs[j] == "\\" { let j = j + 1 }
+                  let j = j + 1
+                }
+                if j >= n { do fail("pic: a text literal is not closed") }
+                let j = j + 1
+              }
+              if c != "'" and c != "\"" {
+                if j < n {
+                  if contains(pairs, c ++ cs[j]) { let j = j + 1 }
+                }
+              }
+            }
+          }
+          let tok = ""
+          for k in range(i, j) { let tok = tok ++ cs[k] }
+          if c == "'" { let tok = sq }
+          if alias[tok] != null { let tok = alias[tok] }
+        }
+      }
+    }
+    if tok != null {
+      if depth == 0 and (tok == "skill" or tok == "reach") {
+        let whole = chunk ++ line
+        if len(whole) > 0 { let chunks = chunks ++ [whole] }
+        let chunk = []
+        let line = []
+      }
+      if tok == "{" { let depth = depth + 1 }
+      if tok == "}" { let depth = depth - 1 }
+      if c == "\"" or c == "'" {
+        if seen[tok] == null {
+          let seen = put(seen, tok, len(strs))
+          let strs = strs ++ [tok]
+        }
+      }
+      let line = line ++ [tok]
+    }
+    let i = j
+  }
+  let whole = chunk ++ line
+  if len(whole) > 0 { let chunks = chunks ++ [whole] }
+  # the grown rules (grown.pi): token rewrites of each declaration; a quoted name a rule makes goes in the literal
+  # table like every text the lexer saw
+  let rules = grown_rules()
+  if len(rules) > 0 {
+    let nc = []
+    for ch in chunks {
+      let gr = grow_rewrite(ch, rules)
+      let nc = nc ++ [gr[0]]
+      for q in gr[1] {
+        if seen[q] == null {
+          let seen = put(seen, q, len(strs))
+          let strs = strs ++ [q]
+        }
+      }
+    }
+    let chunks = nc
+  }
+  # a name between { or , and , or } may be a map's shorthand key ({counts, total}): its quoted text goes in the
+  # literal table too, since the parser can only use literals the lexer saw
+  for ch in chunks {
+    let n = len(ch)
+    for i in range(1, n - 1) {
+      let tk = ch[i]
+      if (ch[i - 1] == "{" or ch[i - 1] == ",") and (ch[i + 1] == "," or ch[i + 1] == "}") and tkind(tk) == "id" {
+        let q = "\"" ++ tk ++ "\""
+        if seen[q] == null {
+          let seen = put(seen, q, len(strs))
+          let strs = strs ++ [q]
+        }
+      }
+    }
+  }
+  return {"chunks": chunks, "strs": strs}
+}
+
+# -- grown rules: one token pattern matched at position i of ts -> the bindings ("$id..." -> the name), or null.
+# "$id..." matches a name, "$num..." a number, "$str..." a quoted text, "$any..." any token; others match exactly.
+skill grow_match(ts, i, pat) -> Any {
+  if i + len(pat) > len(ts) { return null }
+  let b = {}
+  for k in range(0, len(pat)) {
+    let pt = pat[k]
+    let tk = ts[i + k]
+    if slice(pt, 0, 1) == "$" {
+      let want = if slice(pt, 0, 3) == "$id" { "id" } else if slice(pt, 0, 4) == "$num" { "num" } else if slice(pt, 0, 4) == "$str" { "str" } else { "" }
+      if want != "" and tkind(tk) != want { return null }
+      if b[pt] != null and b[pt] != tk { return null }
+      let b = put(b, pt, tk)
+    } else {
+      if pt != tk { return null }
+    }
+  }
+  return b
+}
+
+# a replacement token with the bindings in: "$x" -> its token, "\"$x\"" -> the bound name as quoted text
+skill grow_subst(t, b) -> Any {
+  if slice(t, 0, 1) == "$" and b[t] != null { return b[t] }
+  if len(t) > 3 and slice(t, 0, 2) == "\"$" {
+    let v = slice(t, 1, len(t) - 1)
+    if b[v] != null { return "\"" ++ b[v] ++ "\"" }
+  }
+  return t
+}
+
+# a declaration's tokens with every rule applied left to right (a rewrite's output is not matched again) ->
+# [tokens, the quoted texts the rules made]
+skill grow_rewrite(ts, rules) -> Any {
+  let out = []
+  let made = []
+  let n = len(ts)
+  let i = 0
+  while i < n {
+    let hit = null
+    for r in rules {
+      if hit == null {
+        let m = grow_match(ts, i, r[1])
+        if m != null { let hit = [r, m] }
+      }
+    }
+    if hit == null {
+      let out = out ++ [ts[i]]
+      let i = i + 1
+    } else {
+      for t in hit[0][2] {
+        let tk = grow_subst(t, hit[1])
+        let out = out ++ [tk]
+        if tkind(tk) == "str" { let made = made ++ [tk] }
+      }
+      let i = i + len(hit[0][1])
+    }
+  }
+  return [out, made]
+}
+
+skill tkind(t) -> Any {
+  if t == "" { return "eof" }
+  let c = chars(t)[0]
+  if contains("0123456789", c) { return "num" }
+  if c == "\"" { return "str" }
+  if contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", c) { return "id" }
+  return "sym"
+}
+
+# -- parser: one declaration's tokens -> {name, params, body}; each step returns [node, next position] -----
+skill expect(ts, p, v) -> Any {
+  if ts[p] != v { do fail("pic: expected " ++ v ++ ", got " ++ str(ts[p])) }
+  return p + 1
+}
+
+# for (x in xs) { ... } -> for x in xs { ... }: the parentheses many languages put around a loop header are dropped
+skill for_parens(ts) -> Any {
+  if not contains(ts, "for") { return ts }
+  let n = len(ts)
+  let drop = {}
+  let i = 0
+  while i + 1 < n {
+    if ts[i] == "for" and ts[i + 1] == "(" {
+      let d = 0
+      let j = i + 1
+      let found = 0 - 1
+      while j < n and found < 0 {
+        if ts[j] == "(" { let d = d + 1 }
+        if ts[j] == ")" {
+          let d = d - 1
+          if d == 0 { let found = j }
+        }
+        let j = j + 1
+      }
+      if found > 0 and found + 1 < n {
+        if ts[found + 1] == "{" {
+          let drop = put(drop, str(i + 1), true)
+          let drop = put(drop, str(found), true)
+        }
+      }
+    }
+    let i = i + 1
+  }
+  if len(keys(drop)) == 0 { return ts }
+  let out = []
+  for k in range(0, n) {
+    if drop[str(k)] == null { let out = append(out, ts[k]) }
+  }
+  return out
+}
+
+skill parse_decl(ts) -> Any {
+  if ts[0] == "reach" { return null }
+  let ts = for_parens(ts)
+  let p = expect(ts, 0, "skill")
+  let name = ts[p]
+  let p = expect(ts, p + 1, "(")
+  let params = []
+  while ts[p] != ")" {
+    if ts[p] == "" { do fail("pic: the parameters of " ++ name ++ " are not closed") }
+    let params = params ++ [ts[p]]
+    let p = p + 1
+    if ts[p] == "," { let p = p + 1 }
+  }
+  let p = p + 1
+  # a return type of any shape (-> Any, -> int, -> (int, int), -> List[str]) is skipped up to the body's {
+  if ts[p] == "->" {
+    let p = p + 1
+    let d = 0
+    while ts[p] != "" and (ts[p] != "{" or d > 0) {
+      if ts[p] == "(" or ts[p] == "[" { let d = d + 1 }
+      if ts[p] == ")" or ts[p] == "]" { let d = d - 1 }
+      let p = p + 1
+    }
+  }
+  let r = parse_block(ts, p)
+  if has_brk(r[0]) { do fail("pic: break or continue outside a loop in skill " ++ name) }
+  if ts[r[1]] != "" {
+    if ts[r[1]] == "let" or tkind(ts[r[1]]) == "id" { do fail("pic: found " ++ str(ts[r[1]]) ++ " outside every skill (after skill " ++ name ++ " ends): the top level holds only skill definitions -- put the code in main or another skill, and pass values as arguments (a constant can be a skill: skill N() -> Any { return 8 })") }
+    do fail("pic: unexpected " ++ str(ts[r[1]]) ++ " after skill " ++ name)
+  }
+  return {"name": name, "params": params, "body": r[0]}
+}
+
+skill parse_block(ts, p) -> Any {
+  let p = expect(ts, p, "{")
+  let stmts = []
+  while ts[p] != "}" {
+    if ts[p] == "" { do fail("pic: a block is not closed") }
+    let r = parse_stmt(ts, p)
+    let stmts = stmts ++ [r[0]]
+    let p = r[1]
+  }
+  return [stmts, p + 1]
+}
+
+# break / continue: rewritten in the parser into flags (a loop body without them is left exactly as it was). Inner
+# loops are rewritten first, so a break that is left always belongs to the loop being built.
+skill has_brk(stmts) -> Any {
+  for s in stmts {
+    let t = s["t"]
+    if t == "break" or t == "continue" { return true }
+    if t == "if" {
+      if has_brk(s["then"]) or has_brk(s["els"]) { return true }
+    }
+    if t == "seq" {
+      if has_brk(s["body"]) { return true }
+    }
+  }
+  return false
+}
+
+# the statements with break -> bf = true, continue -> cf = true, and whatever follows a statement that may set them
+# wrapped in if not (bf or cf)
+skill brk_xform(stmts, bf, cf) -> Any {
+  let out = []
+  let n = len(stmts)
+  let i = 0
+  while i < n {
+    let s = stmts[i]
+    let t = s["t"]
+    if t == "break" { return append(out, {"t": "let", "name": bf, "e": {"t": "bool", "v": true}}) }
+    if t == "continue" { return append(out, {"t": "let", "name": cf, "e": {"t": "bool", "v": true}}) }
+    if (t == "if" or t == "seq") and has_brk([s]) {
+      let s2 = s
+      if t == "if" { let s2 = {"t": "if", "c": s["c"], "then": brk_xform(s["then"], bf, cf), "els": brk_xform(s["els"], bf, cf)} }
+      if t == "seq" { let s2 = {"t": "seq", "body": brk_xform(s["body"], bf, cf)} }
+      let out = append(out, s2)
+      let rest = brk_xform(slice(stmts, i + 1, n), bf, cf)
+      if len(rest) > 0 {
+        let go = {"t": "not", "a": {"t": "bin", "op": "or", "a": {"t": "var", "name": bf}, "b": {"t": "var", "name": cf}}}
+        let out = append(out, {"t": "if", "c": go, "then": rest, "els": []})
+      }
+      return out
+    }
+    let out = append(out, s)
+    let i = i + 1
+  }
+  return out
+}
+
+# a loop: while cond { head; body; tail } -- with break / continue: the condition also needs not bf, cf is reset each
+# pass, and the tail (a for loop's step) runs only when the loop did not break (so i keeps its value after a break)
+skill brk_wrap(cond, body, head, tail, id) -> Any {
+  if has_brk(body) == false { return [[], {"t": "while", "c": cond, "body": head ++ body ++ tail}] }
+  let bf = "__brk" ++ id
+  let cf = "__cnt" ++ id
+  let c2 = {"t": "bin", "op": "and", "a": cond, "b": {"t": "not", "a": {"t": "var", "name": bf}}}
+  let reset = {"t": "let", "name": cf, "e": {"t": "bool", "v": false}}
+  let tail2 = []
+  if len(tail) > 0 { let tail2 = [{"t": "if", "c": {"t": "not", "a": {"t": "var", "name": bf}}, "then": tail, "els": []}] }
+  return [[{"t": "let", "name": bf, "e": {"t": "bool", "v": false}}], {"t": "while", "c": c2, "body": head ++ [reset] ++ brk_xform(body, bf, cf) ++ tail2}]
+}
+
+# x = if c { a } else { b } (and return if ..., else if chains): the statement if c { x = a } else { x = b }, so no
+# expression node is new. target: ["let", name] or ["return"]
+skill ifx_stmt(target, e) -> Any {
+  if target[0] == "let" { return {"t": "let", "name": target[1], "e": e} }
+  return {"t": "return", "e": e}
+}
+
+skill parse_ifx(ts, p, target) -> Any {
+  let c = parse_expr(ts, p + 1, 1)
+  let a = parse_expr(ts, expect(ts, c[1], "{"), 1)
+  let q = expect(ts, expect(ts, a[1], "}"), "else")
+  if ts[q] == "if" {
+    let r = parse_ifx(ts, q, target)
+    return [{"t": "if", "c": c[0], "then": [ifx_stmt(target, a[0])], "els": [r[0]]}, r[1]]
+  }
+  let b = parse_expr(ts, expect(ts, q, "{"), 1)
+  return [{"t": "if", "c": c[0], "then": [ifx_stmt(target, a[0])], "els": [ifx_stmt(target, b[0])]}, expect(ts, b[1], "}")]
+}
+
+skill parse_stmt(ts, p) -> Any {
+  let v = ts[p]
+  if v == "let" {
+    # let (a, b) = e / let [a, b] = e: the parts of a list (a tuple is a list in Pi)
+    if ts[p + 1] == "(" or ts[p + 1] == "[" {
+      let close = ")"
+      if ts[p + 1] == "[" { let close = "]" }
+      let names = []
+      let q = p + 2
+      while ts[q] != close {
+        if ts[q] == "" { do fail("pic: the names of a let (...) are not closed") }
+        if ts[q] != "," { let names = append(names, ts[q]) }
+        let q = q + 1
+      }
+      let r = parse_expr(ts, expect(ts, q + 1, "="), 1)
+      let tmp = "__d" ++ str(p)
+      let body = [{"t": "let", "name": tmp, "e": r[0]}]
+      for i in range(0, len(names)) { let body = append(body, {"t": "let", "name": names[i], "e": {"t": "index", "a": {"t": "var", "name": tmp}, "b": {"t": "lit", "k": i}}}) }
+      return [{"t": "seq", "body": body}, r[1]]
+    }
+    if ts[p + 3] == "if" and ts[p + 2] == "=" { return parse_ifx(ts, p + 3, ["let", ts[p + 1]]) }
+    let r = parse_expr(ts, expect(ts, p + 2, "="), 1)
+    return [{"t": "let", "name": ts[p + 1], "e": r[0]}, r[1]]
+  }
+  if v == "return" {
+    if ts[p + 1] == "}" { return [{"t": "return", "e": {"t": "null"}}, p + 1] }
+    if ts[p + 1] == "if" { return parse_ifx(ts, p + 1, ["return"]) }
+    let r = parse_expr(ts, p + 1, 1)
+    return [{"t": "return", "e": r[0]}, r[1]]
+  }
+  if v == "do" {
+    let r = parse_expr(ts, p + 1, 1)
+    return [do_stmt(r[0]), r[1]]
+  }
+  if v == "break" or v == "continue" { return [{"t": v}, p + 1] }
+  if v == "while" {
+    let c = parse_expr(ts, p + 1, 1)
+    let b = parse_block(ts, c[1])
+    let w = brk_wrap(c[0], b[0], [], [], str(p))
+    if len(w[0]) == 0 { return [w[1], b[1]] }
+    return [{"t": "seq", "body": w[0] ++ [w[1]]}, b[1]]
+  }
+  if v == "if" {
+    let c = parse_expr(ts, p + 1, 1)
+    let a = parse_block(ts, c[1])
+    let p = a[1]
+    let els = []
+    if ts[p] == "else" {
+      if ts[p + 1] == "if" {
+        let r = parse_stmt(ts, p + 1)
+        let els = [r[0]]
+        let p = r[1]
+      } else {
+        let r = parse_block(ts, p + 1)
+        let els = r[0]
+        let p = r[1]
+      }
+    }
+    return [{"t": "if", "c": c[0], "then": a[0], "els": els}, p]
+  }
+  if v == "gpu" {
+    # gpu for x in xs -> v { B }  (see gpu_loop)
+    let q = expect(ts, p + 1, "for")
+    let x = ts[q]
+    let q = expect(ts, q + 1, "in")
+    let xse = null
+    let ae = null
+    let be = null
+    if ts[q] == "range" and ts[q + 1] == "(" {
+      let ra = parse_expr(ts, q + 2, 1)
+      let rb = parse_expr(ts, expect(ts, ra[1], ","), 1)
+      let ae = ra[0]
+      let be = rb[0]
+      let q = expect(ts, rb[1], ")")
+    } else {
+      let rx = parse_expr(ts, q, 1)
+      let xse = rx[0]
+      let q = rx[1]
+    }
+    let q = expect(ts, q, "->")
+    let vname = ts[q]
+    let body = parse_block(ts, q + 1)
+    return [gpu_loop(x, xse, ae, be, vname, body[0], str(p)), body[1]]
+  }
+  if v == "par" {
+    # par for x in xs -> v { B }  (see par_loop)
+    let q = expect(ts, p + 1, "for")
+    let x = ts[q]
+    let q = expect(ts, q + 1, "in")
+    let xs = parse_expr(ts, q, 1)
+    let q = expect(ts, xs[1], "->")
+    let vname = ts[q]
+    let body = parse_block(ts, q + 1)
+    return [par_loop(x, xs[0], vname, body[0], str(p), p), body[1]]
+  }
+  if v == "for" {
+    # for x in range(a, b) { B }  is  let x = a; let lim = b; while x < lim { B; let x = x + 1 }
+    # for x in xs { B }           is  let l = xs; let n = len(l); let i = 0; while i < n { let x = l[i]; B; let i = i + 1 }
+    let x = ts[p + 1]
+    let q = expect(ts, p + 2, "in")
+    let id = str(p)
+    let one = {"t": "lit", "k": 1}
+    # for x in lines(path) { B }: streamed from disk, each 8 MB chunk one memory region (see lines_loop)
+    if ts[q] == "lines" and ts[q + 1] == "(" {
+      let pe = parse_expr(ts, q + 2, 1)
+      let body = parse_block(ts, expect(ts, pe[1], ")"))
+      if has_brk(body[0]) { do fail("pic: break / continue in a for ... in lines(...) loop is not supported") }
+      return [lines_loop(x, pe[0], body[0], id), body[1]]
+    }
+    # range(n) is range(0, n); range(a, b, s) with a literal step s counts by s (down while x > b if s < 0); any
+    # other step takes the list way below
+    let rng = null
+    if ts[q] == "range" and ts[q + 1] == "(" {
+      let a = parse_expr(ts, q + 2, 1)
+      let ae = a[0]
+      let be = null
+      let sv = 1
+      let bp = a[1]
+      if ts[bp] == "," {
+        let b = parse_expr(ts, bp + 1, 1)
+        let be = b[0]
+        let bp = b[1]
+        if ts[bp] == "," {
+          let s = parse_expr(ts, bp + 1, 1)
+          let sv = 0
+          if s[0]["t"] == "lit" { let sv = s[0]["k"] }
+          if s[0]["t"] == "neg" and s[0]["a"]["t"] == "lit" { let sv = 0 - s[0]["a"]["k"] }
+          let bp = s[1]
+        }
+      } else {
+        let be = ae
+        let ae = {"t": "lit", "k": 0}
+      }
+      if sv != 0 and ts[bp] == ")" { let rng = [ae, be, sv, bp + 1] }
+    }
+    if rng != null {
+      let a = [rng[0]]
+      let b = [rng[1]]
+      let bp = rng[3]
+      let one = {"t": "lit", "k": rng[2]}
+      # "free": each pass is its own memory region (only the names the body binds survive it)
+      let fr = ts[bp] == "free"
+      if fr { let bp = bp + 1 }
+      let body = parse_block(ts, bp)
+      if fr and has_brk(body[0]) { do fail("pic: break / continue in a free loop is not supported") }
+      if fr { let body = [regioned(body[0], x, [], id), body[1]] }
+      let lim = "__lim" ++ id
+      let fm = []
+      if fr { let fm = [fmark(id)] }
+      let xv = {"t": "var", "name": x}
+      let step = {"t": "let", "name": x, "e": {"t": "bin", "op": "+", "a": xv, "b": one}}
+      let cmp = "<"
+      if rng[2] < 0 { let cmp = ">" }
+      let w = brk_wrap({"t": "bin", "op": cmp, "a": xv, "b": {"t": "var", "name": lim}}, body[0], [], [step], id)
+      let first = [{"t": "let", "name": x, "e": a[0]}, {"t": "let", "name": lim, "e": b[0]}] ++ fm
+      return [{"t": "seq", "body": first ++ w[0] ++ [w[1]]}, body[1]]
+    }
+    let xs = parse_expr(ts, q, 1)
+    let bp = xs[1]
+    let fr = ts[bp] == "free"
+    if fr { let bp = bp + 1 }
+    let body = parse_block(ts, bp)
+    if fr and has_brk(body[0]) { do fail("pic: break / continue in a free loop is not supported") }
+    if fr { let body = [regioned(body[0], x, [], id), body[1]] }
+    let l = "__l" ++ id
+    let cnt = "__n" ++ id
+    let i = "__i" ++ id
+    let iv = {"t": "var", "name": i}
+    let get = {"t": "let", "name": x, "e": {"t": "index", "a": {"t": "var", "name": l}, "b": iv}}
+    let step = {"t": "let", "name": i, "e": {"t": "bin", "op": "+", "a": iv, "b": one}}
+    let w = brk_wrap({"t": "bin", "op": "<", "a": iv, "b": {"t": "var", "name": cnt}}, body[0], [get], [step], id)
+    let first = [{"t": "let", "name": l, "e": xs[0]}, {"t": "let", "name": cnt, "e": {"t": "call", "name": "len", "args": [{"t": "var", "name": l}]}}]
+    let first = first ++ [{"t": "let", "name": i, "e": {"t": "lit", "k": 0}}]
+    if fr { let first = first ++ [fmark(id)] }
+    return [{"t": "seq", "body": first ++ w[0] ++ [w[1]]}, body[1]]
+  }
+  if v == "skill" { do fail("pic: a skill cannot be defined inside another skill: define it at the top level and pass it what it needs as arguments") }
+  # xs.append(v) / xs.push(v) / xs.extend(ys) / xs.sort() / xs.reverse() on their own change xs (as Python and JS
+  # mean them): let xs = append(xs, v) ... -- a value would be computed and dropped otherwise
+  if tkind(v) == "id" and ts[p + 1] == "." and tkind(ts[p + 2]) == "id" and ts[p + 3] == "(" {
+    let r = parse_expr(ts, p, 1)
+    let c = r[0]
+    let m = ts[p + 2]
+    if c["t"] == "call" and contains(["append", "push", "extend", "sort", "reverse"], m) {
+      let nv0 = c
+      if m == "extend" { let nv0 = nbin("++", nv(v), c["args"][1]) }
+      return [nlet(v, nv0), r[1]]
+    }
+    return [{"t": "do", "e": c}, r[1]]
+  }
+  # f(x) on its own is do f(x): the do is optional
+  if tkind(v) == "id" and ts[p + 1] == "(" {
+    let r = parse_expr(ts, p, 1)
+    return [do_stmt(r[0]), r[1]]
+  }
+  # name = value, as most languages write it: the same as let name = value (let binds and rebinds); and
+  # name += / -= / *= value: let name = name op (value)
+  if tkind(v) == "id" and ts[p + 1] == "=" {
+    if ts[p + 2] == "if" { return parse_ifx(ts, p + 2, ["let", v]) }
+    let r = parse_expr(ts, p + 2, 1)
+    return [{"t": "let", "name": v, "e": r[0]}, r[1]]
+  }
+  # xs[i] = value, g[r][c] = value, m[k] += value (-= *= ++=): the name rebound to a copy rebuilt from the inside out --
+  # let g = rt_setat(g, r, rt_setat(g[r], c, value)); lists and maps alike (values stay immutable underneath)
+  if tkind(v) == "id" and ts[p + 1] == "[" {
+    let idx = []
+    let q = p + 1
+    while ts[q] == "[" {
+      let ix = parse_expr(ts, q + 1, 1)
+      let idx = append(idx, ix[0])
+      let q = expect(ts, ix[1], "]")
+    }
+    let op = ""
+    if contains(["+", "-", "*", "++"], ts[q]) and ts[q + 1] == "=" {
+      let op = ts[q]
+      let q = q + 1
+    }
+    if ts[q] == "=" {
+      let r = parse_expr(ts, q + 1, 1)
+      let paths = [{"t": "var", "name": v}]
+      for k in range(0, len(idx) - 1) { let paths = append(paths, {"t": "index", "a": paths[k], "b": idx[k]}) }
+      let last = len(idx) - 1
+      let val = r[0]
+      if op != "" { let val = {"t": "bin", "op": op, "a": {"t": "index", "a": paths[last], "b": idx[last]}, "b": val} }
+      let k = last
+      while k >= 0 {
+        let val = {"t": "call", "name": "rt_setat", "args": [paths[k], idx[k], val]}
+        let k = k - 1
+      }
+      return [{"t": "let", "name": v, "e": val}, r[1]]
+    }
+  }
+  if tkind(v) == "id" and contains(["+", "-", "*", "++"], ts[p + 1]) and ts[p + 2] == "=" {
+    let r = parse_expr(ts, p + 3, 1)
+    return [{"t": "let", "name": v, "e": {"t": "bin", "op": ts[p + 1], "a": {"t": "var", "name": v}, "b": r[0]}}, r[1]]
+  }
+  do fail("pic: cannot start a statement with " ++ str(v))
+  return [null, p]
+}
+
+
+# ---- hardware in the language: AST builders for the desugared loop forms (par for, for ... free, lines()) ------
+skill nv(n) -> Any { return {"t": "var", "name": n} }
+skill nlet(n, e) -> Any { return {"t": "let", "name": n, "e": e} }
+skill ncall(f, args) -> Any { return {"t": "call", "name": f, "args": args} }
+skill nlit(k) -> Any { return {"t": "lit", "k": k} }
+skill nbin(op, a, b) -> Any { return {"t": "bin", "op": op, "a": a, "b": b} }
+skill nlist(items) -> Any { return {"t": "list", "items": items} }
+
+# a call whose value is dropped: append(xs, v), put(m, k, v), sort(xs), reverse(xs) on their own change their first
+# argument (xs = append(xs, v)) -- as a plain statement they computed a new value and threw it away, and a loop
+# waiting for xs to grow ran forever (the Flash brain's first program)
+skill do_stmt(e) -> Any {
+  if e["t"] == "call" and contains(["append", "put", "sort", "reverse"], e["name"]) and len(e["args"]) > 0 {
+    let a0 = e["args"][0]
+    if a0["t"] == "var" { return {"t": "let", "name": a0["name"], "e": e} }
+  }
+  return {"t": "do", "e": e}
+}
+
+# x.f(a, b) (a method call, as most languages write it) is f(x, a, b), from the "." at p -> [node, next position].
+# A few names are Pi's: strip -> trim, push -> append, toUpperCase -> upper; "sep".join(xs) (Python, the receiver
+# a text literal) is join(xs, sep); x.length / x.size / x.len() are len(x)
+skill method_call(ts, p, e) -> Any {
+  let m = ts[p + 1]
+  let alias = {"strip": "trim", "push": "append", "toUpperCase": "upper", "toLowerCase": "lower", "size": "len", "length": "len"}
+  let f = m
+  if alias[m] != null { let f = alias[m] }
+  if ts[p + 2] != "(" {
+    if f == "len" { return [ncall("len", [e]), p + 2] }
+    do fail("pic: ." ++ m ++ " -- a value has no fields in Pi: use a map, m[\"" ++ m ++ "\"]")
+  }
+  let args = []
+  let q = p + 3
+  while ts[q] != ")" {
+    let r = parse_expr(ts, q, 1)
+    let args = args ++ [r[0]]
+    let q = r[1]
+    if ts[q] == "," { let q = q + 1 }
+  }
+  if f == "join" and e["t"] == "str" and len(args) == 1 { return [ncall("join", [args[0], e]), q + 1] }
+  return [ncall(f, [e] ++ args), q + 1]
+}
+
+# a comprehension, from its "for" at p, el the item: [el for x in xs] is map(xs, fn(x) => el); "if c" filters xs
+# first; a second "for" makes a list for each x and joins them -> [node, next position]
+skill parse_compr(ts, p, el) -> Any {
+  let x = ts[p + 1]
+  let q = expect(ts, p + 2, "in")
+  let r = parse_expr(ts, q, 1)
+  let xs = r[0]
+  let q = r[1]
+  let cond = null
+  if ts[q] == "if" {
+    let c = parse_expr(ts, q + 1, 1)
+    let cond = c[0]
+    let q = c[1]
+  }
+  let inner = null
+  if ts[q] == "for" {
+    let ir = parse_compr(ts, q, el)
+    let inner = ir[0]
+    let q = ir[1]
+  }
+  if cond != null { let xs = ncall("filter", [xs, {"t": "fn", "params": [x], "body": [{"t": "return", "e": cond}]}]) }
+  if inner != null {
+    let m = ncall("map", [xs, {"t": "fn", "params": [x], "body": [{"t": "return", "e": inner}]}])
+    let cat = {"t": "fn", "params": ["__ca", "__cb"], "body": [{"t": "return", "e": nbin("++", nv("__ca"), nv("__cb"))}]}
+    return [ncall("reduce", [m, cat, nlist([])]), q]
+  }
+  return [ncall("map", [xs, {"t": "fn", "params": [x], "body": [{"t": "return", "e": el}]}]), q]
+}
+skill nidx(a, k) -> Any { return {"t": "index", "a": a, "b": nlit(k)} }
+
+# the names a loop body binds that must outlive one pass (not the loop's own temporaries "__...", not x)
+skill fmark(id) -> Any { return nlet("__fm" ++ id, ncall("mark", [])) }
+
+skill carried(body, x) -> Any {
+  let out = []
+  for n in collect(body, []) {
+    if n != x and slice(n, 0, 2) != "__" { let out = out ++ [n] }
+  }
+  return out
+}
+
+# body wrapped in its own memory region: everything one pass allocates is freed at its end, except the carried
+# names (and extra), which are copied down to the loop's mark (taken once before the loop: fmark) and rebound
+skill regioned(body, x, extra, id) -> Any {
+  let keep = carried(body, x) ++ extra
+  let m = "__fm" ++ id
+  let k = "__fk" ++ id
+  let items = []
+  for n in keep { let items = items ++ [nv(n)] }
+  let out = body ++ [nlet(k, ncall("release", [nv(m), nlist(items)]))]
+  let i = 0
+  for n in keep {
+    let out = out ++ [nlet(n, nidx(nv(k), i))]
+    let i = i + 1
+  }
+  return out
+}
+
+# for x in lines(path) { B }: the file streamed from disk 8 MB at a time; each chunk's lines are one region
+skill lines_loop(x, pathe, body, id) -> Any {
+  let f = "__lf" ++ id
+  let pos = "__lp" ++ id
+  let carry = "__lc" ++ id
+  let more = "__lm" ++ id
+  let b = "__lb" ++ id
+  let nb = "__ln" ++ id
+  let ls = "__ll" ++ id
+  let li = "__li" ++ id
+  let lk = "__lk" ++ id
+  let chunk = nlit(8000000)
+  let get = nlet(x, {"t": "index", "a": nv(ls), "b": nv(li)})
+  let inner = {"t": "while", "c": nbin("<", nv(li), nv(lk)), "body": [get] ++ body ++ [nlet(li, nbin("+", nv(li), nlit(1)))]}
+  let pass = [nlet(b, ncall("read_bytes", [nv(f), nv(pos), chunk])), nlet(nb, nlit(0))]
+  let pass = pass ++ [{"t": "if", "c": nbin("!=", nv(b), {"t": "null"}), "then": [nlet(nb, ncall("len", [nv(b)]))], "els": []}]
+  let pass = pass ++ [nlet(ls, ncall("split", [nbin("++", nv(carry), ncall("arr_text", [nv(b), nlit(0), nv(nb)])), {"t": "str", "raw": "\"\\n\""}]))]
+  # a full chunk keeps its last (maybe cut) line for the next one; the last chunk reads every line
+  let pass = pass ++ [nlet(lk, nbin("-", ncall("len", [nv(ls)]), nlit(1))), nlet(more, {"t": "bool", "v": true})]
+  let pass = pass ++ [{"t": "if", "c": nbin("<", nv(nb), chunk), "then": [nlet(more, {"t": "bool", "v": false})], "els": []}]
+  let pass = pass ++ [{"t": "if", "c": nbin("==", nv(more), {"t": "bool", "v": false}), "then": [{"t": "if", "c": nbin(">", ncall("len", [{"t": "index", "a": nv(ls), "b": nv(lk)}]), nlit(0)), "then": [nlet(lk, nbin("+", nv(lk), nlit(1)))], "els": []}], "els": []}]
+  let pass = pass ++ [nlet(li, nlit(0)), inner]
+  let pass = pass ++ [nlet(carry, {"t": "str", "raw": "\"\""}), {"t": "if", "c": nv(more), "then": [nlet(carry, {"t": "index", "a": nv(ls), "b": nbin("-", ncall("len", [nv(ls)]), nlit(1))})], "els": []}]
+  let pass = pass ++ [nlet(pos, nbin("+", nv(pos), nv(nb)))]
+  let loop = {"t": "while", "c": nv(more), "body": regioned(pass, x, [carry, pos, more], id)}
+  let first = [nlet(f, pathe), nlet(pos, nlit(0)), nlet(carry, {"t": "str", "raw": "\"\""}), nlet(more, {"t": "bool", "v": true}), fmark(id)]
+  return {"t": "seq", "body": first ++ [loop]}
+}
+
+# par for x in xs -> v { B }: worker processes (this same program, started again with "__par id w W") each take
+# the items i % W == w; after the loop v is the list of v's value at the end of each item's body, in order.
+# Inside a worker, a different par loop runs serially (no nested spawning).
+skill par_loop(x, xse, v, body, id, pnum) -> Any {
+  let pi = "__pi" ++ id
+  let pl = "__pl" ++ id
+  let pn = "__pn" ++ id
+  let pc = "__pc" ++ id
+  let pk = "__pk" ++ id
+  let pb = "__pb" ++ id
+  let pbs = "__pbs" ++ id
+  let pm = "__pm" ++ id
+  let ps = "__ps" ++ id
+  let idl = ncall("str", [nlit(pnum)])
+  let get = nlet(x, {"t": "index", "a": nv(pl), "b": nv(pk)})
+  # a worker: its items, each in its own region, values encoded as text, written to a file, then exit
+  let wbody = [get, nlet(pm, ncall("mark", [])), nlet(v, {"t": "null"})] ++ body
+  let wbody = wbody ++ [nlet(ps, ncall("release", [nv(pm), ncall("par_enc", [nv(v)])])), nlet(pb, ncall("append", [nv(pb), nv(ps)]))]
+  let wbody = wbody ++ [{"t": "if", "c": nbin(">=", ncall("len", [nv(pb)]), nlit(500)), "then": [nlet(pbs, ncall("append", [nv(pbs), ncall("join", [nv(pb), {"t": "str", "raw": "\"\""}])])), nlet(pb, nlist([]))], "els": []}]
+  let wbody = wbody ++ [nlet(pk, nbin("+", nv(pk), nidx(nv(pi), 2)))]
+  let worker = [nlet(pk, nidx(nv(pi), 1)), nlet(pb, nlist([])), nlet(pbs, nlist([])), {"t": "while", "c": nbin("<", nv(pk), nv(pn)), "body": wbody}]
+  let worker = worker ++ [{"t": "do", "e": ncall("write_file", [ncall("par_file", [idl, nidx(nv(pi), 1)]), ncall("join", [ncall("append", [nv(pbs), ncall("join", [nv(pb), {"t": "str", "raw": "\"\""}])]), {"t": "str", "raw": "\"\""}])])}]
+  let worker = worker ++ [{"t": "do", "e": ncall("exit", [nlit(0)])}]
+  # serial (inside some other par loop's worker): the same values, in this process
+  let sbody = [nlet(x, {"t": "index", "a": nv(pl), "b": nv(pk)}), nlet(v, {"t": "null"})] ++ body ++ [nlet(pb, ncall("append", [nv(pb), nv(v)])), nlet(pk, nbin("+", nv(pk), nlit(1)))]
+  let serial = [nlet(pk, nlit(0)), nlet(pb, nlist([])), {"t": "while", "c": nbin("<", nv(pk), nv(pn)), "body": sbody}, nlet(v, nv(pb))]
+  let first = [nlet(pi, ncall("par_info", [])), nlet(pl, xse), nlet(pn, ncall("len", [nv(pl)])), nlet(pc, nlit(0))]
+  let first = first ++ [{"t": "if", "c": nbin("!=", nv(pi), {"t": "null"}), "then": [nlet(pc, nlit(2)), {"t": "if", "c": nbin("==", nidx(nv(pi), 0), idl), "then": [nlet(pc, nlit(1))], "els": []}], "els": []}]
+  let rest = [{"t": "if", "c": nbin("==", nv(pc), nlit(1)), "then": worker, "els": []}]
+  let rest = rest ++ [{"t": "if", "c": nbin("==", nv(pc), nlit(2)), "then": serial, "els": []}]
+  let rest = rest ++ [{"t": "if", "c": nbin("==", nv(pc), nlit(0)), "then": [nlet(v, ncall("par_gather", [idl, nv(pn), ncall("par_workers", [])]))], "els": []}]
+  return {"t": "seq", "body": first ++ rest}
+}
+
+
+# ---- gpu for: the body compiled HERE to integer bytecode (integers only: a text literal made in the parser would not
+# be in the lexer's table); rt.pi turns the bytecode into PTX at run time and runs one GPU thread per item.
+# bytecode -- statements: 100 var <expr> 199 (let) | 101 <cond> 198 <stmts> 197 (while) |
+#             102 <cond> 198 <then> 196 <else> 197 (if); expressions in postfix: 2 var | 3 k | 4 outer |
+#             10 + 11 - 12 * 13 // 14 % 15 < 16 <= 17 > 18 >= 19 == 20 != 21 min 22 max 23 and 24 or | 30 abs 31 neg 32 not
+skill gpu_opcode(op) -> Any {
+  let ops = ["+", "-", "*", "//", "%", "<", "<=", ">", ">=", "==", "!=", "min", "max", "and", "or"]
+  let i = 0
+  for o in ops {
+    if o == op { return 10 + i }
+    let i = i + 1
+  }
+  return 0 - 1
+}
+
+skill gpu_cap(caps, n) -> Any {
+  let i = 0
+  for c in caps {
+    if c == n { return [i, caps] }
+    let i = i + 1
+  }
+  return [len(caps), caps ++ [n]]
+}
+
+# -> [codes, caps]
+skill gpu_expr(e, vars, caps) -> Any {
+  let t = e["t"]
+  if t == "lit" { return [[3, e["k"]], caps] }
+  if t == "bool" {
+    if e["v"] { return [[3, 1], caps] }
+    return [[3, 0], caps]
+  }
+  if t == "var" {
+    let n = e["name"]
+    if vars[n] != null { return [[2, vars[n]], caps] }
+    let r = gpu_cap(caps, n)
+    return [[4, r[0]], r[1]]
+  }
+  if t == "neg" or t == "not" {
+    let r = gpu_expr(e["a"], vars, caps)
+    let k = 31
+    if t == "not" { let k = 32 }
+    return [r[0] ++ [k], r[1]]
+  }
+  if t == "bin" {
+    let k = gpu_opcode(e["op"])
+    if k < 0 { do fail("pic: gpu for: the operator " ++ e["op"] ++ " cannot run on the GPU") }
+    let ra = gpu_expr(e["a"], vars, caps)
+    let rb = gpu_expr(e["b"], vars, ra[1])
+    return [ra[0] ++ rb[0] ++ [k], rb[1]]
+  }
+  if t == "call" {
+    let f = e["name"]
+    let args = e["args"]
+    if (f == "min" or f == "max") and len(args) == 2 {
+      let ra = gpu_expr(args[0], vars, caps)
+      let rb = gpu_expr(args[1], vars, ra[1])
+      return [ra[0] ++ rb[0] ++ [gpu_opcode(f)], rb[1]]
+    }
+    if f == "abs" and len(args) == 1 {
+      let r = gpu_expr(args[0], vars, caps)
+      return [r[0] ++ [30], r[1]]
+    }
+    do fail("pic: gpu for: " ++ f ++ "() cannot run on the GPU (only integers, + - * // %, comparisons, and/or/not, min max abs)")
+  }
+  do fail("pic: gpu for: this expression cannot run on the GPU: " ++ t)
+  return null
+}
+
+skill gpu_stmts(ss, vars, caps) -> Any {
+  let out = []
+  for st in ss {
+    let t = st["t"]
+    if t == "let" {
+      let r = gpu_expr(st["e"], vars, caps)
+      let out = out ++ [100, vars[st["name"]]] ++ r[0] ++ [199]
+      let caps = r[1]
+    } else {
+      if t == "while" {
+        let rc = gpu_expr(st["c"], vars, caps)
+        let rb = gpu_stmts(st["body"], vars, rc[1])
+        let out = out ++ [101] ++ rc[0] ++ [198] ++ rb[0] ++ [197]
+        let caps = rb[1]
+      } else {
+        if t == "if" {
+          let rc = gpu_expr(st["c"], vars, caps)
+          let rt = gpu_stmts(st["then"], vars, rc[1])
+          let re = gpu_stmts(st["els"], vars, rt[1])
+          let out = out ++ [102] ++ rc[0] ++ [198] ++ rt[0] ++ [196] ++ re[0] ++ [197]
+          let caps = re[1]
+        } else {
+          if t == "seq" {
+            let r = gpu_stmts(st["body"], vars, caps)
+            let out = out ++ r[0]
+            let caps = r[1]
+          } else { do fail("pic: gpu for: only let, while, if and for-range run on the GPU (found " ++ t ++ ")") }
+        }
+      }
+    }
+  }
+  return [out, caps]
+}
+
+# gpu for x in xs -> v { B }  /  gpu for x in range(a, b) -> v { B }: one GPU thread per item; v (an integer) comes back
+# as an array, in order. Names the body binds live in GPU registers (starting at 0); other names it reads are the
+# program's integers of the moment, passed in.
+skill gpu_loop(x, xse, ae, be, v, body, id) -> Any {
+  let vars = {}
+  let vars = put(vars, x, 0)
+  let nv2 = 1
+  for n in collect(body, []) {
+    if vars[n] == null {
+      let vars = put(vars, n, nv2)
+      let nv2 = nv2 + 1
+    }
+  }
+  if vars[v] == null { do fail("pic: gpu for: the body must set " ++ v) }
+  let r = gpu_stmts(body, vars, [])
+  let codes = []
+  for c in r[0] { let codes = codes ++ [nlit(c)] }
+  let capv = []
+  for c in r[1] { let capv = capv ++ [nv(c)] }
+  let gx = "__gx" ++ id
+  let ga = "__ga" ++ id
+  let gn = "__gn" ++ id
+  let first = []
+  if xse == null {
+    let first = [nlet(gx, {"t": "null"}), nlet(ga, ae), nlet(gn, nbin("-", be, nv(ga)))]
+  } else {
+    let first = [nlet(gx, xse), nlet(ga, nlit(0)), nlet(gn, ncall("len", [nv(gx)]))]
+  }
+  let call = ncall("gpu_map", [nlist(codes), nv(gx), nv(ga), nv(gn), nlist(capv), nlit(nv2), nlit(vars[v])])
+  return {"t": "seq", "body": first ++ [nlet(v, call)]}
+}
+
+# one function for every expression: an operand (with its unary operators and [index] suffixes), then
+# precedence climbing over the binary operators, so nesting costs one call per level
+skill parse_expr(ts, p, minp) -> Any {
+  let t = ts[p]
+  let k = tkind(t)
+  let e = null
+  if t == "-" {
+    let r = parse_expr(ts, p + 1, 6)
+    let e = {"t": "neg", "a": r[0]}
+    let p = r[1]
+  }
+  if e == null and t == "not" {
+    let r = parse_expr(ts, p + 1, 3)
+    let e = {"t": "not", "a": r[0]}
+    let p = r[1]
+  }
+  # if c { a } else { b } as an expression (else if chains): only the chosen branch is evaluated
+  if e == null and t == "if" {
+    let c = parse_expr(ts, p + 1, 1)
+    let a = parse_expr(ts, expect(ts, c[1], "{"), 1)
+    let q = expect(ts, expect(ts, a[1], "}"), "else")
+    if ts[q] == "if" {
+      let r = parse_expr(ts, q, 1)
+      let e = {"t": "ifx", "c": c[0], "a": a[0], "b": r[0]}
+      let p = r[1]
+    } else {
+      let r = parse_expr(ts, expect(ts, q, "{"), 1)
+      let e = {"t": "ifx", "c": c[0], "a": a[0], "b": r[0]}
+      let p = expect(ts, r[1], "}")
+    }
+  }
+  # () => e
+  if e == null and t == "(" and ts[p + 1] == ")" and ts[p + 2] == "=>" {
+    let r = parse_expr(ts, p + 3, 1)
+    let e = {"t": "fn", "params": [], "body": [{"t": "return", "e": r[0]}]}
+    let p = r[1]
+  }
+  if e == null and t == "(" {
+    let r = parse_expr(ts, p + 1, 1)
+    let e = r[0]
+    let p = r[1]
+    # (a, b, ...): a tuple, which in Pi is a list
+    if ts[p] == "," {
+      let items = [e]
+      while ts[p] == "," {
+        let r = parse_expr(ts, p + 1, 1)
+        let items = append(items, r[0])
+        let p = r[1]
+      }
+      let e = {"t": "list", "items": items}
+    }
+    let p = expect(ts, p, ")")
+    # (a, b) => e and (x) => e: a function value
+    if ts[p] == "=>" {
+      let ps = [e]
+      if e["t"] == "list" { let ps = e["items"] }
+      let names = []
+      for v in ps {
+        if v["t"] != "var" { do fail("pic: the parameters before => must be names") }
+        let names = append(names, v["name"])
+      }
+      let r = parse_expr(ts, p + 1, 1)
+      let e = {"t": "fn", "params": names, "body": [{"t": "return", "e": r[0]}]}
+      let p = r[1]
+    }
+  }
+  if e == null and (t == "[" or t == "{") {
+    let close = "]"
+    let kind = "list"
+    if t == "{" {
+      let close = "}"
+      let kind = "map"
+    }
+    let items = []
+    let p = p + 1
+    while ts[p] != close {
+      let short = false
+      if kind == "map" {
+        # {counts, total} (JavaScript's shorthand) is {"counts": counts, "total": total}
+        if tkind(ts[p]) == "id" and (ts[p + 1] == "," or ts[p + 1] == "}") {
+          let short = true
+          let items = items ++ [{"t": "str", "raw": "\"" ++ ts[p] ++ "\""}, {"t": "var", "name": ts[p]}]
+          let p = p + 1
+        } else {
+          if tkind(ts[p]) != "str" { do fail("pic: a map key must be quoted text, got " ++ str(ts[p]) ++ " -- write {\"" ++ str(ts[p]) ++ "\": ...} for that key, or put(m, " ++ str(ts[p]) ++ ", v) for the key a name holds") }
+          let items = items ++ [{"t": "str", "raw": ts[p]}]
+          let p = expect(ts, p + 1, ":")
+        }
+      }
+      if short == false {
+        let r = parse_expr(ts, p, 1)
+        let items = items ++ [r[0]]
+        let p = r[1]
+      }
+      if ts[p] == "," { let p = p + 1 }
+      # [e for x in xs if c]: a list comprehension
+      if kind == "list" and len(items) == 1 and ts[p] == "for" {
+        let cr = parse_compr(ts, p, items[0])
+        let items = [cr[0]]
+        let p = cr[1]
+        let kind = "compr"
+      }
+    }
+    let e = {"t": kind, "items": items}
+    if kind == "compr" { let e = items[0] }
+    let p = p + 1
+  }
+  if e == null and k == "num" {
+    if contains(t, ".") or contains(t, "e") or contains(t, "E") {
+      let e = {"t": "real", "raw": t}
+    } else {
+      let e = {"t": "lit", "k": num(t)}
+    }
+    let p = p + 1
+  }
+  if e == null and k == "str" {
+    let e = {"t": "str", "raw": t}
+    let p = p + 1
+  }
+  if e == null and (t == "true" or t == "false") {
+    let e = {"t": "bool", "v": t == "true"}
+    let p = p + 1
+  }
+  if e == null and t == "null" {
+    let e = {"t": "null"}
+    let p = p + 1
+  }
+  if e == null and t == "fn" {
+    # fn(a, b) => expr   or   fn(a, b) { ... }  -- a function value that captures the names it uses
+    let p = expect(ts, p + 1, "(")
+    let params = []
+    while ts[p] != ")" {
+      let params = params ++ [ts[p]]
+      let p = p + 1
+      if ts[p] == "," { let p = p + 1 }
+    }
+    let p = p + 1
+    if ts[p] == "=>" {
+      let r = parse_expr(ts, p + 1, 1)
+      let e = {"t": "fn", "params": params, "body": [{"t": "return", "e": r[0]}]}
+      let p = r[1]
+    } else {
+      let b = parse_block(ts, p)
+      let e = {"t": "fn", "params": params, "body": b[0]}
+      let p = b[1]
+    }
+  }
+  # x => e: a function value, as JavaScript and C# write it (fn(x) => e)
+  if e == null and k == "id" and ts[p + 1] == "=>" {
+    let r = parse_expr(ts, p + 2, 1)
+    let e = {"t": "fn", "params": [t], "body": [{"t": "return", "e": r[0]}]}
+    let p = r[1]
+  }
+  if e == null and k == "id" {
+    if ts[p + 1] == "(" {
+      let args = []
+      let p = p + 2
+      while ts[p] != ")" {
+        let r = parse_expr(ts, p, 1)
+        let a = r[0]
+        let p = r[1]
+        # f(e for x in xs): the comprehension's list is the argument
+        if ts[p] == "for" {
+          let cr = parse_compr(ts, p, a)
+          let a = cr[0]
+          let p = cr[1]
+        }
+        let args = args ++ [a]
+        if ts[p] == "," { let p = p + 1 }
+      }
+      let e = {"t": "call", "name": t, "args": args}
+      # print(a, b, ...): print("{} is {}", x, y) formats; any other print(a, b) writes them joined by spaces
+      if t == "print" and len(args) > 1 {
+        let a0 = args[0]
+        if a0["t"] == "str" and (contains(a0["raw"], "{}") or contains(a0["raw"], "{:")) {
+          let e = ncall("print", [ncall("format", args)])
+        } else {
+          let ss = []
+          for a in args { let ss = ss ++ [ncall("str", [a])] }
+          let e = ncall("print", [ncall("join", [nlist(ss), {"t": "str", "raw": "\" \""}])])
+        }
+      }
+      let p = p + 1
+    } else {
+      let e = {"t": "var", "name": t}
+      let p = p + 1
+    }
+  }
+  if e == null { do fail("pic: unexpected " ++ str(t)) }
+  let more = true
+  while more {
+    if ts[p] == "[" {
+      let r = parse_expr(ts, p + 1, 1)
+      let e = {"t": "index", "a": e, "b": r[0]}
+      let p = expect(ts, r[1], "]")
+    } else {
+      if ts[p] == "." and tkind(ts[p + 1]) == "id" {
+        let e = method_call(ts, p, e)
+        let p = e[1]
+        let e = e[0]
+      } else {
+        let more = false
+      }
+    }
+  }
+  let precs = {"or": 1, "and": 2, "<": 3, "<=": 3, ">": 3, ">=": 3, "==": 3, "!=": 3, "+": 4, "-": 4, "++": 4, "*": 5, "/": 5, "//": 5, "%": 5, "^": 6}
+  let going = true
+  while going {
+    let op = ts[p]
+    # a mod b is a % b where an operator is expected -- unless mod starts the next statement (mod = .., mod += ..,
+    # mod[i] = ..), so mod still works as a name
+    if op == "mod" and ts[p + 1] != "=" and ts[p + 1] != "[" and ts[p + 2] != "=" { let op = "%" }
+    # e as int / as f64 / as str (Rust's casts): int(e), float(e), str(e) -- tighter than any operator
+    if op == "as" and tkind(ts[p + 1]) == "id" {
+      let ty = ts[p + 1]
+      let cv = "int"
+      if contains(["f64", "f32", "float", "double", "real"], ty) { let cv = "float" }
+      if contains(["str", "String", "string", "text"], ty) { let cv = "str" }
+      let e = ncall(cv, [e])
+      let p = p + 2
+      let op = ts[p]
+    }
+    let pr = precs[op]
+    if pr == null or pr < minp {
+      let going = false
+    } else {
+      let r = parse_expr(ts, p + 1, pr + 1)
+      let e = {"t": "bin", "op": op, "a": e, "b": r[0]}
+      let p = r[1]
+    }
+  }
+  return [e, p]
+}
+
+# a real literal's mantissa and power of ten: "3.14" -> [314, -2], "1.5e3" -> [15, 2]. Pure integer work, so
+# pic stays float-free; the runtime turns it into a double.
+skill real_lit(raw) -> Any {
+  let cs = chars(raw)
+  let n = len(cs)
+  # locate the dot and the exponent marker, then read those positions after the scan (flags set in an
+  # if-branch are only reliably visible once the loop is over, not to a later condition mid-loop)
+  let dotpos = n
+  let epos = n
+  let i = 0
+  while i < n {
+    if cs[i] == "." { let dotpos = i }
+    if cs[i] == "e" or cs[i] == "E" { let epos = i }
+    let i = i + 1
+  }
+  # the mantissa digits (everything before the exponent, dot removed), built by self-accumulation
+  let mant = ""
+  let i = 0
+  while i < epos {
+    if cs[i] != "." { let mant = mant ++ cs[i] }
+    let i = i + 1
+  }
+  let dec = 0
+  if dotpos < epos { let dec = epos - dotpos - 1 }
+  let exp = 0
+  if epos < n {
+    let j = epos + 1
+    let neg = cs[j] == "-"
+    if cs[j] == "-" or cs[j] == "+" { let j = j + 1 }
+    let es = ""
+    while j < n {
+      let es = es ++ cs[j]
+      let j = j + 1
+    }
+    let mag = num(es)
+    if neg { let exp = 0 - mag } else { let exp = mag }
+  }
+  return [num(mant), exp - dec]
+}
+
+# -- code generator: every function returns the bytes of its node; values travel in RAX --------------------
+# cx: {raw, vars (name -> frame offset), funcs (name -> [slot, arity]), strs (literal -> r15 offset), gbase, ftbase}
+skill imports() -> Any {
+  return ["ExitProcess", "GetStdHandle", "WriteFile", "VirtualAlloc", "CreateFileA", "ReadFile", "GetFileSize", "CloseHandle", "GetCommandLineA", "LoadLibraryA", "GetProcAddress", "FindFirstFileA", "FindNextFileA", "FindClose", "SetFilePointerEx"]
+}
+
+skill builtins() -> Any {
+  return {"len": ["rt_len", 1], "str": ["rt_str", 1], "num": ["rt_num", 1], "contains": ["rt_contains", 2],
+    "put": ["rt_put", 3], "append": ["rt_append", 2], "slice": ["rt_slice", 3, "opt"], "chars": ["rt_chars", 1],
+    "ord": ["rt_ord", 1], "chr": ["rt_chr", 1], "fail": ["rt_fail", 1], "read_file": ["rt_read_file", 1],
+    "write_file": ["rt_write_file", 2], "print": ["rt_print", 1], "arg": ["rt_arg", 1],
+    "keys": ["rt_keys", 1], "values": ["rt_values", 1], "has": ["rt_has", 1], "get": ["rt_get", 3, "opt"],
+    "lower": ["rt_lowers", 1], "upper": ["rt_uppers", 1], "trim": ["rt_trim", 1],
+    "split": ["rt_split", 2, "opt"], "join": ["rt_join", 2, "opt"], "reverse": ["rt_reverse", 1],
+    "sum": ["rt_sum", 1], "abs": ["rt_abs", 1], "sort": ["rt_sort", 1],
+    "min": ["rt_min", 1, "var"], "max": ["rt_max", 1, "var"],
+    "format": ["rt_format", 1, "var"], "range": ["rt_range", 1, "var"],
+    "sqrt": ["rt_sqrt", 1], "int": ["rt_int", 1], "float": ["rt_float", 1], "floor": ["rt_floorw", 1], "ceil": ["rt_ceil", 1], "round": ["rt_round", 1],
+    "typeof": ["rt_typeof", 1], "input": ["rt_input", 0], "hset": ["rt_hset", 1], "hset_add": ["rt_hset_add", 2], "hset_has": ["rt_hset_has", 2], "tcp": ["rt_tcp", 3], "spawn": ["rt_spawn", 1], "wait": ["rt_wait", 2], "screen": ["rt_screen", 1], "http": ["rt_http", 1], "mouse": ["rt_mouse", 3], "key": ["rt_key", 1], "play": ["rt_play", 1], "render": ["rt_render", 3], "fgwin": ["rt_fgwin", 0], "focus": ["rt_focus", 1], "fmap": ["rt_fmap", 1], "fbyte": ["rt_fbyte", 2], "ticks": ["rt_ticks", 0], "gpu_mm": ["rt_gpu_mm", 3], "gpu_seq": ["rt_gpu_seq", 7], "exit": ["rt_exit", 1], "gpu_run": ["rt_gpu_run", 5], "listdir": ["rt_listdir", 1], "read_at": ["rt_read_at", 3], "read_bytes": ["rt_read_bytes", 3], "arr_text": ["rt_arr_text", 3], "arr": ["rt_arr", 1], "aget": ["rt_aget", 2], "aset": ["rt_aset", 3], "mark": ["rt_mark", 0], "release": ["rt_release", 2], "memused": ["rt_memused", 0],
+    "exp": ["rt_expw", 1], "log": ["rt_logw", 1], "log10": ["rt_log10w", 1], "log2": ["rt_log2w", 1],
+    "sin": ["rt_sinw", 1], "cos": ["rt_cosw", 1], "tan": ["rt_tanw", 1], "atan": ["rt_atanw", 1]}
+}
+
+# call a skill through the table: mov rax, [r15 + slot]; add rax, r15; call rax
+skill calln(cx, name) -> Any {
+  let f = cx["funcs"][name]
+  if f == null { do fail("pic: unknown function " ++ name ++ "()") }
+  return [73, 139, 135] ++ le32(cx["ftbase"] + 8 * f[0]) ++ [76, 1, 248, 255, 208]
+}
+
+skill drop(n) -> Any {
+  if n == 0 { return [] }
+  return [72, 129, 196] ++ le32(8 * n)                                               # add rsp, 8n
+}
+
+# arguments are pushed left to right, the callee reads them above its return address, the caller drops them
+skill callf(cx, name, args) -> Any {
+  let code = []
+  for a in args { let code = code ++ gen_expr(cx, a) ++ [80] }                       # push rax
+  return code ++ calln(cx, name) ++ drop(len(args))
+}
+
+# numbers may be integers (immediate 2n+1) or reals (boxed). `pre` leaves rax=a, rcx=b. If both are tagged
+# integers, run `fast` inline; otherwise call `slow`(a, b) -- the float path in rt.pi.
+# numdual with overflow exits: the fast small-integer path works in rdx (rax and rcx keep the operands) and each
+# "JO" in pieces is a jo to the slow call, so a result past 2^62 never wraps -- the runtime gives the exact one
+skill numdual_ov(pre, pieces, slow, cx) -> Any {
+  let call = [80, 81] ++ calln(cx, slow) ++ [72, 129, 196, 16, 0, 0, 0]              # push a; push b; call; add rsp,16
+  let total = 5
+  for pc in pieces {
+    if pc == "JO" { let total = total + 6 } else { let total = total + len(pc) }
+  }
+  let fast = []
+  for pc in pieces {
+    if pc == "JO" { let fast = fast ++ [15, 128] ++ le32(total - len(fast) - 6) } else { let fast = fast ++ pc }
+  }
+  let fastj = fast ++ [233] ++ le32(len(call))
+  let guard = [72, 137, 194, 72, 33, 202, 246, 194, 1, 15, 132] ++ le32(len(fastj))
+  return pre ++ guard ++ fastj ++ call
+}
+
+skill numdual(pre, fast, slow, cx) -> Any {
+  let call = [80, 81] ++ calln(cx, slow) ++ [72, 129, 196, 16, 0, 0, 0]              # push a; push b; call; add rsp,16
+  let fastj = fast ++ [233] ++ le32(len(call))                                        # jmp over the slow path
+  let guard = [72, 137, 194, 72, 33, 202, 246, 194, 1, 15, 132] ++ le32(len(fastj))   # mov rdx,rax; and rdx,rcx; test dl,1; jz slow
+  return pre ++ guard ++ fastj ++ call
+}
+
+# a comparison with the same guard: fast integer compare, or rt_cmp(a, b) against zero. cc is the setcc opcode.
+skill cmpdual(pre, cc, cx) -> Any {
+  let fast = [72, 57, 200, 15, cc, 192, 72, 15, 182, 192]                             # cmp rax,rcx; setcc al; movzx
+  let call = [80, 81] ++ calln(cx, "rt_cmp") ++ [72, 129, 196, 16, 0, 0, 0] ++ [72, 131, 248, 1, 15, cc, 192, 72, 15, 182, 192]
+  let fastj = fast ++ [233] ++ le32(len(call))
+  let guard = [72, 137, 194, 72, 33, 202, 246, 194, 1, 15, 132] ++ le32(len(fastj))
+  return pre ++ guard ++ fastj ++ call
+}
+
+# call a closure value: push the arguments, then the closure pointer, then call through [closure + 8]
+skill gen_closcall(cx, fe, args) -> Any {
+  let code = []
+  for a in args { let code = code ++ gen_expr(cx, a) ++ [80] }
+  let code = code ++ gen_expr(cx, fe) ++ [80, 72, 139, 64, 8, 255, 208]              # push rax; mov rax,[rax+8]; call rax
+  return code ++ drop(len(args) + 1)
+}
+
+skill gen_expr(cx, e) -> Any {
+  let t = e["t"]
+  let raw = cx["raw"]
+  if t == "lit" or t == "bool" {
+    let k = e["k"]
+    if t == "bool" {
+      let k = 0
+      if e["v"] { let k = 1 }
+    }
+    # a literal past the small range (|k| > 2^62): built at run time from 9-digit pieces, which the runtime's big
+    # integers make exact -- ((top x 10^9) + next) x 10^9 + ...
+    # (2^62 - 1 computed: an older compiler made a literal's tagged form 2k + 1 in its own wrapping integers, so a
+    # literal past 2^61 in this source would come out wrong while the seed builds it)
+    let lim = 2305843009213693951 * 2 + 1
+    if raw == false and (k > lim or k < 0 - lim - 1) {
+      let m = abs(k)
+      let limbs = []
+      while m > 0 {
+        let limbs = append(limbs, m % 1000000000)
+        let m = m // 1000000000
+      }
+      let tree = {"t": "lit", "k": limbs[len(limbs) - 1]}
+      let i = len(limbs) - 2
+      while i >= 0 {
+        let tree = {"t": "bin", "op": "+", "a": {"t": "bin", "op": "*", "a": tree, "b": {"t": "lit", "k": 1000000000}}, "b": {"t": "lit", "k": limbs[i]}}
+        let i = i - 1
+      }
+      if k < 0 { let tree = {"t": "neg", "a": tree} }
+      return gen_expr(cx, tree)
+    }
+    if raw == false { let k = 2 * k + 1 }
+    return [72, 184] ++ le64(k)                                                      # mov rax, imm64
+  }
+  if t == "null" { return [72, 49, 192] }                                            # xor rax, rax
+  if t == "str" { return [73, 141, 135] ++ le32(cx["strs"][e["raw"]]) }              # lea rax, [r15 + d]
+  if t == "real" {
+    # a real literal is built at run time from an integer mantissa and a power of ten, so pic needs no floats
+    let r = real_lit(e["raw"])
+    return callf(cx, "rt_reallit", [{"t": "lit", "k": r[0]}, {"t": "lit", "k": r[1]}])
+  }
+  if t == "var" {
+    let ci = cx["caps"][e["name"]]
+    if ci != null {
+      # a captured variable: load the closure pointer, then the capture at [clos + 16 + 8*index]
+      let closoff = cx["vars"]["__clos"]
+      return [72, 139, 133] ++ le32(closoff) ++ [72, 139, 128] ++ le32(16 + 8 * ci)
+    }
+    let off = cx["vars"][e["name"]]
+    # a skill's name as a value (serve_http(handle), map(xs, double)): the closure of its wrapper __ref_<name>
+    if off == null and cx["funcs"]["__ref_" ++ e["name"]] != null { return gen_expr(cx, {"t": "closure", "name": "__ref_" ++ e["name"], "caps": []}) }
+    if off == null { do fail("pic: unknown variable " ++ e["name"]) }
+    return [72, 139, 133] ++ le32(off)                                               # mov rax, [rbp + off]
+  }
+  if t == "closure" {
+    # build [kind=5, code address, cap0, cap1, ...]: evaluate the captures, allocate, fill it in
+    let caps = e["caps"]
+    let code = []
+    for c in caps { let code = code ++ gen_expr(cx, {"t": "var", "name": c}) ++ [80] }
+    let nb = 16 + 8 * len(caps)
+    let code = code ++ [72, 184] ++ le64(nb) ++ [80] ++ calln(cx, "rt_alloc") ++ drop(1)
+    let code = code ++ [72, 199, 0] ++ le32(5 + 256 * len(caps))                      # mov qword [rax], 5 + 256*ncap
+    let slot = cx["funcs"][e["name"]][0]
+    let code = code ++ [73, 139, 143] ++ le32(cx["ftbase"] + 8 * slot) ++ [76, 1, 249] ++ [72, 137, 72, 8]
+    let j = len(caps) - 1
+    while j >= 0 {
+      let code = code ++ [89, 72, 137, 136] ++ le32(16 + 8 * j)                       # pop rcx; mov [rax+16+8j], rcx
+      let j = j - 1
+    }
+    return code
+  }
+  if t == "ifx" {
+    # the condition's machine truth; test rax, rax; jz over a and its jmp; a; jmp over b; b
+    let ca = gen_expr(cx, e["a"])
+    let cb = gen_expr(cx, e["b"])
+    let ja = ca ++ [233] ++ le32(len(cb))
+    return gen_cond(cx, e["c"]) ++ [72, 133, 192, 15, 132] ++ le32(len(ja)) ++ ja ++ cb
+  }
+  if t == "neg" {
+    let a = gen_expr(cx, e["a"])
+    if raw { return a ++ [72, 247, 216] }                                            # neg rax
+    # mov rdx,rax; neg rdx; add rdx,2 (= 2(-n)+1); jo slow (-(-2^62) is big); mov rax,rdx
+    let slow = [80] ++ calln(cx, "rt_neg") ++ [72, 131, 196, 8]                       # push rax; call rt_neg; add rsp,8
+    let fast = [72, 137, 194, 72, 247, 218, 72, 131, 194, 2, 15, 128] ++ le32(8) ++ [72, 137, 208]
+    let fastj = fast ++ [233] ++ le32(len(slow))
+    return a ++ [168, 1, 15, 132] ++ le32(len(fastj)) ++ fastj ++ slow               # test al,1; jz slow
+  }
+  if t == "index" { return callf(cx, "rt_index", [e["a"], e["b"]]) }
+  if t == "list" or t == "map" {
+    let code = []
+    for x in e["items"] { let code = code ++ gen_expr(cx, x) ++ [80] }
+    let n = len(e["items"])
+    let count = n
+    let fname = "rt_list_pack"
+    if t == "map" {
+      let count = n // 2
+      let fname = "rt_map_pack"
+    }
+    # mov rax, rsp; push rax; mov rax, count; push rax; call the packer; drop the items and its two arguments
+    return code ++ [72, 137, 224, 80, 72, 184] ++ le64(2 * count + 1) ++ [80] ++ calln(cx, fname) ++ drop(n + 2)
+  }
+  if t == "call" {
+    let name = e["name"]
+    let args = e["args"]
+    let n = len(args)
+    if raw {
+      if name == "peek" { return gen_expr(cx, args[0]) ++ [72, 139, 0] }             # mov rax, [rax]
+      if name == "peekb" { return gen_expr(cx, args[0]) ++ [72, 15, 182, 0] }        # movzx rax, byte [rax]
+      if name == "poke" { return gen_expr(cx, args[0]) ++ [80] ++ gen_expr(cx, args[1]) ++ [89, 72, 137, 1] }
+      if name == "pokeb" { return gen_expr(cx, args[0]) ++ [80] ++ gen_expr(cx, args[1]) ++ [89, 136, 1] }
+      # bit operations on machine words (a checksum or a compressed stream is nothing but these)
+      if contains(["band", "bor", "bxor", "shl", "shr"], name) {
+        let pre = gen_expr(cx, args[0]) ++ [80] ++ gen_expr(cx, args[1]) ++ [72, 137, 193, 88]                # rax=x, rcx=y
+        if name == "band" { return pre ++ [72, 33, 200] }                                                     # and rax, rcx
+        if name == "bor" { return pre ++ [72, 9, 200] }                                                       # or rax, rcx
+        if name == "bxor" { return pre ++ [72, 49, 200] }                                                     # xor rax, rcx
+        if name == "shl" { return pre ++ [72, 211, 224] }                                                     # shl rax, cl
+        return pre ++ [72, 211, 232]                                                                          # shr rax, cl
+      }
+      if name == "gaddr" { return [73, 141, 135] ++ le32(cx["gbase"] + 8 * args[0]["k"]) }
+      if name == "wcall" { return gen_wcall(cx, args) }
+      if name == "wcallp" { return gen_wcallp(cx, args) }
+      # float primitives: a double is carried as its 64-bit pattern in a general register
+      if name == "i2f" { return gen_expr(cx, args[0]) ++ [242, 72, 15, 42, 192, 102, 72, 15, 126, 192] }      # cvtsi2sd xmm0,rax; movq rax,xmm0
+      if name == "f2i" { return gen_expr(cx, args[0]) ++ [102, 72, 15, 110, 192, 242, 72, 15, 44, 192] }      # movq xmm0,rax; cvttsd2si rax,xmm0
+      if name == "fsqrt" { return gen_expr(cx, args[0]) ++ [102, 72, 15, 110, 192, 242, 15, 81, 192, 102, 72, 15, 126, 192] }  # movq xmm0,rax; sqrtsd; movq rax,xmm0
+      if contains(["fadd", "fsub", "fmul", "fdiv", "flt"], name) {
+        let pre = gen_expr(cx, args[0]) ++ [80] ++ gen_expr(cx, args[1]) ++ [72, 137, 193, 88]                # rax=x, rcx=y
+        let pre = pre ++ [102, 72, 15, 110, 192, 102, 72, 15, 110, 201]                                       # xmm0=x, xmm1=y
+        if name == "fadd" { return pre ++ [242, 15, 88, 193, 102, 72, 15, 126, 192] }
+        if name == "fsub" { return pre ++ [242, 15, 92, 193, 102, 72, 15, 126, 192] }
+        if name == "fmul" { return pre ++ [242, 15, 89, 193, 102, 72, 15, 126, 192] }
+        if name == "fdiv" { return pre ++ [242, 15, 94, 193, 102, 72, 15, 126, 192] }
+        return pre ++ [102, 15, 46, 193, 15, 146, 192, 72, 15, 182, 192]                                      # flt: ucomisd xmm0,xmm1; setb al; movzx
+      }
+    } else {
+      let b = builtins()[name]
+      if b != null {
+        # "var": any number of arguments, passed as one list; "opt": the last argument may be left out (null)
+        if b[2] == "var" { return callf(cx, b[0], [{"t": "list", "items": args}]) }
+        let given = args
+        if b[2] == "opt" and n == b[1] - 1 { let given = args ++ [{"t": "null"}] }
+        if b[1] != len(given) { do fail("pic: " ++ name ++ "() takes " ++ str(b[1]) ++ " argument(s)") }
+        return callf(cx, b[0], given)
+      }
+    }
+    let f = cx["funcs"][name]
+    if f == null {
+      # not a skill: a closure held in a local variable or a capture, called as a value
+      if raw == false and (cx["vars"][name] != null or cx["caps"][name] != null) {
+        return gen_closcall(cx, {"t": "var", "name": name}, args)
+      }
+      do fail("pic: unknown function " ++ name ++ "()")
+    }
+    if f[1] != n { do fail("pic: " ++ name ++ "() takes " ++ str(f[1]) ++ " argument(s)") }
+    return callf(cx, name, args)
+  }
+  let op = e["op"]
+  if t == "not" or contains(["<", "<=", ">", ">=", "==", "!=", "and", "or"], op) {
+    let code = gen_cond(cx, e)
+    if raw { return code }
+    return code ++ [72, 141, 68, 0, 1]                                               # lea rax, [2rax + 1]
+  }
+  if op == "++" { return callf(cx, "rt_concat", [e["a"], e["b"]]) }
+  if op == "/" { return callf(cx, "rt_div", [e["a"], e["b"]]) }                       # division is always real
+  if op == "^" { return callf(cx, "rt_pow", [e["a"], e["b"]]) }                        # power
+  let pre = gen_expr(cx, e["a"]) ++ [80] ++ gen_expr(cx, e["b"]) ++ [72, 137, 193, 88]  # rax = a, rcx = b
+  # small integers inline, checked for overflow (then the exact big result comes from the runtime)
+  if op == "+" {
+    if raw { return pre ++ [72, 1, 200] }
+    return numdual_ov(pre, [[72, 137, 194], [72, 1, 202], "JO", [72, 255, 202], "JO", [72, 137, 208]], "rt_add", cx)  # mov rdx,rax; add rdx,rcx; jo; dec rdx; jo; mov rax,rdx
+  }
+  if op == "-" {
+    if raw { return pre ++ [72, 41, 200] }
+    return numdual_ov(pre, [[72, 137, 194], [72, 41, 202], "JO", [72, 255, 194], [72, 137, 208]], "rt_subn", cx)      # mov rdx,rax; sub rdx,rcx; jo; inc rdx; mov rax,rdx
+  }
+  if op == "*" {
+    if raw { return pre ++ [72, 15, 175, 193] }
+    # rdx = a (sar), r8 = 2b (rcx - 1), rdx = 2ab (jo), inc
+    return numdual_ov(pre, [[72, 137, 194], [72, 209, 250], [73, 137, 200], [73, 255, 200], [73, 15, 175, 208], "JO", [72, 255, 194], [72, 137, 208]], "rt_mul", cx)
+  }
+  if op == "//" or op == "%" {
+    # cqo; idiv rcx; then floor it as Pi does: a remainder whose sign differs from the divisor moves one down
+    let core = [72, 153, 72, 247, 249, 72, 133, 210, 116, 14, 73, 137, 208, 73, 49, 200, 121, 6, 72, 255, 200, 72, 1, 202]
+    if op == "%" { let core = core ++ [72, 137, 208] }                               # mov rax, rdx
+    if raw { return pre ++ core }
+    let fast = [72, 209, 248, 72, 209, 249] ++ core ++ [72, 141, 68, 0, 1]           # sar both; (core); retag
+    let slow = "rt_idiv"
+    if op == "%" { let slow = "rt_mod" }
+    return numdual(pre, fast, slow, cx)
+  }
+  do fail("pic: cannot compile the operator " ++ str(op))
+  return []
+}
+
+# a condition: leaves a machine truth value in RAX (0 false, non-zero true)
+skill gen_cond(cx, e) -> Any {
+  let t = e["t"]
+  let raw = cx["raw"]
+  let setz = [72, 133, 192, 15, 148, 192, 72, 15, 182, 192]                         # test; sete al; movzx
+  let setnz = [72, 133, 192, 15, 149, 192, 72, 15, 182, 192]
+  if t == "not" { return gen_cond(cx, e["a"]) ++ setz }
+  if t == "bin" {
+    let op = e["op"]
+    if op == "and" or op == "or" {
+      let a = gen_cond(cx, e["a"])
+      let b = gen_cond(cx, e["b"]) ++ setnz
+      let short = [49, 192]                                                          # xor eax, eax
+      let jop = 132                                                                  # jz
+      if op == "or" {
+        let short = [184, 1, 0, 0, 0]                                                # mov eax, 1
+        let jop = 133                                                                # jnz
+      }
+      return a ++ [72, 133, 192, 15, jop] ++ le32(len(b) + 5) ++ b ++ [233] ++ le32(len(short)) ++ short
+    }
+    if (op == "==" or op == "!=") and raw == false {
+      let code = callf(cx, "rt_eqr", [e["a"], e["b"]])
+      if op == "!=" { return code ++ [131, 240, 1] }                                 # xor eax, 1
+      return code
+    }
+    let ccs = {"<": 156, "<=": 158, ">": 159, ">=": 157, "==": 148, "!=": 149}
+    if ccs[op] != null {
+      let pre = gen_expr(cx, e["a"]) ++ [80] ++ gen_expr(cx, e["b"]) ++ [72, 137, 193, 88]
+      let fast = [72, 57, 200, 15, ccs[op], 192, 72, 15, 182, 192]                    # cmp; setcc; movzx
+      # raw code and == / != compare word for word; ordering on tagged values may meet a real, so guard it
+      if raw or op == "==" or op == "!=" { return pre ++ fast }
+      return cmpdual(pre, ccs[op], cx)
+    }
+  }
+  let code = gen_expr(cx, e)
+  if raw { return code }
+  return code ++ [80] ++ calln(cx, "rt_truthy") ++ drop(1)
+}
+
+# wcall("Name", a, b, ...): a Windows x64 call into kernel32 -- arguments in rcx, rdx, r8, r9 and then the
+# stack, 32 bytes of shadow space, the stack aligned to 16; rbx keeps the stack pointer across it
+skill gen_wcall(cx, args) -> Any {
+  let imps = imports()
+  let idx = null
+  let i = 0
+  for name in imps {
+    if "\"" ++ name ++ "\"" == args[0]["raw"] { let idx = i }
+    let i = i + 1
+  }
+  if idx == null { do fail("pic: wcall of an unknown import " ++ str(args[0]["raw"])) }
+  let rest = slice(args, 1, len(args))
+  let n = len(rest)
+  let code = []
+  for a in rest { let code = code ++ gen_expr(cx, a) ++ [80] }
+  let space = 32
+  if n > 4 { let space = 32 + 8 * (n - 4) }
+  let space = align(space, 16)
+  let code = code ++ [72, 137, 227, 72, 131, 228, 240, 72, 129, 236] ++ le32(space)  # mov rbx,rsp; and rsp,-16; sub rsp
+  let regs = [[72, 139, 139], [72, 139, 147], [76, 139, 131], [76, 139, 139]]       # mov rcx/rdx/r8/r9, [rbx + d]
+  let i = 0
+  while i < n {
+    let d = 8 * (n - 1 - i)
+    if i < 4 {
+      let code = code ++ regs[i] ++ le32(d)
+    } else {
+      let code = code ++ [72, 139, 131] ++ le32(d) ++ [72, 137, 132, 36] ++ le32(32 + 8 * (i - 4))
+    }
+    let i = i + 1
+  }
+  return code ++ [65, 255, 151] ++ le32(8 * idx) ++ [72, 137, 220] ++ drop(n)       # call [r15 + 8i]; mov rsp, rbx
+}
+
+# wcallp(address, a, b, ...): the same Windows x64 call, to a function address found at run time (GetProcAddress)
+# -- how the runtime reaches any system DLL (sockets: ws2_32) without an import table entry
+skill gen_wcallp(cx, args) -> Any {
+  let n = len(args) - 1
+  let code = []
+  for a in args { let code = code ++ gen_expr(cx, a) ++ [80] }
+  let space = 32
+  if n > 4 { let space = 32 + 8 * (n - 4) }
+  let space = align(space, 16)
+  let code = code ++ [72, 137, 227, 72, 131, 228, 240, 72, 129, 236] ++ le32(space)
+  let regs = [[72, 139, 139], [72, 139, 147], [76, 139, 131], [76, 139, 139]]
+  let i = 0
+  while i < n {
+    let d = 8 * (n - 1 - i)
+    if i < 4 {
+      let code = code ++ regs[i] ++ le32(d)
+    } else {
+      let code = code ++ [72, 139, 131] ++ le32(d) ++ [72, 137, 132, 36] ++ le32(32 + 8 * (i - 4))
+    }
+    let i = i + 1
+  }
+  return code ++ [72, 139, 131] ++ le32(8 * n) ++ [255, 208, 72, 137, 220] ++ drop(n + 1)   # mov rax,[rbx+8n]; call rax; mov rsp,rbx
+}
+
+skill gen_block(cx, stmts) -> Any {
+  let code = []
+  for s in stmts { let code = code ++ gen_stmt(cx, s) }
+  return code
+}
+
+skill gen_stmt(cx, s) -> Any {
+  let t = s["t"]
+  if t == "let" {
+    let store = [72, 137, 133] ++ le32(cx["vars"][s["name"]])                     # mov [rbp+off], rax
+    # a list nothing else can see yet: grow it in place (see own_body; never a closure's captured name)
+    let form = s["own"]
+    if form != null and cx["caps"][s["name"]] == null {
+      if form == "append" { return callf(cx, "rt_append_own", s["e"]["args"]) ++ store }
+      if form == "concat" { return callf(cx, "rt_concat_own", [s["e"]["a"], s["e"]["b"]]) ++ store }
+      if form == "put" { return callf(cx, "rt_put_own", s["e"]["args"]) ++ store }
+      if form == "rt_setat" { return callf(cx, "rt_setat_own", s["e"]["args"]) ++ store }
+    }
+    return gen_expr(cx, s["e"]) ++ store
+  }
+  if t == "return" { return gen_expr(cx, s["e"]) ++ [72, 137, 236, 93, 195] }      # mov rsp, rbp; pop rbp; ret
+  if t == "do" { return gen_expr(cx, s["e"]) }
+  if t == "seq" { return gen_block(cx, s["body"]) }
+  if t == "if" {
+    let c = gen_cond(cx, s["c"])
+    let a = gen_block(cx, s["then"])
+    let b = gen_block(cx, s["els"])
+    if len(b) > 0 { let a = a ++ [233] ++ le32(len(b)) }                            # jmp over the else
+    return c ++ [72, 133, 192, 15, 132] ++ le32(len(a)) ++ a ++ b                    # test; jz else
+  }
+  if t == "while" {
+    let c = gen_cond(cx, s["c"])
+    let b = gen_block(cx, s["body"])
+    let back = 0 - (len(c) + 9 + len(b) + 5)
+    return c ++ [72, 133, 192, 15, 132] ++ le32(len(b) + 5) ++ b ++ [233] ++ le32(back)
+  }
+  do fail("pic: cannot compile " ++ str(t))
+  return []
+}
+
+# every name a skill binds with let (in any block), in order of first appearance
+skill collect(stmts, names) -> Any {
+  for s in stmts {
+    let t = s["t"]
+    if t == "let" {
+      if contains(names, s["name"]) == false { let names = names ++ [s["name"]] }
+    }
+    if t == "seq" or t == "while" { let names = collect(s["body"], names) }
+    if t == "if" { let names = collect(s["els"], collect(s["then"], names)) }
+  }
+  return names
+}
+
+# ---- lists that grow in place ----------------------------------------------------------------------------------
+# A local list that nothing else can see may be extended in place (rt_append_own, rt_concat_own: spare room, then
+# doubling) instead of copied whole on every append. own_body follows each skill's statements in order and marks
+# the self-extensions (let x = append(x, e) / let x = x ++ e) where x is "clean": given a fresh [] and only grown
+# since, its list not yet able to reach anything else. A list stops being clean when it escapes -- passed to a
+# skill, stored in a list or map, rebound to another name, captured -- and is clean again only after a fresh [].
+# Uses that cannot keep it: len, x[i], a for loop over it (whose length is fixed when the loop starts), ++, the
+# pure builtins str join contains slice sum, and anything in a return. Loops are followed to a fixpoint.
+# Regions: release(m, ...) frees what was made since let m = mark(), so it dirties exactly the lists made or grown
+# since then; a skill whose mark values can escape (passed, stored, returned) is left entirely as it was.
+# state: [clean (name -> true/false), regions (mark variable -> names made or grown since)]
+skill own_form(n, e) -> Any {
+  let t = e["t"]
+  if t == "list" or t == "map" {
+    if len(e["items"]) == 0 { return "fresh" }
+    return "other"
+  }
+  # maps too: let m = put(m, k, v) and m[k] = v (let m = rt_setat(m, k, v)) change m in place when it is clean
+  if t == "call" and (e["name"] == "put" or e["name"] == "rt_setat") and len(e["args"]) == 3 {
+    if e["args"][0]["t"] == "var" and e["args"][0]["name"] == n { return e["name"] }
+  }
+  if t == "call" and e["name"] == "append" and len(e["args"]) == 2 {
+    if e["args"][0]["t"] == "var" and e["args"][0]["name"] == n { return "append" }
+  }
+  if t == "bin" and e["op"] == "++" {
+    if e["a"]["t"] == "var" and e["a"]["name"] == n { return "concat" }
+  }
+  return "other"
+}
+
+# the hidden list of a for loop: "__l" and digits
+skill own_isfor(n) -> Any {
+  if slice(n, 0, 3) != "__l" or len(n) < 4 { return false }
+  for c in chars(slice(n, 3, len(n))) {
+    if contains("0123456789", c) == false { return false }
+  }
+  return true
+}
+
+skill own_ismark(e) -> Any { return e["t"] == "call" and e["name"] == "mark" and len(e["args"]) == 0 }
+
+skill own_clean(st, n) -> Any { return st[0][n] == true }
+
+skill own_dirty(st, n) -> Any { return [put(st[0], n, false), st[1]] }
+
+# n now holds a list made or grown here: every open region holds it
+skill own_touch(st, n) -> Any {
+  let rg = st[1]
+  for k in keys(rg) {
+    let ns = rg[k]
+    if ns != null {
+      if contains(ns, n) == false { let rg = put(rg, k, ns ++ [n]) }
+    }
+  }
+  return [st[0], rg]
+}
+
+# release(a, ...): the region of mark variable a is gone (a region not known: nothing stays clean)
+skill own_release(st, a) -> Any {
+  if a["t"] == "var" {
+    let ns = st[1][a["name"]]
+    if ns != null {
+      let c = st[0]
+      for n in ns { let c = put(c, n, false) }
+      return [c, put(st[1], a["name"], [])]
+    }
+  }
+  return [{}, st[1]]
+}
+
+skill own_join(a, b) -> Any {
+  let c = {}
+  for k in keys(a[0]) {
+    if a[0][k] == true and b[0][k] == true { let c = put(c, k, true) }
+  }
+  let rg = a[1]
+  for k in keys(b[1]) {
+    let nb = b[1][k]
+    let na = rg[k]
+    if nb != null {
+      if na == null { let rg = put(rg, k, nb) } else {
+        let u = na
+        for n in nb {
+          if contains(u, n) == false { let u = u ++ [n] }
+        }
+        let rg = put(rg, k, u)
+      }
+    }
+  }
+  return [c, rg]
+}
+
+skill own_setne(x, y) -> Any {
+  if x == null or y == null { return (x == null) != (y == null) }
+  if len(x) != len(y) { return true }
+  for n in x {
+    if contains(y, n) == false { return true }
+  }
+  return false
+}
+
+skill own_same(a, b) -> Any {
+  for k in keys(a[0]) {
+    if (a[0][k] == true) != (b[0][k] == true) { return false }
+  }
+  for k in keys(b[0]) {
+    if (a[0][k] == true) != (b[0][k] == true) { return false }
+  }
+  for k in keys(a[1]) {
+    if own_setne(a[1][k], b[1][k]) { return false }
+  }
+  for k in keys(b[1]) {
+    if own_setne(a[1][k], b[1][k]) { return false }
+  }
+  return true
+}
+
+# an expression's effect on the state (evaluated left to right)
+skill own_e(e, st) -> Any {
+  let t = e["t"]
+  if t == "var" { return own_dirty(st, e["name"]) }
+  if t == "call" {
+    let args = e["args"]
+    if e["name"] == "release" and len(args) == 2 { return own_release(own_e(args[1], st), args[0]) }
+    let safe = contains(["len", "str", "join", "contains", "slice", "sum", "keys", "values", "get"], e["name"])
+    for a in args {
+      if (safe and a["t"] == "var") == false { let st = own_e(a, st) }
+    }
+    return st
+  }
+  if t == "index" {
+    if e["a"]["t"] != "var" { let st = own_e(e["a"], st) }
+    return own_e(e["b"], st)
+  }
+  if t == "bin" {
+    if e["op"] == "++" {
+      if e["a"]["t"] != "var" { let st = own_e(e["a"], st) }
+      if e["b"]["t"] != "var" { let st = own_e(e["b"], st) }
+      return st
+    }
+    return own_e(e["b"], own_e(e["a"], st))
+  }
+  if t == "neg" or t == "not" { return own_e(e["a"], st) }
+  if t == "ifx" { return own_e(e["b"], own_e(e["a"], own_e(e["c"], st))) }
+  if t == "list" or t == "map" {
+    for x in e["items"] { let st = own_e(x, st) }
+    return st
+  }
+  if t == "closure" {
+    for c in e["caps"] { let st = own_dirty(st, c) }
+  }
+  return st
+}
+
+# statements -> [statements with the in-place extensions marked ("own"), state after them]
+skill own_s(stmts, st) -> Any {
+  let out = []
+  for s in stmts {
+    let t = s["t"]
+    let s2 = s
+    if t == "let" {
+      let n = s["name"]
+      let e = s["e"]
+      let form = own_form(n, e)
+      if form == "fresh" { let st = own_touch([put(st[0], n, true), st[1]], n) }
+      if form == "append" or form == "concat" or form == "put" or form == "rt_setat" {
+        if form == "append" { let st = own_e(e["args"][1], st) }
+        if form == "concat" {
+          if e["b"]["t"] != "var" { let st = own_e(e["b"], st) }
+        }
+        if form == "put" or form == "rt_setat" { let st = own_e(e["args"][2], own_e(e["args"][1], st)) }
+        if own_clean(st, n) {
+          let s2 = {"t": "let", "name": n, "e": e, "own": form}
+          let st = own_touch(st, n)
+        }
+      }
+      if form == "other" {
+        if own_ismark(e) {
+          let st = [put(st[0], n, false), put(st[1], n, [])]
+        } else {
+          # a for loop's hidden list holds the very object it walks: that object is no longer only its own name's
+          # (an in-place write to it -- a map's put, x[k] = v -- would change what the loop sees)
+          if own_isfor(n) and e["t"] == "var" { let st = own_dirty(st, e["name"]) } else { let st = own_e(e, st) }
+          let st = [put(st[0], n, false), put(st[1], n, null)]
+        }
+      }
+    }
+    if t == "return" or t == "do" { let st = own_e(s["e"], st) }
+    if t == "seq" {
+      let r = own_s(s["body"], st)
+      let s2 = {"t": "seq", "body": r[0]}
+      let st = r[1]
+    }
+    if t == "if" {
+      let sc = own_e(s["c"], st)
+      let ra = own_s(s["then"], sc)
+      let rb = own_s(s["els"], sc)
+      let s2 = {"t": "if", "c": s["c"], "then": ra[0], "els": rb[0]}
+      let st = own_join(ra[1], rb[1])
+    }
+    if t == "while" {
+      # the state at the loop's head: what enters, joined with what each pass leaves, until it stops changing
+      let head = st
+      let done = false
+      while done == false {
+        let sc = own_e(s["c"], head)
+        let r = own_s(s["body"], sc)
+        let h2 = own_join(head, r[1])
+        if own_same(h2, head) {
+          let done = true
+          let s2 = {"t": "while", "c": s["c"], "body": r[0]}
+          let st = sc
+        } else { let head = h2 }
+      }
+    }
+    let out = out ++ [s2]
+  }
+  return [out, st]
+}
+
+# the names bound to mark()
+skill own_mk(stmts, mk) -> Any {
+  for s in stmts {
+    let t = s["t"]
+    if t == "let" {
+      if own_ismark(s["e"]) and contains(mk, s["name"]) == false { let mk = mk ++ [s["name"]] }
+    }
+    if t == "seq" or t == "while" { let mk = own_mk(s["body"], mk) }
+    if t == "if" { let mk = own_mk(s["els"], own_mk(s["then"], mk)) }
+  }
+  return mk
+}
+
+# can a mark value reach anything but release(m, ...)?
+skill own_esc(e, mk) -> Any {
+  let t = e["t"]
+  if t == "var" { return contains(mk, e["name"]) }
+  if t == "call" {
+    if e["name"] == "mark" { return true }
+    let i = 0
+    for a in e["args"] {
+      if (e["name"] == "release" and i == 0 and a["t"] == "var") == false {
+        if own_esc(a, mk) { return true }
+      }
+      let i = i + 1
+    }
+    return false
+  }
+  if t == "index" or t == "bin" { return own_esc(e["a"], mk) or own_esc(e["b"], mk) }
+  if t == "neg" or t == "not" { return own_esc(e["a"], mk) }
+  if t == "ifx" { return own_esc(e["c"], mk) or own_esc(e["a"], mk) or own_esc(e["b"], mk) }
+  if t == "list" or t == "map" {
+    for x in e["items"] {
+      if own_esc(x, mk) { return true }
+    }
+    return false
+  }
+  if t == "closure" {
+    for c in e["caps"] {
+      if contains(mk, c) { return true }
+    }
+  }
+  return false
+}
+
+skill own_esc_s(stmts, mk) -> Any {
+  for s in stmts {
+    let t = s["t"]
+    if t == "let" {
+      if own_ismark(s["e"]) == false {
+        if own_esc(s["e"], mk) { return true }
+      }
+    }
+    if t == "return" or t == "do" {
+      if own_esc(s["e"], mk) { return true }
+    }
+    if t == "seq" {
+      if own_esc_s(s["body"], mk) { return true }
+    }
+    if t == "while" {
+      if own_esc(s["c"], mk) or own_esc_s(s["body"], mk) { return true }
+    }
+    if t == "if" {
+      if own_esc(s["c"], mk) or own_esc_s(s["then"], mk) or own_esc_s(s["els"], mk) { return true }
+    }
+  }
+  return false
+}
+
+# a skill's body with its in-place extensions marked
+skill own_body(f) -> Any {
+  let mk = own_mk(f["body"], [])
+  if own_esc_s(f["body"], mk) { return f["body"] }
+  return own_s(f["body"], [{}, {}])[0]
+}
+
+skill gen_fn(cx, f) -> Any {
+  let params = f["params"]
+  let k = len(params)
+  let vars = {}
+  let i = 0
+  for p in params {
+    let vars = put(vars, p, 16 + 8 * (k - 1 - i))                                    # pushed left to right
+    let i = i + 1
+  }
+  let nl = 0
+  for v in collect(f["body"], []) {
+    if vars[v] == null {
+      let nl = nl + 1
+      let vars = put(vars, v, 0 - 8 * nl)
+    }
+  }
+  let caps = f["caps"]
+  if caps == null { let caps = [] }
+  let capsmap = {}
+  let i = 0
+  for c in caps {
+    let capsmap = put(capsmap, c, i)
+    let i = i + 1
+  }
+  let raw = slice(f["name"], 0, 3) == "rt_"
+  let body = f["body"]
+  if raw == false { let body = own_body(f) }
+  let cx = put(put(put(cx, "vars", vars), "caps", capsmap), "raw", raw)
+  let code = [85, 72, 137, 229, 72, 129, 236] ++ le32(align(8 * nl, 16))             # push rbp; mov rbp,rsp; sub rsp
+  if nl > 0 {
+    # every local starts as null: lea rdi, [rbp - 8n]; mov ecx, n; xor eax, eax; rep stosq
+    let code = code ++ [72, 141, 189] ++ le32(0 - 8 * nl) ++ [185] ++ le32(nl) ++ [49, 192, 243, 72, 171]
+  }
+  return code ++ gen_block(cx, body) ++ [72, 49, 192, 72, 137, 236, 93, 195]    # falling off the end gives null
+}
+
+# the entry: point r15 at the table, align the stack, start the runtime, run main, print its value, exit 0
+# (a program stops with a non-zero code only through fail(); this keeps a compiled program usable as a tool)
+skill stub(cx, iat_off) -> Any {
+  let code = [76, 141, 61] ++ le32(iat_off - 7) ++ [72, 131, 228, 240]               # lea r15, [rip + d]; and rsp,-16
+  let code = code ++ calln(cx, "rt_init") ++ calln(cx, "main") ++ [80] ++ calln(cx, "rt_print") ++ drop(1)
+  return code ++ [72, 49, 192, 80] ++ calln(cx, "rt_exit") ++ [204]                  # xor rax,rax; push 0; rt_exit(0)
+}
+
+# a text literal's bytes, its escapes decoded (\n \t \r \" \\ \/)
+skill decode(raw) -> Any {
+  let cs = chars(raw)
+  let n = len(cs) - 1
+  let esc = {"n": 10, "t": 9, "r": 13, "\"": 34, "\\": 92, "/": 47}
+  let out = []
+  let i = 1
+  while i < n {
+    let c = cs[i]
+    if c == "\\" {
+      let i = i + 1
+      let b = esc[cs[i]]
+      if b == null { do fail("pic: unsupported escape in " ++ raw) }
+      let out = out ++ [b]
+    } else {
+      # any byte: text is bytes, so a literal written in UTF-8 ("æ", "→") stays UTF-8 (len counts its bytes)
+      let b = ord(c)
+      let out = out ++ [b]
+    }
+    let i = i + 1
+  }
+  return out
+}
+
+# -- function values -------------------------------------------------------------------------------------
+# the builtin words and raw primitives a fn may name without capturing them (they are not variables)
+skill builtin_names() -> Any {
+  return ["len", "str", "num", "contains", "put", "append", "slice", "chars", "ord", "fail", "read_file", "write_file", "print", "arg",
+    "keys", "values", "has", "get", "lower", "upper", "trim", "split", "join", "reverse", "sum", "abs", "sort", "min", "max",
+    "format", "range", "sqrt", "int", "float", "chr", "floor", "ceil", "round",
+    "exp", "log", "log10", "log2", "sin", "cos", "tan", "atan", "mark", "release", "memused", "typeof", "input", "hset", "hset_add", "hset_has", "tcp", "spawn", "wait", "screen", "http", "mouse", "key", "play", "render", "fgwin", "focus", "fmap", "fbyte", "ticks", "gpu_mm", "gpu_seq", "exit", "gpu_run", "arr", "aget", "aset", "listdir", "read_at", "read_bytes", "arr_text"]
+}
+skill primitives() -> Any { return ["peek", "poke", "peekb", "pokeb", "gaddr", "wcall", "wcallp"] }
+
+# free variables: the names a node reads that are neither bound here nor global (so a fn must capture them),
+# matching the interpreter's rule -- every var and call name mentioned, minus the fn's own parameters/locals
+skill fv_add(acc, name, bound, globals) -> Any {
+  if contains(bound, name) { return acc }
+  if contains(globals, name) { return acc }
+  if contains(acc, name) { return acc }
+  return acc ++ [name]
+}
+
+skill fv_expr(e, bound, globals, acc) -> Any {
+  let t = e["t"]
+  if t == "var" { return fv_add(acc, e["name"], bound, []) }                        # a variable is never a global
+  if t == "call" {
+    let acc = fv_add(acc, e["name"], bound, globals)
+    for a in e["args"] { let acc = fv_expr(a, bound, globals, acc) }
+    return acc
+  }
+  if t == "index" or t == "bin" { return fv_expr(e["b"], bound, globals, fv_expr(e["a"], bound, globals, acc)) }
+  if t == "neg" or t == "not" { return fv_expr(e["a"], bound, globals, acc) }
+  if t == "ifx" { return fv_expr(e["b"], bound, globals, fv_expr(e["a"], bound, globals, fv_expr(e["c"], bound, globals, acc))) }
+  if t == "list" or t == "map" {
+    for x in e["items"] { let acc = fv_expr(x, bound, globals, acc) }
+    return acc
+  }
+  if t == "closure" {
+    for c in e["caps"] { let acc = fv_add(acc, c, bound, globals) }
+    return acc
+  }
+  if t == "fn" {
+    let inner = bound ++ e["params"] ++ collect(e["body"], [])
+    return fv_stmts(e["body"], inner, globals, acc)
+  }
+  return acc
+}
+
+skill fv_stmts(stmts, bound, globals, acc) -> Any {
+  for s in stmts {
+    let t = s["t"]
+    if t == "let" or t == "return" or t == "do" { let acc = fv_expr(s["e"], bound, globals, acc) }
+    if t == "seq" { let acc = fv_stmts(s["body"], bound, globals, acc) }
+    if t == "while" { let acc = fv_stmts(s["body"], bound, globals, fv_expr(s["c"], bound, globals, acc)) }
+    if t == "if" {
+      let acc = fv_expr(s["c"], bound, globals, acc)
+      let acc = fv_stmts(s["then"], bound, globals, acc)
+      let acc = fv_stmts(s["els"], bound, globals, acc)
+    }
+  }
+  return acc
+}
+
+# lift every fn literal to a top-level skill __fnN(params..., __clos) and leave a closure node in its place;
+# each returns [node, hidden] where hidden is the list of lifted skills collected so far
+skill hoist_expr(e, globals, hidden) -> Any {
+  let t = e["t"]
+  if t == "fn" {
+    let r = hoist_stmts(e["body"], globals, hidden)
+    let body2 = r[0]
+    let hidden = r[1]
+    let bound = e["params"] ++ collect(body2, [])
+    let caps = fv_stmts(body2, bound, globals, [])
+    let name = "__fn" ++ str(len(hidden))
+    let hd = {"name": name, "params": e["params"] ++ ["__clos"], "body": body2, "caps": caps}
+    return [{"t": "closure", "name": name, "caps": caps}, hidden ++ [hd]]
+  }
+  if t == "call" {
+    let args = []
+    for a in e["args"] {
+      let r = hoist_expr(a, globals, hidden)
+      let args = args ++ [r[0]]
+      let hidden = r[1]
+    }
+    return [{"t": "call", "name": e["name"], "args": args}, hidden]
+  }
+  if t == "index" {
+    let ra = hoist_expr(e["a"], globals, hidden)
+    let rb = hoist_expr(e["b"], globals, ra[1])
+    return [{"t": "index", "a": ra[0], "b": rb[0]}, rb[1]]
+  }
+  if t == "bin" {
+    let ra = hoist_expr(e["a"], globals, hidden)
+    let rb = hoist_expr(e["b"], globals, ra[1])
+    return [{"t": "bin", "op": e["op"], "a": ra[0], "b": rb[0]}, rb[1]]
+  }
+  if t == "neg" or t == "not" {
+    let ra = hoist_expr(e["a"], globals, hidden)
+    return [{"t": t, "a": ra[0]}, ra[1]]
+  }
+  if t == "ifx" {
+    let rc = hoist_expr(e["c"], globals, hidden)
+    let ra = hoist_expr(e["a"], globals, rc[1])
+    let rb = hoist_expr(e["b"], globals, ra[1])
+    return [{"t": "ifx", "c": rc[0], "a": ra[0], "b": rb[0]}, rb[1]]
+  }
+  if t == "list" or t == "map" {
+    let items = []
+    for x in e["items"] {
+      let r = hoist_expr(x, globals, hidden)
+      let items = items ++ [r[0]]
+      let hidden = r[1]
+    }
+    return [{"t": t, "items": items}, hidden]
+  }
+  return [e, hidden]
+}
+
+skill hoist_stmts(stmts, globals, hidden) -> Any {
+  let out = []
+  for s in stmts {
+    let t = s["t"]
+    if t == "let" {
+      let r = hoist_expr(s["e"], globals, hidden)
+      let out = out ++ [{"t": "let", "name": s["name"], "e": r[0]}]
+      let hidden = r[1]
+    } else { if t == "return" or t == "do" {
+      let r = hoist_expr(s["e"], globals, hidden)
+      let out = out ++ [{"t": t, "e": r[0]}]
+      let hidden = r[1]
+    } else { if t == "seq" {
+      let r = hoist_stmts(s["body"], globals, hidden)
+      let out = out ++ [{"t": "seq", "body": r[0]}]
+      let hidden = r[1]
+    } else { if t == "while" {
+      let rc = hoist_expr(s["c"], globals, hidden)
+      let rb = hoist_stmts(s["body"], globals, rc[1])
+      let out = out ++ [{"t": "while", "c": rc[0], "body": rb[0]}]
+      let hidden = rb[1]
+    } else { if t == "if" {
+      let rc = hoist_expr(s["c"], globals, hidden)
+      let rt = hoist_stmts(s["then"], globals, rc[1])
+      let re = hoist_stmts(s["els"], globals, rt[1])
+      let out = out ++ [{"t": "if", "c": rc[0], "then": rt[0], "els": re[0]}]
+      let hidden = re[1]
+    } else {
+      let out = out ++ [s]
+    } } } } }
+  }
+  return [out, hidden]
+}
+
+# the executable: .text = [entry stub][skills]; .data = [IAT | skill table | 16 globals | text objects]
+# [ILT][import descriptor][names], with r15 at the start of .data
+# the skills a program names without calling them (handle in serve_http(handle)): a wrapper __ref_<name>(params,
+# __clos) for each, so the name can be a value; found from the tokens (a skill name not after "skill", not before "(")
+skill skill_refs(chunks, decls) -> Any {
+  let ar = {}
+  for d in decls { let ar = put(ar, d["name"], d["params"]) }
+  let seen = {}
+  let out = []
+  for ch in chunks {
+    let n = len(ch)
+    let i = 0
+    while i < n {
+      let tk = ch[i]
+      if ar[tk] != null and seen[tk] == null {
+        let before = ""
+        if i > 0 { let before = ch[i - 1] }
+        let after = ""
+        if i + 1 < n { let after = ch[i + 1] }
+        if before != "skill" and after != "(" {
+          let seen = put(seen, tk, 1)
+          let ps = []
+          for q in ar[tk] { let ps = append(ps, {"t": "var", "name": q}) }
+          let out = append(out, {"name": "__ref_" ++ tk, "params": ar[tk] ++ ["__clos"], "body": [{"t": "return", "e": {"t": "call", "name": tk, "args": ps}}], "caps": []})
+        }
+      }
+      let i = i + 1
+    }
+  }
+  return out
+}
+
+skill build_exe(chunks, strs) -> Any {
+  let imps = imports()
+  let ni = len(imps) + 1
+  # parse every declaration, then lift fn literals to top-level skills
+  let decls = []
+  for ch in chunks {
+    if ch[0] == "skill" { let decls = decls ++ [parse_decl(ch ++ [""])] }
+  }
+  let globals = []
+  for d in decls { let globals = globals ++ [d["name"]] }
+  for b in builtin_names() { let globals = globals ++ [b] }
+  let globals = globals ++ primitives()
+  let decls2 = []
+  let hidden = []
+  for d in decls {
+    let r = hoist_stmts(d["body"], globals, hidden)
+    let decls2 = decls2 ++ [{"name": d["name"], "params": d["params"], "body": r[0]}]
+    let hidden = r[1]
+  }
+  let alldecls = decls2 ++ hidden ++ skill_refs(chunks, decls)
+  # the skill table: name -> [slot, arity], in the order the code is emitted
+  let funcs = {}
+  let nf = 0
+  for d in alldecls {
+    if funcs[d["name"]] != null { do fail("pic: two skills named " ++ d["name"]) }
+    let funcs = put(funcs, d["name"], [nf, len(d["params"])])
+    let nf = nf + 1
+  }
+  if funcs["main"] == null { do fail("pic: the program needs a main()") }
+  if funcs["main"][1] != 0 { do fail("pic: main() takes no arguments") }
+  let ftbase = 8 * ni
+  let gbase = ftbase + 8 * nf
+  let sbase = gbase + 128
+  let strmap = {}
+  let sdata = []
+  for s in strs {
+    let bs = decode(s)
+    let strmap = put(strmap, s, sbase + len(sdata))
+    let sdata = sdata ++ le64(1) ++ le64(len(bs)) ++ bs ++ zeros((8 - len(bs) % 8) % 8)
+  }
+  let cx = {"raw": false, "vars": {}, "funcs": funcs, "strs": strmap, "gbase": gbase, "ftbase": ftbase, "caps": {}}
+  let base = len(stub(cx, 0))
+  let code = []
+  let table = []
+  for d in alldecls {
+    let table = table ++ [base + len(code)]
+    let code = code ++ gen_fn(cx, d)
+  }
+  # two sections, as a linker makes them: .text (read, execute) holds the code, .data (read, write) the rest
+  let codelen = base + len(code)
+  let trva = 4096
+  let drva = trva + align(codelen, 4096)
+  let code = stub(cx, drva - trva) ++ code
+  let ft = []
+  for start in table { let ft = ft ++ le64(trva + start - drva) }
+  let ilt_off = sbase + len(sdata)
+  let desc_off = ilt_off + 8 * ni
+  let hn_off = desc_off + 40
+  let hn = []
+  let thunk = []
+  for name in imps {
+    let thunk = thunk ++ le64(drva + hn_off + len(hn))
+    let entry = [0, 0] ++ text_bytes(name) ++ [0]
+    if len(entry) % 2 == 1 { let entry = entry ++ [0] }
+    let hn = hn ++ entry
+  }
+  let thunk = thunk ++ le64(0)
+  let dll_off = hn_off + len(hn)
+  let desc = le32(drva + ilt_off) ++ le32(0) ++ le32(0) ++ le32(drva + dll_off) ++ le32(drva) ++ zeros(20)
+  let data = thunk ++ ft ++ zeros(128) ++ sdata ++ thunk ++ desc ++ hn ++ text_bytes("kernel32.dll") ++ [0]
+  let dsize = len(data)
+  let traw = align(codelen, 512)
+  let draw = align(dsize, 512)
+  let dirs = []
+  let d = 0
+  while d < 16 {
+    if d == 1 {
+      let dirs = dirs ++ le32(drva + desc_off) ++ le32(40)
+    } else {
+      if d == 12 {
+        let dirs = dirs ++ le32(drva) ++ le32(8 * ni)
+      } else {
+        let dirs = dirs ++ [0, 0, 0, 0, 0, 0, 0, 0]
+      }
+    }
+    let d = d + 1
+  }
+  let opt = le16(523) ++ [14, 0] ++ le32(traw) ++ le32(draw) ++ le32(0) ++ le32(trva) ++ le32(trva)
+  let opt = opt ++ le64(4194304) ++ le32(4096) ++ le32(512)
+  let opt = opt ++ le16(6) ++ le16(0) ++ le16(0) ++ le16(0) ++ le16(6) ++ le16(0) ++ le32(0)
+  let opt = opt ++ le32(drva + align(dsize, 4096)) ++ le32(512) ++ le32(0) ++ le16(3) ++ le16(33024)
+  let opt = opt ++ le64(1048576) ++ le64(4096) ++ le64(1048576) ++ le64(4096) ++ le32(0) ++ le32(16) ++ dirs
+  let coff = le16(34404) ++ le16(2) ++ le32(0) ++ le32(0) ++ le32(0) ++ le16(len(opt)) ++ le16(35)
+  let text = [46, 116, 101, 120, 116, 0, 0, 0] ++ le32(codelen) ++ le32(trva) ++ le32(traw) ++ le32(512)
+  let text = text ++ le32(0) ++ le32(0) ++ le16(0) ++ le16(0) ++ le32(1610612768)   # code, execute, read
+  let dsec = [46, 100, 97, 116, 97, 0, 0, 0] ++ le32(dsize) ++ le32(drva) ++ le32(draw) ++ le32(512 + traw)
+  let dsec = dsec ++ le32(0) ++ le32(0) ++ le16(0) ++ le16(0) ++ le32(3221225536)   # data, read, write
+  let headers = [77, 90] ++ zeros(58) ++ le32(64) ++ [80, 69, 0, 0] ++ coff ++ opt ++ text ++ dsec
+  let headers = headers ++ zeros(512 - len(headers))
+  return headers ++ code ++ zeros(traw - codelen) ++ data ++ zeros(draw - dsize)
+}
+
+# -- drivers ----------------------------------------------------------------------------------------------
+# rt is the runtime's source (examples/native/rt.pi); it is compiled together with the program
+skill compile_text(src, rt) -> Any {
+  let lx = lex(rt ++ "\n" ++ src)
+  return build_exe(lx["chunks"], lx["strs"])
+}
+
+# the directory part of a path (up to and including the last "/" or "\"), "" if there is none
+skill dirof(path) -> Any {
+  let cs = chars(path)
+  let cut = 0
+  for i in range(0, len(cs)) {
+    if cs[i] == "/" or cs[i] == "\\" { let cut = i + 1 }
+  }
+  return slice(path, 0, cut)
+}
+
+# the quoted path in an `import "x.pi"` line
+skill import_path(t) -> Any {
+  let cs = chars(t)
+  let n = len(cs)
+  let i = 0
+  while i < n and cs[i] != "\"" { let i = i + 1 }
+  let i = i + 1
+  let start = i
+  while i < n and cs[i] != "\"" { let i = i + 1 }
+  return slice(t, start, i)
+}
+
+# read a file and inline its imports, each file once, resolved against the importing file's directory (the same
+# rule the interpreter uses); returns [source, seen]
+skill expand(path, seen) -> Any {
+  if contains(seen, path) { return ["", seen] }
+  let seen = append(seen, path)
+  let src = read_file(path)
+  if src == null { do fail("pic: cannot read " ++ str(path)) }
+  let dir = dirof(path)
+  let out = ""
+  for line in split(src, "\n") {
+    if slice(trim(line), 0, 7) == "import " {
+      let r = expand(dir ++ import_path(trim(line)), seen)
+      let out = out ++ r[0] ++ "\n"
+      let seen = r[1]
+    } else {
+      let out = out ++ line ++ "\n"
+    }
+  }
+  return [out, seen]
+}
+
+skill compile_file(src_path, out_path) -> Any {
+  let rt = read_file("examples/native/rt.pi")
+  if rt == null { do fail("pic: cannot read examples/native/rt.pi") }
+  let ex = expand(src_path, [])
+  let exe = compile_text(ex[0], rt)
+  do write_file(out_path, exe)
+  return len(exe)
+}
+
+# compiled by pic, this is the native compiler: pic.exe SOURCE OUTPUT
+skill main() -> Any { return compile_file(arg(1), arg(2)) }

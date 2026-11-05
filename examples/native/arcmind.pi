@@ -1,0 +1,147 @@
+# Pi's mind on real ARC puzzles (the TRAINING set only -- the evaluation set stays unseen).
+#
+# The same core loop as mind.pi (mindcore.pi): for each puzzle Pi searches its language for the smallest program that
+# turns every training input into its output -- searching on all training pairs but the last, and checking the answer
+# on that last one (its own held-out example) and in interp.pi. Only then is the program run on the test input; the
+# test output is used to score, never to search. At night, words are learned from the puzzles solved so far, so later
+# puzzles are attempted in a richer language; at the end every unsolved puzzle gets one more try with all the words.
+#
+#   out\arcmind.exe [how many puzzles] [training folder]
+import "mindcore.pi"
+import "json.pi"
+
+skill pairs_of(js) -> Any {
+  let out = []
+  for p in js { let out = append(out, [p["input"], p["output"]]) }
+  return out
+}
+
+# -> [[id, train pairs, test pairs]]
+skill load_arc(dir, limit) -> Any {
+  let names = listdir(dir)
+  if names == null { return null }
+  let out = []
+  for nm in sort(names) {
+    if len(out) < limit and contains(nm, ".json") {
+      let js = json_parse(read_file(dir ++ "\\" ++ nm))
+      let out = append(out, [slice(nm, 0, len(nm) - 5), pairs_of(js["train"]), pairs_of(js["test"])])
+    }
+  }
+  return out
+}
+
+# search on all training pairs but the last; that last one is the held-out check; -> [tree or null, work]
+skill solve_arc(task, lib, active, pl, pre, cap) -> Any {
+  let tr = task[1]
+  # bigger grids, fewer candidates held at once (working memory holds fewer items when each is larger)
+  let cells = 1
+  for ex in tr {
+    if valtype(ex[0]) == "G" { let cells = max(cells, len(ex[0]) * len(ex[0][0])) }
+  }
+  if cells > 100 { let cap = max(1000, cap * 100 // cells) }
+  let m = mark()
+  let r = solve(slice(tr, 0, len(tr) - 1), [tr[len(tr) - 1]], lib, active, pl, pre, 7, cap)
+  if r[0] == null and len(lib) > 0 {
+    let none = []
+    for w in lib { let none = append(none, false) }
+    let r2 = solve(slice(tr, 0, len(tr) - 1), [tr[len(tr) - 1]], lib, none, pl, pre, 7, cap)
+    if r2[0] != null { let r = r2 }
+  }
+  return release(m, r)
+}
+
+# does the program give every test output? (the score; never used while searching)
+skill passes_test(tree, task, lib) -> Any {
+  for ex in task[2] {
+    let y = sev(tree, null, ex[0], null, lib)
+    if y == null { return false }
+    if y != ex[1] { return false }
+  }
+  return true
+}
+
+skill main() -> Any {
+  let limit = 400
+  if arg(1) != null { let limit = num(arg(1)) }
+  let dir = "C:\\Users\\Dough\\laya-plus\\data\\benchmarks\\arc_agi\\data\\training"
+  if arg(2) != null { let dir = arg(2) }
+  let tasks = load_arc(dir, limit)
+  # arcmind.exe 400 <folder> k n : only every n-th puzzle from the k-th (n players side by side)
+  if arg(4) != null and tasks != null {
+    let k = num(arg(3))
+    let nn = num(arg(4))
+    let mine = []
+    for j in range(0, len(tasks)) {
+      if j % nn == k { let mine = append(mine, tasks[j]) }
+    }
+    let tasks = mine
+  }
+  if tasks == null { return "cannot read " ++ dir }
+  let pl = pools()
+  let pre = prelude()
+  let lib = []
+  let active = []
+  let episodes = []
+  let solved = {}
+  let fitted = 0
+  let wrong = []
+  let out = "Pi meets " ++ str(len(tasks)) ++ " ARC training puzzles.\n"
+  let cap = 10000
+  let chunk = 50
+  let i = 0
+  while i < len(tasks) {
+    # day: a batch of puzzles
+    let got = 0
+    for k in range(i, min(i + chunk, len(tasks))) {
+      let t = tasks[k]
+      let r = solve_arc(t, lib, active, pl, pre, cap)
+      if r[0] != null {
+        let fitted = fitted + 1
+        if passes_test(r[0], t, lib) {
+          let solved = put(solved, t[0], r[0])
+          let episodes = append(episodes, r[0])
+          let got = got + 1
+        } else {
+          let wrong = append(wrong, t[0] ++ ": " ++ show(r[0]))
+        }
+      }
+    }
+    let line = "puzzles " ++ str(i + 1) ++ "-" ++ str(min(i + chunk, len(tasks))) ++ ": " ++ str(got) ++ " solved"
+    do print(line)
+    let out = out ++ line ++ "\n"
+    # night: words from everything solved so far
+    let real = []
+    for e in episodes { let real = append(real, true) }
+    let l = learn(lib, episodes, 3, real)
+    let lib = l[0]
+    let episodes = l[1]
+    for a in l[2] {
+      let w = lib[a[0]]
+      let out = out ++ "  night: new word w" ++ str(a[0]) ++ "(a: " ++ w[1] ++ ") -> " ++ w[2] ++ " = " ++ show(w[0]) ++ "\n"
+    }
+    let active = awake_words(lib, episodes)
+    let i = i + chunk
+  }
+  let first = len(keys(solved))
+  # one more try for every unsolved puzzle, now with all the words
+  let late = 0
+  if len(lib) > 0 {
+    for t in tasks {
+      if solved[t[0]] == null {
+        let r = solve_arc(t, lib, active, pl, pre, cap)
+        if r[0] != null {
+          if passes_test(r[0], t, lib) {
+            let solved = put(solved, t[0], r[0])
+            let late = late + 1
+          }
+        }
+      }
+    }
+  }
+  let out = out ++ "\nsolved (test output exactly right):\n"
+  for t in tasks {
+    if solved[t[0]] != null { let out = out ++ "  " ++ t[0] ++ ": " ++ show(solved[t[0]]) ++ "\n" }
+  }
+  for x in wrong { let out = out ++ "  FITTED BUT WRONG ON TEST -- " ++ x ++ "\n" }
+  return out ++ "\nPi solved " ++ str(len(keys(solved))) ++ " of " ++ str(len(tasks)) ++ " ARC training puzzles (" ++ str(first) ++ " on the first pass, " ++ str(late) ++ " more with the words learned later; " ++ str(fitted) ++ " fitted their training pairs on the first pass)."
+}

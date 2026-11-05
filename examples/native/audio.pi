@@ -1,0 +1,623 @@
+# audio: a score -> a 24-bit stereo WAV at 48 kHz. Every sample of every note is computed on the GPU from the physics of
+# the instrument (shadelib.pi, sound_library), then played into a synthesised hall by real convolution.
+#   score lines:  seconds  duration  midi-note-or-Hz  velocity(0..1)  instrument  pan(-1..1)
+#   instruments:  piano strings bell bass kick snare hat
+# au_render(score text, instruments source, path, wet)
+import "shade.pi"
+
+skill au_inst(name) -> Any {
+  let names = ["piano", "strings", "bell", "bass", "kick", "snare", "hat"]
+  let i = 0
+  for n in names {
+    if n == name { return i }
+    i += 1
+  }
+  return fail("score: no instrument called " ++ name)
+}
+
+# seconds as text -> thousandths, exactly (the score is integers on the GPU)
+skill au_milli(t) -> Any {
+  let neg = slice(t, 0, 1) == "-"
+  let s = if neg { slice(t, 1, len(t)) } else { t }
+  let p = split(s, ".")
+  let whole = if len(p[0]) > 0 { int(p[0]) } else { 0 }
+  let fr = if len(p) > 1 { slice(p[1] ++ "000", 0, 3) } else { "000" }
+  let v = whole * 1000 + int(fr)
+  return if neg { 0 - v } else { v }
+}
+
+# a MIDI note number -> thousandths of a Hz, in equal temperament
+skill au_midi_mhz(m) -> Any {
+  let r = 440000.0 * exp(float(m - 69) * 0.05776226504666)
+  return int(r + 0.5)
+}
+
+# how long after its onset a note can still be heard, thousandths of a second
+skill au_life(id, hold) -> Any {
+  if id == 0 { return hold + 1500 }
+  if id == 1 { return hold + 4000 }
+  if id == 2 { return 9000 }
+  if id == 3 { return hold + 800 }
+  if id == 4 { return 1500 }
+  if id == 5 { return 700 }
+  return hold * 8 + 100
+}
+
+# notes in order of onset
+skill au_sorted(notes) -> Any {
+  let n = len(notes)
+  let idx = arr(n + 1)
+  for i in range(0, n) {
+    let j = i
+    let v = notes[i][0]
+    while j > 0 and notes[aget(idx, j - 1)][0] > v {
+      aset(idx, j, aget(idx, j - 1))
+      j -= 1
+    }
+    aset(idx, j, i)
+  }
+  let out = []
+  for i in range(0, n) { out = append(out, notes[aget(idx, i)]) }
+  return out
+}
+
+# lines -> notes [onset, end, milliHz, vel, id, pan, hold], in samples
+skill au_parse(text, sr) -> Any {
+  let notes = []
+  let ln = 0
+  for line in split(text, "\n") {
+    ln += 1
+    let l = trim(line)
+    if len(l) > 0 and slice(l, 0, 1) != "#" {
+      let f = []
+      for w in split(join(split(l, "\t"), " "), " ") {
+        if len(w) > 0 { f = append(f, w) }
+      }
+      if len(f) < 5 { fail("score, line " ++ str(ln) ++ ": seconds duration note velocity instrument [pan]") }
+      let on = au_milli(f[0])
+      let hold = au_milli(f[1])
+      let id = au_inst(f[4])
+      let pitch = if contains(f[2], ".") { au_milli(f[2]) } else if int(f[2]) < 128 { au_midi_mhz(int(f[2])) } else { int(f[2]) * 1000 }
+      let pan = if len(f) > 5 { au_milli(f[5]) } else { 0 }
+      let onset = on * sr // 1000
+      notes = append(notes, [onset, onset + au_life(id, hold) * sr // 1000, pitch, au_milli(f[3]), id, pan, hold * sr // 1000])
+    }
+  }
+  return au_sorted(notes)
+}
+
+# the notes as 32-bit integers in GPU memory
+skill rt_au_put32(h, it, vt) -> Any {
+  do rt_poke32(rt_untag(h) + 4 * rt_untag(it), band(rt_untag(vt), 4294967295))
+  return rt_tag(0)
+}
+
+skill au_table(notes) -> Any {
+  let n = 1 + len(notes) * 7
+  let host = rt_host_alloc(4 * n)
+  rt_au_put32(host, 0, len(notes))
+  let i = 1
+  for no in notes {
+    for x in no {
+      rt_au_put32(host, i, x)
+      i += 1
+    }
+  }
+  let dev = rt_gpu_alloc(4 * n)
+  rt_host_to_gpu(dev, host, 4 * n)
+  rt_host_free(host)
+  return dev
+}
+
+# a kernel over samples 0 .. n, in launches kept short
+skill au_fill(k, out, tb, n, sr) -> Any {
+  let bs = 256
+  let chunk = 4096
+  let at = 0
+  let last = ticks()
+  while at < n {
+    let m = min(chunk, n - at)
+    let u = rt_usec()
+    let r = rt_gpu_launch(k, (m + bs - 1) // bs, bs, [out, tb, at, m, sr, bs])
+    if r != 0 { fail("a sound launch failed: " ++ str(r)) }
+    let took = rt_usec() - u
+    if took > 60000 and chunk > 512 { chunk = chunk // 2 }
+    if took < 15000 and chunk < 1048576 { chunk = chunk * 2 }
+    at += m
+    if ticks() - last > 5000 {
+      last = ticks()
+      print("  " ++ str(at // sr) ++ " s of " ++ str(n // sr) ++ " s")
+    }
+  }
+  return n
+}
+
+# ---- the hall: each output sample is the sum of every input sample before it, weighted by the room's response ----------
+skill au_conv_kernel() -> Any {
+  return ".version 7.0\n.target sm_80\n.address_size 64\n.entry pi_conv (.param .u64 pdry, .param .u64 pir, .param .u64 pout, .param .u32 pm, .param .u32 pstart, .param .u32 pn, .param .u32 pbs)
+{
+.reg .u32 %u<16>;
+.reg .u64 %d<8>;
+.reg .f32 %f<12>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+ld.param.u32 %u1, [pbs];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %tid.x;
+mul.lo.u32 %u2, %u2, %u1;
+add.u32 %u2, %u2, %u3;
+setp.ge.u32 %p0, %u2, %u0;
+@%p0 exit;
+ld.param.u32 %u4, [pstart];
+add.u32 %u4, %u4, %u2;
+ld.param.u32 %u5, [pm];
+add.u32 %u6, %u4, 1;
+min.u32 %u5, %u5, %u6;
+ld.param.u64 %d0, [pdry];
+ld.param.u64 %d1, [pir];
+mul.wide.u32 %d2, %u4, 8;
+add.u64 %d2, %d2, %d0;
+mov.f32 %f0, 0f00000000;
+mov.f32 %f1, 0f00000000;
+mov.u32 %u7, 0;
+TOP:
+setp.ge.u32 %p1, %u7, %u5;
+@%p1 bra END;
+ld.global.f32 %f2, [%d1];
+ld.global.f32 %f3, [%d1+4];
+ld.global.f32 %f4, [%d2];
+ld.global.f32 %f5, [%d2+4];
+fma.rn.f32 %f0, %f2, %f4, %f0;
+fma.rn.f32 %f1, %f3, %f5, %f1;
+add.u64 %d1, %d1, 8;
+sub.u64 %d2, %d2, 8;
+add.u32 %u7, %u7, 1;
+bra TOP;
+END:
+mul.wide.u32 %d3, %u4, 8;
+ld.param.u64 %d4, [pout];
+add.u64 %d3, %d3, %d4;
+st.global.f32 [%d3], %f0;
+st.global.f32 [%d3+4], %f1;
+exit;
+}
+.entry pi_mix (.param .u64 pdry, .param .u64 pwet, .param .u64 ppcm, .param .u32 pstart, .param .u32 pn, .param .u32 pdryg, .param .u32 pwetg, .param .u32 pbs)
+{
+.reg .u32 %u<20>;
+.reg .u64 %d<8>;
+.reg .f32 %f<16>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+ld.param.u32 %u1, [pbs];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %tid.x;
+mul.lo.u32 %u2, %u2, %u1;
+add.u32 %u2, %u2, %u3;
+setp.ge.u32 %p0, %u2, %u0;
+@%p0 exit;
+ld.param.u32 %u4, [pstart];
+add.u32 %u4, %u4, %u2;
+mul.wide.u32 %d0, %u4, 8;
+ld.param.u64 %d1, [pdry];
+ld.param.u64 %d2, [pwet];
+add.u64 %d1, %d1, %d0;
+add.u64 %d2, %d2, %d0;
+ld.param.u32 %u5, [pdryg];
+ld.param.u32 %u6, [pwetg];
+cvt.rn.f32.u32 %f0, %u5;
+cvt.rn.f32.u32 %f1, %u6;
+mul.f32 %f0, %f0, 0f358637BD;
+mul.f32 %f1, %f1, 0f358637BD;
+ld.global.f32 %f2, [%d1];
+ld.global.f32 %f3, [%d1+4];
+ld.global.f32 %f4, [%d2];
+ld.global.f32 %f5, [%d2+4];
+mul.f32 %f2, %f2, %f0;
+mul.f32 %f3, %f3, %f0;
+fma.rn.f32 %f2, %f4, %f1, %f2;
+fma.rn.f32 %f3, %f5, %f1, %f3;
+abs.f32 %f6, %f2;
+abs.f32 %f7, %f3;
+mul.f32 %f8, %f6, %f6;
+mul.f32 %f8, %f8, %f8;
+mul.f32 %f9, %f7, %f7;
+mul.f32 %f9, %f9, %f9;
+add.f32 %f8, %f8, 0f3F800000;
+add.f32 %f9, %f9, 0f3F800000;
+sqrt.rn.f32 %f8, %f8;
+sqrt.rn.f32 %f9, %f9;
+sqrt.rn.f32 %f8, %f8;
+sqrt.rn.f32 %f9, %f9;
+div.rn.f32 %f2, %f2, %f8;
+div.rn.f32 %f3, %f3, %f9;
+mul.f32 %f2, %f2, 0f4AFFFFFE;
+mul.f32 %f3, %f3, 0f4AFFFFFE;
+cvt.rni.s32.f32 %u7, %f2;
+cvt.rni.s32.f32 %u8, %f3;
+mul.wide.u32 %d3, %u4, 6;
+ld.param.u64 %d4, [ppcm];
+add.u64 %d3, %d3, %d4;
+shr.u32 %u9, %u7, 8;
+shr.u32 %u10, %u7, 16;
+st.global.u8 [%d3], %u7;
+st.global.u8 [%d3+1], %u9;
+st.global.u8 [%d3+2], %u10;
+shr.u32 %u9, %u8, 8;
+shr.u32 %u10, %u8, 16;
+st.global.u8 [%d3+3], %u8;
+st.global.u8 [%d3+4], %u9;
+st.global.u8 [%d3+5], %u10;
+exit;
+}
+.entry pi_peak (.param .u64 pbuf, .param .u64 ppk, .param .u32 pn, .param .u32 pbs)
+{
+.reg .u32 %u<12>;
+.reg .u64 %d<6>;
+.reg .f32 %f<8>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+ld.param.u32 %u1, [pbs];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %tid.x;
+mul.lo.u32 %u2, %u2, %u1;
+add.u32 %u2, %u2, %u3;
+setp.ge.u32 %p0, %u2, %u0;
+@%p0 exit;
+mul.wide.u32 %d0, %u2, 8;
+ld.param.u64 %d1, [pbuf];
+add.u64 %d0, %d0, %d1;
+ld.global.f32 %f0, [%d0];
+ld.global.f32 %f1, [%d0+4];
+abs.f32 %f0, %f0;
+abs.f32 %f1, %f1;
+max.f32 %f0, %f0, %f1;
+mul.f32 %f0, %f0, 0f47C35000;
+cvt.rzi.u32.f32 %u4, %f0;
+ld.param.u64 %d2, [ppk];
+atom.global.max.u32 %u5, [%d2], %u4;
+exit;
+}
+"
+}
+
+skill rt_au_get32(h) -> Any { return rt_tag(rt_peek32(rt_untag(h))) }
+
+# the loudest sample in a buffer, in hundred-thousandths
+skill au_peak(k, buf, n) -> Any {
+  let bs = 256
+  let pk = rt_gpu_alloc(16)
+  rt_gpu_zero(pk, 16)
+  let r = rt_gpu_launch(k, (n + bs - 1) // bs, bs, [buf, pk, n, bs])
+  if r != 0 { fail("the level check failed: " ++ str(r)) }
+  let h = rt_host_alloc(16)
+  rt_gpu_to_host(h, pk, 16)
+  let v = rt_au_get32(h)
+  rt_gpu_free(pk)
+  rt_host_free(h)
+  return v
+}
+
+skill rt_au_wav(patht, ht, framest, srt) -> Any {
+  let n = rt_untag(framest)
+  let sr = rt_untag(srt)
+  let hd = rt_zero(rt_alloc(44), 44)
+  do rt_poke32(hd, 1179011410)
+  do rt_poke32(hd + 4, 36 + n * 6)
+  do rt_poke32(hd + 8, 1163280727)
+  do rt_poke32(hd + 12, 544501094)
+  do rt_poke32(hd + 16, 16)
+  do pokeb(hd + 20, 1)
+  do pokeb(hd + 22, 2)
+  do rt_poke32(hd + 24, sr)
+  do rt_poke32(hd + 28, sr * 6)
+  do pokeb(hd + 32, 6)
+  do pokeb(hd + 34, 24)
+  do rt_poke32(hd + 36, 1635017060)
+  do rt_poke32(hd + 40, n * 6)
+  let h = wcall("CreateFileA", rt_cstr(patht), 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 { return rt_tag(0) }
+  do wcall("WriteFile", h, hd, 44, gaddr(2), 0)
+  do wcall("WriteFile", h, rt_untag(ht), n * 6, gaddr(2), 0)
+  do wcall("CloseHandle", h)
+  return rt_tag(n * 6 + 44)
+}
+
+# ---- FLAC: the recording, smaller and bit for bit the same -------------------------------------------------------------
+# Each block of 4096 samples, each channel: the simplest predictor that fits, and what it missed in Rice codes.
+skill rt_fl_bits(bw, v, n) -> Any {
+  let acc = bor(shl(peek(bw + 8), n), band(v, shl(1, n) - 1))
+  let cnt = peek(bw + 16) + n
+  let q = peek(bw)
+  while cnt >= 8 {
+    let cnt = cnt - 8
+    do pokeb(q, band(shr(acc, cnt), 255))
+    let q = q + 1
+  }
+  do poke(bw, q)
+  do poke(bw + 8, band(acc, shl(1, cnt) - 1))
+  do poke(bw + 16, cnt)
+  return 0
+}
+
+skill rt_fl_residual(x, r, m, order) -> Any {
+  for i in range(order, m) {
+    let v = peek(x + 8 * i)
+    if order == 1 { let v = v - peek(x + 8 * (i - 1)) }
+    if order == 2 { let v = v - 2 * peek(x + 8 * (i - 1)) + peek(x + 8 * (i - 2)) }
+    if order == 3 { let v = v - 3 * peek(x + 8 * (i - 1)) + 3 * peek(x + 8 * (i - 2)) - peek(x + 8 * (i - 3)) }
+    do poke(r + 8 * i, v)
+  }
+  return 0
+}
+
+skill rt_fl_sum(r, m, order) -> Any {
+  let s = 0
+  for i in range(order, m) {
+    let v = peek(r + 8 * i)
+    if v < 0 { let v = 0 - v }
+    let s = s + v
+  }
+  return s
+}
+
+skill rt_fl_channel(bw, x, r, m) -> Any {
+  let best = 0
+  let bs = 0 - 1
+  for o in range(0, 4) {
+    do rt_fl_residual(x, r, m, o)
+    let s = rt_fl_sum(r, m, o)
+    if bs < 0 or s < bs {
+      let bs = s
+      let best = o
+    }
+  }
+  do rt_fl_residual(x, r, m, best)
+  # a zero bit, then 001nnn: a fixed predictor of order n, then no wasted bits
+  do rt_fl_bits(bw, bor(8, best), 7)
+  do rt_fl_bits(bw, 0, 1)
+  for i in range(0, best) { do rt_fl_bits(bw, band(peek(x + 8 * i), 16777215), 24) }
+  do rt_fl_bits(bw, 0, 2)
+  do rt_fl_bits(bw, 0, 4)
+  let k = 0
+  let cnt = m - best
+  while k < 14 and shl(cnt, k) < bs { let k = k + 1 }
+  do rt_fl_bits(bw, k, 4)
+  for i in range(best, m) {
+    let v = peek(r + 8 * i)
+    let u = 2 * v
+    if v < 0 { let u = 0 - 2 * v - 1 }
+    let q = shr(u, k)
+    while q >= 32 {
+      do rt_fl_bits(bw, 0, 32)
+      let q = q - 32
+    }
+    do rt_fl_bits(bw, 1, q + 1)
+    if k > 0 { do rt_fl_bits(bw, band(u, shl(1, k) - 1), k) }
+  }
+  return 0
+}
+
+# frames of 6-byte stereo samples at host pcm -> the FLAC frames in memory. -> [buffer, bytes, sizes array (raw), count]
+skill rt_flac(pcmt, framest) -> Any {
+  let pcm = rt_untag(pcmt)
+  let n = rt_untag(framest)
+  let block = 4096
+  let count = (n + block - 1) // block
+  let out = rt_alloc(n * 6 + count * 64 + 4096)
+  let sizes = rt_alloc(8 * count + 8)
+  let xl = rt_alloc(8 * block)
+  let xr = rt_alloc(8 * block)
+  let res = rt_alloc(8 * block)
+  let c8 = rt_alloc(8 * 256)
+  let c16 = rt_alloc(8 * 256)
+  for i in range(0, 256) {
+    let a = i
+    let b = shl(i, 8)
+    for k in range(0, 8) {
+      if band(a, 128) != 0 { let a = band(bxor(shl(a, 1), 7), 255) } else { let a = band(shl(a, 1), 255) }
+      if band(b, 32768) != 0 { let b = band(bxor(shl(b, 1), 32773), 65535) } else { let b = band(shl(b, 1), 65535) }
+    }
+    do poke(c8 + 8 * i, a)
+    do poke(c16 + 8 * i, b)
+  }
+  let bw = rt_zero(rt_alloc(24), 24)
+  let q = out
+  for f in range(0, count) {
+    let start = f * block
+    let m = n - start
+    if m > block { let m = block }
+    for i in range(0, m) {
+      let p = pcm + 6 * (start + i)
+      let l = peekb(p) + 256 * peekb(p + 1) + 65536 * peekb(p + 2)
+      if l >= 8388608 { let l = l - 16777216 }
+      let r = peekb(p + 3) + 256 * peekb(p + 4) + 65536 * peekb(p + 5)
+      if r >= 8388608 { let r = r - 16777216 }
+      do poke(xl + 8 * i, l)
+      do poke(xr + 8 * i, r)
+    }
+    do poke(bw, q)
+    do poke(bw + 8, 0)
+    do poke(bw + 16, 0)
+    do rt_fl_bits(bw, 65528, 16)
+    # block size 4096 (code 12), or spelled out at the end; 48 kHz (code 10)
+    let code = 12
+    if m != block { let code = 7 }
+    do rt_fl_bits(bw, code, 4)
+    do rt_fl_bits(bw, 10, 4)
+    do rt_fl_bits(bw, 1, 4)
+    do rt_fl_bits(bw, 6, 3)
+    do rt_fl_bits(bw, 0, 1)
+    # the frame's number, coded like UTF-8
+    if f < 128 {
+      do rt_fl_bits(bw, f, 8)
+    } else {
+      if f < 2048 {
+        do rt_fl_bits(bw, 192 + shr(f, 6), 8)
+        do rt_fl_bits(bw, 128 + band(f, 63), 8)
+      } else {
+        do rt_fl_bits(bw, 224 + shr(f, 12), 8)
+        do rt_fl_bits(bw, 128 + band(shr(f, 6), 63), 8)
+        do rt_fl_bits(bw, 128 + band(f, 63), 8)
+      }
+    }
+    if m != block { do rt_fl_bits(bw, m - 1, 16) }
+    let e = peek(bw)
+    let crc = 0
+    let j = q
+    while j < e {
+      let crc = peek(c8 + 8 * bxor(crc, peekb(j)))
+      let j = j + 1
+    }
+    do rt_fl_bits(bw, crc, 8)
+    do rt_fl_channel(bw, xl, res, m)
+    do rt_fl_channel(bw, xr, res, m)
+    if peek(bw + 16) > 0 { do rt_fl_bits(bw, 0, 8 - peek(bw + 16)) }
+    let e = peek(bw)
+    let crc = 0
+    let j = q
+    while j < e {
+      let crc = band(bxor(shl(crc, 8), peek(c16 + 8 * bxor(shr(crc, 8), peekb(j)))), 65535)
+      let j = j + 1
+    }
+    do pokeb(e, shr(crc, 8))
+    do pokeb(e + 1, band(crc, 255))
+    do poke(sizes + 8 * f, e + 2 - q)
+    let q = e + 2
+  }
+  let r = rt_list_new(0)
+  let r = rt_append(r, rt_tag(out))
+  let r = rt_append(r, rt_tag(q - out))
+  let r = rt_append(r, rt_tag(sizes))
+  return rt_append(r, rt_tag(count))
+}
+skill rt_fl_size(st, it) -> Any { return rt_tag(peek(rt_untag(st) + 8 * rt_untag(it))) }
+
+# the 34 bytes that describe the stream, as byte values
+skill fl_streaminfo(frames, maxframe) -> Any {
+  let sr = 48000
+  let b = [16, 0, 16, 0, 0, 0, 0, (maxframe // 65536) % 256, (maxframe // 256) % 256, maxframe % 256]
+  // 20 bits rate, 3 bits channels - 1, 5 bits depth - 1, 36 bits samples
+  let hi = sr * 16 + 1 * 2 + 1
+  b = b ++ [(hi // 65536) % 256, (hi // 256) % 256, hi % 256]
+  b = b ++ [7 * 16 + (frames // 4294967296) % 16, (frames // 16777216) % 256, (frames // 65536) % 256, (frames // 256) % 256, frames % 256]
+  for i in range(0, 16) { b = append(b, 0) }
+  return b
+}
+
+skill rt_au_flacfile(patht, headt, buft, nt) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(patht), 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 { return rt_tag(0) }
+  do wcall("WriteFile", h, headt + 16, peek(headt + 8), gaddr(2), 0)
+  do wcall("WriteFile", h, rt_untag(buft), rt_untag(nt), gaddr(2), 0)
+  do wcall("CloseHandle", h)
+  return rt_tag(1)
+}
+
+# the piece -> [PCM in host memory, frames]. wet: thousandths of hall mixed in
+skill au_pcm(score, src, wet) -> Any {
+  let sr = 48000
+  let t0 = ticks()
+  let notes = au_parse(score, sr)
+  if len(notes) == 0 { fail("the score has no notes") }
+  let frames = 0
+  for no in notes { frames = max(frames, no[1]) }
+  // the hall rings on after the last note
+  let ir_len = sr * 3
+  let n = frames + ir_len
+  print(str(len(notes)) ++ " notes, " ++ str(n // sr) ++ " s")
+  let ptx = sh_compile_sound(src)
+  write_file("out\\sound_last.ptx", ptx)
+  let rc = rt_gpu_open()
+  if rc != 1 { fail("the GPU could not be opened: " ++ str(rc)) }
+  let mod = rt_sh_module(ptx, "out\\shade_log.txt")
+  if mod < 0 { fail("the driver refused the GPU code (" ++ str(mod) ++ "): " ++ read_file("out\\shade_log.txt")) }
+  let mod2 = rt_sh_module(au_conv_kernel(), "out\\shade_log.txt")
+  if mod2 < 0 { fail("the driver refused the mixing code (" ++ str(mod2) ++ "): " ++ read_file("out\\shade_log.txt")) }
+  let dry = rt_gpu_alloc(8 * n)
+  let hall = rt_gpu_alloc(8 * n)
+  let ir = rt_gpu_alloc(8 * ir_len)
+  let pcm = rt_gpu_alloc(6 * n)
+  if dry < 0 or hall < 0 or ir < 0 or pcm < 0 { fail("not enough GPU memory for " ++ str(n // sr) ++ " s of sound") }
+  rt_gpu_zero(dry, 8 * n)
+  let tb = au_table(notes)
+  let u0 = rt_usec()
+  au_fill(rt_gpu_fn(mod, "pi_sound"), dry, tb, frames, sr)
+  let u1 = rt_usec()
+  print("instruments: " ++ str((u1 - u0) // 1000) ++ " ms")
+  au_fill(rt_gpu_fn(mod, "pi_impulse"), ir, tb, ir_len, sr)
+  let u2 = rt_usec()
+  print("the hall: " ++ str((u2 - u1) // 1000) ++ " ms")
+  let kc = rt_gpu_fn(mod2, "pi_conv")
+  let bs = 256
+  let chunk = 2048
+  let at = 0
+  let last = ticks()
+  while at < n {
+    let m = min(chunk, n - at)
+    let u = rt_usec()
+    let r = rt_gpu_launch(kc, (m + bs - 1) // bs, bs, [dry, ir, hall, ir_len, at, m, bs])
+    if r != 0 { fail("the convolution failed: " ++ str(r)) }
+    let took = rt_usec() - u
+    if took > 80000 and chunk > 256 { chunk = chunk // 2 }
+    if took < 20000 and chunk < 262144 { chunk = chunk * 2 }
+    at += m
+    if ticks() - last > 5000 {
+      last = ticks()
+      print("  hall: " ++ str(at // sr) ++ " s of " ++ str(n // sr) ++ " s")
+    }
+  }
+  let u3 = rt_usec()
+  print("convolution: " ++ str((u3 - u2) // 1000) ++ " ms")
+  let kp = rt_gpu_fn(mod2, "pi_peak")
+  let pd = max(au_peak(kp, dry, n), 1)
+  let ph = max(au_peak(kp, hall, n), 1)
+  // dry and hall levelled, then mixed; the master limiter rounds off whatever passes full scale
+  let dg = 850000 * 100000 // pd
+  let wg = dg * pd // ph * wet // 1000
+  print("peak dry " ++ str(pd) ++ ", hall " ++ str(ph) ++ " (hundred-thousandths)")
+  let km = rt_gpu_fn(mod2, "pi_mix")
+  let at2 = 0
+  while at2 < n {
+    let m = min(1048576, n - at2)
+    let r = rt_gpu_launch(km, (m + bs - 1) // bs, bs, [dry, hall, pcm, at2, m, dg, wg, bs])
+    if r != 0 { fail("the mix failed: " ++ str(r)) }
+    at2 += m
+  }
+  let host = rt_host_alloc(6 * n)
+  rt_gpu_to_host(host, pcm, 6 * n)
+  rt_gpu_free(dry)
+  rt_gpu_free(hall)
+  rt_gpu_free(ir)
+  rt_gpu_free(pcm)
+  rt_gpu_free(tb)
+  print("the sound took " ++ str(ticks() - t0) ++ " ms")
+  return [host, n]
+}
+
+skill au_bytes(xs) -> Any {
+  let a = arr(len(xs) + 1)
+  let i = 0
+  for x in xs {
+    aset(a, i, x)
+    i += 1
+  }
+  return arr_text(a, 0, len(xs))
+}
+
+# the piece -> path: .flac if it ends so, otherwise .wav
+skill au_render(score, src, path, wet) -> Any {
+  let r = au_pcm(score, src, wet)
+  let size = 0
+  if slice(path, len(path) - 5, len(path)) == ".flac" {
+    let f = rt_flac(r[0], r[1])
+    let mf = 0
+    for i in range(0, f[3]) { mf = max(mf, rt_fl_size(f[2], i)) }
+    let head = au_bytes([102, 76, 97, 67, 128, 0, 0, 34] ++ fl_streaminfo(r[1], mf))
+    rt_au_flacfile(path, head, f[0], f[1])
+    size = f[1] + 42
+  } else {
+    size = rt_au_wav(path, r[0], r[1], 48000)
+  }
+  print("wrote " ++ path ++ ", " ++ str(size // 1024) ++ " KB")
+  return size
+}

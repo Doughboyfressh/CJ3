@@ -1,0 +1,149 @@
+# The library of Pi acting on what it sees (act.pi and uiagent.pi): find a button by its label; test windows.
+#   out\act.exe                   test: random windows whose button labels are drawn by the real font engine; Pi must
+#                                 find a named button (right only if the point is inside that button)
+#   out\act.exe find "Label"      the real screen: where Pi would click
+#   out\act.exe click "Label" act the real screen: click it (only with the word act -- Pi's hands are off otherwise)
+import "vision.pi"
+import "ocr.pi"
+
+# the ink inside a box (inset by 2 to leave the button's border out): dark-on-light or light-on-dark by its brightness
+skill box_ink(img, b) -> Any {
+  let W = img[0]
+  let x0 = b[0]
+  let y0 = b[1]
+  let w = max(1, b[2] - b[0] + 1)
+  let h = max(1, b[3] - b[1] + 1)
+  let a = arr(w * h)
+  let tot = 0
+  for y in range(0, h) {
+    for x in range(0, w) {
+      let c = aget(img[2], (y0 + y) * W + x0 + x)
+      let lum = (299 * (c // 65536) + 587 * ((c // 256) % 256) + 114 * (c % 256)) // 1000
+      do aset(a, y * w + x, lum)
+      let tot = tot + lum
+    }
+  }
+  if tot // (w * h) >= 128 {
+    for i in range(0, w * h) { do aset(a, i, 255 - aget(a, i)) }
+  }
+  return [w, h, a]
+}
+
+skill read_box(img, b, temps, lex) -> Any {
+  if b[2] - b[0] < 6 or b[3] - b[1] < 6 { return "" }
+  let ink = box_ink_any(img, b[0] + 2, b[1] + 2, b[2] - 2, b[3] - 2)
+  return trim(read_line_lex(ink[2], ink[0], 0, 0, ink[0] - 1, ink[1] - 1, temps, lex))
+}
+
+# -> [x, y, kind, what Pi read] at the centre of the best match, or null (a match: at most a third of the letters wrong)
+skill find_label(img, label, temps, lex) -> Any {
+  let u = understand(img[0], img[1], img[2], 1)
+  let want = lower(label)
+  let best = null
+  let bs = 0 - 1
+  for o in u[9] {
+    let t = read_box(img, [o[1], o[2], o[3], o[4]], temps, lex)
+    let s = edits(lower(t), want)
+    if bs < 0 or s < bs {
+      let bs = s
+      let best = [(o[1] + o[3]) // 2, (o[2] + o[4]) // 2, o[0], t]
+    }
+  }
+  for l in u[8] {
+    let t = read_box(img, [max(0, l[0] - 2), max(0, l[1] - 2), min(img[0] - 1, l[2] + 2), min(img[1] - 1, l[3] + 2)], temps, lex)
+    let s = edits(lower(t), want)
+    if bs < 0 or s < bs {
+      let bs = s
+      let best = [(l[0] + l[2]) // 2, (l[1] + l[3]) // 2, "text", t]
+    }
+  }
+  if best == null or bs * 3 > len(label) { return null }
+  return best
+}
+
+skill rnd(s) -> Any { return (s * 1103515245 + 12345) % 2147483648 }
+
+skill mixc(a, b, t) -> Any {
+  let r = ((a // 65536) * (255 - t) + (b // 65536) * t) // 255
+  let g = (((a // 256) % 256) * (255 - t) + ((b // 256) % 256) * t) // 255
+  let bl = ((a % 256) * (255 - t) + (b % 256) * t) // 255
+  return r * 65536 + g * 256 + bl
+}
+
+# draw text (rendered by the font engine) centred in a box, blended from bg to fg by its ink
+skill put_text(p, w, box, text, size, font, bg, fg) -> Any {
+  let t = render(text, size, font)
+  let tw = t[0]
+  let th = t[1]
+  let ox = (box[0] + box[2]) // 2 - tw // 2
+  let oy = (box[1] + box[3]) // 2 - th // 2
+  for y in range(0, th) {
+    for x in range(0, tw) {
+      let px = ox + x
+      let py = oy + y
+      if px > box[0] and px < box[2] and py > box[1] and py < box[3] {
+        let c = aget(t[2], y * tw + x)
+        let ink = 255 - (299 * (c // 65536) + 587 * ((c // 256) % 256) + 114 * (c % 256)) // 1000
+        if ink > 0 { do aset(p, py * w + px, mixc(bg, fg, ink)) }
+      }
+    }
+  }
+  return p
+}
+
+skill labels() -> Any { return ["OK", "Cancel", "Save", "Open", "Close", "Apply", "Next", "Back", "Help", "Delete", "Search", "Settings", "Print", "Share", "Rename", "Upload"] }
+
+# -> [img, buttons [label, x0, y0, x1, y1], seed, font, size]
+skill compose(seed, fonts) -> Any {
+  let s = rnd(seed)
+  let w = 480
+  let h = 300
+  let p = arr(w * h)
+  do fill(p, w, 0, 0, w - 1, h - 1, 3101307)
+  do fill(p, w, 40, 30, 439, 269, 15790320)
+  do fill(p, w, 40, 30, 439, 47, 2109536)
+  let s = rnd(s)
+  let font = fonts[s // 65536 % len(fonts)]
+  let s = rnd(s)
+  let size = 12 + s // 65536 % 7
+  # a line of plain text inside the window that mentions labels too (Pi should still pick the button)
+  do put_text(p, w, [50, 60, 430, 90], "Save your work before you close or share it.", size, font, 15790320, 1052688)
+  let s = rnd(s)
+  let n = 3 + s // 65536 % 2
+  let all = labels()
+  let chosen = []
+  while len(chosen) < n {
+    let s = rnd(s)
+    let l = all[s // 65536 % len(all)]
+    let dup = false
+    for c in chosen {
+      if c == l { let dup = true }
+    }
+    if dup == false { let chosen = append(chosen, l) }
+  }
+  let s = rnd(s)
+  let blue = s // 65536 % 2 == 0
+  let bg = 13421772
+  let fg = 1052688
+  if blue {
+    let bg = 3368652
+    let fg = 16777215
+  }
+  let btns = []
+  for i in range(0, n) {
+    let b = [60 + i * 95, 220, 149 + i * 95, 247]
+    do fill(p, w, b[0], b[1], b[2], b[3], bg)
+    do put_text(p, w, b, chosen[i], size, font, bg, fg)
+    let btns = append(btns, [chosen[i], b[0], b[1], b[2], b[3]])
+  }
+  return [[w, h, p], btns, s, font, size]
+}
+
+skill learn_set(fonts, sizes) -> Any {
+  let temps = []
+  for f in fonts {
+    for z in sizes { let temps = temps ++ learn_font(z, f) }
+  }
+  return temps
+}
+

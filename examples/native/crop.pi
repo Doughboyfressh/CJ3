@@ -1,0 +1,18 @@
+# save a crop of the screen (diagnostic): out\crop.exe x0 y0 x1 y1 -> out\crop.bmp
+import "senses.pi"
+
+skill main() -> Any {
+  let img = see(1)
+  let x0 = num(arg(1))
+  let y0 = num(arg(2))
+  let x1 = num(arg(3))
+  let y1 = num(arg(4))
+  let w = x1 - x0
+  let h = y1 - y0
+  let a = arr(w * h)
+  for y in range(0, h) {
+    for x in range(0, w) { do aset(a, y * w + x, aget(img[2], (y0 + y) * img[0] + x0 + x)) }
+  }
+  do bmp_write("out\\crop.bmp", w, h, a)
+  return "out\\crop.bmp " ++ str(w) ++ "x" ++ str(h)
+}

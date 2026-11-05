@@ -1,0 +1,339 @@
+# Pi's world knowledge: facts, rules learned from them, and reasoning checked on facts it was not given.
+#
+# Facts: the Wikidata facts in data/pairs/wikipedia_pairs.jsonl (subject, relation, value), into Pi's own store.
+# Rules: chains that hold across the facts -- "if X r1 Y and Y r2 Z, then X r3 Z" -- found by counting, kept when they
+#        have support (>= 20 cases) and confidence (>= 40% of the time the chain holds, the conclusion does too).
+# Test:  one fact in ten is held back from the store. Pi must INFER each held-back fact from the rest with its rules
+#        (no lookup is possible: the fact is not there). Scored against Wikidata, beside a simple baseline (the most
+#        common value of that relation).
+#
+#   out\kb.exe [MB of facts]
+import "json.pi"
+
+skill DATA() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\pairs\\wikipedia_pairs.jsonl" }
+
+# ---- hash tables on in-place arrays (no copying as they grow) ----------------------------------------------------
+skill TBL() -> Any { return 2097152 }
+
+skill strhash(s) -> Any {
+  let h1 = 7
+  let h2 = 13
+  for c in chars(s) {
+    let h1 = (h1 * 1000003 + ord(c) + 1) % 1073741789
+    let h2 = (h2 * 999983 + ord(c) + 7) % 1073741783
+  }
+  return h1 * 1073741783 + h2 + 1
+}
+
+skill new_table() -> Any { return {"keys": arr(TBL()), "vals": arr(TBL())} }
+
+skill slot_of(tab, key) -> Any {
+  let ks = tab["keys"]
+  let i = key % TBL()
+  let probes = 0
+  while probes < TBL() {
+    let k = aget(ks, i)
+    if k == 0 or k == key { return i }
+    let i = (i + 1) % TBL()
+    let probes = probes + 1
+  }
+  # a full table is a clean failure, never an endless loop
+  do fail("hash table full")
+  return 0
+}
+
+skill bump(tab, key, by) -> Any {
+  let i = slot_of(tab, key)
+  if aget(tab["keys"], i) == 0 { do aset(tab["keys"], i, key) }
+  do aset(tab["vals"], i, aget(tab["vals"], i) + by)
+  return aget(tab["vals"], i)
+}
+
+skill get_val(tab, key) -> Any {
+  let i = slot_of(tab, key)
+  if aget(tab["keys"], i) == 0 { return 0 }
+  return aget(tab["vals"], i)
+}
+
+skill set_val(tab, key, v) -> Any {
+  let i = slot_of(tab, key)
+  do aset(tab["keys"], i, key)
+  do aset(tab["vals"], i, v)
+  return v
+}
+
+skill gl_push(g, x) -> Any {
+  let cur = append(g[1], x)
+  if len(cur) >= 256 { return [append(g[0], cur), []] }
+  return [g[0], cur]
+}
+skill gl_items(g) -> Any {
+  let out = []
+  for c in g[0] { let out = out ++ c }
+  return out ++ g[1]
+}
+
+skill lines_at(off, n) -> Any {
+  let t = read_at(DATA(), off, n)
+  if t == null { return [] }
+  let ls = split(t, "\n")
+  if off > 0 { let ls = slice(ls, 1, len(ls)) }
+  return slice(ls, 0, len(ls) - 1)
+}
+
+skill subject_name(title) -> Any {
+  if contains(title, " (") { return split(title, " (")[0] }
+  return title
+}
+
+# ---- the store: facts by subject (chained through an in-place "next" array) ---------------------------------------
+skill MAXF() -> Any { return 1500000 }
+
+# the i-th item of a chunked list [full chunks of 256, last chunk]
+skill fget(g, i) -> Any {
+  let c = i // 256
+  if c < len(g[0]) { return g[0][c][i % 256] }
+  return g[1][i % 256]
+}
+
+skill main() -> Any {
+  let mb = 200
+  if arg(1) != null { let mb = num(arg(1)) }
+  let size = 1330000000
+  let piece = 4000000
+  let pieces = mb * 1000000 // piece
+  let step = size // (pieces + 1)
+  # 1. facts
+  let seen = new_table()
+  let facts = [[], []]
+  let nf = 0
+  for k in range(0, pieces) {
+    let m = mark()
+    let got = []
+    for line in lines_at(k * step, piece) {
+      if contains(line, "\"kind\": \"pair\"") {
+        let d = json_parse(line)
+        if typeof(d["value"]) == "text" and d["approximate"] != true {
+          let got = append(got, [subject_name(d["title"]), d["relation"], d["value"]])
+        }
+      }
+    }
+    let fresh = []
+    for f in got {
+      let hk = strhash(f[0] ++ "|" ++ f[1] ++ "|" ++ f[2])
+      if get_val(seen, hk) == 0 and nf + len(fresh) < MAXF() - 1 {
+        do set_val(seen, hk, 1)
+        let fresh = append(fresh, f)
+      }
+    }
+    let fresh = release(m, fresh)
+    for f in fresh {
+      let facts = gl_push(facts, f)
+      let nf = nf + 1
+    }
+    if k % 5 == 0 { do print("piece " ++ str(k) ++ ": " ++ str(nf) ++ " facts, heap " ++ str(memused() // 1000000) ++ " MB") }
+  }
+  # never flattened: fact i is read straight from its chunk (flattening copied the growing list: quadratic)
+  let fs = facts
+  # one fact in ten is held back (chosen by its hash, so the choice ignores everything Pi might learn)
+  let held = [[], []]
+  let nh = 0
+  let head = new_table()
+  let next = arr(MAXF())
+  let stored = 0
+  let isheld = arr(nf + 1)
+  for i in range(0, nf) {
+    let f = fget(fs, i)
+    let m = mark()
+    let r = [strhash(f[0] ++ "|" ++ f[1] ++ "|" ++ f[2]) % 10 == 0, strhash(f[0])]
+    let r = release(m, r)
+    if r[0] {
+      do aset(isheld, i, 1)
+      let held = gl_push(held, f)
+      let nh = nh + 1
+    } else {
+      do aset(next, i, get_val(head, r[1]))
+      do set_val(head, r[1], i + 1)
+      let stored = stored + 1
+    }
+  }
+  let out = "Pi stored " ++ str(stored) ++ " Wikidata facts (" ++ str(mb) ++ " MB of the file) and held back " ++ str(nh) ++ " to reason about.\n"
+  do print(out)
+  # 2. rules: count chains x -r1-> y -r2-> z, and how often x -r3-> z is also known
+  let body = new_table()
+  let trip = new_table()
+  let rules = [[], []]
+  # what the store knows (held-back facts are NOT in it)
+  let known = new_table()
+  for i in range(0, nf) {
+    if aget(isheld, i) == 0 {
+      let f = fget(fs, i)
+      let m = mark()
+      do set_val(known, strhash(f[0] ++ "|" ++ f[1] ++ "|" ++ f[2]), 1)
+      do release(m, 0)
+    }
+  }
+  let aliases = 0
+  for i in range(0, nf) {
+    let f = fget(fs, i)
+    let mm = mark()
+    let newr = []
+    if aget(isheld, i) == 0 {
+      # is Y just X under another name? (Y already shares two or more facts with X) -- then the chain is no reasoning
+      let shared = 0
+      let j = get_val(head, strhash(f[2]))
+      while j > 0 and shared < 2 {
+        let g = fget(fs, j - 1)
+        if get_val(known, strhash(f[0] ++ "|" ++ g[1] ++ "|" ++ g[2])) > 0 { let shared = shared + 1 }
+        let j = aget(next, j - 1)
+      }
+      let j = 0
+      if shared < 2 { let j = get_val(head, strhash(f[2])) } else { let aliases = aliases + 1 }
+      while j > 0 {
+        let g = fget(fs, j - 1)
+        if g[2] != f[0] {
+          do bump(body, strhash(f[1] ++ "|" ++ g[1]), 1)
+          # what else is known about x with the same value z?
+          let k = get_val(head, strhash(f[0]))
+          while k > 0 {
+            let h = fget(fs, k - 1)
+            if h[2] == g[2] and k - 1 != i {
+              if bump(trip, strhash(f[1] ++ "|" ++ g[1] ++ "|" ++ h[1]), 1) == 1 { let newr = append(newr, [f[1], g[1], h[1]]) }
+            }
+            let k = aget(next, k - 1)
+          }
+        }
+        let j = aget(next, j - 1)
+      }
+    }
+    let newr = release(mm, newr)
+    for r in newr { let rules = gl_push(rules, r) }
+  }
+  let found = []
+  for r in gl_items(rules) {
+    let s = get_val(trip, strhash(r[0] ++ "|" ++ r[1] ++ "|" ++ r[2]))
+    let b = get_val(body, strhash(r[0] ++ "|" ++ r[1]))
+    if s >= 20 and s * 10 >= b * 4 { let found = append(found, [r[0], r[1], r[2], s, s * 100 // b]) }
+  }
+  # rule index: head relation -> its rules
+  let out = out ++ "Pi learned " ++ str(len(found)) ++ " rules (chains that hold >= 40% of the time, >= 20 cases). The strongest:\n"
+  let shown = 0
+  let sorted = []
+  for r in found { let sorted = append(sorted, [0 - r[3], r]) }
+  for pr in sort_pairs(sorted) {
+    let r = pr[1]
+    if shown < 12 {
+      let out = out ++ "  " ++ r[2] ++ "(X, Z)  <=  " ++ r[0] ++ "(X, Y) and " ++ r[1] ++ "(Y, Z)   [" ++ str(r[3]) ++ " cases, " ++ str(r[4]) ++ "%]\n"
+      let shown = shown + 1
+    }
+  }
+  # baseline: the most common value of each relation in the store
+  let vcount = new_table()
+  let bestc = new_table()
+  let besti = new_table()
+  for i in range(0, nf) {
+    if aget(isheld, i) == 0 {
+      let f = fget(fs, i)
+      let m = mark()
+      let c = bump(vcount, strhash(f[1] ++ "|" ++ f[2]), 1)
+      let rk = strhash(f[1])
+      if c > get_val(bestc, rk) {
+        do set_val(bestc, rk, c)
+        do set_val(besti, rk, i + 1)
+      }
+      do release(m, 0)
+    }
+  }
+  # 3. the test: infer each held-back fact from the rest
+  let rule_heads = {}
+  for r in found {
+    let rs = rule_heads[r[2]]
+    if rs == null { let rs = [] }
+    let rule_heads = put(rule_heads, r[2], append(rs, r))
+  }
+  let askable = 0
+  let answered = 0
+  let right = 0
+  let base_right = 0
+  let shows = []
+  for hi in range(0, nh) {
+    let f = fget(held, hi)
+    let rs = rule_heads[f[1]]
+    if rs != null {
+      let askable = askable + 1
+      let m = mark()
+      # votes for each candidate value, weighted by the rule's confidence
+      let votes = {}
+      let why = {}
+      let i = get_val(head, strhash(f[0]))
+      while i > 0 {
+        let a = fget(fs, i - 1)
+        for r in rs {
+          if a[1] == r[0] {
+            let j = get_val(head, strhash(a[2]))
+            while j > 0 {
+              let b = fget(fs, j - 1)
+              if b[1] == r[1] {
+                let v = votes[b[2]]
+                if v == null { let v = 0 }
+                let votes = put(votes, b[2], v + r[4])
+                if why[b[2]] == null { let why = put(why, b[2], r[0] ++ "(" ++ f[0] ++ ", " ++ a[2] ++ ") and " ++ r[1] ++ "(" ++ a[2] ++ ", " ++ b[2] ++ ")") }
+              }
+              let j = aget(next, j - 1)
+            }
+          }
+        }
+        let i = aget(next, i - 1)
+      }
+      let best = null
+      let bv = 0
+      for k in keys(votes) {
+        if votes[k] > bv {
+          let best = k
+          let bv = votes[k]
+        }
+      }
+      let res = [0, 0, null]
+      if best != null {
+        let res = [1, 0, null]
+        if best == f[2] { let res = [1, 1, f[1] ++ "(" ++ f[0] ++ ", " ++ best ++ ")   because " ++ why[best]] }
+      }
+      let res = release(m, res)
+      let answered = answered + res[0]
+      let right = right + res[1]
+      if res[2] != null and len(shows) < 8 { let shows = append(shows, res[2]) }
+      let m2 = mark()
+      let bi = get_val(besti, strhash(f[1]))
+      let hit = false
+      if bi > 0 { let hit = fget(fs, bi - 1)[2] == f[2] }
+      do release(m2, 0)
+      if hit { let base_right = base_right + 1 }
+    }
+  }
+  let out = out ++ "\nTEST: " ++ str(nh) ++ " facts held back; " ++ str(askable) ++ " are of a relation some rule concludes.\n"
+  let out = out ++ "  Pi inferred an answer for " ++ str(answered) ++ "; right (= Wikidata): " ++ str(right) ++ " (" ++ str(right * 100 // max(1, answered)) ++ "% of its answers, " ++ str(right * 100 // max(1, askable)) ++ "% of the askable)\n"
+  let out = out ++ "  baseline, always the most common value of the relation: " ++ str(base_right) ++ " right (" ++ str(base_right * 100 // max(1, askable)) ++ "% of the askable)\n"
+  let out = out ++ "\nfacts Pi was not given, inferred correctly:\n"
+  for s in shows { let out = out ++ "  " ++ s ++ "\n" }
+  return out
+}
+
+# sort [key, value] pairs by key (insertion into a sorted list of keys; small lists)
+skill sort_pairs(ps) -> Any {
+  let ks = []
+  for p in ps { let ks = append(ks, p[0]) }
+  let ks = sort(ks)
+  let out = []
+  let used = {}
+  for k in ks {
+    for i in range(0, len(ps)) {
+      if ps[i][0] == k and used[str(i)] == null and len(out) < len(ks) {
+        if len(out) < 40 {
+          let out = append(out, ps[i])
+        }
+        let used = put(used, str(i), true)
+      }
+    }
+  }
+  return out
+}

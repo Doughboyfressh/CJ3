@@ -1,0 +1,46 @@
+# text, lists and maps: everything the runtime gives a compiled program, folded into one checksum
+skill count_words(text) -> Any {
+  let counts = {}
+  let word = ""
+  for c in chars(text ++ " ") {
+    if c == " " {
+      if len(word) > 0 {
+        let n = counts[word]
+        if n == null { let n = 0 }
+        let counts = put(counts, word, n + 1)
+      }
+      let word = ""
+    } else {
+      let word = word ++ c
+    }
+  }
+  return counts
+}
+
+skill digits_sum(s) -> Any {
+  let total = 0
+  for c in chars(s) { let total = total + ord(c) - 48 }
+  return total
+}
+
+skill main() -> Any {
+  let counts = count_words("the cat and the dog and the bird")
+  let score = counts["the"] * 100 + counts["and"] * 10 + len(counts)
+  let xs = []
+  for i in range(0, 10) { let xs = append(xs, i * i) }
+  let ys = slice(xs, 2, -2) ++ [1000]
+  let total = 0
+  for y in ys { let total = total + y }
+  let label = "n=" ++ str(total) ++ ";"
+  let back = num(slice(label, 2, len(label) - 1))
+  let checks = 0
+  if contains(label, "=") { let checks = checks + 1 }
+  if contains(xs, 81) { let checks = checks + 2 }
+  # contains(map, key) is whether the key is there (it used to give null for any map)
+  if contains("The Dog", "the d") and contains(counts, "dog") and not contains(counts, "fox") { let checks = checks + 4 }
+  if [1, [2, "x"]] == [1, [2, "x"]] { let checks = checks + 8 }
+  if {"a": 1} != {"a": 2} { let checks = checks + 16 }
+  if xs[-1] == 81 and xs[99] == null { let checks = checks + 32 }
+  if not ("" or []) { let checks = checks + 64 }
+  return score * 1000000 + back * 100 + checks + digits_sum("12345") * 1000
+}

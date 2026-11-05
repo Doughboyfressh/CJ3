@@ -1,0 +1,36 @@
+# The equation solver's test, importing the solver core. Checked by correct answers on known equations, and by
+# native == interpreter on this file (quadratic roots match bit-for-bit because IEEE sqrt is correctly rounded).
+import "eqlib.pi"
+
+skill B(b) -> Any {
+  if b { return "1" }
+  return "0"
+}
+
+skill main() -> Any {
+  let out = B(equation("2+3*4")["value"] == 14)
+  let out = out ++ B(equation("(2+3)*4")["value"] == 20)
+  let out = out ++ B(equation("2^10")["value"] == 1024)
+  let out = out ++ B(equation("10/4")["value"] == 2.5)
+  let out = out ++ B(equation("100 - 7*8")["value"] == 44)
+  let out = out ++ B(equation("2*(3+4)^2")["value"] == 98)
+  let out = out ++ B(equation("-5 + 3")["value"] == -2)
+  let out = out ++ B(equation("17 % 5")["value"] == 2)
+  let out = out ++ B(equation("3 + 4*2^3 - 1")["value"] == 34)
+  let out = out ++ B(equation("2*x + 3 = 11")["x"] == 4)
+  let out = out ++ B(equation("x/2 = 5")["x"] == 10)
+  let out = out ++ B(equation("3*x - 7 = 2*x + 1")["x"] == 8)
+  let out = out ++ B(equation("5*x = 3")["x"] == 0.6)
+  let out = out ++ B(equation("x + x + x = 9")["x"] == 3)
+  let out = out ++ B(equation("x^2 = 4")["roots"] == [-2, 2])
+  let out = out ++ B(equation("x^2 - 5*x + 6 = 0")["roots"] == [2, 3])
+  let out = out ++ B(equation("2*x^2 - 8 = 0")["roots"] == [-2, 2])
+  let out = out ++ B(equation("x^2 - 2*x + 1 = 0")["roots"] == [1, 1])
+  let q = equation("x^2 = 2")["roots"]
+  let out = out ++ B(q[0] > -1.4142136 and q[0] < -1.4142135 and q[1] > 1.4142135 and q[1] < 1.4142136)
+  let out = out ++ B(equation("x^2 + 1 = 0")["status"] == "no real solution")
+  let out = out ++ B(equation("x^3 = 8")["status"] == "degree too high")
+  let out = out ++ B(equation("7 = 7")["status"] == "every x is a solution")
+  let out = out ++ B(equation("0 = 5")["status"] == "no solution")
+  return out
+}

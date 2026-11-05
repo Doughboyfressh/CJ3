@@ -1,0 +1,71 @@
+# pidraft: Pi drafts its brain's next tokens from what has already been said. The brain rewrites its own programs
+# (a fix re-sends the whole program with one line changed), echoes names from tool responses and repeats its own
+# phrases, so the tokens after the latest earlier occurrence of the last few tokens are often exactly the next ones.
+# The brain checks a draft in one pass; whatever it agrees with is kept, so a draft can only cost time, never change
+# what is said.
+#   pd_new()                 an empty drafter
+#   pd_push(pd, seq)         after each token appended to seq (the whole sequence so far)
+#   pd_draft(pd, seq, k)     up to k tokens that may come next (empty when nothing matches)
+
+skill PD_SIZE() -> Any { return 1048573 }
+
+# how many tokens back a match must agree before its continuation is worth a verify pass (draftsim measures it;
+# out\pd_minm.txt overrides, for that measuring)
+skill PD_MINM() -> Any {
+  let t = read_file("out\\pd_minm.txt")
+  if t != null { return int(trim(t)) }
+  return 6
+}
+
+skill pd_new() -> Any { return [arr(PD_SIZE()), arr(PD_SIZE()), arr(PD_SIZE()), PD_MINM()] }
+
+# the slot of the n tokens of seq ending at position e (inclusive)
+skill pd_hash(seq, e, n) -> Any {
+  let h = 0
+  for j in range(e - n + 1, e + 1) { h = (h * 262147 + seq[j] + 1) % PD_SIZE() }
+  return h
+}
+
+# seq just grew by one token: the n-grams that END one before the new token now point at it (as position + 1, so 0
+# is "never seen"). Registering one behind keeps a lookup of the current suffix from finding itself.
+skill pd_push(pd, seq) -> Any { return pd_push_at(pd, seq, len(seq)) }
+
+# ... as if seq were only its first L tokens (a prompt registered token by token without slicing it)
+skill pd_push_at(pd, seq, L) -> Any {
+  let e = L - 2
+  for n in [1, 2, 3] {
+    if e - n + 1 >= 0 { aset(pd[n - 1], pd_hash(seq, e, n), L) }
+  }
+  return 0
+}
+
+# the longest suffix (3, then 2 tokens; 1 only for a token seen inside a long earlier run) that occurred before ->
+# the tokens that followed it, up to k
+skill pd_draft(pd, seq, k) -> Any {
+  let L = len(seq)
+  for n in [3, 2] {
+    if L >= n + 1 {
+      let p = aget(pd[n - 1], pd_hash(seq, L - 1, n)) - 1
+      // (p < L: an entry left from a longer, discarded sequence points past the end)
+      if p >= n and p < L {
+        let same = true
+        for j in range(0, n) {
+          if seq[p - n + j] != seq[L - n + j] { same = false }
+        }
+        // a copy, not a coincidence: the earlier text must agree for at least PD_MINM() tokens back
+        let m = n
+        while m < 64 and p - 1 - m >= 0 and seq[p - 1 - m] == seq[L - 1 - m] { m += 1 }
+        if same and m >= pd[3] {
+          let out = []
+          let q = p
+          while q < L and len(out) < k {
+            out ++= [seq[q]]
+            q += 1
+          }
+          return out
+        }
+      }
+    }
+  }
+  return []
+}

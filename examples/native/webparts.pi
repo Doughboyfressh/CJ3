@@ -1,0 +1,18 @@
+# webparts: sitelib's pure parts (what a Pi website's server is built from) -- JSON both ways, URL decoding, forms,
+# the reply text, the path guard that keeps a site in out\site\, and chr()
+import "sitelib.pi"
+
+skill main() -> Any {
+  let v = parse_json("{\"name\": \"Ada\", \"tags\": [\"x\", \"y z\"], \"n\": 42, \"r\": 2.5, \"ok\": true, \"none\": null, \"q\": \"say \\\"hi\\\"\\n\"}")
+  print(v["name"], v["tags"], v["n"] + 1, v["r"] * 2, v["ok"], v["none"], len(v["q"]))
+  print(to_json(v))
+  print(to_json([1, "two", {"k": [3]}, null]), to_json(parse_json("[]")), to_json(parse_json("{}")))
+  print(url_decode("a%20b+c%2Fd%C3%A9"), to_json(site_query("x=1&msg=hello+world&e=%3D&flag")))
+  print(chr(65), chr(233), len(chr(233)), chr(9786), len(chr(128512)))
+  print(site_path("index.html"), site_path("data/notes.json"), site_path("../x"), site_path("C:\\x"), site_path("/etc"))
+  let page = site_reply_text("<h1>hi</h1>")
+  print(split(page, "\r\n")[0], split(page, "\r\n")[1], split(page, "\r\n")[2])
+  print(split(site_reply_text({"a": 1}), "\r\n")[1], slice(site_reply_text({"a": 1}), len(site_reply_text({"a": 1})) - 7, len(site_reply_text({"a": 1}))))
+  print(split(site_reply_text(reply(404, "text/plain", "gone")), "\r\n")[0], split(site_reply_text(site_file("no_such_file.txt")), "\r\n")[0])
+  return "ok"
+}

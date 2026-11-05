@@ -1,0 +1,178 @@
+# nimage: a neural image. A small network, trained from scratch on this PC's GPU, learns to reproduce ONE real
+# photograph -- input a pixel's (x, y), output its colour. The trained weights ARE that picture: Pi reconstructs real
+# captured data, it does not invent it. This is the first proof of the path to a real place or person.
+#   nimage IN.ppm OUT.png [steps] [hidden] [L]
+# IN.ppm is a real photo as binary PPM (P6). Big real data never becomes a Pi list: pixels and features are poked
+# straight into GPU host buffers.
+import "grad.pi"
+
+# ---- read a binary PPM (P6): -> [width, height, the file's bytes as an int array, offset where pixels start] ----
+skill ni_tok(b, i) -> Any {
+  # skip whitespace and # comments from i, then read one integer -> [value, next index]
+  let n = len(b)
+  while i < n {
+    let c = aget(b, i)
+    if c == 35 {
+      while i < n and aget(b, i) != 10 { i += 1 }
+    } else if c == 32 or c == 9 or c == 10 or c == 13 {
+      i += 1
+    } else {
+      break
+    }
+  }
+  let v = 0
+  while i < n and aget(b, i) >= 48 and aget(b, i) <= 57 {
+    v = v * 10 + aget(b, i) - 48
+    i += 1
+  }
+  return [v, i]
+}
+skill ni_read_ppm(path) -> Any {
+  let size = rt_file_size(path)
+  if size == 0 { fail("cannot read " ++ path) }
+  let b = read_bytes(path, 0, size)
+  if len(b) < 2 or aget(b, 0) != 80 or aget(b, 1) != 54 { fail(path ++ " is not a binary PPM (P6); convert with: ffmpeg -i in.jpg -vf scale=W:H out.ppm") }
+  let w = ni_tok(b, 2)
+  let h = ni_tok(b, w[1])
+  let mx = ni_tok(b, h[1])
+  # exactly one whitespace byte follows maxval, then the pixels
+  return [w[0], h[0], b, mx[1] + 1]
+}
+
+# ---- Fourier features of (x, y): [x, y, sin(f x), cos(f x), sin(f y), cos(f y) for f = pi 2^k] ----
+skill ni_nfeat(L) -> Any { return 2 + 4 * L }
+# fill the GPU input tensor's host buffer, pixel by pixel, feature by feature (no Pi list)
+skill ni_features(host, w, h, L) -> Any {
+  let idx = 0
+  for yy in range(0, h) {
+    let fy = (float(yy) + 0.5) / float(h) * 2.0 - 1.0
+    for xx in range(0, w) {
+      let fx = (float(xx) + 0.5) / float(w) * 2.0 - 1.0
+      rt_g_putbits(host, idx, g_f32bits(fx))
+      idx += 1
+      rt_g_putbits(host, idx, g_f32bits(fy))
+      idx += 1
+      let freq = 3.14159265
+      for k in range(0, L) {
+        rt_g_putbits(host, idx, g_f32bits(sin(freq * fx)))
+        idx += 1
+        rt_g_putbits(host, idx, g_f32bits(cos(freq * fx)))
+        idx += 1
+        rt_g_putbits(host, idx, g_f32bits(sin(freq * fy)))
+        idx += 1
+        rt_g_putbits(host, idx, g_f32bits(cos(freq * fy)))
+        idx += 1
+        freq = freq * 2.0
+      }
+    }
+  }
+  return 0
+}
+
+# ---- the network: Fourier features -> some ReLU layers -> 3 colours ----
+skill ni_net(G, st, F, hid, nlayers) -> Any {
+  let sizes = [F]
+  for i in range(0, nlayers) { sizes = append(sizes, hid) }
+  sizes = append(sizes, 3)
+  let layers = []
+  for l in range(0, len(sizes) - 1) {
+    let fin = sizes[l]
+    let fout = sizes[l + 1]
+    let w = g_param(G, fin, fout)
+    let b = g_param(G, 1, fout)
+    # He initialisation for ReLU; the last layer small so it starts near grey
+    let scale = if l == len(sizes) - 2 { 0.01 } else { sqrt(2.0 / float(fin)) }
+    g_randn(w, st, scale)
+    layers = append(layers, [w, b])
+  }
+  return layers
+}
+skill ni_fwd(G, layers, x) -> Any {
+  let h = x
+  let n = len(layers)
+  for l in range(0, n) {
+    let act = if l == n - 1 { "" } else { "relu" }
+    h = g_dense(G, h, layers[l][0], layers[l][1], act, 0.0)
+  }
+  return h
+}
+
+# pred (N*3 on the GPU) -> an int array of bytes 0..255, clamped
+skill ni_to_bytes(pred, n3) -> Any {
+  let host = rt_host_alloc(4 * n3)
+  rt_gpu_to_host(host, pred[0], 4 * n3)
+  let out = arr(n3 + 1)
+  for i in range(0, n3) {
+    let v = g_bits_real(rt_g_getbits(host, i))
+    let q = int(v * 255.0 + 0.5)
+    if q < 0 { q = 0 }
+    if q > 255 { q = 255 }
+    aset(out, i, q)
+  }
+  rt_host_free(host)
+  return out
+}
+skill rt_ni_pack(bt) -> Any {
+  let b = bt
+  let n = peek(b + 8)
+  let p = rt_alloc(n)
+  for i in range(0, n) { do pokeb(p + i, rt_untag(peek(b + 16 + 8 * i)) % 256) }
+  return rt_tag(p)
+}
+
+skill main() -> Any {
+  if arg(1) == null or arg(2) == null { return "nimage IN.ppm OUT.png [steps] [hidden] [L]" }
+  let img = ni_read_ppm(arg(1))
+  let w = img[0]
+  let h = img[1]
+  let bytes = img[2]
+  let pstart = img[3]
+  let N = w * h
+  let steps = if arg(3) != null { int(arg(3)) } else { 2500 }
+  let hid = if arg(4) != null { int(arg(4)) } else { 256 }
+  let L = if arg(5) != null { int(arg(5)) } else { 10 }
+  let F = ni_nfeat(L)
+  print("photo " ++ str(w) ++ " x " ++ str(h) ++ " = " ++ str(N) ++ " pixels; " ++ str(F) ++ " features, " ++ str(hid) ++ " hidden")
+  let t0 = ticks()
+
+  let G = g_open()
+  let st = arr(1)
+  aset(st, 0, 1234567)
+
+  # input features, uploaded once
+  let x = g_tensor(N, F)
+  let hostx = rt_host_alloc(4 * N * F)
+  ni_features(hostx, w, h, L)
+  rt_host_to_gpu(x[0], hostx, 4 * N * F)
+  rt_host_free(hostx)
+
+  # target colours, straight from the file's bytes
+  let tgt = g_tensor(N, 3)
+  let hosty = rt_host_alloc(4 * N * 3)
+  for i in range(0, N * 3) { rt_g_putbits(hosty, i, g_f32bits(float(aget(bytes, pstart + i)) / 255.0)) }
+  rt_host_to_gpu(tgt[0], hosty, 4 * N * 3)
+  rt_host_free(hosty)
+  print("data ready in " ++ str(ticks() - t0) ++ " ms")
+
+  let layers = ni_net(G, st, F, hid, 3)
+  let opt = g_opt(G, 0.004)
+  let tt = ticks()
+  for step in range(0, steps + 1) {
+    g_zero_grad(G)
+    let L2 = g_mse(G, ni_fwd(G, layers, x), tgt)
+    g_backward(G)
+    g_step(G, opt)
+    if step % 200 == 0 {
+      let psnr = 0.0 - 10.0 * log10(L2 + 0.0000000001)
+      print("step " ++ str(step) ++ "  loss " ++ format("{:.6f}", L2) ++ "  PSNR " ++ format("{:.2f}", psnr) ++ " dB  (" ++ str((ticks() - tt) // 1000) ++ " s)")
+    }
+  }
+
+  # reconstruct and write it out
+  g_zero_grad(G)
+  let pred = ni_fwd(G, layers, x)
+  let bb = ni_to_bytes(pred, N * 3)
+  let size = rt_png_write(arg(2), rt_ni_pack(bb), w, h)
+  print("wrote " ++ arg(2) ++ ", " ++ str(size) ++ " bytes, total " ++ str((ticks() - t0) // 1000) ++ " s")
+  return 0
+}

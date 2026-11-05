@@ -1,0 +1,318 @@
+# Pi's NEURAL reader, trained on the GPU: does this sentence state the fact? A 2048 -> 2048 -> 1 network over a
+# sentence's hashed features (relation x word stem, paragraph, sentence number, subject named), in fixed-point
+# integers; both big products (forward X.W1, backward Xt.dH) run on the RTX through Pi's own PTX kernel (gpu_mm),
+# the CPU reads the articles and builds the batches. Learns from facts.txt (train split by subject, held-out
+# subjects left out); tested on the test split: which sentence of the article states the fact -- the counting
+# model (out\reader_model.txt) vs the network vs both.
+#   out\nnread.exe [steps] [test facts]
+import "readerlib.pi"
+
+skill D() -> Any { return 2048 }
+
+skill rnd(st) -> Any {
+  do aset(st, 0, (aget(st, 0) * 1103515245 + 12345) % 2147483648)
+  return aget(st, 0) // 65536
+}
+
+skill real_i(x) -> Any {
+  if x < 0.0 { return 0 - real_i(0.0 - x) }
+  if x < 1.0 { return 0 }
+  return rd_int(split(str(x), ".")[0])
+}
+
+skill imin2(a, b) -> Any {
+  if a < b { return a }
+  return b
+}
+
+# a sentence's hashed feature buckets (relation-crossed, as the counting model's keys)
+skill buckets(ri, ws, para, si, subj1) -> Any {
+  let out = []
+  for f in sent_feats(ws, para, si, subj1) { let out = append(out, sl_key(str(ri) ++ "|" ++ f) % D()) }
+  return out
+}
+
+# put a row into the batch: X (row-major) and Xt (feature-major)
+skill set_row(X, XT, r, bs) -> Any {
+  let n = D()
+  for b in bs {
+    do aset(X, r * n + b, 1)
+    do aset(XT, b * n + r, 1)
+  }
+  return 0
+}
+
+skill relu_logits(Z, w2) -> Any {
+  let n = D()
+  let L = arr(n)
+  for r in range(0, n) {
+    let s = 0
+    let base = r * n
+    let j = 0
+    while j < n {
+      let z = aget(Z, base + j)
+      if z > 0 { let s = s + z * aget(w2, j) }
+      let j = j + 1
+    }
+    do aset(L, r, s)
+  }
+  return L
+}
+
+# one training step on a full batch -> how many of the batch's rows were on the wrong side
+skill step(X, XT, y, W1, w2, lr) -> Any {
+  let n = D()
+  let mz = mark()
+  let Z = gpu_mm(X, W1, n)
+  let L = relu_logits(Z, w2)
+  let gi = arr(n)
+  let wrong = 0
+  for r in range(0, n) {
+    let p = 1.0 / (1.0 + exp(0.0 - aget(L, r) * 1.0 / 1048576.0))
+    let g = p - aget(y, r) * 1.0
+    do aset(gi, r, real_i(g * 1024.0))
+    if (p > 0.5 and aget(y, r) == 0) or (p <= 0.5 and aget(y, r) == 1) { let wrong = wrong + 1 }
+  }
+  # dw2 and dH (CPU), then dW1 = Xt . dH on the GPU
+  let dw2 = arr(n)
+  let dH = arr(n * n)
+  for r in range(0, n) {
+    let g = aget(gi, r)
+    if g != 0 {
+      let base = r * n
+      let j = 0
+      while j < n {
+        let z = aget(Z, base + j)
+        if z > 0 {
+          do aset(dw2, j, aget(dw2, j) + g * z)
+          do aset(dH, base + j, (g * aget(w2, j)) // 1024)
+        }
+        let j = j + 1
+      }
+    }
+  }
+  let dW1 = gpu_mm(XT, dH, n)
+  let i = 0
+  while i < n * n {
+    let d = aget(dW1, i)
+    if d != 0 { do aset(W1, i, aget(W1, i) - (d * lr) // 2048) }
+    let i = i + 1
+  }
+  for j in range(0, n) { do aset(w2, j, aget(w2, j) - (aget(dw2, j) * lr) // (1024 * 2048)) }
+  do release(mz, 0)
+  return wrong
+}
+
+# the network's logits for a batch of rows (no training)
+skill forward(X, W1, w2) -> Any {
+  let mz = mark()
+  let Z = gpu_mm(X, W1, D())
+  let L = relu_logits(Z, w2)
+  return release(mz, L)
+}
+
+# for each pending fact: is the top sentence a stating one, by counts / network / sums
+skill score_pending(pend, L, res) -> Any {
+  let r = res
+  for p in pend {
+    let labs = p[0]
+    let cnt = p[1]
+    let b0 = p[2]
+    let best = [0, 0, 0, 0, 0]
+    let bv = [0.0, 0.0, 0.0, 0.0, 0.0]
+    for i in range(0, len(labs)) {
+      let nn = aget(L, b0 + i) * 1.0 / 1048576.0
+      let vs = [cnt[i], nn, cnt[i] + nn, cnt[i] + 0.5 * nn, cnt[i] + 2.0 * nn]
+      for k in range(0, 5) {
+        if i == 0 or vs[k] > bv[k] {
+          let bv = slice(bv, 0, k) ++ [vs[k]] ++ slice(bv, k + 1, 5)
+          let best = slice(best, 0, k) ++ [i] ++ slice(best, k + 1, 5)
+        }
+      }
+    }
+    let nr = []
+    for k in range(0, 5) {
+      let a = 0
+      if labs[best[k]] { let a = 1 }
+      let nr = append(nr, r[k] + a)
+    }
+    let r = append(nr, r[5])
+  }
+  return r
+}
+
+skill main() -> Any {
+  let steps = 200
+  if arg(1) != null { let steps = rd_int(arg(1)) }
+  let nte = 1500
+  if arg(2) != null { let nte = rd_int(arg(2)) }
+  let n = D()
+  let t0 = ticks()
+  let rl = rm_rels()
+  let ex = excluded()
+  # training facts: every 10th train-split fact (subject split as the reader: key % 50 -> 7 test, 13 tune)
+  let lines = split(read_file("out\\facts.txt"), "\n")
+  let need = hset(4194304)
+  let trf = []
+  let blk = []
+  let tef = []
+  let ntr = 0
+  for line in lines {
+    let m = mark()
+    let item = fact_item(line, rl)
+    let keep = false
+    if item != null {
+      let k = sl_key(lower(item[1]))
+      if hset_has(ex, k) == false {
+        if k % 50 == 7 and len(tef) < nte {
+          let tef = append(tef, item)
+          do hset_add(need, k)
+          let keep = true
+        }
+        if k % 50 != 7 and k % 50 != 13 {
+          let ntr = ntr + 1
+          if ntr % 10 == 0 and len(trf) * 1000 + len(blk) < steps * 600 {
+            let blk = append(blk, item)
+            do hset_add(need, k)
+            let keep = true
+            if len(blk) >= 1000 {
+              let trf = append(trf, blk)
+              let blk = []
+            }
+          }
+        }
+      }
+    }
+    if keep == false { do release(m, 0) }
+  }
+  let trf = append(trf, blk)
+  let ix = article_index_h(need)
+  let t1 = ticks()
+  # the network: W1 (features x hidden), w2 (hidden), small random integers (x1024 fixed point)
+  let st = arr(1)
+  do aset(st, 0, 12345)
+  let W1 = arr(n * n)
+  for i in range(0, n * n) { do aset(W1, i, rnd(st) % 129 - 64) }
+  let w2 = arr(n)
+  for j in range(0, n) { do aset(w2, j, rnd(st) % 129 - 64) }
+  # training: batches of 2048 sentences (each fact: its stating sentences + up to 3 others)
+  let X = arr(n * n)
+  let XT = arr(n * n)
+  let y = arr(n)
+  let r = 0
+  let done = 0
+  let wrongs = []
+  let nfact = 0
+  for chunk in trf {
+    for f in chunk {
+      if done < steps {
+        let m = mark()
+        let ss = article(ix, f[1])
+        let rows = []
+        if ss != null {
+          let vw = split(f[2], " ")
+          let subj1 = lower(sl_words(f[1])[0])
+          let negs = 0
+          for x in ss {
+            let pos = holds(x[0], vw)
+            if pos or negs < 3 {
+              if pos == false { let negs = negs + 1 }
+              let lab = 0
+              if pos { let lab = 1 }
+              let rows = append(rows, [lab, buckets(f[0], x[0], x[1], x[2], subj1)])
+            }
+          }
+          let anyp = false
+          for q in rows {
+            if q[0] == 1 { let anyp = true }
+          }
+          if anyp == false { let rows = [] }
+        }
+        let rows = release(m, rows)
+        if len(rows) > 0 { let nfact = nfact + 1 }
+        for q in rows {
+          if r < n {
+            do set_row(X, XT, r, q[1])
+            do aset(y, r, q[0])
+            let r = r + 1
+          }
+        }
+        if r >= n {
+          let w = step(X, XT, y, W1, w2, 1)
+          let wrongs = append(wrongs, w)
+          let done = done + 1
+          # clear the batch (only the cells that were set)
+          let i = 0
+          while i < n * n {
+            do aset(X, i, 0)
+            do aset(XT, i, 0)
+            let i = i + 1
+          }
+          let r = 0
+        }
+      }
+    }
+  }
+  let t2 = ticks()
+  # test: which sentence of the article states the fact -- counting model, network, both
+  let rm = rm_load()
+  let res = [0, 0, 0, 0, 0, 0]
+  let pend = []
+  let Xb = arr(n * n)
+  let rb = 0
+  let nt = 0
+  for f in tef {
+    let m = mark()
+    let ss = article(ix, f[1])
+    let one = null
+    if ss != null {
+      let vw = split(f[2], " ")
+      let subj1 = lower(sl_words(f[1])[0])
+      let labs = []
+      let cnt = []
+      let bks = []
+      let anyp = false
+      for x in slice(ss, 0, imin2(len(ss), 120)) {
+        let pos = holds(x[0], vw)
+        if pos { let anyp = true }
+        let labs = append(labs, pos)
+        let cnt = append(cnt, rm_sent(rm, f[0], x[0], x[1], x[2], subj1))
+        let bks = append(bks, buckets(f[0], x[0], x[1], x[2], subj1))
+      }
+      if anyp { let one = [labs, cnt, bks] }
+    }
+    let one = release(m, one)
+    if one != null {
+      if rb + len(one[2]) > n {
+        let L = forward(Xb, W1, w2)
+        let res = score_pending(pend, L, res)
+        let pend = []
+        let i = 0
+        while i < n * n {
+          do aset(Xb, i, 0)
+          let i = i + 1
+        }
+        let rb = 0
+      }
+      let first = rb
+      for bs in one[2] {
+        for b in bs { do aset(Xb, rb * n + b, 1) }
+        let rb = rb + 1
+      }
+      let pend = append(pend, [one[0], one[1], first])
+      let nt = nt + 1
+    }
+  }
+  if len(pend) > 0 {
+    let L = forward(Xb, W1, w2)
+    let res = score_pending(pend, L, res)
+  }
+  let t3 = ticks()
+  let wl = []
+  for k in [0, len(wrongs) // 4, len(wrongs) // 2, len(wrongs) - 1] {
+    if k >= 0 and k < len(wrongs) { let wl = append(wl, str(100 * wrongs[k] // n) ++ "%") }
+  }
+  let out = "trained on " ++ str(nfact) ++ " facts' articles, " ++ str(done) ++ " GPU steps of 2048 sentences (" ++ str((t2 - t1) // 1000) ++ " s; data " ++ str((t1 - t0) // 1000) ++ " s); batch errors over training: " ++ join(wl, " -> ") ++ "\n"
+  let out = out ++ "held-out facts " ++ str(nt) ++ " (scored on the GPU in " ++ str((t3 - t2) // 1000) ++ " s): the top sentence states the fact -- counting model " ++ pc(res[0], nt) ++ ", NETWORK " ++ pc(res[1], nt) ++ ", both " ++ pc(res[2], nt) ++ ", both (network x0.5) " ++ pc(res[3], nt) ++ ", both (network x2) " ++ pc(res[4], nt) ++ "\n"
+  return out
+}

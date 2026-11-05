@@ -1,0 +1,4087 @@
+# rt -- Pi's native runtime, written in Pi itself. pic compiles it into every program.
+#
+# Functions named rt_* are compiled in the raw dialect: values are plain machine integers, conditions test for
+# non-zero, and the primitives reach the machine -- peek(a) / poke(a, v) (8 bytes), peekb / pokeb (1 byte),
+# gaddr(k) (the address of global slot k) and wcall("Name", ...) (a call into kernel32).
+#
+# The values every other function sees: an integer n is 2n + 1 (so the low bit is 1); null is 0; anything else
+# is the address of an object [kind, length, payload]: kind 1 text (bytes), 2 list (values), 3 map (key and
+# value pairs, in order). Objects are never changed after they are made, so they are shared freely.
+# Globals: 0 the next free byte of the heap, 1 the standard output handle, 2 a scratch word, 3 the heap's start,
+# 4 the standard input handle, 5 a one-byte input buffer, 6 the end of the committed heap, 7 the end of the reserve.
+#
+# The heap: 24 GB of address space is RESERVED at the start (it costs nothing), and memory is COMMITTED 256 MB at a
+# time as the heap grows -- Windows charges only for what Pi uses (the old heap committed one fixed 4 GB block).
+
+skill rt_init() -> Any {
+  let reserve = 25769803776
+  let heap = wcall("VirtualAlloc", 0, reserve, 8192, 4)
+  if heap == 0 { do wcall("ExitProcess", 3) }
+  if wcall("VirtualAlloc", heap, 268435456, 4096, 4) == 0 { do wcall("ExitProcess", 3) }
+  do poke(gaddr(0), heap)
+  do poke(gaddr(3), heap)
+  do poke(gaddr(6), heap + 268435456)
+  do poke(gaddr(7), heap + reserve)
+  do poke(gaddr(1), wcall("GetStdHandle", 0 - 11))
+  return 0
+}
+
+skill rt_oom() -> Any {
+  do poke(gaddr(0), peek(gaddr(3)))
+  do wcall("WriteFile", peek(gaddr(1)), rt_cstr("out of memory (24 GB heap)"), 26, gaddr(2), 0)
+  do wcall("ExitProcess", 4)
+  return 0
+}
+
+skill rt_alloc(n) -> Any {
+  let p = peek(gaddr(0))
+  let q = p + (n + 7) // 8 * 8
+  if q > peek(gaddr(6)) {
+    # commit more, in 256 MB steps; past the reserve, or if Windows will not commit, a clean failure
+    let top = peek(gaddr(6))
+    let nt = top
+    while nt < q { let nt = nt + 268435456 }
+    if nt > peek(gaddr(7)) { do rt_oom() }
+    if wcall("VirtualAlloc", top, nt - top, 4096, 4) == 0 { do rt_oom() }
+    do poke(gaddr(6), nt)
+  }
+  do poke(gaddr(0), q)
+  return p
+}
+
+skill rt_obj(kind, n, bytes) -> Any {
+  let p = rt_alloc(16 + bytes)
+  do poke(p, kind)
+  do poke(p + 8, n)
+  return p
+}
+
+skill rt_text_new(n) -> Any { return rt_obj(1, n, n) }
+skill rt_list_new(n) -> Any { return rt_obj(2, n, 8 * n) }
+skill rt_map_new(n) -> Any { return rt_obj(3, n, 16 * n) }
+skill rt_tag(n) -> Any { return 2 * n + 1 }
+skill rt_untag(v) -> Any { return (v - 1) // 2 }
+
+# 0 null, 1 text, 2 list, 3 map, 4 integer (booleans are the integers 1 and 0), 5 function, 6 real, 7 set, 8 array,
+# 9 big integer (a whole number past 2^62: see "whole numbers of any size"). The kind is
+# the low byte of an object's first word (a function keeps its capture count in the bytes above it).
+skill rt_kind(v) -> Any {
+  if v == 0 { return 0 }
+  if v % 2 == 1 { return 4 }
+  return peek(v) % 256
+}
+
+skill rt_truthy(v) -> Any {
+  let k = rt_kind(v)
+  if k == 0 { return 0 }
+  if k == 4 { return v != 1 }
+  return peek(v + 8) != 0
+}
+
+skill rt_len(v) -> Any {
+  let k = rt_kind(v)
+  if k == 1 or k == 2 or k == 3 or k == 8 { return rt_tag(peek(v + 8)) }
+  return 1
+}
+
+# [a, b, c] and {"k": v}: the values were pushed in order; addr is the stack pointer after the last push
+skill rt_list_pack(addr, nt) -> Any {
+  let n = rt_untag(nt)
+  let l = rt_list_new(n)
+  for i in range(0, n) { do poke(l + 16 + 8 * i, peek(addr + 8 * (n - 1 - i))) }
+  return l
+}
+
+skill rt_map_pack(addr, nt) -> Any {
+  let n = rt_untag(nt)
+  let m = rt_map_alloc(n, 0)
+  for i in range(0, 2 * n) { do poke(m + 16 + 8 * i, peek(addr + 8 * (2 * n - 1 - i))) }
+  do rt_mi_build(m)
+  return m
+}
+
+# ---- maps with a hash index ----------------------------------------------------------------------------------------
+# A map of 8 or more pairs, or one made to grow in place, carries an index after its pairs: cap slots of 8 bytes (the
+# pair's number + 1; 0 empty; cap a power of two, at least twice the room for pairs). The first word keeps, above the
+# kind byte, cap (bits 8..47; 0: no index, the linear walk) and whether the map grows in place (bit 48: then it has
+# room for rt_owncap(n) pairs, the index after that room). The index is inside the map's own allocation, so freeing a
+# region or copying the map out of one carries it along; equal maps stay equal (== reads the pairs only). Keys equal
+# by == hash alike: numbers by their value as a real (1 and 1.0), text by its bytes, anything else by kind and length.
+skill rt_mi_cap(m) -> Any { return (peek(m) // 256) % 1099511627776 }
+skill rt_mi_own(m) -> Any { return (peek(m) // 281474976710656) % 2 }
+skill rt_mi_room(m) -> Any {
+  if rt_mi_own(m) == 1 { return rt_owncap(peek(m + 8)) }
+  return peek(m + 8)
+}
+skill rt_mi_base(m) -> Any { return m + 16 + 16 * rt_mi_room(m) }
+
+# a map with room for n pairs (own: rt_owncap(n) of them) and its index's space; the pairs not yet written
+skill rt_map_alloc(n, own) -> Any {
+  let room = n
+  if own == 1 { let room = rt_owncap(n) }
+  let cap = 0
+  if own == 1 or n >= 8 {
+    let cap = 16
+    while cap < 2 * room { let cap = 2 * cap }
+  }
+  let m = rt_alloc(16 + 16 * room + 8 * cap)
+  do poke(m, 3 + 256 * cap + 281474976710656 * own)
+  do poke(m + 8, n)
+  return m
+}
+
+# bytes a map occupies: its pairs' room and its index
+skill rt_map_bytes(m) -> Any { return 16 + 16 * rt_mi_room(m) + 8 * rt_mi_cap(m) }
+
+skill rt_hash(k) -> Any {
+  if k == 0 { return 0 }
+  let kd = rt_kind(k)
+  if kd == 4 or kd == 6 or kd == 9 {
+    let b = rt_realbits(k)
+    # 0.0 and -0.0 are equal
+    if b * 2 == 0 { return 0 }
+    return b * 1181783497276652981 + 7
+  }
+  if kd == 1 {
+    let n = peek(k + 8)
+    let h = 5381
+    for i in range(0, n) { let h = h * 1099511628211 + peekb(k + 16 + i) }
+    return h
+  }
+  return kd * 1000003 + peek(k + 8)
+}
+
+skill rt_mi_slot(h, cap) -> Any {
+  let s = (h // 65536) % cap
+  if s < 0 { return s + cap }
+  return s
+}
+
+# pair i (its hash h) into the index (base, cap): the first empty slot from its own
+skill rt_mi_add(base, cap, h, i) -> Any {
+  let s = rt_mi_slot(h, cap)
+  while peek(base + 8 * s) != 0 { let s = (s + 1) % cap }
+  do poke(base + 8 * s, i + 1)
+  return 0
+}
+
+# the index of m made from its pairs (nothing when it has none)
+skill rt_mi_build(m) -> Any {
+  let cap = rt_mi_cap(m)
+  if cap == 0 { return 0 }
+  let base = rt_mi_base(m)
+  for s in range(0, cap) { do poke(base + 8 * s, 0) }
+  let n = peek(m + 8)
+  for i in range(0, n) { do rt_mi_add(base, cap, rt_hash(peek(m + 16 + 16 * i)), i) }
+  return 0
+}
+
+# equality as Pi's ==: integers by value, text by content, lists and maps element by element
+skill rt_eqr(a, b) -> Any {
+  # numbers compare by value across int and real (1 == 1.0), as the interpreter's == does
+  let na = rt_kind(a)
+  let nb = rt_kind(b)
+  if (na == 4 or na == 6 or na == 9) and (nb == 4 or nb == 6 or nb == 9) {
+    if na == 4 and nb == 4 {
+      if a == b { return 1 }
+      return 0
+    }
+    # integers of any size: small and big never hold the same value, two bigs compare limb by limb
+    if (na == 4 or na == 9) and (nb == 4 or nb == 9) {
+      if na != nb { return 0 }
+      if rt_bcmp(a, b) == 0 { return 1 }
+      return 0
+    }
+    let x = rt_realbits(a)
+    let y = rt_realbits(b)
+    if flt(x, y) { return 0 }
+    if flt(y, x) { return 0 }
+    return 1
+  }
+  if a == b { return 1 }
+  let ka = rt_kind(a)
+  if ka != rt_kind(b) { return 0 }
+  if ka == 0 or ka == 4 or ka == 5 { return 0 }
+  let n = peek(a + 8)
+  if n != peek(b + 8) { return 0 }
+  if ka == 1 {
+    for i in range(0, n) {
+      if peekb(a + 16 + i) != peekb(b + 16 + i) { return 0 }
+    }
+    return 1
+  }
+  let words = n
+  if ka == 3 { let words = 2 * n }
+  for i in range(0, words) {
+    if rt_eqr(peek(a + 16 + 8 * i), peek(b + 16 + 8 * i)) == 0 { return 0 }
+  }
+  return 1
+}
+
+skill rt_eq(a, b) -> Any { return 2 * rt_eqr(a, b) + 1 }
+
+skill rt_map_find(m, key) -> Any {
+  let n = peek(m + 8)
+  let cap = rt_mi_cap(m)
+  if cap > 0 {
+    let base = rt_mi_base(m)
+    let s = rt_mi_slot(rt_hash(key), cap)
+    while s >= 0 {
+      let v = peek(base + 8 * s)
+      if v == 0 { return 0 - 1 }
+      if rt_eqr(peek(m + 16 + 16 * (v - 1)), key) { return v - 1 }
+      let s = (s + 1) % cap
+    }
+  }
+  for i in range(0, n) {
+    if rt_eqr(peek(m + 16 + 16 * i), key) { return i }
+  }
+  return 0 - 1
+}
+
+# x[k]: a map's value, a list's item or a text's character; null when there is none (negative k from the end)
+skill rt_index(v, k) -> Any {
+  let kind = rt_kind(v)
+  if kind == 3 {
+    let i = rt_map_find(v, k)
+    if i < 0 { return 0 }
+    return peek(v + 24 + 16 * i)
+  }
+  if kind != 1 and kind != 2 { return 0 }
+  # a whole real (928.0, from / or floor) indexes like its integer; a fractional one is an error, not a silent null
+  if rt_kind(k) == 6 {
+    let fb = peek(k + 8)
+    let fi = f2i(fb)
+    if flt(i2f(fi), fb) or flt(fb, i2f(fi)) { do rt_fail(rt_concat("a list or text index must be a whole number, got ", rt_str(k))) }
+    let k = rt_tag(fi)
+  }
+  if rt_kind(k) != 4 { return 0 }
+  let n = peek(v + 8)
+  let i = rt_untag(k)
+  if i < 0 { let i = i + n }
+  if i < 0 or i >= n { return 0 }
+  if kind == 2 { return peek(v + 16 + 8 * i) }
+  let s = rt_text_new(1)
+  do pokeb(s + 16, peekb(v + 16 + i))
+  return s
+}
+
+# xs[i] = v in a program is let xs = rt_setat(xs, i, v): a new list with element i replaced (negative i counts from
+# the end); m[k] = v on a map is put(m, k, v)
+skill rt_setat(v, k, x) -> Any {
+  let kind = rt_kind(v)
+  if kind == 3 { return rt_put(v, k, x) }
+  if kind != 2 { do rt_fail("xs[i] = v: xs must be a list or a map") }
+  if rt_kind(k) != 4 { do rt_fail("xs[i] = v: the index must be an integer") }
+  let n = peek(v + 8)
+  let i = rt_untag(k)
+  if i < 0 { let i = i + n }
+  if i < 0 or i >= n { do rt_fail("xs[i] = v: index out of range") }
+  let r = rt_list_new(n)
+  for j in range(0, n) { do poke(r + 16 + 8 * j, peek(v + 16 + 8 * j)) }
+  do poke(r + 16 + 8 * i, x)
+  return r
+}
+
+# put(map, key, value): a new map, the key's value replaced in place or the pair added at the end
+skill rt_put(m, key, val) -> Any {
+  let n = peek(m + 8)
+  let i = rt_map_find(m, key)
+  let size = n
+  if i < 0 { let size = n + 1 }
+  let r = rt_map_alloc(size, 0)
+  for j in range(0, 2 * n) { do poke(r + 16 + 8 * j, peek(m + 16 + 8 * j)) }
+  if i < 0 {
+    do poke(r + 16 + 16 * n, key)
+    do poke(r + 24 + 16 * n, val)
+  } else {
+    do poke(r + 24 + 16 * i, val)
+  }
+  # the index: the old one's slots when it has the same size (the pairs keep their numbers), plus the new key
+  let cap = rt_mi_cap(r)
+  if cap > 0 {
+    if rt_mi_cap(m) == cap {
+      let ob = rt_mi_base(m)
+      let nb = rt_mi_base(r)
+      for s in range(0, cap) { do poke(nb + 8 * s, peek(ob + 8 * s)) }
+      if i < 0 { do rt_mi_add(nb, cap, rt_hash(key), n) }
+    } else {
+      do rt_mi_build(r)
+    }
+  }
+  return r
+}
+
+# let m = put(m, k, v) where the compiler proved nothing else sees m (own_names in pic.pi): the map changes in place
+# while it has room (rt_owncap pairs), and is copied into twice the room when it has not
+skill rt_put_own(m, key, val) -> Any {
+  if rt_kind(m) != 3 { return rt_put(m, key, val) }
+  let n = peek(m + 8)
+  let i = rt_map_find(m, key)
+  if rt_mi_own(m) == 1 {
+    if i >= 0 {
+      do poke(m + 24 + 16 * i, val)
+      return m
+    }
+    if n + 1 <= rt_owncap(n) {
+      do poke(m + 16 + 16 * n, key)
+      do poke(m + 24 + 16 * n, val)
+      do poke(m + 8, n + 1)
+      do rt_mi_add(rt_mi_base(m), rt_mi_cap(m), rt_hash(key), n)
+      return m
+    }
+  }
+  let size = n
+  if i < 0 { let size = n + 1 }
+  let r = rt_map_alloc(size, 1)
+  for j in range(0, 2 * n) { do poke(r + 16 + 8 * j, peek(m + 16 + 8 * j)) }
+  if i < 0 {
+    do poke(r + 16 + 16 * n, key)
+    do poke(r + 24 + 16 * n, val)
+  } else {
+    do poke(r + 24 + 16 * i, val)
+  }
+  do rt_mi_build(r)
+  return r
+}
+
+# let x = rt_setat(x, k, v) (x[k] = v) when nothing else sees x: a map grows in place, a list's item is written
+skill rt_setat_own(v, k, x) -> Any {
+  let kind = rt_kind(v)
+  if kind == 3 { return rt_put_own(v, k, x) }
+  if kind == 2 and rt_kind(k) == 4 {
+    let n = peek(v + 8)
+    let i = rt_untag(k)
+    if i < 0 { let i = i + n }
+    if i >= 0 and i < n {
+      do poke(v + 16 + 8 * i, x)
+      return v
+    }
+  }
+  return rt_setat(v, k, x)
+}
+
+skill rt_append(l, x) -> Any {
+  let n = peek(l + 8)
+  let r = rt_list_new(n + 1)
+  for i in range(0, n) { do poke(r + 16 + 8 * i, peek(l + 16 + 8 * i)) }
+  do poke(r + 16 + 8 * n, x)
+  return r
+}
+
+# a ++ b: lists joined, anything else joined as text
+skill rt_concat(a, b) -> Any {
+  if rt_kind(a) == 2 and rt_kind(b) == 2 {
+    let na = peek(a + 8)
+    let nb = peek(b + 8)
+    let r = rt_list_new(na + nb)
+    for i in range(0, na) { do poke(r + 16 + 8 * i, peek(a + 16 + 8 * i)) }
+    for i in range(0, nb) { do poke(r + 16 + 8 * (na + i), peek(b + 16 + 8 * i)) }
+    return r
+  }
+  let sa = rt_str(a)
+  let sb = rt_str(b)
+  let na = peek(sa + 8)
+  let nb = peek(sb + 8)
+  let r = rt_text_new(na + nb)
+  for i in range(0, na) { do pokeb(r + 16 + i, peekb(sa + 16 + i)) }
+  for i in range(0, nb) { do pokeb(r + 16 + na + i, peekb(sb + 16 + i)) }
+  return r
+}
+
+# ---- lists that grow in place. When the compiler proves a local list is seen only through its own variable (see
+# own_names in pic.pi), `let x = append(x, v)` and `let x = x ++ ys` come here: the list is allocated with room to
+# spare -- 8 slots, then doubling -- so growing it is a write, not a copy of everything before. The room a list of
+# length n has is rt_owncap(n), so no extra word is kept: every list these make was allocated at that size.
+skill rt_owncap(n) -> Any {
+  if n <= 8 { return 8 }
+  let c = 16
+  while c < n { let c = 2 * c }
+  return c
+}
+
+skill rt_own_copy(l) -> Any {
+  let n = peek(l + 8)
+  let r = rt_obj(2, n, 8 * rt_owncap(n))
+  for i in range(0, n) { do poke(r + 16 + 8 * i, peek(l + 16 + 8 * i)) }
+  return r
+}
+
+skill rt_append_own(l, x) -> Any {
+  if rt_kind(l) != 2 { return rt_own_copy(rt_append(l, x)) }
+  let n = peek(l + 8)
+  if n > 0 and n < rt_owncap(n) {
+    do poke(l + 16 + 8 * n, x)
+    do poke(l + 8, n + 1)
+    return l
+  }
+  let r = rt_obj(2, n + 1, 8 * rt_owncap(n + 1))
+  for i in range(0, n) { do poke(r + 16 + 8 * i, peek(l + 16 + 8 * i)) }
+  do poke(r + 16 + 8 * n, x)
+  return r
+}
+
+skill rt_concat_own(a, b) -> Any {
+  if rt_kind(a) != 2 or rt_kind(b) != 2 {
+    let r = rt_concat(a, b)
+    if rt_kind(r) == 2 { return rt_own_copy(r) }
+    return r
+  }
+  let na = peek(a + 8)
+  let nb = peek(b + 8)
+  let n = na + nb
+  if na > 0 and n <= rt_owncap(na) {
+    for i in range(0, nb) { do poke(a + 16 + 8 * (na + i), peek(b + 16 + 8 * i)) }
+    do poke(a + 8, n)
+    return a
+  }
+  let r = rt_obj(2, n, 8 * rt_owncap(n))
+  for i in range(0, na) { do poke(r + 16 + 8 * i, peek(a + 16 + 8 * i)) }
+  for i in range(0, nb) { do poke(r + 16 + 8 * (na + i), peek(b + 16 + 8 * i)) }
+  return r
+}
+
+skill rt_itoa(n) -> Any {
+  let neg = 0
+  let m = n
+  if n < 0 {
+    let neg = 1
+    let m = 0 - n
+  }
+  let digits = 1
+  let x = m
+  while x >= 10 {
+    let x = x // 10
+    let digits = digits + 1
+  }
+  let ln = digits + neg
+  let s = rt_text_new(ln)
+  let i = ln - 1
+  let x = m
+  while i >= neg {
+    do pokeb(s + 16 + i, 48 + x % 10)
+    let x = x // 10
+    let i = i - 1
+  }
+  if neg { do pokeb(s + 16, 45) }
+  return s
+}
+
+skill rt_str(v) -> Any {
+  let k = rt_kind(v)
+  if k == 1 { return v }
+  if k == 4 { return rt_itoa(rt_untag(v)) }
+  if k == 9 { return rt_btoa(v) }
+  if k == 0 { return "null" }
+  if k == 5 { return "<fn>" }
+  if k == 6 { return rt_ftoa(peek(v + 8)) }
+  return rt_repr(v)
+}
+
+# map, filter and reduce, written in Pi: higher-order words that used to live in Rust, now the language's own.
+# f is a function value (a closure); each is called through the compiler's closure-call.
+# Results grow in chunks of 256, joined once at the end (appending item by item copied the whole list each time).
+skill map(xs, fn_given) -> Any {
+  let chunks = []
+  let cur = []
+  for x in xs {
+    let cur = append(cur, fn_given(x))
+    if len(cur) == 256 {
+      let chunks = append(chunks, cur)
+      let cur = []
+    }
+  }
+  let out = []
+  for c in chunks { let out = out ++ c }
+  return out ++ cur
+}
+
+skill filter(xs, fn_given) -> Any {
+  let chunks = []
+  let cur = []
+  for x in xs {
+    if fn_given(x) {
+      let cur = append(cur, x)
+      if len(cur) == 256 {
+        let chunks = append(chunks, cur)
+        let cur = []
+      }
+    }
+  }
+  let out = []
+  for c in chunks { let out = out ++ c }
+  return out ++ cur
+}
+
+# apply(f, args): call a function value with the items of a list as its arguments
+skill apply(fn_given, args) -> Any {
+  let n = len(args)
+  if n == 0 { return fn_given() }
+  if n == 1 { return fn_given(args[0]) }
+  if n == 2 { return fn_given(args[0], args[1]) }
+  if n == 3 { return fn_given(args[0], args[1], args[2]) }
+  if n == 4 { return fn_given(args[0], args[1], args[2], args[3]) }
+  if n == 5 { return fn_given(args[0], args[1], args[2], args[3], args[4]) }
+  if n == 6 { return fn_given(args[0], args[1], args[2], args[3], args[4], args[5]) }
+  do fail("apply: more than 6 arguments")
+  return null
+}
+
+skill reduce(xs, fn_given, start) -> Any {
+  let acc = start
+  for x in xs { let acc = fn_given(acc, x) }
+  return acc
+}
+
+skill rt_num(s) -> Any {
+  let k = rt_kind(s)
+  if k == 4 { return s }
+  if k != 1 { return 0 }
+  let n = peek(s + 8)
+  let i = 0
+  let neg = 0
+  if n > 0 and peekb(s + 16) == 45 {
+    let neg = 1
+    let i = 1
+  }
+  if i >= n { return 0 }
+  # more than 18 digits: a big integer (every character checked first)
+  if n - i > 18 {
+    for j in range(i, n) {
+      let c = peekb(s + 16 + j)
+      if c < 48 or c > 57 { return 0 }
+    }
+    return rt_batoi(s, i, n, neg)
+  }
+  let v = 0
+  while i < n {
+    let c = peekb(s + 16 + i)
+    if c < 48 or c > 57 { return 0 }
+    let v = v * 10 + (c - 48)
+    let i = i + 1
+  }
+  if neg { let v = 0 - v }
+  return rt_tag(v)
+}
+
+skill rt_contains(h, x) -> Any {
+  let k = rt_kind(h)
+  if k == 2 {
+    for i in range(0, peek(h + 8)) {
+      if rt_eqr(peek(h + 16 + 8 * i), x) { return 3 }
+    }
+    return 1
+  }
+  # a map: whether the key is there (as "c in seen" is in Python) -- it used to give null, so a seen-set built from a
+  # map never saw anything (the steering run's sum came out as 1 + ... + 10000)
+  if k == 3 {
+    if rt_map_find(h, x) >= 0 { return 3 }
+    return 1
+  }
+  # text in text ignores case, as Pi's contains does; anything else (a number) gives null
+  if k == 1 and rt_kind(x) == 1 {
+    let n = peek(h + 8)
+    let m = peek(x + 8)
+    for i in range(0, n - m + 1) {
+      let same = 1
+      let j = 0
+      while same and j < m {
+        if rt_lower(peekb(h + 16 + i + j)) != rt_lower(peekb(x + 16 + j)) { let same = 0 }
+        let j = j + 1
+      }
+      if same { return 3 }
+    }
+    return 1
+  }
+  return 0
+}
+
+skill rt_lower(b) -> Any {
+  if b >= 65 and b <= 90 { return b + 32 }
+  return b
+}
+
+skill rt_chars(s) -> Any {
+  let n = peek(s + 8)
+  let l = rt_list_new(n)
+  for i in range(0, n) {
+    let c = rt_text_new(1)
+    do pokeb(c + 16, peekb(s + 16 + i))
+    do poke(l + 16 + 8 * i, c)
+  }
+  return l
+}
+
+skill rt_ord(s) -> Any { return rt_tag(peekb(s + 16)) }
+
+skill rt_slice(v, at, bt) -> Any {
+  let n = peek(v + 8)
+  let a = rt_untag(at)
+  let b = rt_untag(bt)
+  # slice(v, a): to the end
+  if bt == 0 { let b = n }
+  if a < 0 { let a = a + n }
+  if b < 0 { let b = b + n }
+  if a < 0 { let a = 0 }
+  if b > n { let b = n }
+  if b < a { let b = a }
+  if rt_kind(v) == 2 {
+    let r = rt_list_new(b - a)
+    for i in range(a, b) { do poke(r + 16 + 8 * (i - a), peek(v + 16 + 8 * i)) }
+    return r
+  }
+  let r = rt_text_new(b - a)
+  for i in range(a, b) { do pokeb(r + 16 + i - a, peekb(v + 16 + i)) }
+  return r
+}
+
+# a value as text: text inside lists and maps is quoted
+skill rt_repr(v) -> Any {
+  let k = rt_kind(v)
+  if k == 1 { return rt_concat(rt_concat("\"", v), "\"") }
+  if k != 2 and k != 3 { return rt_str(v) }
+  let n = peek(v + 8)
+  let out = "["
+  if k == 3 { let out = "{" }
+  for i in range(0, n) {
+    if i > 0 { let out = rt_concat(out, ", ") }
+    if k == 2 {
+      let out = rt_concat(out, rt_repr(peek(v + 16 + 8 * i)))
+    } else {
+      let out = rt_concat(rt_concat(rt_concat(out, rt_repr(peek(v + 16 + 16 * i))), ": "), rt_repr(peek(v + 24 + 16 * i)))
+    }
+  }
+  if k == 3 { return rt_concat(out, "}") }
+  return rt_concat(out, "]")
+}
+
+skill rt_out(s) -> Any {
+  do wcall("WriteFile", peek(gaddr(1)), s + 16, peek(s + 8), gaddr(2), 0)
+  return 0
+}
+
+# print(x): text as it is, anything else as Pi writes it, then a newline
+skill rt_print(v) -> Any {
+  do rt_out(rt_concat(rt_str(v), "\n"))
+  return v
+}
+
+skill rt_fail(msg) -> Any {
+  do rt_out(rt_concat(rt_concat("PiRuntimeError: ", rt_str(msg)), "\n"))
+  do wcall("ExitProcess", 1)
+  return 0
+}
+
+skill rt_exit(v) -> Any {
+  let code = 0
+  if rt_kind(v) == 4 { let code = rt_untag(v) }
+  do wcall("ExitProcess", code)
+  return 0
+}
+
+# a text as a C string (its bytes and a 0)
+skill rt_cstr(s) -> Any {
+  let n = peek(s + 8)
+  let p = rt_alloc(n + 1)
+  for i in range(0, n) { do pokeb(p + i, peekb(s + 16 + i)) }
+  do pokeb(p + n, 0)
+  return p
+}
+
+skill rt_read_file(path) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 128, 0)
+  if h == 0 - 1 { return 0 }
+  let size = wcall("GetFileSize", h, 0) % 4294967296
+  let s = rt_text_new(size)
+  do wcall("ReadFile", h, s + 16, size, gaddr(2), 0)
+  do wcall("CloseHandle", h)
+  return s
+}
+
+# write_file(path, text or a list of byte values)
+skill rt_write_file(path, data) -> Any {
+  let n = peek(data + 8)
+  let buf = data + 16
+  if rt_kind(data) == 2 {
+    let buf = rt_alloc(n)
+    for i in range(0, n) { do pokeb(buf + i, rt_untag(peek(data + 16 + 8 * i)) % 256) }
+  }
+  let h = wcall("CreateFileA", rt_cstr(path), 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 { return 0 }
+  do wcall("WriteFile", h, buf, n, gaddr(2), 0)
+  do wcall("CloseHandle", h)
+  return 3
+}
+
+# arg(k): the k-th word of the command line (0 is the program), quotes respected; null past the end
+skill rt_arg(kt) -> Any {
+  let want = rt_untag(kt)
+  let p = wcall("GetCommandLineA")
+  let idx = 0
+  while 1 {
+    while peekb(p) == 32 { let p = p + 1 }
+    if peekb(p) == 0 { return 0 }
+    let quoted = 0
+    if peekb(p) == 34 {
+      let quoted = 1
+      let p = p + 1
+    }
+    let start = p
+    if quoted {
+      while peekb(p) != 0 and peekb(p) != 34 { let p = p + 1 }
+    } else {
+      while peekb(p) != 0 and peekb(p) != 32 { let p = p + 1 }
+    }
+    if idx == want {
+      let s = rt_text_new(p - start)
+      for i in range(0, p - start) { do pokeb(s + 16 + i, peekb(start + i)) }
+      return s
+    }
+    if quoted and peekb(p) == 34 { let p = p + 1 }
+    let idx = idx + 1
+  }
+  return 0
+}
+
+# -- words moved out of Rust into Pi: keys values has get lower upper trim split join reverse sum abs sort min max
+# Each matches the interpreter's word (checked by examples/native/words.pi): text is bytes, numbers are integers.
+
+skill rt_kv(m, which) -> Any {
+  if rt_kind(m) != 3 { return 0 }
+  let n = peek(m + 8)
+  let l = rt_list_new(n)
+  for i in range(0, n) { do poke(l + 16 + 8 * i, peek(m + 16 + 16 * i + 8 * which)) }
+  return l
+}
+skill rt_keys(m) -> Any { return rt_kv(m, 0) }
+skill rt_values(m) -> Any { return rt_kv(m, 1) }
+
+# has(x): x is not null
+skill rt_has(v) -> Any {
+  if v == 0 { return 1 }
+  return 3
+}
+
+# get(map, key) or get(list, i): like x[k], but text gives null; get(m, k, d): d where that is null
+skill rt_get(v, k, d) -> Any {
+  if rt_kind(v) == 1 { return d }
+  let r = rt_index(v, k)
+  if r == 0 { return d }
+  return r
+}
+
+# a text's bytes a..b (machine indices) as a new text
+skill rt_sub(s, a, b) -> Any {
+  let r = rt_text_new(b - a)
+  for i in range(a, b) { do pokeb(r + 16 + i - a, peekb(s + 16 + i)) }
+  return r
+}
+
+skill rt_case(s, up) -> Any {
+  if rt_kind(s) != 1 { return 0 }
+  let n = peek(s + 8)
+  let r = rt_text_new(n)
+  for i in range(0, n) {
+    let b = peekb(s + 16 + i)
+    if up {
+      if b >= 97 and b <= 122 { let b = b - 32 }
+    } else {
+      if b >= 65 and b <= 90 { let b = b + 32 }
+    }
+    do pokeb(r + 16 + i, b)
+  }
+  return r
+}
+skill rt_lowers(s) -> Any { return rt_case(s, 0) }
+skill rt_uppers(s) -> Any { return rt_case(s, 1) }
+
+skill rt_isspace(b) -> Any { return b == 32 or (b >= 9 and b <= 13) }
+
+skill rt_trim(s) -> Any {
+  if rt_kind(s) != 1 { return 0 }
+  let n = peek(s + 8)
+  let a = 0
+  while a < n and rt_isspace(peekb(s + 16 + a)) { let a = a + 1 }
+  let b = n
+  while b > a and rt_isspace(peekb(s + 15 + b)) { let b = b - 1 }
+  return rt_sub(s, a, b)
+}
+
+# x occurs in s at byte i
+skill rt_at(s, i, x) -> Any {
+  for j in range(0, peek(x + 8)) {
+    if peekb(s + 16 + i + j) != peekb(x + 16 + j) { return 0 }
+  }
+  return 1
+}
+
+# split(s, sep): pieces between each sep; with no sep (or ""), the runs of non-space
+# two passes -- count the pieces, then allocate the list once and fill it (appending piece by piece copied the
+# whole list each time: quadratic, and out of memory on a 5 MB text of 70,000 lines)
+skill rt_split(s, sep) -> Any {
+  if rt_kind(s) != 1 { return 0 }
+  let n = peek(s + 8)
+  if rt_kind(sep) == 1 and peek(sep + 8) > 0 {
+    let m = peek(sep + 8)
+    let count = 1
+    let i = 0
+    while i + m <= n {
+      if rt_at(s, i, sep) {
+        let count = count + 1
+        let i = i + m
+      } else {
+        let i = i + 1
+      }
+    }
+    let out = rt_list_new(count)
+    let k = 0
+    let start = 0
+    let i = 0
+    while i + m <= n {
+      if rt_at(s, i, sep) {
+        do poke(out + 16 + 8 * k, rt_sub(s, start, i))
+        let k = k + 1
+        let i = i + m
+        let start = i
+      } else {
+        let i = i + 1
+      }
+    }
+    do poke(out + 16 + 8 * k, rt_sub(s, start, n))
+    return out
+  }
+  let count = 0
+  let i = 0
+  while i < n {
+    while i < n and rt_isspace(peekb(s + 16 + i)) { let i = i + 1 }
+    let start = i
+    while i < n and rt_isspace(peekb(s + 16 + i)) == 0 { let i = i + 1 }
+    if i > start { let count = count + 1 }
+  }
+  let out = rt_list_new(count)
+  let k = 0
+  let i = 0
+  while i < n {
+    while i < n and rt_isspace(peekb(s + 16 + i)) { let i = i + 1 }
+    let start = i
+    while i < n and rt_isspace(peekb(s + 16 + i)) == 0 { let i = i + 1 }
+    if i > start {
+      do poke(out + 16 + 8 * k, rt_sub(s, start, i))
+      let k = k + 1
+    }
+  }
+  return out
+}
+
+# join(xs, sep): each item as text, sep between (no sep: nothing between)
+# two passes too: every item as text, the total length, then one text filled once (concatenating was quadratic)
+skill rt_join(xs, sep) -> Any {
+  if rt_kind(xs) != 2 { return 0 }
+  let n = peek(xs + 8)
+  let parts = rt_list_new(n)
+  let total = 0
+  let sl = 0
+  if rt_kind(sep) == 1 { let sl = peek(sep + 8) }
+  for i in range(0, n) {
+    let t = rt_str(peek(xs + 16 + 8 * i))
+    do poke(parts + 16 + 8 * i, t)
+    let total = total + peek(t + 8)
+    if i > 0 { let total = total + sl }
+  }
+  let out = rt_text_new(total)
+  let pos = 0
+  for i in range(0, n) {
+    if i > 0 {
+      for j in range(0, sl) { do pokeb(out + 16 + pos + j, peekb(sep + 16 + j)) }
+      let pos = pos + sl
+    }
+    let t = peek(parts + 16 + 8 * i)
+    let tl = peek(t + 8)
+    for j in range(0, tl) { do pokeb(out + 16 + pos + j, peekb(t + 16 + j)) }
+    let pos = pos + tl
+  }
+  return out
+}
+
+skill rt_reverse(v) -> Any {
+  let k = rt_kind(v)
+  let n = peek(v + 8)
+  if k == 2 {
+    let r = rt_list_new(n)
+    for i in range(0, n) { do poke(r + 16 + 8 * i, peek(v + 8 + 8 * (n - i))) }
+    return r
+  }
+  if k == 1 {
+    let r = rt_text_new(n)
+    for i in range(0, n) { do pokeb(r + 16 + i, peekb(v + 15 + n - i)) }
+    return r
+  }
+  return 0
+}
+
+# sum(xs): the numbers in it added up (other items skipped)
+skill rt_sum(xs) -> Any {
+  if rt_kind(xs) != 2 { return 0 }
+  # exact at any size, reals included (it used to wrap past 2^62 and skip reals): small sums stay on the machine
+  # path while they are far from overflowing
+  let t = 1
+  let hi = 2305843009213693952
+  for i in range(0, peek(xs + 8)) {
+    let x = peek(xs + 16 + 8 * i)
+    let k = rt_kind(x)
+    if k == 4 and rt_kind(t) == 4 and t < hi and t > 0 - hi and x < hi and x > 0 - hi {
+      let t = t + x - 1
+    } else {
+      if k == 4 or k == 6 or k == 9 { let t = rt_add(t, x) }
+    }
+  }
+  return t
+}
+
+skill rt_abs(v) -> Any {
+  if rt_kind(v) == 6 {
+    let b = peek(v + 8)
+    if flt(b, i2f(0)) { return rt_mkreal(fmul(b, i2f(0 - 1))) }
+    return v
+  }
+  if rt_kind(v) == 9 {
+    if peek(v + 16) == 1 { return rt_bneg(v) }
+    return v
+  }
+  if rt_kind(v) != 4 { return 0 }
+  # -2^62 has no small opposite: it becomes big
+  let lo = 1 - 2 * 4611686018427387903 - 2
+  if v == lo { return rt_bneg(v) }
+  if v < 0 { return 2 - v }
+  return v
+}
+
+# min(a, b, ...) / max(...): the first extreme among the numbers given, null if none (pic packs the
+# arguments into a list); tagged integers order the same as their values
+skill rt_extreme(xs, wantmax) -> Any {
+  let best = 0
+  let found = 0
+  for i in range(0, peek(xs + 8)) {
+    let x = peek(xs + 16 + 8 * i)
+    # any number, by value (it used to skip reals and compare only small integers)
+    let k = rt_kind(x)
+    if k == 4 or k == 6 or k == 9 {
+      if found == 0 {
+        let best = x
+        let found = 1
+      } else {
+        let c = rt_untag(rt_cmp(x, best))
+        if wantmax {
+          if c > 0 { let best = x }
+        } else {
+          if c < 0 { let best = x }
+        }
+      }
+    }
+  }
+  return best
+}
+# format(t, a, b, ...): each "{}" in t takes the next value as text (none left: nothing); pic packs the
+# arguments into one list, the template first
+skill rt_format(args) -> Any {
+  let t = peek(args + 16)
+  if rt_kind(t) != 1 { return 0 }
+  let n = peek(t + 8)
+  let next = 1
+  let out = ""
+  let start = 0
+  let i = 0
+  while i + 1 < n {
+    # a placeholder: {} or {:spec} (up to 16 bytes, no { inside) -- {:.2f} gives 2 decimals, any other spec ({:?},
+    # {:d}) is plain {}; the specs used to come out raw. Anything else in braces ("{ }") stays text.
+    let j = 0 - 1
+    if peekb(t + 16 + i) == 123 {
+      if peekb(t + 17 + i) == 125 { let j = i + 1 }
+      if peekb(t + 17 + i) == 58 {
+        let k = i + 1
+        while k < n and k < i + 18 and peekb(t + 16 + k) != 125 and peekb(t + 16 + k) != 123 { let k = k + 1 }
+        if k < n and peekb(t + 16 + k) == 125 { let j = k }
+      }
+    }
+    if j >= 0 {
+      let out = rt_concat(out, rt_sub(t, start, i))
+      if next < peek(args + 8) {
+        let v = peek(args + 16 + 8 * next)
+        let nd = rt_fmtprec(t, i + 1, j)
+        let bs = rt_fmtbase(t, i + 1, j)
+        if bs > 0 and rt_kind(v) == 4 {
+          let out = rt_concat(out, rt_fmtpad(rt_itob(rt_untag(v), bs), t, i + 1, j))
+        } else {
+          if nd >= 0 and (rt_kind(v) == 6 or rt_kind(v) == 4) {
+            let out = rt_concat(out, rt_fmtfix(v, nd))
+          } else {
+            let out = rt_concat(out, rt_str(v))
+          }
+        }
+      }
+      let next = next + 1
+      let i = j + 1
+      let start = i
+    } else {
+      let i = i + 1
+    }
+  }
+  return rt_concat(out, rt_sub(t, start, n))
+}
+
+# a format spec (bytes a .. b of t, a the ":") ending in b, o or x -> that base (2, 8, 16), else 0
+skill rt_fmtbase(t, a, b) -> Any {
+  if b - a < 2 or peekb(t + 16 + a) != 58 { return 0 }
+  let c = peekb(t + 16 + b - 1)
+  if c == 98 { return 2 }
+  if c == 111 { return 8 }
+  if c == 120 or c == 88 { return 16 }
+  return 0
+}
+
+# an integer in base 2, 8 or 16 (lower-case digits, "-" first if negative)
+skill rt_itob(n, base) -> Any {
+  if n == 0 { return "0" }
+  let neg = 0
+  if n < 0 { let neg = 1 }
+  let m = n
+  if neg { let m = 0 - n }
+  let ds = "0123456789abcdef"
+  let rev = []
+  while m > 0 {
+    let rev = rt_append(rev, peekb(ds + 16 + m % base))
+    let m = m // base
+  }
+  let k = peek(rev + 8)
+  let r = rt_text_new(k + neg)
+  if neg { do pokeb(r + 16, 45) }
+  for i in range(0, k) { do pokeb(r + 16 + neg + i, peek(rev + 16 + 8 * (k - 1 - i))) }
+  return r
+}
+
+# a width in a spec ({:8b}, {:08b}: the digits after ":") pads s on the left, with 0s if the width starts with 0
+skill rt_fmtpad(s, t, a, b) -> Any {
+  let k = a + 1
+  let zero = 0
+  if k < b and peekb(t + 16 + k) == 48 { let zero = 1 }
+  let w = 0
+  while k < b and peekb(t + 16 + k) >= 48 and peekb(t + 16 + k) <= 57 {
+    let w = w * 10 + peekb(t + 16 + k) - 48
+    let k = k + 1
+  }
+  let fill = " "
+  if zero { let fill = "0" }
+  let s = s
+  while peek(s + 8) < w { let s = rt_concat(fill, s) }
+  return s
+}
+
+# the precision in a format spec (bytes a .. b of t): ".N" then "f" -> N, else -1
+skill rt_fmtprec(t, a, b) -> Any {
+  let k = a
+  while k < b {
+    if peekb(t + 16 + k) == 46 {
+      let d = 0
+      let m = k + 1
+      let any = 0
+      while m < b and peekb(t + 16 + m) >= 48 and peekb(t + 16 + m) <= 57 {
+        let d = d * 10 + peekb(t + 16 + m) - 48
+        let m = m + 1
+        let any = 1
+      }
+      if any and m < b and peekb(t + 16 + m) == 102 { return d }
+      return 0 - 1
+    }
+    let k = k + 1
+  }
+  return 0 - 1
+}
+
+# a number with exactly nd decimals (rounded half up), as text; past ~9e15 scaled, plain text
+skill rt_fmtfix(v, nd) -> Any {
+  let x = rt_realbits(v)
+  let neg = flt(x, i2f(0))
+  if neg { let x = fmul(x, i2f(0 - 1)) }
+  let nd = nd
+  if nd > 15 { let nd = 15 }
+  let sc = 1
+  for q in range(0, nd) { let sc = sc * 10 }
+  let y = fadd(fmul(x, i2f(sc)), fdiv(i2f(1), i2f(2)))
+  if flt(y, fmul(i2f(1000000000), i2f(9000000))) == 0 { return rt_str(v) }
+  let mm = f2i(rt_floor(y))
+  let ip = mm // sc
+  let fp = mm % sc
+  let s = rt_itoa(ip)
+  if nd > 0 {
+    let ds = rt_itoa(fp)
+    let z = ""
+    for q in range(0, nd - peek(ds + 8)) { let z = rt_concat(z, "0") }
+    let s = rt_concat(rt_concat(s, "."), rt_concat(z, ds))
+  }
+  if neg and mm != 0 { return rt_concat("-", s) }
+  return s
+}
+
+# range(n) or range(a, b): the integers a, a+1, ..., b-1 (pic packs the arguments into one list)
+skill rt_range(args) -> Any {
+  let a = 0
+  let b = rt_untag(peek(args + 16))
+  if peek(args + 8) >= 2 {
+    let a = b
+    let b = rt_untag(peek(args + 24))
+  }
+  # range(a, b, step): every step-th from a, stopping before b (a negative step counts down)
+  let st = 1
+  if peek(args + 8) >= 3 { let st = rt_untag(peek(args + 32)) }
+  if st == 0 { do rt_fail("range: the step must not be 0") }
+  let n = 0
+  if st > 0 and b > a { let n = (b - a + st - 1) // st }
+  if st < 0 and a > b { let n = (a - b - st - 1) // (0 - st) }
+  let l = rt_list_new(n)
+  for i in range(0, n) { do poke(l + 16 + 8 * i, rt_tag(a + i * st)) }
+  return l
+}
+
+skill rt_min(xs) -> Any { return rt_extreme(xs, 0) }
+skill rt_max(xs) -> Any { return rt_extreme(xs, 1) }
+
+# sort's order: two numbers by value, anything else by its text, byte by byte
+skill rt_textlt(x, y) -> Any {
+  let n = peek(x + 8)
+  let m = peek(y + 8)
+  let i = 0
+  while i < n and i < m {
+    let a = peekb(x + 16 + i)
+    let b = peekb(y + 16 + i)
+    if a != b { return a < b }
+    let i = i + 1
+  }
+  return n < m
+}
+skill rt_less(a, b) -> Any {
+  let ka = rt_kind(a)
+  let kb = rt_kind(b)
+  if ka == 4 and kb == 4 { return a < b }
+  # numbers by value at any size (reals used to sort by their text: 10.0 before 9.5)
+  if (ka == 4 or ka == 6 or ka == 9) and (kb == 4 or kb == 6 or kb == 9) { return rt_untag(rt_cmp(a, b)) < 0 }
+  return rt_textlt(rt_str(a), rt_str(b))
+}
+
+# sort(xs): a stable bottom-up merge sort (equal items keep their order, as the interpreter's sort does)
+skill rt_sort(xs) -> Any {
+  if rt_kind(xs) != 2 { return 0 }
+  let n = peek(xs + 8)
+  let a = rt_list_new(n)
+  let b = rt_list_new(n)
+  for i in range(0, n) { do poke(a + 16 + 8 * i, peek(xs + 16 + 8 * i)) }
+  let w = 1
+  while w < n {
+    let lo = 0
+    while lo < n {
+      let mid = lo + w
+      if mid > n { let mid = n }
+      let hi = lo + 2 * w
+      if hi > n { let hi = n }
+      let i = lo
+      let j = mid
+      let k = lo
+      while k < hi {
+        let left = 0
+        if i < mid {
+          if j >= hi {
+            let left = 1
+          } else {
+            if rt_less(peek(a + 16 + 8 * j), peek(a + 16 + 8 * i)) == 0 { let left = 1 }
+          }
+        }
+        if left {
+          do poke(b + 16 + 8 * k, peek(a + 16 + 8 * i))
+          let i = i + 1
+        } else {
+          do poke(b + 16 + 8 * k, peek(a + 16 + 8 * j))
+          let j = j + 1
+        }
+        let k = k + 1
+      }
+      let lo = hi
+    }
+    let t = a
+    let a = b
+    let b = t
+    let w = 2 * w
+  }
+  return a
+}
+
+# -- real numbers -----------------------------------------------------------------------------------------
+# A real is a boxed IEEE double: [kind=6, 8-byte double bits]. Integers stay immediate (2n+1); a value is a real
+# only when division or a non-integer literal made it, so integer code never allocates. The float operations
+# themselves are primitives pic emits (i2f f2i fadd fsub fmul fdiv flt): they work on the 64-bit double pattern.
+
+skill rt_mkreal(bits) -> Any {
+  let p = rt_alloc(16)
+  do poke(p, 6)
+  do poke(p + 8, bits)
+  return p
+}
+
+# the double-bit pattern of any number: a real's stored bits, or an integer converted
+skill rt_realbits(v) -> Any {
+  if rt_kind(v) == 6 { return peek(v + 8) }
+  if rt_kind(v) == 9 { return rt_btof(v) }
+  return i2f(rt_untag(v))
+}
+
+# floor(x) as double bits: truncate toward zero, then step down one if x was negative and not whole
+skill rt_floor(x) -> Any {
+  let t = f2i(x)
+  let ft = i2f(t)
+  if flt(x, ft) { return i2f(t - 1) }
+  return ft
+}
+
+# the slow paths of + - * // % and unary -: reached when a real is involved, when an operand is a big integer, or
+# when the inline small-integer path overflowed (it never wraps: the exact answer comes from here)
+skill rt_add(a, b) -> Any {
+  if rt_isint(a) and rt_isint(b) { return rt_badd(a, b) }
+  return rt_mkreal(fadd(rt_realbits(a), rt_realbits(b)))
+}
+skill rt_subn(a, b) -> Any {
+  if rt_isint(a) and rt_isint(b) { return rt_badd(a, rt_bneg(b)) }
+  return rt_mkreal(fsub(rt_realbits(a), rt_realbits(b)))
+}
+skill rt_mul(a, b) -> Any {
+  if rt_isint(a) and rt_isint(b) { return rt_bmul(a, b) }
+  # [0] * n and "ab" * n (either way round): repeated, as most languages' programs write it
+  let ka = rt_kind(a)
+  let kb = rt_kind(b)
+  if (ka == 1 or ka == 2) and kb == 4 { return rt_repeat(a, rt_untag(b)) }
+  if (kb == 1 or kb == 2) and ka == 4 { return rt_repeat(b, rt_untag(a)) }
+  return rt_mkreal(fmul(rt_realbits(a), rt_realbits(b)))
+}
+# a list or text n times over (n < 0: none); list items are shared, which is safe -- xs[i] = v makes a new list
+skill rt_repeat(v, n) -> Any {
+  let n = n
+  if n < 0 { let n = 0 }
+  let m = peek(v + 8)
+  if rt_kind(v) == 1 {
+    let r = rt_text_new(m * n)
+    for k in range(0, n) {
+      for i in range(0, m) { do pokeb(r + 16 + k * m + i, peekb(v + 16 + i)) }
+    }
+    return r
+  }
+  let r = rt_list_new(m * n)
+  for k in range(0, n) {
+    for i in range(0, m) { do poke(r + 16 + 8 * (k * m + i), peek(v + 16 + 8 * i)) }
+  }
+  return r
+}
+skill rt_neg(a) -> Any {
+  if rt_isint(a) { return rt_bneg(a) }
+  return rt_mkreal(fmul(rt_realbits(a), i2f(0 - 1)))
+}
+# / is always real, as the interpreter's division is (6 / 2 is 3.0)
+skill rt_div(a, b) -> Any { return rt_mkreal(fdiv(rt_realbits(a), rt_realbits(b))) }
+skill rt_idiv(a, b) -> Any {
+  if rt_isint(a) and rt_isint(b) { return rt_bdivmod(a, b, 0) }
+  return rt_mkreal(rt_floor(fdiv(rt_realbits(a), rt_realbits(b))))
+}
+skill rt_mod(a, b) -> Any {
+  if rt_isint(a) and rt_isint(b) { return rt_bdivmod(a, b, 1) }
+  let x = rt_realbits(a)
+  let y = rt_realbits(b)
+  return rt_mkreal(fsub(x, fmul(y, rt_floor(fdiv(x, y)))))
+}
+
+# compare two numbers by value, giving the tagged integer -1, 0 or 1 (integers exactly, at any size)
+skill rt_cmp(a, b) -> Any {
+  if rt_kind(a) == 4 and rt_kind(b) == 4 {
+    if a < b { return rt_tag(0 - 1) }
+    if b < a { return rt_tag(1) }
+    return rt_tag(0)
+  }
+  if rt_isint(a) and rt_isint(b) { return rt_tag(rt_bcmp(a, b)) }
+  let x = rt_realbits(a)
+  let y = rt_realbits(b)
+  if flt(x, y) { return rt_tag(0 - 1) }
+  if flt(y, x) { return rt_tag(1) }
+  return rt_tag(0)
+}
+
+# ==== whole numbers of any size ===================================================================================
+# A small integer is a tagged machine word (|v| <= 2^62). Past that, + - * // % ^ (and num of a long text) give a
+# big: kind 9, [9][n][sign 0 or 1][limb 0][limb 1]..., n = 1 + the limb count, limbs in base 10^9, least
+# significant first, raw machine words (no pointers, so regions copy it as bytes). Every result passes rt_bnorm, so
+# a value that fits is always small: small and big never hold the same number, and the inline paths stay exact.
+skill rt_isint(v) -> Any {
+  let k = rt_kind(v)
+  return k == 4 or k == 9
+}
+
+skill rt_bnew(s, nl) -> Any {
+  let p = rt_alloc(24 + 8 * nl)
+  do poke(p, 9)
+  do poke(p + 8, nl + 1)
+  do poke(p + 16, s)
+  for i in range(0, nl) { do poke(p + 24 + 8 * i, 0) }
+  return p
+}
+
+# the limb count without leading zero limbs
+skill rt_blen(p) -> Any {
+  let nl = peek(p + 8) - 1
+  while nl > 0 and peek(p + 16 + 8 * nl) == 0 { let nl = nl - 1 }
+  return nl
+}
+
+# any integer as a big (a small one spread over three limbs: 2^62 < 10^27)
+skill rt_tobig(v) -> Any {
+  if rt_kind(v) == 9 { return v }
+  let x = rt_untag(v)
+  let s = 0
+  let m = x
+  if x < 0 {
+    let s = 1
+    let m = 0 - x
+  }
+  let p = rt_bnew(s, 3)
+  do poke(p + 24, m % 1000000000)
+  do poke(p + 32, (m // 1000000000) % 1000000000)
+  do poke(p + 40, m // 1000000000000000000)
+  return p
+}
+
+# a result tidied: leading zero limbs dropped, given back small when it fits (-2^62 .. 2^62 - 1)
+skill rt_bnorm(p) -> Any {
+  let nl = rt_blen(p)
+  if nl == 0 { return 1 }
+  let s = peek(p + 16)
+  if nl <= 3 {
+    let top = 0
+    if nl == 3 { let top = peek(p + 40) }
+    if top < 5 {
+      let m = top * 1000000000000000000 + peek(p + 24)
+      if nl >= 2 { let m = m + peek(p + 32) * 1000000000 }
+      let lim = 4611686018427387903
+      if s == 0 and m <= lim { return 2 * m + 1 }
+      if s == 1 and m <= lim + 1 { return 1 - 2 * m }
+    }
+  }
+  if nl == peek(p + 8) - 1 { return p }
+  let r = rt_bnew(s, nl)
+  for i in range(0, nl) { do poke(r + 24 + 8 * i, peek(p + 24 + 8 * i)) }
+  return r
+}
+
+# |a| against |b| (bigs) -> -1, 0, 1
+skill rt_bmcmp(a, b) -> Any {
+  let la = rt_blen(a)
+  let lb = rt_blen(b)
+  if la < lb { return 0 - 1 }
+  if la > lb { return 1 }
+  let i = la - 1
+  while i >= 0 {
+    let x = peek(a + 24 + 8 * i)
+    let y = peek(b + 24 + 8 * i)
+    if x < y { return 0 - 1 }
+    if x > y { return 1 }
+    let i = i - 1
+  }
+  return 0
+}
+
+# |a| + |b| with sign s
+skill rt_bmadd(a, b, s) -> Any {
+  let la = rt_blen(a)
+  let lb = rt_blen(b)
+  let nl = la
+  if lb > nl { let nl = lb }
+  let r = rt_bnew(s, nl + 1)
+  let c = 0
+  for i in range(0, nl) {
+    let x = c
+    if i < la { let x = x + peek(a + 24 + 8 * i) }
+    if i < lb { let x = x + peek(b + 24 + 8 * i) }
+    let c = 0
+    if x >= 1000000000 {
+      let x = x - 1000000000
+      let c = 1
+    }
+    do poke(r + 24 + 8 * i, x)
+  }
+  do poke(r + 24 + 8 * nl, c)
+  return r
+}
+
+# |a| - |b| (|a| >= |b|) with sign s
+skill rt_bmsub(a, b, s) -> Any {
+  let la = rt_blen(a)
+  let lb = rt_blen(b)
+  let r = rt_bnew(s, la)
+  let c = 0
+  for i in range(0, la) {
+    let x = peek(a + 24 + 8 * i) - c
+    if i < lb { let x = x - peek(b + 24 + 8 * i) }
+    let c = 0
+    if x < 0 {
+      let x = x + 1000000000
+      let c = 1
+    }
+    do poke(r + 24 + 8 * i, x)
+  }
+  return r
+}
+
+skill rt_badd(a, b) -> Any {
+  let x = rt_tobig(a)
+  let y = rt_tobig(b)
+  let sx = peek(x + 16)
+  let sy = peek(y + 16)
+  if sx == sy { return rt_bnorm(rt_bmadd(x, y, sx)) }
+  let c = rt_bmcmp(x, y)
+  if c == 0 { return 1 }
+  if c > 0 { return rt_bnorm(rt_bmsub(x, y, sx)) }
+  return rt_bnorm(rt_bmsub(y, x, sy))
+}
+
+skill rt_bneg(a) -> Any {
+  let x = rt_tobig(a)
+  let nl = rt_blen(x)
+  let r = rt_bnew(1 - peek(x + 16), nl)
+  for i in range(0, nl) { do poke(r + 24 + 8 * i, peek(x + 24 + 8 * i)) }
+  return rt_bnorm(r)
+}
+
+skill rt_bmul(a, b) -> Any {
+  # both small and under 2^31: the machine product is exact
+  if rt_kind(a) == 4 and rt_kind(b) == 4 {
+    let x = rt_untag(a)
+    let y = rt_untag(b)
+    if x < 2147483648 and x > 0 - 2147483648 and y < 2147483648 and y > 0 - 2147483648 { return 2 * (x * y) + 1 }
+  }
+  let x = rt_tobig(a)
+  let y = rt_tobig(b)
+  let la = rt_blen(x)
+  let lb = rt_blen(y)
+  if la == 0 or lb == 0 { return 1 }
+  let s = 0
+  if peek(x + 16) != peek(y + 16) { let s = 1 }
+  let r = rt_bnew(s, la + lb)
+  for i in range(0, la) {
+    let ai = peek(x + 24 + 8 * i)
+    let c = 0
+    for j in range(0, lb) {
+      let t = peek(r + 24 + 8 * (i + j)) + ai * peek(y + 24 + 8 * j) + c
+      do poke(r + 24 + 8 * (i + j), t % 1000000000)
+      let c = t // 1000000000
+    }
+    let k = i + lb
+    while c > 0 {
+      let t = peek(r + 24 + 8 * k) + c
+      do poke(r + 24 + 8 * k, t % 1000000000)
+      let c = t // 1000000000
+      let k = k + 1
+    }
+  }
+  return rt_bnorm(r)
+}
+
+# out = |b| x d (0 <= d < 10^9); out has room for b's limbs + 1
+skill rt_bmulsmall(b, d, out) -> Any {
+  let lb = rt_blen(b)
+  let c = 0
+  for j in range(0, lb) {
+    let t = peek(b + 24 + 8 * j) * d + c
+    do poke(out + 24 + 8 * j, t % 1000000000)
+    let c = t // 1000000000
+  }
+  do poke(out + 24 + 8 * lb, c)
+  for j in range(lb + 1, peek(out + 8) - 1) { do poke(out + 24 + 8 * j, 0) }
+  return out
+}
+
+# r = r - t in place (|r| >= |t|; t no longer than r)
+skill rt_bmsubin(r, t) -> Any {
+  let nr = peek(r + 8) - 1
+  let nt = rt_blen(t)
+  let c = 0
+  for i in range(0, nr) {
+    let x = peek(r + 24 + 8 * i) - c
+    if i < nt { let x = x - peek(t + 24 + 8 * i) }
+    let c = 0
+    if x < 0 {
+      let x = x + 1000000000
+      let c = 1
+    }
+    do poke(r + 24 + 8 * i, x)
+  }
+  return r
+}
+
+# the top three limbs of p as a real (the value / 10^(9 (len - 3)))
+skill rt_btop3(p, nl) -> Any {
+  let x = i2f(0)
+  for k in range(1, 4) {
+    let i = nl - k
+    let x = fmul(x, i2f(1000000000))
+    if i >= 0 { let x = fadd(x, i2f(peek(p + 24 + 8 * i))) }
+  }
+  return x
+}
+
+# |a| divmod |b| (b not zero): the quotient's limbs go into q (zeroed, room for a's limbs); the remainder is returned
+# (a big, sign 0). One limb of a at a time: the remainder r gains it at the bottom, the next quotient limb is
+# estimated from the leading limbs as reals (off by at most a little), then corrected exactly.
+skill rt_bmdivmod(a, b, q) -> Any {
+  let la = rt_blen(a)
+  let lb = rt_blen(b)
+  if lb == 1 {
+    let d = peek(b + 24)
+    let rem = 0
+    let i = la - 1
+    while i >= 0 {
+      let cur = rem * 1000000000 + peek(a + 24 + 8 * i)
+      do poke(q + 24 + 8 * i, cur // d)
+      let rem = cur % d
+      let i = i - 1
+    }
+    let rr = rt_bnew(0, 1)
+    do poke(rr + 24, rem)
+    return rr
+  }
+  let r = rt_bnew(0, lb + 1)
+  let t = rt_bnew(0, lb + 1)
+  let fb = rt_btop3(b, lb)
+  let i = la - 1
+  while i >= 0 {
+    let k = lb
+    while k > 0 {
+      do poke(r + 24 + 8 * k, peek(r + 16 + 8 * k))
+      let k = k - 1
+    }
+    do poke(r + 24, peek(a + 24 + 8 * i))
+    let qd = 0
+    if rt_bmcmp(r, b) >= 0 {
+      let lr = rt_blen(r)
+      let est = fdiv(rt_btop3(r, lr), fb)
+      if lr > lb { let est = fmul(est, i2f(1000000000)) }
+      let qd = f2i(est)
+      if qd > 999999999 { let qd = 999999999 }
+      if qd < 0 { let qd = 0 }
+      do rt_bmulsmall(b, qd, t)
+      while rt_bmcmp(t, r) > 0 {
+        let qd = qd - 1
+        do rt_bmulsmall(b, qd, t)
+      }
+      do rt_bmsubin(r, t)
+      while rt_bmcmp(r, b) >= 0 {
+        do rt_bmsubin(r, b)
+        let qd = qd + 1
+      }
+    }
+    do poke(q + 24 + 8 * i, qd)
+    let i = i - 1
+  }
+  return r
+}
+
+# a // b (want 0) or a % b (want 1) for integers, floored as Pi's // and %: the remainder takes the divisor's sign
+skill rt_bdivmod(a, b, want) -> Any {
+  let x = rt_tobig(a)
+  let y = rt_tobig(b)
+  if rt_blen(y) == 0 { do rt_fail("integer division by zero") }
+  let q = rt_bnew(0, rt_blen(x) + 1)
+  let r = rt_bmdivmod(x, y, q)
+  let sx = peek(x + 16)
+  let sy = peek(y + 16)
+  let exact = rt_blen(r) == 0
+  if sx == sy {
+    if want == 0 { return rt_bnorm(q) }
+    do poke(r + 16, sy)
+    return rt_bnorm(r)
+  }
+  if want == 0 {
+    let qq = q
+    if exact == 0 { let qq = rt_bmadd(q, rt_tobig(3), 0) }
+    do poke(qq + 16, 1)
+    return rt_bnorm(qq)
+  }
+  if exact { return 1 }
+  return rt_bnorm(rt_bmsub(y, r, sy))
+}
+
+# a against b for integers -> -1, 0, 1 (raw)
+skill rt_bcmp(a, b) -> Any {
+  let x = rt_tobig(a)
+  let y = rt_tobig(b)
+  let sx = peek(x + 16)
+  let sy = peek(y + 16)
+  if sx != sy {
+    if sx == 1 { return 0 - 1 }
+    return 1
+  }
+  let c = rt_bmcmp(x, y)
+  if sx == 1 { return 0 - c }
+  return c
+}
+
+# a big as double bits (rounded; past ~1.8e308 it is infinite)
+skill rt_btof(p) -> Any {
+  let nl = rt_blen(p)
+  let x = i2f(0)
+  let i = nl - 1
+  while i >= 0 {
+    let x = fadd(fmul(x, i2f(1000000000)), i2f(peek(p + 24 + 8 * i)))
+    let i = i - 1
+  }
+  if peek(p + 16) == 1 { let x = fmul(x, i2f(0 - 1)) }
+  return x
+}
+
+# a big in decimal
+skill rt_btoa(p) -> Any {
+  let nl = rt_blen(p)
+  let s = peek(p + 16)
+  let top = rt_itoa(peek(p + 16 + 8 * nl))
+  let tl = peek(top + 8)
+  let out = rt_text_new(s + tl + 9 * (nl - 1))
+  let k = 0
+  if s == 1 {
+    do pokeb(out + 16, 45)
+    let k = 1
+  }
+  for i in range(0, tl) { do pokeb(out + 16 + k + i, peekb(top + 16 + i)) }
+  let k = k + tl
+  let i = nl - 2
+  while i >= 0 {
+    let x = peek(p + 24 + 8 * i)
+    let j = 8
+    while j >= 0 {
+      do pokeb(out + 16 + k + j, 48 + x % 10)
+      let x = x // 10
+      let j = j - 1
+    }
+    let k = k + 9
+    let i = i - 1
+  }
+  return out
+}
+
+# the digits s[i0 .. n) (checked by the caller) as an integer, negative if neg
+skill rt_batoi(s, i0, n, neg) -> Any {
+  let nd = n - i0
+  let nl = (nd + 8) // 9
+  let p = rt_bnew(neg, nl)
+  for j in range(0, nl) {
+    let e = n - 9 * j
+    let b = e - 9
+    if b < i0 { let b = i0 }
+    let x = 0
+    for k in range(b, e) { let x = x * 10 + (peekb(s + 16 + k) - 48) }
+    do poke(p + 24 + 8 * j, x)
+  }
+  return rt_bnorm(p)
+}
+
+# a ^ e for an integer a and a raw e >= 0, exactly (squaring)
+skill rt_bpow(a, e) -> Any {
+  let r = 3
+  let p = a
+  let e = e
+  while e > 0 {
+    if e % 2 == 1 { let r = rt_bmul(r, p) }
+    let e = e // 2
+    if e > 0 { let p = rt_bmul(p, p) }
+  }
+  return r
+}
+
+# a real from a literal: mantissa m times ten to the e (both tagged integers pic worked out)
+skill rt_reallit(m, e) -> Any {
+  let mi = rt_untag(m)
+  let k = rt_untag(e)
+  # 9007199254740993.0 comes as 90071992547409930 e-1: drop the zeros first, so the value is rounded once
+  while k < 0 and mi != 0 and mi % 10 == 0 {
+    let mi = mi // 10
+    let k = k + 1
+  }
+  let x = i2f(mi)
+  # one multiply or divide by 10^|k| (exact up to 10^22), so the result is rounded once -- stepping by 10 rounded
+  # at every step and left literals like 0.1 + 0.2 or 17-digit values an ulp off
+  let kk = k
+  if kk < 0 { let kk = 0 - kk }
+  let p = i2f(1)
+  while kk > 0 {
+    let p = fmul(p, i2f(10))
+    let kk = kk - 1
+  }
+  if k > 0 { return rt_mkreal(fmul(x, p)) }
+  if k < 0 { return rt_mkreal(fdiv(x, p)) }
+  return rt_mkreal(x)
+}
+
+# a decimal number's text ("2.5", "-1e3", " 0.125") -> the real, or null if it is not one
+skill rt_parse_real(s) -> Any {
+  let n = peek(s + 8)
+  let i = 0
+  while i < n and peekb(s + 16 + i) == 32 { let i = i + 1 }
+  let neg = 0
+  if i < n and peekb(s + 16 + i) == 45 {
+    let neg = 1
+    let i = i + 1
+  } else {
+    if i < n and peekb(s + 16 + i) == 43 { let i = i + 1 }
+  }
+  let m = 0
+  let e = 0
+  let nd = 0
+  let any = 0
+  while i < n and peekb(s + 16 + i) >= 48 and peekb(s + 16 + i) <= 57 {
+    if nd < 18 {
+      let m = m * 10 + peekb(s + 16 + i) - 48
+      if m > 0 { let nd = nd + 1 }
+    } else {
+      let e = e + 1
+    }
+    let any = 1
+    let i = i + 1
+  }
+  if i < n and peekb(s + 16 + i) == 46 {
+    let i = i + 1
+    while i < n and peekb(s + 16 + i) >= 48 and peekb(s + 16 + i) <= 57 {
+      if nd < 18 {
+        let m = m * 10 + peekb(s + 16 + i) - 48
+        if m > 0 { let nd = nd + 1 }
+        let e = e - 1
+      }
+      let any = 1
+      let i = i + 1
+    }
+  }
+  if any == 0 { return 0 }
+  if i < n and (peekb(s + 16 + i) == 101 or peekb(s + 16 + i) == 69) {
+    let i = i + 1
+    let es = 1
+    if i < n and peekb(s + 16 + i) == 45 {
+      let es = 0 - 1
+      let i = i + 1
+    } else {
+      if i < n and peekb(s + 16 + i) == 43 { let i = i + 1 }
+    }
+    let x = 0
+    while i < n and peekb(s + 16 + i) >= 48 and peekb(s + 16 + i) <= 57 {
+      if x < 100000 { let x = x * 10 + peekb(s + 16 + i) - 48 }
+      let i = i + 1
+    }
+    let e = e + es * x
+  }
+  if neg { let m = 0 - m }
+  return rt_reallit(rt_tag(m), rt_tag(e))
+}
+
+# a real as text: a whole value prints like an integer (as the interpreter's str does); otherwise up to six
+# fractional digits, trailing zeros trimmed
+skill rt_ftoa(bits) -> Any {
+  let neg = flt(bits, i2f(0))
+  let x = bits
+  if neg { let x = fmul(bits, i2f(0 - 1)) }
+  # 10^16 and past: d.dddddde+N (the whole part no longer fits the machine word, and was printed wrapped)
+  let lim = fmul(i2f(100000000), i2f(100000000))
+  if flt(x, lim) == 0 {
+    if flt(fsub(x, x), i2f(1)) == 0 {
+      if flt(i2f(0), x) == 0 { return "nan" }
+      if neg { return "-inf" }
+      return "inf"
+    }
+    let e = 0
+    let ten = i2f(10)
+    while flt(x, ten) == 0 {
+      let x = fdiv(x, ten)
+      let e = e + 1
+    }
+    let out = rt_concat(rt_concat(rt_ftoa(x), "e+"), rt_itoa(e))
+    if neg { return rt_concat("-", out) }
+    return out
+  }
+  let ip = f2i(x)
+  let frac = fsub(x, i2f(ip))
+  # round the fraction to six decimal places as one integer 0..1000000 (a carry rolls into the whole part)
+  let half = fdiv(i2f(1), i2f(2))
+  let fr = f2i(fadd(fmul(frac, i2f(1000000)), half))
+  if fr >= 1000000 {
+    let ip = ip + 1
+    let fr = 0
+  }
+  let out = rt_itoa(ip)
+  if fr > 0 {
+    let ds = rt_itoa(fr)
+    let pad = 6 - peek(ds + 8)
+    let z = ""
+    for i in range(0, pad) { let z = z ++ "0" }
+    let ds = rt_concat(z, ds)
+    let m = peek(ds + 8)
+    while m > 1 and peekb(ds + 15 + m) == 48 { let m = m - 1 }
+    let out = rt_concat(rt_concat(out, "."), rt_sub(ds, 0, m))
+  }
+  if neg { return rt_concat("-", out) }
+  return out
+}
+
+# -- math words on reals ----------------------------------------------------------------------------------
+# sqrt floor ceil round abs and ^ match the interpreter exactly (sqrt is sqrtsd, round is ties-to-even).
+# Transcendental words (exp log sin cos) come later; they cannot be bit-identical to the interpreter's libm.
+
+skill rt_sqrt(v) -> Any {
+  let b = rt_realbits(v)
+  if flt(b, i2f(0)) { return 0 }                 # sqrt of a negative is null, as the interpreter's is
+  return rt_mkreal(fsqrt(b))
+}
+
+# int(x): a whole number -- a real cut toward zero (3.9 -> 3, -3.9 -> -3), text read as a number, integers as they are
+skill rt_int(v) -> Any {
+  let k = rt_kind(v)
+  if k == 1 {
+    let r = rt_num(v)
+    if r == 0 { let r = rt_parse_real(v) }
+    if r == 0 { return 0 }
+    return rt_int(r)
+  }
+  if k != 6 { return v }
+  let x = rt_realbits(v)
+  let neg = 0
+  if flt(x, i2f(0)) {
+    let neg = 1
+    let x = fmul(x, i2f(0 - 1))
+  }
+  # below 2^61: the machine cut; past it every real is whole -- halve it (exactly) below 2^61, then multiply back
+  let top = fmul(i2f(1073741824), i2f(2147483648))
+  let e = 0
+  while flt(x, top) == 0 {
+    let x = fdiv(x, i2f(2))
+    let e = e + 1
+    if e > 1100 { do rt_fail("int: not a finite number") }
+  }
+  let r = rt_tag(f2i(x))
+  if e > 0 { let r = rt_bmul(r, rt_bpow(rt_tag(2), e)) }
+  if neg { return rt_neg(r) }
+  return r
+}
+
+# float(x): the same number as a real (text read first)
+skill rt_float(v) -> Any {
+  if rt_kind(v) == 1 {
+    let r = rt_parse_real(v)
+    if r == 0 { return 0 }
+    return r
+  }
+  if v == 0 { return 0 }
+  return rt_mkreal(rt_realbits(v))
+}
+
+skill rt_floorw(v) -> Any {
+  if rt_kind(v) == 9 { return v }                # a big integer is already whole (a real would lose its digits)
+  return rt_mkreal(rt_floor(rt_realbits(v)))
+}
+
+skill rt_ceil(v) -> Any {
+  if rt_kind(v) == 9 { return v }
+  let b = rt_realbits(v)
+  return rt_mkreal(fmul(rt_floor(fmul(b, i2f(0 - 1))), i2f(0 - 1)))   # ceil(x) = -floor(-x)
+}
+
+# round(): half to even (banker's rounding), as the interpreter's round does
+skill rt_round(v) -> Any {
+  if rt_kind(v) == 9 { return v }
+  let x = rt_realbits(v)
+  let fl = rt_floor(x)
+  let frac = fsub(x, fl)
+  let half = fdiv(i2f(1), i2f(2))
+  let nlo = f2i(fl)
+  if flt(frac, half) { return rt_mkreal(fl) }
+  if flt(half, frac) { return rt_mkreal(i2f(nlo + 1)) }
+  if nlo % 2 == 0 { return rt_mkreal(fl) }
+  return rt_mkreal(i2f(nlo + 1))
+}
+
+# a ^ b for an integer exponent: exact repeated squaring, giving a real as the interpreter's ^ does
+skill rt_pow(a, b) -> Any {
+  if rt_kind(b) != 4 {
+    # a real exponent: a whole one (2.0) goes the exact way below; otherwise exp(b log a) for a > 0, 0 for a = 0
+    let eb = rt_realbits(b)
+    let wb = rt_floor(eb)
+    let whole = flt(wb, eb) == 0 and flt(eb, wb) == 0
+    if whole and flt(eb, i2f(1000000)) and flt(i2f(0 - 1000000), eb) { return rt_pow(rt_mkreal(rt_realbits(a)), rt_tag(f2i(wb))) }
+    let x = rt_realbits(a)
+    if flt(x, i2f(0)) { do rt_fail("pow: a negative number to a fractional power has no real value") }
+    if flt(i2f(0), x) == 0 { return rt_mkreal(i2f(0)) }
+    return rt_mkreal(rt_exp(fmul(eb, rt_log(x))))
+  }
+  # an integer to a whole power: exact, at any size (2 ^ 1000 used to go through reals and wrap)
+  if rt_isint(a) and rt_untag(b) >= 0 { return rt_bpow(a, rt_untag(b)) }
+  let base = rt_realbits(a)
+  let e = rt_untag(b)
+  let neg = 0
+  if e < 0 {
+    let neg = 1
+    let e = 0 - e
+  }
+  let r = i2f(1)
+  let p = base
+  while e > 0 {
+    if e % 2 == 1 { let r = fmul(r, p) }
+    let p = fmul(p, p)
+    let e = e // 2
+  }
+  if neg { let r = fdiv(i2f(1), r) }
+  return rt_mkreal(r)
+}
+
+# -- transcendental words as Pi series ---------------------------------------------------------------------
+# exp log log10 log2 sin cos tan atan, computed from series over the float primitives. They are Pi's own
+# approximations (about 1e-12 on the tested ranges), NOT bit-identical to the interpreter's libm, so programs
+# that must match should compare them by tolerance. pi and ln2 are derived from fast-converging series, not
+# hardcoded. Everything here works on double bit patterns; the *w wrappers take and return tagged values.
+
+# ln 2 from 2*atanh(1/3): t = 1/3 converges fast, so no constant is needed to bootstrap it
+skill rt_ln2() -> Any {
+  let t = fdiv(i2f(1), i2f(3))
+  let t2 = fmul(t, t)
+  let term = t
+  let sum = t
+  let k = 3
+  while k < 44 {
+    let term = fmul(term, t2)
+    let sum = fadd(sum, fdiv(term, i2f(k)))
+    let k = k + 2
+  }
+  return fmul(i2f(2), sum)
+}
+
+# atan(x) for a small |x| by its alternating series
+skill rt_atans(x) -> Any {
+  let x2 = fmul(x, x)
+  let term = x
+  let sum = x
+  let k = 3
+  let add = 0
+  while k < 80 {
+    let term = fmul(term, x2)
+    let piece = fdiv(term, i2f(k))
+    if add { let sum = fadd(sum, piece) } else { let sum = fsub(sum, piece) }
+    let add = 1 - add
+    let k = k + 2
+  }
+  return sum
+}
+
+# pi from Machin's formula 16*atan(1/5) - 4*atan(1/239)
+skill rt_pi() -> Any {
+  let a = rt_atans(fdiv(i2f(1), i2f(5)))
+  let b = rt_atans(fdiv(i2f(1), i2f(239)))
+  return fsub(fmul(i2f(16), a), fmul(i2f(4), b))
+}
+
+skill rt_exp(x) -> Any {
+  let ln2 = rt_ln2()
+  let kf = rt_floor(fadd(fdiv(x, ln2), fdiv(i2f(1), i2f(2))))
+  let r = fsub(x, fmul(kf, ln2))
+  let term = i2f(1)
+  let sum = i2f(1)
+  let nn = 1
+  while nn < 20 {
+    let term = fdiv(fmul(term, r), i2f(nn))
+    let sum = fadd(sum, term)
+    let nn = nn + 1
+  }
+  let k = f2i(kf)
+  let p = sum
+  while k > 0 {
+    let p = fmul(p, i2f(2))
+    let k = k - 1
+  }
+  while k < 0 {
+    let p = fdiv(p, i2f(2))
+    let k = k + 1
+  }
+  return p
+}
+
+# natural log: reduce x to m near 1 by powers of two, then log(m) = 2*atanh((m-1)/(m+1))
+skill rt_log(x) -> Any {
+  let ln2 = rt_ln2()
+  let e = 0
+  let m = x
+  let hi = fdiv(i2f(4), i2f(3))
+  let lo = fdiv(i2f(2), i2f(3))
+  while flt(hi, m) {
+    let m = fdiv(m, i2f(2))
+    let e = e + 1
+  }
+  while flt(m, lo) {
+    let m = fmul(m, i2f(2))
+    let e = e - 1
+  }
+  let t = fdiv(fsub(m, i2f(1)), fadd(m, i2f(1)))
+  let t2 = fmul(t, t)
+  let term = t
+  let sum = t
+  let k = 3
+  while k < 44 {
+    let term = fmul(term, t2)
+    let sum = fadd(sum, fdiv(term, i2f(k)))
+    let k = k + 2
+  }
+  return fadd(fmul(i2f(e), ln2), fmul(i2f(2), sum))
+}
+
+# reduce an angle to [-pi, pi]
+skill rt_reduce(x) -> Any {
+  let tp = fmul(i2f(2), rt_pi())
+  let q = rt_floor(fadd(fdiv(x, tp), fdiv(i2f(1), i2f(2))))
+  return fsub(x, fmul(q, tp))
+}
+
+skill rt_sin(x) -> Any {
+  let r = rt_reduce(x)
+  let r2 = fmul(r, r)
+  let term = r
+  let sum = r
+  let nn = 1
+  while nn < 16 {
+    let d = i2f(2 * nn * (2 * nn + 1))
+    let term = fdiv(fmul(fmul(term, r2), i2f(0 - 1)), d)
+    let sum = fadd(sum, term)
+    let nn = nn + 1
+  }
+  return sum
+}
+
+skill rt_cos(x) -> Any {
+  let r = rt_reduce(x)
+  let r2 = fmul(r, r)
+  let term = i2f(1)
+  let sum = i2f(1)
+  let nn = 1
+  while nn < 16 {
+    let d = i2f((2 * nn - 1) * (2 * nn))
+    let term = fdiv(fmul(fmul(term, r2), i2f(0 - 1)), d)
+    let sum = fadd(sum, term)
+    let nn = nn + 1
+  }
+  return sum
+}
+
+# atan over the whole line: fold |x|>1 to 1/|x| (pi/2 - atan(1/x)), then if the argument is still not small,
+# shift by pi/4 (atan(r) = pi/4 + atan((r-1)/(r+1))) so the series argument stays well under 1
+skill rt_atan(x) -> Any {
+  let neg = flt(x, i2f(0))
+  let a = x
+  if neg { let a = fmul(x, i2f(0 - 1)) }
+  let big = flt(i2f(1), a)
+  let r = a
+  if big { let r = fdiv(i2f(1), a) }
+  let shift = flt(fdiv(i2f(42), i2f(100)), r)
+  let s = r
+  if shift { let s = fdiv(fsub(r, i2f(1)), fadd(r, i2f(1))) }
+  let v = rt_atans(s)
+  if shift { let v = fadd(fdiv(rt_pi(), i2f(4)), v) }
+  if big { let v = fsub(fdiv(rt_pi(), i2f(2)), v) }
+  if neg { let v = fmul(v, i2f(0 - 1)) }
+  return v
+}
+
+skill rt_expw(v) -> Any { return rt_mkreal(rt_exp(rt_realbits(v))) }
+skill rt_logw(v) -> Any {
+  let b = rt_realbits(v)
+  if flt(i2f(0), b) == 0 { return 0 }
+  return rt_mkreal(rt_log(b))
+}
+skill rt_log10w(v) -> Any {
+  let b = rt_realbits(v)
+  if flt(i2f(0), b) == 0 { return 0 }
+  return rt_mkreal(fdiv(rt_log(b), rt_log(i2f(10))))
+}
+skill rt_log2w(v) -> Any {
+  let b = rt_realbits(v)
+  if flt(i2f(0), b) == 0 { return 0 }
+  return rt_mkreal(fdiv(rt_log(b), rt_ln2()))
+}
+skill rt_sinw(v) -> Any { return rt_mkreal(rt_sin(rt_realbits(v))) }
+skill rt_cosw(v) -> Any { return rt_mkreal(rt_cos(rt_realbits(v))) }
+skill rt_tanw(v) -> Any {
+  let b = rt_realbits(v)
+  return rt_mkreal(fdiv(rt_sin(b), rt_cos(b)))
+}
+skill rt_atanw(v) -> Any { return rt_mkreal(rt_atan(rt_realbits(v))) }
+
+# -- region memory -----------------------------------------------------------------------------------------
+# There is no garbage collector; regions give memory back. `let m = mark()` remembers the allocation point;
+# `release(m, keep)` frees everything allocated since, except `keep`, which is deep-copied (only the parts made
+# after the mark), relocated down to the mark and returned. Values are never mutated, so nothing older can point
+# into the region; any OTHER value made since the mark must not be used after the release.
+
+skill rt_memused() -> Any { return rt_tag(peek(gaddr(0)) - peek(gaddr(3))) }
+skill rt_mark() -> Any { return rt_tag(peek(gaddr(0))) }
+
+# copy the parts of v that live in [lo, hi) to fresh memory above the heap top
+skill rt_rcopy(v, lo, hi) -> Any {
+  if v == 0 { return 0 }
+  if v % 2 == 1 { return v }
+  if v < lo or v >= hi { return v }
+  let w = peek(v)
+  let k = w % 256
+  if k == 1 {
+    let n = peek(v + 8)
+    let r = rt_text_new(n)
+    for i in range(0, n) { do pokeb(r + 16 + i, peekb(v + 16 + i)) }
+    return r
+  }
+  if k == 3 {
+    let n = peek(v + 8)
+    let r = rt_map_alloc(n, 0)
+    for i in range(0, 2 * n) { do poke(r + 16 + 8 * i, rt_rcopy(peek(v + 16 + 8 * i), lo, hi)) }
+    do rt_mi_build(r)
+    return r
+  }
+  if k == 2 {
+    let n = peek(v + 8)
+    let r = rt_obj(k, n, 8 * n)
+    for i in range(0, n) { do poke(r + 16 + 8 * i, rt_rcopy(peek(v + 16 + 8 * i), lo, hi)) }
+    return r
+  }
+  if k == 5 {
+    let nc = w // 256
+    let r = rt_alloc(16 + 8 * nc)
+    do poke(r, w)
+    do poke(r + 8, peek(v + 8))
+    for i in range(0, nc) { do poke(r + 16 + 8 * i, rt_rcopy(peek(v + 16 + 8 * i), lo, hi)) }
+    return r
+  }
+  if k == 7 or k == 8 or k == 9 {
+    let ns = peek(v + 8)
+    let r = rt_alloc(16 + 8 * ns)
+    for i in range(0, 2 + ns) { do poke(r + 8 * i, peek(v + 8 * i)) }
+    return r
+  }
+  let r = rt_alloc(16)
+  do poke(r, w)
+  do poke(r + 8, peek(v + 8))
+  return r
+}
+
+# bytes an object occupies on the heap (allocations are rounded up to 8)
+skill rt_objsize(p) -> Any {
+  let w = peek(p)
+  let k = w % 256
+  if k == 1 { return (16 + peek(p + 8) + 7) // 8 * 8 }
+  if k == 2 { return 16 + 8 * peek(p + 8) }
+  if k == 3 { return rt_map_bytes(p) }
+  if k == 5 { return 16 + 8 * (w // 256) }
+  if k == 7 or k == 8 or k == 9 { return 16 + 8 * peek(p + 8) }
+  return 16
+}
+
+# how many value-holding words follow an object's 16-byte header
+skill rt_fields(p) -> Any {
+  let w = peek(p)
+  let k = w % 256
+  if k == 2 { return peek(p + 8) }
+  if k == 3 { return 2 * peek(p + 8) }
+  if k == 5 { return w // 256 }
+  return 0
+}
+
+skill rt_release(mt, keep) -> Any {
+  let m = rt_untag(mt)
+  let top = peek(gaddr(0))
+  let c = rt_rcopy(keep, m, top)
+  let fin = peek(gaddr(0))
+  let delta = top - m
+  # relocate pointers that point inside the copied block [top, fin)
+  let p = top
+  while p < fin {
+    let nf = rt_fields(p)
+    for i in range(0, nf) {
+      let a = p + 16 + 8 * i
+      let x = peek(a)
+      if x % 2 == 0 and x >= top and x < fin { do poke(a, x - delta) }
+    }
+    let p = p + rt_objsize(p)
+  }
+  # move the block down to the mark and free everything above it
+  let size = fin - top
+  for i in range(0, size // 8) { do poke(m + 8 * i, peek(top + 8 * i)) }
+  do poke(gaddr(0), m + size)
+  if c % 2 == 0 and c >= top and c < fin { return c - delta }
+  return c
+}
+
+# typeof(x): what kind of value x is, as text -- "null" "text" "list" "map" "int" "fn" "real"
+skill rt_typeof(v) -> Any {
+  let k = rt_kind(v)
+  if k == 0 { return "null" }
+  if k == 1 { return "text" }
+  if k == 2 { return "list" }
+  if k == 3 { return "map" }
+  if k == 4 { return "int" }
+  if k == 5 { return "fn" }
+  if k == 7 { return "set" }
+  if k == 8 { return "array" }
+  if k == 9 { return "int" }
+  return "real"
+}
+
+# -- hash sets of integers ------------------------------------------------------------------------------------
+# A set object [7, slots, slot...] with open addressing. It holds integers only (never pointers), so it is safe
+# alongside region memory. hset(n) makes one with n slots (keep it well under full); hset_add(s, k) adds the
+# integer k and says whether it was new. This is the one mutable value in Pi: the set changes in place.
+skill rt_hset(nt) -> Any {
+  let n = rt_untag(nt)
+  let p = rt_alloc(16 + 8 * n)
+  do poke(p, 7)
+  do poke(p + 8, n)
+  for i in range(0, n) { do poke(p + 16 + 8 * i, 0) }
+  return p
+}
+
+skill rt_hset_add(h, kt) -> Any {
+  let n = peek(h + 8)
+  let i = rt_untag(kt) % n
+  let probes = 0
+  while probes < n {
+    let s = peek(h + 16 + 8 * i)
+    if s == 0 {
+      do poke(h + 16 + 8 * i, kt)
+      return 3
+    }
+    if s == kt { return 1 }
+    let i = i + 1
+    if i == n { let i = 0 }
+    let probes = probes + 1
+  }
+  return 1
+}
+
+# is the integer k in the set?
+skill rt_hset_has(h, kt) -> Any {
+  let n = peek(h + 8)
+  let i = rt_untag(kt) % n
+  let probes = 0
+  while probes < n {
+    let s = peek(h + 16 + 8 * i)
+    if s == 0 { return 1 }
+    if s == kt { return 3 }
+    let i = i + 1
+    if i == n { let i = 0 }
+    let probes = probes + 1
+  }
+  return 1
+}
+
+# input(): the next line from standard input (without its line ending), or null at the end of input.
+# Globals 4 and 5: the standard input handle, and a one-byte read buffer.
+skill rt_input() -> Any {
+  if peek(gaddr(4)) == 0 { do poke(gaddr(4), wcall("GetStdHandle", 0 - 10)) }
+  let h = peek(gaddr(4))
+  # a line of any length: the buffer doubles when full (it used to stop at 4,096 bytes and drop the rest)
+  let cap = 4096
+  let buf = rt_text_new(cap)
+  let n = 0
+  let got = 0
+  let going = 1
+  while going {
+    do poke(gaddr(2), 0)
+    let ok = wcall("ReadFile", h, gaddr(5), 1, gaddr(2), 0)
+    if ok == 0 or peek(gaddr(2)) == 0 {
+      let going = 0
+    } else {
+      let got = 1
+      let b = peekb(gaddr(5))
+      if b == 10 {
+        let going = 0
+      } else {
+        if b != 13 {
+          if n == cap {
+            let nb = rt_text_new(2 * cap)
+            for k in range(0, n) { do pokeb(nb + 16 + k, peekb(buf + 16 + k)) }
+            let buf = nb
+            let cap = 2 * cap
+          }
+          do pokeb(buf + 16 + n, b)
+          let n = n + 1
+        }
+      }
+    }
+  }
+  if got == 0 { return 0 }
+  return rt_sub(buf, 0, n)
+}
+
+# ---- networking: Windows sockets, reached at run time (LoadLibraryA + GetProcAddress, called with wcallp) ----
+skill rt_u32(v) -> Any { return (v % 4294967296 + 4294967296) % 4294967296 }
+
+skill rt_wsproc(name) -> Any {
+  let m = wcall("LoadLibraryA", rt_cstr("ws2_32.dll"))
+  return wcall("GetProcAddress", m, rt_cstr(name))
+}
+
+# tcp(ip, port, data): connect to ip:port (dotted text), send all of data, read until the other side closes;
+# -> the reply as text, or null if the connection fails
+skill rt_tcp(ip, portt, data) -> Any {
+  let port = rt_untag(portt)
+  let wsa = rt_alloc(512)
+  do wcallp(rt_wsproc("WSAStartup"), 514, wsa)
+  let s = wcallp(rt_wsproc("socket"), 2, 1, 6)
+  if s == 0 - 1 { return 0 }
+  let sa = rt_alloc(16)
+  for i in range(0, 16) { do pokeb(sa + i, 0) }
+  do pokeb(sa, 2)
+  do pokeb(sa + 2, port // 256)
+  do pokeb(sa + 3, port % 256)
+  let n = peek(ip + 8)
+  let part = 0
+  let k = 4
+  for i in range(0, n) {
+    let c = peekb(ip + 16 + i)
+    if c == 46 {
+      do pokeb(sa + k, part)
+      let k = k + 1
+      let part = 0
+    } else {
+      let part = part * 10 + c - 48
+    }
+  }
+  do pokeb(sa + k, part)
+  if rt_u32(wcallp(rt_wsproc("connect"), s, sa, 16)) != 0 {
+    do wcallp(rt_wsproc("closesocket"), s)
+    return 0
+  }
+  let len = peek(data + 8)
+  let sent = 0
+  let fsend = rt_wsproc("send")
+  while sent < len {
+    let r = rt_u32(wcallp(fsend, s, data + 16 + sent, len - sent, 0))
+    if r == 0 or r >= 2147483648 {
+      do wcallp(rt_wsproc("closesocket"), s)
+      return 0
+    }
+    let sent = sent + r
+  }
+  let cap = 65536
+  let buf = rt_alloc(cap)
+  let got = 0
+  let frecv = rt_wsproc("recv")
+  let going = 1
+  while going == 1 {
+    if cap - got < 16384 {
+      let nb = rt_alloc(cap * 2)
+      for i in range(0, got // 8 + 1) { do poke(nb + 8 * i, peek(buf + 8 * i)) }
+      let buf = nb
+      let cap = cap * 2
+    }
+    let r = rt_u32(wcallp(frecv, s, buf + got, cap - got, 0))
+    if r == 0 or r >= 2147483648 { let going = 0 } else { let got = got + r }
+  }
+  do wcallp(rt_wsproc("closesocket"), s)
+  let t = rt_text_new(got)
+  for i in range(0, got) { do pokeb(t + 16 + i, peekb(buf + i)) }
+  return t
+}
+
+# ---- a web server's sockets (sitelib.pi's serve_http): listening is on 127.0.0.1 ONLY, never the network ----------
+# rt_listen(port): a socket listening on 127.0.0.1:port -> the socket, or null (the port is taken)
+skill rt_listen(portt) -> Any {
+  let port = rt_untag(portt)
+  let wsa = rt_alloc(512)
+  do wcallp(rt_wsproc("WSAStartup"), 514, wsa)
+  let s = wcallp(rt_wsproc("socket"), 2, 1, 6)
+  if s == 0 - 1 { return 0 }
+  let sa = rt_alloc(16)
+  for i in range(0, 16) { do pokeb(sa + i, 0) }
+  do pokeb(sa, 2)
+  do pokeb(sa + 2, port // 256)
+  do pokeb(sa + 3, port % 256)
+  do pokeb(sa + 4, 127)
+  do pokeb(sa + 7, 1)
+  if rt_u32(wcallp(rt_wsproc("bind"), s, sa, 16)) != 0 {
+    do wcallp(rt_wsproc("closesocket"), s)
+    return 0
+  }
+  if rt_u32(wcallp(rt_wsproc("listen"), s, 16)) != 0 {
+    do wcallp(rt_wsproc("closesocket"), s)
+    return 0
+  }
+  return rt_tag(s)
+}
+
+# rt_accept(socket): wait for the next connection -> its socket, or null
+skill rt_accept(st) -> Any {
+  let c = wcallp(rt_wsproc("accept"), rt_untag(st), 0, 0)
+  if c == 0 - 1 { return 0 }
+  return rt_tag(c)
+}
+
+# rt_recv_some(socket): the bytes that have arrived (waiting for some), as text; "" once the other side closed
+skill rt_recv_some(ct) -> Any {
+  let cap = 65536
+  let buf = rt_alloc(cap)
+  let r = rt_u32(wcallp(rt_wsproc("recv"), rt_untag(ct), buf, cap, 0))
+  if r >= 2147483648 { let r = 0 }
+  let t = rt_text_new(r)
+  for i in range(0, r) { do pokeb(t + 16 + i, peekb(buf + i)) }
+  return t
+}
+
+# rt_send_all(socket, text): send every byte -> 1, or 0 if the connection broke
+skill rt_send_all(ct, data) -> Any {
+  let len = peek(data + 8)
+  let sent = 0
+  let fsend = rt_wsproc("send")
+  while sent < len {
+    let r = rt_u32(wcallp(fsend, rt_untag(ct), data + 16 + sent, len - sent, 0))
+    if r == 0 or r >= 2147483648 { return rt_tag(0) }
+    let sent = sent + r
+  }
+  return rt_tag(1)
+}
+
+skill rt_closesock(ct) -> Any {
+  do wcallp(rt_wsproc("closesocket"), rt_untag(ct))
+  return 0
+}
+
+# chr(n): the character with code n as UTF-8 text (chr(65) is "A", chr(233) is "é" -- two bytes, chr(9786) "☺")
+skill rt_chr(nt) -> Any {
+  let n = rt_untag(nt)
+  if n < 0 or n > 1114111 { do rt_fail("chr: not a character code") }
+  if n < 128 {
+    let t = rt_text_new(1)
+    do pokeb(t + 16, n)
+    return t
+  }
+  if n < 2048 {
+    let t = rt_text_new(2)
+    do pokeb(t + 16, 192 + n // 64)
+    do pokeb(t + 17, 128 + n % 64)
+    return t
+  }
+  if n < 65536 {
+    let t = rt_text_new(3)
+    do pokeb(t + 16, 224 + n // 4096)
+    do pokeb(t + 17, 128 + n // 64 % 64)
+    do pokeb(t + 18, 128 + n % 64)
+    return t
+  }
+  let t = rt_text_new(4)
+  do pokeb(t + 16, 240 + n // 262144)
+  do pokeb(t + 17, 128 + n // 4096 % 64)
+  do pokeb(t + 18, 128 + n // 64 % 64)
+  do pokeb(t + 19, 128 + n % 64)
+  return t
+}
+
+# ---- Pi's senses and hands: Windows system DLLs reached at run time (no import entries, no outside libraries) ----
+skill rt_proc(dll, name) -> Any {
+  let m = wcall("LoadLibraryA", rt_cstr(dll))
+  if m == 0 { return 0 }
+  return wcall("GetProcAddress", m, rt_cstr(name))
+}
+
+skill rt_zero(p, n) -> Any {
+  for i in range(0, n) { do pokeb(p + i, 0) }
+  return p
+}
+
+skill rt_poke32(p, v) -> Any {
+  let u = (v % 4294967296 + 4294967296) % 4294967296
+  do pokeb(p, u % 256)
+  do pokeb(p + 1, (u // 256) % 256)
+  do pokeb(p + 2, (u // 65536) % 256)
+  do pokeb(p + 3, (u // 16777216) % 256)
+  return p
+}
+
+skill rt_peek32(p) -> Any { return peekb(p) + 256 * peekb(p + 1) + 65536 * peekb(p + 2) + 16777216 * peekb(p + 3) }
+
+# spawn(command line): start another program (a Pi agent) with no window -> its process handle, or null
+skill rt_spawn(cmd) -> Any {
+  let si = rt_zero(rt_alloc(104), 104)
+  do rt_poke32(si, 104)
+  let pi = rt_zero(rt_alloc(24), 24)
+  let ok = wcallp(rt_proc("kernel32.dll", "CreateProcessA"), 0, rt_cstr(cmd), 0, 0, 0, 134217728, 0, 0, si, pi)
+  if rt_u32(ok) == 0 { return 0 }
+  do wcallp(rt_proc("kernel32.dll", "CloseHandle"), peek(pi + 8))
+  return rt_tag(peek(pi))
+}
+
+# spawn_out(cmd, path): run cmd with no window, its stdout and stderr going to the file path (created fresh); -> the
+# process handle (for wait / rt_kill), or null. Called by name (rt_spawn_out) -- the brain's hands use it.
+skill rt_spawn_out(cmd, path) -> Any {
+  let sa = rt_zero(rt_alloc(24), 24)
+  do rt_poke32(sa, 24)
+  do rt_poke32(sa + 16, 1)
+  let fh = wcall("CreateFileA", rt_cstr(path), 1073741824, 3, sa, 2, 128, 0)
+  if fh == 0 - 1 { return 0 }
+  let si = rt_zero(rt_alloc(104), 104)
+  do rt_poke32(si, 104)
+  do rt_poke32(si + 60, 256)
+  do poke(si + 88, fh)
+  do poke(si + 96, fh)
+  let pi = rt_zero(rt_alloc(24), 24)
+  let ok = wcallp(rt_proc("kernel32.dll", "CreateProcessA"), 0, rt_cstr(cmd), 0, 0, 1, 134217728, 0, 0, si, pi)
+  do wcall("CloseHandle", fh)
+  if rt_u32(ok) == 0 { return 0 }
+  do wcallp(rt_proc("kernel32.dll", "CloseHandle"), peek(pi + 8))
+  return rt_tag(peek(pi))
+}
+
+# kill(handle): end a process (one that wait timed out on) and close its handle
+skill rt_kill(ht) -> Any {
+  let h = rt_untag(ht)
+  do wcallp(rt_proc("kernel32.dll", "TerminateProcess"), h, 1)
+  do wcallp(rt_proc("kernel32.dll", "WaitForSingleObject"), h, 2000)
+  do wcallp(rt_proc("kernel32.dll", "CloseHandle"), h)
+  return rt_tag(0)
+}
+
+# wait(handle, ms): -> the agent's exit code once it has finished, or null if it is still running after ms
+skill rt_wait(ht, mst) -> Any {
+  let h = rt_untag(ht)
+  let r = rt_u32(wcallp(rt_proc("kernel32.dll", "WaitForSingleObject"), h, rt_untag(mst)))
+  if r != 0 { return 0 }
+  let code = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_proc("kernel32.dll", "GetExitCodeProcess"), h, code)
+  do wcallp(rt_proc("kernel32.dll", "CloseHandle"), h)
+  return rt_tag(rt_peek32(code))
+}
+
+# screen(step): what is on the screen now, every step-th pixel -> [width, height, arr of 0xRRGGBB]
+skill rt_screen(stept) -> Any {
+  let step = rt_untag(stept)
+  if step < 1 { let step = 1 }
+  # real pixels: without this a scaled display (125%, 150%) hands Pi a resized, blurred copy of the screen
+  do wcallp(rt_proc("user32.dll", "SetProcessDPIAware"))
+  let sw = rt_u32(wcallp(rt_proc("user32.dll", "GetSystemMetrics"), 0))
+  let sh = rt_u32(wcallp(rt_proc("user32.dll", "GetSystemMetrics"), 1))
+  let hdc = wcallp(rt_proc("user32.dll", "GetDC"), 0)
+  let mdc = wcallp(rt_proc("gdi32.dll", "CreateCompatibleDC"), hdc)
+  let bmp = wcallp(rt_proc("gdi32.dll", "CreateCompatibleBitmap"), hdc, sw, sh)
+  let old = wcallp(rt_proc("gdi32.dll", "SelectObject"), mdc, bmp)
+  do wcallp(rt_proc("gdi32.dll", "BitBlt"), mdc, 0, 0, sw, sh, hdc, 0, 0, 13369376)
+  let bi = rt_zero(rt_alloc(48), 48)
+  do rt_poke32(bi, 40)
+  do rt_poke32(bi + 4, sw)
+  do rt_poke32(bi + 8, 0 - sh)
+  do pokeb(bi + 12, 1)
+  do pokeb(bi + 14, 32)
+  let buf = rt_alloc(sw * sh * 4)
+  do wcallp(rt_proc("gdi32.dll", "GetDIBits"), mdc, bmp, 0, sh, buf, bi, 0)
+  do wcallp(rt_proc("gdi32.dll", "SelectObject"), mdc, old)
+  do wcallp(rt_proc("gdi32.dll", "DeleteObject"), bmp)
+  do wcallp(rt_proc("gdi32.dll", "DeleteDC"), mdc)
+  do wcallp(rt_proc("user32.dll", "ReleaseDC"), 0, hdc)
+  let w = sw // step
+  let h = sh // step
+  let a = rt_arr(rt_tag(w * h))
+  for y in range(0, h) {
+    for x in range(0, w) {
+      let p = buf + 4 * ((y * step) * sw + x * step)
+      do poke(a + 16 + 8 * (y * w + x), rt_tag(peekb(p + 2) * 65536 + peekb(p + 1) * 256 + peekb(p)))
+    }
+  }
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(w))
+  let out = rt_append(out, rt_tag(h))
+  return rt_append(out, a)
+}
+
+# render(text, size, font): black text on white, drawn by Windows' own font engine (GDI, smoothed like the screen)
+# -> [width, height, arr of 0xRRGGBB]; the text sits 4 pixels in from the top left. Pi's teacher for reading.
+skill rt_render(txt, sizet, face) -> Any {
+  let size = rt_untag(sizet)
+  let n = peek(txt + 8)
+  let s = rt_cstr(txt)
+  # a font name ending in "@ct" draws with ClearType (coloured edges, as the screen does); otherwise greyscale smoothing
+  let quality = 4
+  let fl = peek(face + 8)
+  let fname = rt_cstr(face)
+  if fl > 3 {
+    if peekb(face + 16 + fl - 3) == 64 and peekb(face + 16 + fl - 2) == 99 and peekb(face + 16 + fl - 1) == 116 {
+      let quality = 5
+      do pokeb(fname + fl - 3, 0)
+    }
+  }
+  let hdc = wcallp(rt_proc("user32.dll", "GetDC"), 0)
+  let mdc = wcallp(rt_proc("gdi32.dll", "CreateCompatibleDC"), hdc)
+  let font = wcallp(rt_proc("gdi32.dll", "CreateFontA"), 0 - size, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, quality, 0, fname)
+  let oldf = wcallp(rt_proc("gdi32.dll", "SelectObject"), mdc, font)
+  let sz = rt_zero(rt_alloc(16), 16)
+  do wcallp(rt_proc("gdi32.dll", "GetTextExtentPoint32A"), mdc, s, n, sz)
+  let w = rt_peek32(sz) + 8
+  let h = rt_peek32(sz + 4) + 8
+  let bmp = wcallp(rt_proc("gdi32.dll", "CreateCompatibleBitmap"), hdc, w, h)
+  let oldb = wcallp(rt_proc("gdi32.dll", "SelectObject"), mdc, bmp)
+  do wcallp(rt_proc("gdi32.dll", "PatBlt"), mdc, 0, 0, w, h, 16711778)
+  do wcallp(rt_proc("gdi32.dll", "SetBkMode"), mdc, 1)
+  do wcallp(rt_proc("gdi32.dll", "SetTextColor"), mdc, 0)
+  do wcallp(rt_proc("gdi32.dll", "TextOutA"), mdc, 4, 4, s, n)
+  let bi = rt_zero(rt_alloc(48), 48)
+  do rt_poke32(bi, 40)
+  do rt_poke32(bi + 4, w)
+  do rt_poke32(bi + 8, 0 - h)
+  do pokeb(bi + 12, 1)
+  do pokeb(bi + 14, 32)
+  let buf = rt_alloc(w * h * 4)
+  do wcallp(rt_proc("gdi32.dll", "GetDIBits"), mdc, bmp, 0, h, buf, bi, 0)
+  do wcallp(rt_proc("gdi32.dll", "SelectObject"), mdc, oldb)
+  do wcallp(rt_proc("gdi32.dll", "SelectObject"), mdc, oldf)
+  do wcallp(rt_proc("gdi32.dll", "DeleteObject"), bmp)
+  do wcallp(rt_proc("gdi32.dll", "DeleteObject"), font)
+  do wcallp(rt_proc("gdi32.dll", "DeleteDC"), mdc)
+  do wcallp(rt_proc("user32.dll", "ReleaseDC"), 0, hdc)
+  let a = rt_arr(rt_tag(w * h))
+  for i in range(0, w * h) {
+    let p = buf + 4 * i
+    do poke(a + 16 + 8 * i, rt_tag(peekb(p + 2) * 65536 + peekb(p + 1) * 256 + peekb(p)))
+  }
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(w))
+  let out = rt_append(out, rt_tag(h))
+  return rt_append(out, a)
+}
+
+# a Pi text as a NUL-ended UTF-16 string (bytes taken as code points) for the wide Windows calls
+skill rt_wstr(s, f, n) -> Any {
+  let p = rt_zero(rt_alloc(2 * n + 2), 2 * n + 2)
+  for i in range(0, n) { do pokeb(p + 2 * i, peekb(s + 16 + f + i)) }
+  return p
+}
+
+# http(url): GET an http:// or https:// page (WinHTTP does the TLS) -> the body as text, or null
+skill rt_http(url) -> Any {
+  let n = peek(url + 8)
+  let secure = 0
+  let at = 0
+  if n > 8 {
+    if peekb(url + 16 + 4) == 115 and peekb(url + 16 + 5) == 58 {
+      let secure = 1
+      let at = 8
+    }
+  }
+  if secure == 0 { let at = 7 }
+  let hs = at
+  while at < n and peekb(url + 16 + at) != 47 and peekb(url + 16 + at) != 58 { let at = at + 1 }
+  let hostn = at - hs
+  let port = 80
+  if secure == 1 { let port = 443 }
+  if at < n and peekb(url + 16 + at) == 58 {
+    let at = at + 1
+    let port = 0
+    while at < n and peekb(url + 16 + at) != 47 {
+      let port = port * 10 + peekb(url + 16 + at) - 48
+      let at = at + 1
+    }
+  }
+  let path = rt_wstr(url, at, n - at)
+  if at >= n { let path = rt_wstr("/", 0, 1) }
+  let ses = wcallp(rt_proc("winhttp.dll", "WinHttpOpen"), rt_wstr("Pi/1", 0, 4), 0, 0, 0, 0)
+  if ses == 0 { return 0 }
+  let con = wcallp(rt_proc("winhttp.dll", "WinHttpConnect"), ses, rt_wstr(url, hs, hostn), port, 0)
+  let flags = 0
+  if secure == 1 { let flags = 8388608 }
+  let req = wcallp(rt_proc("winhttp.dll", "WinHttpOpenRequest"), con, rt_wstr("GET", 0, 3), path, 0, 0, 0, flags)
+  let ok = 0
+  if req != 0 { let ok = rt_u32(wcallp(rt_proc("winhttp.dll", "WinHttpSendRequest"), req, 0, 0, 0, 0, 0, 0)) }
+  if ok != 0 { let ok = rt_u32(wcallp(rt_proc("winhttp.dll", "WinHttpReceiveResponse"), req, 0)) }
+  let t = 0
+  if ok != 0 {
+    let cap = 65536
+    let buf = rt_alloc(cap)
+    let got = 0
+    let avail = rt_alloc(8)
+    let rd = rt_alloc(8)
+    let going = 1
+    while going == 1 {
+      do rt_zero(avail, 8)
+      do wcallp(rt_proc("winhttp.dll", "WinHttpQueryDataAvailable"), req, avail)
+      let k = rt_peek32(avail)
+      if k == 0 { let going = 0 } else {
+        if got + k > cap {
+          let nc = cap * 2
+          while got + k > nc { let nc = nc * 2 }
+          let nb = rt_alloc(nc)
+          for i in range(0, got) { do pokeb(nb + i, peekb(buf + i)) }
+          let buf = nb
+          let cap = nc
+        }
+        do rt_zero(rd, 8)
+        do wcallp(rt_proc("winhttp.dll", "WinHttpReadData"), req, buf + got, k, rd)
+        let r = rt_peek32(rd)
+        if r == 0 { let going = 0 }
+        let got = got + r
+      }
+    }
+    let t = rt_text_new(got)
+    for i in range(0, got) { do pokeb(t + 16 + i, peekb(buf + i)) }
+  }
+  if req != 0 { do wcallp(rt_proc("winhttp.dll", "WinHttpCloseHandle"), req) }
+  if con != 0 { do wcallp(rt_proc("winhttp.dll", "WinHttpCloseHandle"), con) }
+  do wcallp(rt_proc("winhttp.dll", "WinHttpCloseHandle"), ses)
+  return t
+}
+
+# ---- hardware: the SSD mapped into memory, a clock, the GPU -----------------------------------------------------
+# fmap(path): the whole file mapped into memory (the operating system pages it in from the SSD as it is touched)
+# -> [address, size] as integers, or null; fbyte(m, i): its i-th byte. Huge files without reading them in.
+skill rt_fmap(path) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 128, 0)
+  if h == 0 - 1 { return 0 }
+  let szp = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_proc("kernel32.dll", "GetFileSizeEx"), h, szp)
+  let size = peek(szp)
+  if size == 0 { return 0 }
+  let mp = wcallp(rt_proc("kernel32.dll", "CreateFileMappingA"), h, 0, 2, 0, 0, 0)
+  if mp == 0 { return 0 }
+  let base = wcallp(rt_proc("kernel32.dll", "MapViewOfFile"), mp, 4, 0, 0, 0)
+  if base == 0 { return 0 }
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(base))
+  return rt_append(out, rt_tag(size))
+}
+
+skill rt_fbyte(m, it) -> Any {
+  let base = rt_untag(peek(m + 16))
+  let size = rt_untag(peek(m + 24))
+  let i = rt_untag(it)
+  if i < 0 or i >= size { return 0 }
+  return rt_tag(peekb(base + i))
+}
+
+# ticks(): milliseconds since the machine started (for measuring)
+skill rt_ticks() -> Any { return rt_tag(wcallp(rt_proc("kernel32.dll", "GetTickCount64"))) }
+
+# microseconds from the performance counter (ticks() moves in ~15 ms steps, too coarse to time a kernel)
+skill rt_usec() -> Any {
+  let c = rt_zero(rt_alloc(8), 8)
+  let f = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_proc("kernel32.dll", "QueryPerformanceCounter"), c)
+  do wcallp(rt_proc("kernel32.dll", "QueryPerformanceFrequency"), f)
+  let fr = peek(f)
+  return rt_tag(peek(c) // fr * 1000000 + peek(c) % fr * 1000000 // fr)
+}
+
+# gpu_mm(A, B, n): C = A x B for n x n matrices of integers (arr, row by row), computed exactly in 32-bit integers on
+# the GPU through NVIDIA's driver (nvcuda.dll) with a kernel Pi wrote in PTX -- no CUDA toolkit. -> arr C, or the
+# driver's error code (a negative integer) if a step fails
+skill rt_ptx_mm() -> Any {
+  return ".version 6.0\n.target sm_50\n.address_size 64\n.visible .entry mm(.param .u64 pA, .param .u64 pB, .param .u64 pC, .param .u32 pn)\n{\n.reg .u32 %r<20>;\n.reg .u64 %rd<12>;\n.reg .pred %p<4>;\nld.param.u64 %rd1, [pA];\nld.param.u64 %rd2, [pB];\nld.param.u64 %rd3, [pC];\nld.param.u32 %r1, [pn];\ncvta.to.global.u64 %rd1, %rd1;\ncvta.to.global.u64 %rd2, %rd2;\ncvta.to.global.u64 %rd3, %rd3;\nmov.u32 %r2, %ctaid.y;\nmov.u32 %r3, %ntid.y;\nmov.u32 %r4, %tid.y;\nmad.lo.u32 %r5, %r2, %r3, %r4;\nmov.u32 %r6, %ctaid.x;\nmov.u32 %r7, %ntid.x;\nmov.u32 %r8, %tid.x;\nmad.lo.u32 %r9, %r6, %r7, %r8;\nsetp.ge.u32 %p1, %r5, %r1;\n@%p1 bra DONE;\nsetp.ge.u32 %p2, %r9, %r1;\n@%p2 bra DONE;\nmov.u32 %r10, 0;\nmov.u32 %r11, 0;\nLOOP:\nsetp.ge.u32 %p3, %r11, %r1;\n@%p3 bra STORE;\nmad.lo.u32 %r12, %r5, %r1, %r11;\nmul.wide.u32 %rd4, %r12, 4;\nadd.u64 %rd5, %rd1, %rd4;\nld.global.u32 %r13, [%rd5];\nmad.lo.u32 %r14, %r11, %r1, %r9;\nmul.wide.u32 %rd6, %r14, 4;\nadd.u64 %rd7, %rd2, %rd6;\nld.global.u32 %r15, [%rd7];\nmad.lo.u32 %r10, %r13, %r15, %r10;\nadd.u32 %r11, %r11, 1;\nbra LOOP;\nSTORE:\nmad.lo.u32 %r16, %r5, %r1, %r9;\nmul.wide.u32 %rd8, %r16, 4;\nadd.u64 %rd9, %rd3, %rd8;\nst.global.u32 [%rd9], %r10;\nDONE:\nret;\n}\n"
+}
+
+skill rt_cu(name) -> Any { return rt_proc("nvcuda.dll", name) }
+
+# the driver calls made per launch, per copy and per sync, each looked up once and kept in a global slot (8 .. 12):
+# LoadLibraryA + GetProcAddress cost microseconds, and a decode pass makes hundreds of these calls
+skill rt_cu8() -> Any {
+  if peek(gaddr(8)) == 0 { do poke(gaddr(8), rt_cu("cuLaunchKernel")) }
+  return peek(gaddr(8))
+}
+
+skill rt_cu9() -> Any {
+  if peek(gaddr(9)) == 0 { do poke(gaddr(9), rt_cu("cuGraphLaunch")) }
+  return peek(gaddr(9))
+}
+
+skill rt_cu10() -> Any {
+  if peek(gaddr(10)) == 0 { do poke(gaddr(10), rt_cu("cuCtxSynchronize")) }
+  return peek(gaddr(10))
+}
+
+skill rt_cu11() -> Any {
+  if peek(gaddr(11)) == 0 { do poke(gaddr(11), rt_cu("cuMemcpyHtoD_v2")) }
+  return peek(gaddr(11))
+}
+
+skill rt_cu12() -> Any {
+  if peek(gaddr(12)) == 0 { do poke(gaddr(12), rt_cu("cuMemcpyDtoH_v2")) }
+  return peek(gaddr(12))
+}
+
+
+skill rt_gpu_mm(a, b, nt) -> Any {
+  let n = rt_untag(nt)
+  let cells = n * n
+  let bytes = 4 * cells
+  if rt_cu("cuInit") == 0 { return rt_tag(0 - 1) }
+  let r = rt_u32(wcallp(rt_cu("cuInit"), 0))
+  if r != 0 { return rt_tag(0 - 100 - r) }
+  let dev = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuDeviceGet"), dev, 0)
+  let ctx = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuCtxCreate_v2"), ctx, 0, rt_peek32(dev)))
+  if r != 0 { return rt_tag(0 - 200 - r) }
+  let mod = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleLoadData"), mod, rt_cstr(rt_ptx_mm())))
+  if r != 0 { return rt_tag(0 - 300 - r) }
+  let kfn = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleGetFunction"), kfn, peek(mod), rt_cstr("mm")))
+  if r != 0 { return rt_tag(0 - 400 - r) }
+  # host buffers of 32-bit integers
+  let ha = rt_alloc(bytes)
+  let hb = rt_alloc(bytes)
+  let hc = rt_alloc(bytes)
+  for i in range(0, cells) {
+    do rt_poke32(ha + 4 * i, rt_untag(peek(a + 16 + 8 * i)))
+    do rt_poke32(hb + 4 * i, rt_untag(peek(b + 16 + 8 * i)))
+  }
+  let da = rt_zero(rt_alloc(8), 8)
+  let db = rt_zero(rt_alloc(8), 8)
+  let dc = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuMemAlloc_v2"), da, bytes)
+  do wcallp(rt_cu("cuMemAlloc_v2"), db, bytes)
+  do wcallp(rt_cu("cuMemAlloc_v2"), dc, bytes)
+  do wcallp(rt_cu11(), peek(da), ha, bytes)
+  do wcallp(rt_cu11(), peek(db), hb, bytes)
+  # the kernel's parameters: an array of pointers to each argument's value
+  let pn = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(pn, n)
+  let params = rt_alloc(32)
+  do poke(params, da)
+  do poke(params + 8, db)
+  do poke(params + 16, dc)
+  do poke(params + 24, pn)
+  let g = (n + 15) // 16
+  let r = rt_u32(wcallp(rt_cu8(), peek(kfn), g, g, 1, 16, 16, 1, 0, 0, params, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  let r = rt_u32(wcallp(rt_cu10()))
+  if r != 0 { return rt_tag(0 - 600 - r) }
+  do wcallp(rt_cu12(), hc, peek(dc), bytes)
+  do wcallp(rt_cu("cuMemFree_v2"), peek(da))
+  do wcallp(rt_cu("cuMemFree_v2"), peek(db))
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dc))
+  do wcallp(rt_cu("cuModuleUnload"), peek(mod))
+  do wcallp(rt_cu("cuCtxDestroy_v2"), peek(ctx))
+  let c = rt_arr(rt_tag(cells))
+  for i in range(0, cells) {
+    let v = rt_peek32(hc + 4 * i)
+    if v >= 2147483648 { let v = v - 4294967296 }
+    do poke(c + 16 + 8 * i, rt_tag(v))
+  }
+  return c
+}
+
+# gpu_seq(ptx, targets, S, L, B, N, M): run a Pi-written kernel "seqk" over N candidate programs (one GPU thread
+# each) against S target sequences of 12 terms (targets = S*12 integers, sent as 64-bit). The kernel writes a match
+# count, then (program, sequence) pairs. -> [count, p0, s0, p1, s1, ...] (at most M pairs), or a negative code.
+skill rt_gpu_seq(ptx, tg, st, lt, bt, nt, mt) -> Any {
+  let S = rt_untag(st)
+  let N = rt_untag(nt)
+  let M = rt_untag(mt)
+  if rt_cu("cuInit") == 0 { return rt_tag(0 - 1) }
+  let r = rt_u32(wcallp(rt_cu("cuInit"), 0))
+  if r != 0 { return rt_tag(0 - 100 - r) }
+  let dev = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuDeviceGet"), dev, 0)
+  let ctx = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuCtxCreate_v2"), ctx, 0, rt_peek32(dev)))
+  if r != 0 { return rt_tag(0 - 200 - r) }
+  let mod = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleLoadData"), mod, rt_cstr(ptx)))
+  if r != 0 { return rt_tag(0 - 300 - r) }
+  let kfn = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleGetFunction"), kfn, peek(mod), rt_cstr("seqk")))
+  if r != 0 { return rt_tag(0 - 400 - r) }
+  # the targets as 64-bit integers; the output: a 32-bit count then pairs
+  let tbytes = 8 * S * 12
+  let ht = rt_alloc(tbytes)
+  for i in range(0, S * 12) { do poke(ht + 8 * i, rt_untag(peek(tg + 16 + 8 * i))) }
+  # output: one 64-bit "best program" per sequence, all ones = none yet (the kernel keeps the minimum)
+  let obytes = 8 * S
+  let ho = rt_alloc(obytes)
+  for i in range(0, S) { do poke(ho + 8 * i, 0 - 1) }
+  let dt = rt_zero(rt_alloc(8), 8)
+  let dout = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuMemAlloc_v2"), dt, tbytes)
+  do wcallp(rt_cu("cuMemAlloc_v2"), dout, obytes)
+  do wcallp(rt_cu11(), peek(dt), ht, tbytes)
+  do wcallp(rt_cu11(), peek(dout), ho, obytes)
+  let vs = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vs, S)
+  let vl = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vl, rt_untag(lt))
+  let vb = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vb, rt_untag(bt))
+  let vn = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vn, N)
+  # the 7th argument is now the first program id of this launch (64-bit)
+  let vm = rt_zero(rt_alloc(8), 8)
+  do poke(vm, M)
+  let params = rt_alloc(56)
+  do poke(params, dt)
+  do poke(params + 8, vs)
+  do poke(params + 16, vl)
+  do poke(params + 24, vb)
+  do poke(params + 32, vn)
+  do poke(params + 40, dout)
+  do poke(params + 48, vm)
+  let g = (N + 255) // 256
+  let r = rt_u32(wcallp(rt_cu8(), peek(kfn), g, 1, 1, 256, 1, 1, 0, 0, params, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  let r = rt_u32(wcallp(rt_cu10()))
+  if r != 0 { return rt_tag(0 - 600 - r) }
+  do wcallp(rt_cu12(), ho, peek(dout), obytes)
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dt))
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dout))
+  do wcallp(rt_cu("cuModuleUnload"), peek(mod))
+  do wcallp(rt_cu("cuCtxDestroy_v2"), peek(ctx))
+  let c = rt_arr(rt_tag(S))
+  for i in range(0, S) {
+    let v = peek(ho + 8 * i)
+    if v < 0 { let v = 0 - 1 }
+    do poke(c + 16 + 8 * i, rt_tag(v))
+  }
+  return c
+}
+
+# ---- the GPU engine's runtime (called by name): one context for the whole process, GPU memory as integer handles,
+# files copied straight to the GPU, Pi-written kernels loaded and launched. Reals cross as doubles (their bits). -----
+skill rt_gpu_open() -> Any {
+  if rt_cu("cuInit") == 0 { return rt_tag(0 - 1) }
+  let r = rt_u32(wcallp(rt_cu("cuInit"), 0))
+  if r != 0 { return rt_tag(0 - 100 - r) }
+  let dev = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuDeviceGet"), dev, 0)
+  let ctx = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuCtxCreate_v2"), ctx, 0, rt_peek32(dev)))
+  if r != 0 { return rt_tag(0 - 200 - r) }
+  return rt_tag(1)
+}
+
+skill rt_gpu_alloc(nt) -> Any {
+  let d = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuMemAlloc_v2"), d, rt_untag(nt)))
+  if r != 0 { return rt_tag(0 - 700 - r) }
+  return rt_tag(peek(d))
+}
+
+# GPU memory back (a snapshot, a thought) -> 0 when it worked
+skill rt_gpu_free(dt) -> Any { return rt_tag(rt_u32(wcallp(rt_cu("cuMemFree_v2"), rt_untag(dt)))) }
+
+# bytes [off, off+n) of a file -> GPU memory at d, through one 64 MB host buffer
+skill rt_gpu_file(dt, path, offt, nt) -> Any {
+  let d = rt_untag(dt)
+  let off = rt_untag(offt)
+  let n = rt_untag(nt)
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 128, 0)
+  if h == 0 - 1 { return rt_tag(0 - 1) }
+  if rt_u32(wcall("SetFilePointerEx", h, off, 0, 0)) == 0 {
+    do wcall("CloseHandle", h)
+    return rt_tag(0 - 2)
+  }
+  let chunk = 67108864
+  # (a small copy takes a small buffer: these were 64 MB a call, and 64 MB copies of a 2 KB vector add up)
+  if n + 8 < chunk { let chunk = n + 8 }
+  let buf = rt_alloc(chunk)
+  let done = 0
+  while done < n {
+    let want = n - done
+    if want > chunk { let want = chunk }
+    do poke(gaddr(2), 0)
+    do wcall("ReadFile", h, buf, want, gaddr(2), 0)
+    let got = peek(gaddr(2)) % 4294967296
+    if got == 0 { let done = n } else {
+      do wcallp(rt_cu11(), d + done, buf, got)
+      let done = done + got
+    }
+  }
+  do wcall("CloseHandle", h)
+  return rt_tag(done)
+}
+
+# a file kept open for reading (others may read and write it too) -> its handle, or null
+skill rt_fopen_r(path) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 128, 0)
+  if h == 0 - 1 { return 0 }
+  return rt_tag(h)
+}
+
+# a file opened for overlapped reads (many at once, rt_read_batch) -> its handle, or null
+skill rt_fopen_ov(path) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 1073741824, 0)
+  if h == 0 - 1 { return 0 }
+  return rt_tag(h)
+}
+
+# the same with FILE_FLAG_RANDOM_ACCESS: Windows then reads no further ahead than asked (an expert's neighbour in the
+# file is rarely the next one needed) and keeps less of what nobody asked for in its file cache
+skill rt_fopen_ovr(path) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 1342177280, 0)
+  if h == 0 - 1 { return 0 }
+  return rt_tag(h)
+}
+
+# requests [file offset, bytes, buffer offset, gpu destination] read from the overlapped file h all at once into the
+# pinned buffer hb (an NVMe drive serves many reads in flight far faster than one at a time), each copied to the
+# GPU as it arrives -> the bytes moved
+skill rt_read_batch(ht, reqt, hbt) -> Any {
+  let h = rt_untag(ht)
+  let hb = rt_untag(hbt)
+  let nreq = peek(reqt + 8)
+  let ovs = rt_zero(rt_alloc(32 * nreq + 8), 32 * nreq + 8)
+  let fev = rt_proc("kernel32.dll", "CreateEventA")
+  let fres = rt_proc("kernel32.dll", "GetOverlappedResult")
+  let fclose = rt_proc("kernel32.dll", "CloseHandle")
+  let fread = rt_proc("kernel32.dll", "ReadFile")
+  for i in range(0, nreq) {
+    let rq = peek(reqt + 16 + 8 * i)
+    let off = rt_untag(peek(rq + 16))
+    let ov = ovs + 32 * i
+    do rt_poke32(ov + 16, off % 4294967296)
+    do rt_poke32(ov + 20, off // 4294967296)
+    do poke(ov + 24, wcallp(fev, 0, 1, 0, 0))
+    do wcallp(fread, h, hb + rt_untag(peek(rq + 32)), rt_untag(peek(rq + 24)), 0, ov)
+  }
+  let total = 0
+  let cnt = rt_alloc(8)
+  for i in range(0, nreq) {
+    let rq = peek(reqt + 16 + 8 * i)
+    let ov = ovs + 32 * i
+    do poke(cnt, 0)
+    do wcallp(fres, h, ov, cnt, 1)
+    let got = peek(cnt) % 4294967296
+    do wcallp(rt_cu11(), rt_untag(peek(rq + 40)), hb + rt_untag(peek(rq + 32)), got)
+    do wcallp(fclose, peek(ov + 24))
+    let total = total + got
+  }
+  return rt_tag(total)
+}
+
+# n bytes of page-locked host memory (fast copies to the GPU) -> its address, or -1
+skill rt_host_alloc(nt) -> Any {
+  let p = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuMemAllocHost_v2"), p, rt_untag(nt)))
+  if r != 0 { return rt_tag(0 - 1) }
+  return rt_tag(peek(p))
+}
+
+# a page-locked host buffer of n bytes that GPU kernels can address too -> [host address, device address], or null.
+# What a kernel writes there the host reads after a sync with no copy call (a small copy costs ~20 us of driver).
+skill rt_host_mapped(nt) -> Any {
+  let pp = rt_zero(rt_alloc(8), 8)
+  if rt_u32(wcallp(rt_cu("cuMemHostAlloc"), pp, rt_untag(nt), 3)) != 0 { return 0 }
+  let dp = rt_zero(rt_alloc(8), 8)
+  if rt_u32(wcallp(rt_cu("cuMemHostGetDevicePointer_v2"), dp, peek(pp), 0)) != 0 { return 0 }
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(peek(pp)))
+  return rt_append(out, rt_tag(peek(dp)))
+}
+
+# a 32-bit integer into host memory at h (a mapped word a kernel will read)
+skill rt_host_put32(ht, vt) -> Any {
+  do rt_poke32(rt_untag(ht), rt_untag(vt))
+  return vt
+}
+
+# n doubles at host address h (a mapped buffer, read after a sync) -> a list of reals
+skill rt_host_get(ht, nt) -> Any {
+  let h = rt_untag(ht)
+  let n = rt_untag(nt)
+  let l = rt_list_new(n)
+  for i in range(0, n) { do poke(l + 16 + 8 * i, rt_mkreal(peek(h + 8 * i))) }
+  return l
+}
+
+# integers xs as raw 8-byte words through the page-locked host buffer h to GPU memory at d, queued on stream st
+# (the host does not wait; h must not be reused until the stream has passed this copy)
+skill rt_gpu_put_u64_async(dt, xs, ht, st) -> Any {
+  let n = peek(xs + 8)
+  let h = rt_untag(ht)
+  for i in range(0, n) { do poke(h + 8 * i, rt_untag(peek(xs + 16 + 8 * i))) }
+  if peek(gaddr(13)) == 0 { do poke(gaddr(13), rt_cu("cuMemcpyHtoDAsync_v2")) }
+  let r = rt_u32(wcallp(peek(gaddr(13)), rt_untag(dt), h, 8 * n, rt_untag(st)))
+  if r != 0 { return rt_tag(0 - 1400 - r) }
+  return rt_tag(n)
+}
+
+# host <-> GPU copies of n bytes, a page-locked buffer's free, and a host buffer to / from a file (the brain keeps its
+# state snapshots in host memory: the VRAM they took is the experts' cache)
+skill rt_gpu_to_host(ht, dt, nt) -> Any { return rt_tag(rt_u32(wcallp(rt_cu12(), rt_untag(ht), rt_untag(dt), rt_untag(nt)))) }
+skill rt_host_to_gpu(dt, ht, nt) -> Any { return rt_tag(rt_u32(wcallp(rt_cu11(), rt_untag(dt), rt_untag(ht), rt_untag(nt)))) }
+skill rt_host_free(ht) -> Any { return rt_tag(rt_u32(wcallp(rt_cu("cuMemFreeHost"), rt_untag(ht)))) }
+
+skill rt_host_dump(ht, nt, path) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 { return rt_tag(0) }
+  let p = rt_untag(ht)
+  let n = rt_untag(nt)
+  let done = 0
+  while done < n {
+    let want = n - done
+    if want > 1073741824 { let want = 1073741824 }
+    do poke(gaddr(2), 0)
+    do wcall("WriteFile", h, p + done, want, gaddr(2), 0)
+    let got = peek(gaddr(2)) % 4294967296
+    if got == 0 { let done = n + 1 } else { let done = done + got }
+  }
+  do wcall("CloseHandle", h)
+  return rt_tag(done)
+}
+
+# n bytes of the file into host memory at h -> the bytes read
+skill rt_host_load(ht, path, nt) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 128, 0)
+  if h == 0 - 1 { return rt_tag(0) }
+  let p = rt_untag(ht)
+  let n = rt_untag(nt)
+  let done = 0
+  let stop = 0
+  while done < n and stop == 0 {
+    let want = n - done
+    if want > 1073741824 { let want = 1073741824 }
+    do poke(gaddr(2), 0)
+    do wcall("ReadFile", h, p + done, want, gaddr(2), 0)
+    let got = peek(gaddr(2)) % 4294967296
+    if got == 0 { let stop = 1 } else { let done = done + got }
+  }
+  do wcall("CloseHandle", h)
+  return rt_tag(done)
+}
+
+# n bytes at off of the open file h -> GPU memory at d, through the host buffer hb (cap bytes) -> the bytes moved
+skill rt_gpu_fread(dt, ht, offt, nt, hbt, capt) -> Any {
+  let d = rt_untag(dt)
+  let h = rt_untag(ht)
+  let n = rt_untag(nt)
+  let hb = rt_untag(hbt)
+  let cap = rt_untag(capt)
+  if rt_u32(wcall("SetFilePointerEx", h, rt_untag(offt), 0, 0)) == 0 { return rt_tag(0 - 2) }
+  let done = 0
+  while done < n {
+    let want = n - done
+    if want > cap { let want = cap }
+    do poke(gaddr(2), 0)
+    do wcall("ReadFile", h, hb, want, gaddr(2), 0)
+    let got = peek(gaddr(2)) % 4294967296
+    if got == 0 { return rt_tag(done) }
+    do wcallp(rt_cu11(), d + done, hb, got)
+    let done = done + got
+  }
+  return rt_tag(done)
+}
+
+# n bytes of GPU memory from s to d (on the GPU, no host copy)
+skill rt_gpu_copy(dt, st, nt) -> Any {
+  if rt_untag(nt) <= 0 { return rt_tag(0) }
+  let r = rt_u32(wcallp(rt_cu("cuMemcpyDtoD_v2"), rt_untag(dt), rt_untag(st), rt_untag(nt)))
+  if r != 0 { return rt_tag(0 - 1400 - r) }
+  return rt_tag(0)
+}
+
+# n bytes of GPU memory at d set to zero
+skill rt_gpu_zero(dt, nt) -> Any {
+  let r = rt_u32(wcallp(rt_cu("cuMemsetD8_v2"), rt_untag(dt), 0, rt_untag(nt)))
+  if r != 0 { return rt_tag(0 - 800 - r) }
+  return rt_tag(0)
+}
+
+# n bytes of GPU memory at d -> a file (raw), through one 64 MB host buffer; -> the bytes written
+skill rt_gpu_dump(dt, nt, path) -> Any {
+  let d = rt_untag(dt)
+  let n = rt_untag(nt)
+  let h = wcall("CreateFileA", rt_cstr(path), 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 { return rt_tag(0 - 1) }
+  let chunk = 67108864
+  # (a small copy takes a small buffer: these were 64 MB a call, and 64 MB copies of a 2 KB vector add up)
+  if n + 8 < chunk { let chunk = n + 8 }
+  let buf = rt_alloc(chunk)
+  let done = 0
+  while done < n {
+    let want = n - done
+    if want > chunk { let want = chunk }
+    do wcallp(rt_cu12(), buf, d + done, want)
+    do poke(gaddr(2), 0)
+    do wcall("WriteFile", h, buf, want, gaddr(2), 0)
+    let done = done + want
+  }
+  do wcall("CloseHandle", h)
+  return rt_tag(done)
+}
+
+# a list of numbers -> doubles in GPU memory at d
+skill rt_gpu_put(dt, xs) -> Any {
+  let n = peek(xs + 8)
+  let hb = rt_alloc(8 * n + 8)
+  for i in range(0, n) { do poke(hb + 8 * i, rt_realbits(peek(xs + 16 + 8 * i))) }
+  do wcallp(rt_cu11(), rt_untag(dt), hb, 8 * n)
+  return rt_tag(n)
+}
+
+# a list of integers -> raw 8-byte words in GPU memory at d (addresses, indices: not converted to doubles)
+skill rt_gpu_put_u64(dt, xs) -> Any {
+  let n = peek(xs + 8)
+  let hb = rt_alloc(8 * n + 8)
+  for i in range(0, n) { do poke(hb + 8 * i, rt_untag(peek(xs + 16 + 8 * i))) }
+  do wcallp(rt_cu11(), rt_untag(dt), hb, 8 * n)
+  return rt_tag(n)
+}
+
+# move(src, dst): a file renamed / moved (replacing dst) -> true when it worked. Pi deletes nothing: what it no
+# longer wants is moved aside.
+skill rt_move(st, dt) -> Any {
+  let r = wcallp(rt_proc("kernel32.dll", "MoveFileExA"), rt_cstr(st), rt_cstr(dt), 1)
+  if rt_u32(r) == 0 { return rt_tag(0) }
+  return rt_tag(1)
+}
+
+# gather_put(d, base, offs, nb): the nb bytes at base + each offset of offs (a mapped file: no file is opened), side by
+# side in one host buffer, copied to the GPU at d in one go -> the bytes copied
+skill rt_gather_put(dt, bt, offs, nbt) -> Any {
+  let d = rt_untag(dt)
+  let base = rt_untag(bt)
+  let nb = rt_untag(nbt)
+  let n = peek(offs + 8)
+  let hb = rt_alloc(n * nb + 8)
+  for i in range(0, n) {
+    let src = base + rt_untag(peek(offs + 16 + 8 * i))
+    let dst = hb + i * nb
+    for j in range(0, nb) { do pokeb(dst + j, peekb(src + j)) }
+  }
+  do wcallp(rt_cu11(), d, hb, n * nb)
+  return rt_tag(n * nb)
+}
+
+# n doubles from GPU memory at d -> a list of reals
+skill rt_gpu_get(dt, nt) -> Any {
+  let n = rt_untag(nt)
+  let hb = rt_alloc(8 * n + 8)
+  do wcallp(rt_cu12(), hb, rt_untag(dt), 8 * n)
+  let l = rt_list_new(n)
+  for i in range(0, n) { do poke(l + 16 + 8 * i, rt_mkreal(peek(hb + 8 * i))) }
+  return l
+}
+
+skill rt_gpu_module(ptx) -> Any {
+  let mod = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleLoadData"), mod, rt_cstr(ptx)))
+  if r != 0 { return rt_tag(0 - 300 - r) }
+  return rt_tag(peek(mod))
+}
+
+skill rt_gpu_fn(mt, name) -> Any {
+  let f = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleGetFunction"), f, rt_untag(mt), rt_cstr(name)))
+  if r != 0 { return rt_tag(0 - 400 - r) }
+  return rt_tag(peek(f))
+}
+
+# launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
+# parameter reads its low half)
+skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
+  let n = peek(ps + 8)
+  let cells = rt_alloc(8 * n + 8)
+  let ptrs = rt_alloc(8 * n + 8)
+  for i in range(0, n) {
+    do poke(cells + 8 * i, rt_untag(peek(ps + 16 + 8 * i)))
+    do poke(ptrs + 8 * i, cells + 8 * i)
+  }
+  let r = rt_u32(wcallp(rt_cu8(), rt_untag(ft), rt_untag(gxt), 1, 1, rt_untag(bxt), 1, 1, 0, 0, ptrs, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  let r = rt_u32(wcallp(rt_cu10()))
+  if r != 0 { return rt_tag(0 - 600 - r) }
+  return rt_tag(0)
+}
+
+# the same launch without waiting for it: kernels queue up in order on the GPU; rt_gpu_get (or rt_gpu_sync) waits
+skill rt_gpu_go(ft, gxt, bxt, ps) -> Any {
+  let n = peek(ps + 8)
+  let cells = rt_alloc(8 * n + 8)
+  let ptrs = rt_alloc(8 * n + 8)
+  for i in range(0, n) {
+    do poke(cells + 8 * i, rt_untag(peek(ps + 16 + 8 * i)))
+    do poke(ptrs + 8 * i, cells + 8 * i)
+  }
+  let r = rt_u32(wcallp(rt_cu8(), rt_untag(ft), rt_untag(gxt), 1, 1, rt_untag(bxt), 1, 1, 0, 0, ptrs, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  return rt_tag(0)
+}
+
+# the same on a given stream (0 = the default one)
+skill rt_gpu_gos(ft, gxt, bxt, ps, st) -> Any {
+  let n = peek(ps + 8)
+  let cells = rt_alloc(8 * n + 8)
+  let ptrs = rt_alloc(8 * n + 8)
+  for i in range(0, n) {
+    do poke(cells + 8 * i, rt_untag(peek(ps + 16 + 8 * i)))
+    do poke(ptrs + 8 * i, cells + 8 * i)
+  }
+  let r = rt_u32(wcallp(rt_cu8(), rt_untag(ft), rt_untag(gxt), 1, 1, rt_untag(bxt), 1, 1, 0, rt_untag(st), ptrs, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  return rt_tag(0)
+}
+
+# the same with sm bytes of dynamic shared memory (a kernel's .extern .shared array, sized per launch)
+skill rt_gpu_gosm(ft, gxt, bxt, ps, st, smt) -> Any {
+  let n = peek(ps + 8)
+  let cells = rt_alloc(8 * n + 8)
+  let ptrs = rt_alloc(8 * n + 8)
+  for i in range(0, n) {
+    do poke(cells + 8 * i, rt_untag(peek(ps + 16 + 8 * i)))
+    do poke(ptrs + 8 * i, cells + 8 * i)
+  }
+  let r = rt_u32(wcallp(rt_cu8(), rt_untag(ft), rt_untag(gxt), 1, 1, rt_untag(bxt), 1, 1, rt_untag(smt), rt_untag(st), ptrs, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  return rt_tag(0)
+}
+
+# console_utf8(): the console reads and writes UTF-8 (Windows consoles default to an old code page, which showed
+# Pi's em dashes and emoji as "ΓÇö" and "≡ƒæï") -> true when it took
+skill rt_console_utf8() -> Any {
+  let a = wcallp(rt_proc("kernel32.dll", "SetConsoleOutputCP"), 65001)
+  do wcallp(rt_proc("kernel32.dll", "SetConsoleCP"), 65001)
+  if rt_u32(a) == 0 { return rt_tag(0) }
+  return rt_tag(1)
+}
+
+# text added to the end of a file (made if absent), written at once -> true when it took: a log survives a crash
+skill rt_append_file(path, data) -> Any {
+  let s = rt_str(data)
+  let h = wcall("CreateFileA", rt_cstr(path), 4, 3, 0, 4, 128, 0)
+  if h == 0 - 1 { return rt_tag(0) }
+  do wcall("WriteFile", h, s + 16, peek(s + 8), gaddr(2), 0)
+  do wcall("CloseHandle", h)
+  return rt_tag(1)
+}
+
+# a file's size in bytes (0 if it cannot be opened)
+skill rt_file_size(path) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 128, 0)
+  if h == 0 - 1 { return rt_tag(0) }
+  let p = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_proc("kernel32.dll", "GetFileSizeEx"), h, p)
+  do wcall("CloseHandle", h)
+  return rt_tag(peek(p))
+}
+
+# the local time -> [year, month, day, hour, minute, second]
+skill rt_now() -> Any {
+  let t = rt_zero(rt_alloc(16), 16)
+  do wcallp(rt_proc("kernel32.dll", "GetLocalTime"), t)
+  let out = rt_list_new(6)
+  do poke(out + 16, rt_tag(peekb(t) + 256 * peekb(t + 1)))
+  do poke(out + 24, rt_tag(peekb(t + 2) + 256 * peekb(t + 3)))
+  do poke(out + 32, rt_tag(peekb(t + 6) + 256 * peekb(t + 7)))
+  do poke(out + 40, rt_tag(peekb(t + 8) + 256 * peekb(t + 9)))
+  do poke(out + 48, rt_tag(peekb(t + 10) + 256 * peekb(t + 11)))
+  do poke(out + 56, rt_tag(peekb(t + 12) + 256 * peekb(t + 13)))
+  return out
+}
+
+# a process handle's id
+skill rt_pid(ht) -> Any { return rt_tag(rt_u32(wcallp(rt_proc("kernel32.dll", "GetProcessId"), rt_untag(ht)))) }
+
+# the GPU's memory -> [free bytes, total bytes]
+skill rt_gpu_meminfo() -> Any {
+  let f = rt_zero(rt_alloc(8), 8)
+  let t = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuMemGetInfo_v2"), f, t)
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(peek(f)))
+  return rt_append(out, rt_tag(peek(t)))
+}
+
+# events: a point in a stream the host can wait for (recorded inside a capture, it becomes a node of the graph)
+skill rt_gpu_event() -> Any {
+  let e = rt_zero(rt_alloc(8), 8)
+  if rt_u32(wcallp(rt_cu("cuEventCreate"), e, 2)) != 0 { return rt_tag(0 - 1) }
+  return rt_tag(peek(e))
+}
+
+# (with CU_EVENT_RECORD_EXTERNAL: inside a capture a plain record only joins streams; this one becomes a node the host
+# can wait on each time the graph runs)
+skill rt_gpu_event_record(et, st) -> Any {
+  if peek(gaddr(14)) == 0 { do poke(gaddr(14), rt_cu("cuEventRecordWithFlags")) }
+  return rt_tag(rt_u32(wcallp(peek(gaddr(14)), rt_untag(et), rt_untag(st), 1)))
+}
+
+skill rt_gpu_event_wait(et) -> Any {
+  if peek(gaddr(15)) == 0 { do poke(gaddr(15), rt_cu("cuEventSynchronize")) }
+  return rt_tag(rt_u32(wcallp(peek(gaddr(15)), rt_untag(et))))
+}
+
+# graphs: a stream's launches recorded once (capture), then replayed whole with one call per use. The stream is a
+# blocking one, so it stays in order with copies made on the default stream.
+skill rt_gpu_stream() -> Any {
+  let s = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuStreamCreate"), s, 0))
+  if r != 0 { return rt_tag(0 - 900 - r) }
+  return rt_tag(peek(s))
+}
+
+skill rt_gpu_capture(st) -> Any {
+  let r = rt_u32(wcallp(rt_cu("cuStreamBeginCapture_v2"), rt_untag(st), 2))
+  if r != 0 { return rt_tag(0 - 1000 - r) }
+  return rt_tag(0)
+}
+
+skill rt_gpu_capture_end(st) -> Any {
+  let g = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuStreamEndCapture"), rt_untag(st), g))
+  if r != 0 { return rt_tag(0 - 1100 - r) }
+  let e = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuGraphInstantiateWithFlags"), e, peek(g), 0))
+  if r != 0 { return rt_tag(0 - 1200 - r) }
+  return rt_tag(peek(e))
+}
+
+skill rt_gpu_graph_go(et, st) -> Any {
+  let r = rt_u32(wcallp(rt_cu9(), rt_untag(et), rt_untag(st)))
+  if r != 0 { return rt_tag(0 - 1300 - r) }
+  return rt_tag(0)
+}
+
+skill rt_gpu_sync() -> Any {
+  let r = rt_u32(wcallp(rt_cu10()))
+  if r != 0 { return rt_tag(0 - 600 - r) }
+  return rt_tag(0)
+}
+
+# rt_gpu_dotmax(ptx, A, B, m, n, k, chunks): rows of A (m x k) against rows of B (n x k), integers sent as 32-bit and
+# multiplied as floats on the GPU (kernel "dotmax", Pi-written); for every row of A and every chunk of B's rows, the
+# best dot product and which row of B gave it -> an array of m * chunks * 2 integers [best, index]. Called by name.
+skill rt_gpu_dotmax(ptx, at, bt, mt, nt, kt, ct) -> Any {
+  let m = rt_untag(mt)
+  let n = rt_untag(nt)
+  let k = rt_untag(kt)
+  let c = rt_untag(ct)
+  if rt_cu("cuInit") == 0 { return rt_tag(0 - 1) }
+  let r = rt_u32(wcallp(rt_cu("cuInit"), 0))
+  if r != 0 { return rt_tag(0 - 100 - r) }
+  let dev = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuDeviceGet"), dev, 0)
+  let ctx = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuCtxCreate_v2"), ctx, 0, rt_peek32(dev)))
+  if r != 0 { return rt_tag(0 - 200 - r) }
+  let mod = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleLoadData"), mod, rt_cstr(ptx)))
+  if r != 0 { return rt_tag(0 - 300 - r) }
+  let kfn = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleGetFunction"), kfn, peek(mod), rt_cstr("dotmax")))
+  if r != 0 { return rt_tag(0 - 400 - r) }
+  let ab = 4 * m * k
+  let bb = 4 * n * k
+  let ob = 16 * m * c
+  let ha = rt_alloc(ab)
+  for i in range(0, m * k) { do rt_poke32(ha + 4 * i, rt_untag(peek(at + 16 + 8 * i))) }
+  let hb = rt_alloc(bb)
+  for i in range(0, n * k) { do rt_poke32(hb + 4 * i, rt_untag(peek(bt + 16 + 8 * i))) }
+  let da = rt_zero(rt_alloc(8), 8)
+  let db = rt_zero(rt_alloc(8), 8)
+  let dout = rt_zero(rt_alloc(8), 8)
+  let r1 = rt_u32(wcallp(rt_cu("cuMemAlloc_v2"), da, ab))
+  let r2 = rt_u32(wcallp(rt_cu("cuMemAlloc_v2"), db, bb))
+  let r3 = rt_u32(wcallp(rt_cu("cuMemAlloc_v2"), dout, ob))
+  if r1 + r2 + r3 != 0 { return rt_tag(0 - 700) }
+  do wcallp(rt_cu11(), peek(da), ha, ab)
+  do wcallp(rt_cu11(), peek(db), hb, bb)
+  let vm = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vm, m)
+  let vn = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vn, n)
+  let vk = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vk, k)
+  let vc = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vc, c)
+  let params = rt_alloc(56)
+  do poke(params, da)
+  do poke(params + 8, db)
+  do poke(params + 16, dout)
+  do poke(params + 24, vm)
+  do poke(params + 32, vn)
+  do poke(params + 40, vk)
+  do poke(params + 48, vc)
+  let g = (m * c + 255) // 256
+  let r = rt_u32(wcallp(rt_cu8(), peek(kfn), g, 1, 1, 256, 1, 1, 0, 0, params, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  let r = rt_u32(wcallp(rt_cu10()))
+  if r != 0 { return rt_tag(0 - 600 - r) }
+  let ho = rt_alloc(ob)
+  do wcallp(rt_cu12(), ho, peek(dout), ob)
+  do wcallp(rt_cu("cuMemFree_v2"), peek(da))
+  do wcallp(rt_cu("cuMemFree_v2"), peek(db))
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dout))
+  do wcallp(rt_cu("cuModuleUnload"), peek(mod))
+  do wcallp(rt_cu("cuCtxDestroy_v2"), peek(ctx))
+  let res = rt_arr(rt_tag(2 * m * c))
+  for i in range(0, 2 * m * c) { do poke(res + 16 + 8 * i, rt_tag(peek(ho + 8 * i))) }
+  return res
+}
+
+# rt_gpu_seqw(ptx, targets, S, L, B, N, first id, words): as gpu_seq, with Pi's learned words for the kernel "seqw"
+# (words = an integer table, 18 per word: arity, length, 16 tokens), sent as 32-bit integers. Called by name.
+skill rt_gpu_seqw(ptx, tg, st, lt, bt, nt, mt, wt) -> Any {
+  let S = rt_untag(st)
+  let N = rt_untag(nt)
+  if rt_cu("cuInit") == 0 { return rt_tag(0 - 1) }
+  let r = rt_u32(wcallp(rt_cu("cuInit"), 0))
+  if r != 0 { return rt_tag(0 - 100 - r) }
+  let dev = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuDeviceGet"), dev, 0)
+  let ctx = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuCtxCreate_v2"), ctx, 0, rt_peek32(dev)))
+  if r != 0 { return rt_tag(0 - 200 - r) }
+  let mod = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleLoadData"), mod, rt_cstr(ptx)))
+  if r != 0 { return rt_tag(0 - 300 - r) }
+  let kfn = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleGetFunction"), kfn, peek(mod), rt_cstr("seqw")))
+  if r != 0 { return rt_tag(0 - 400 - r) }
+  let tbytes = 8 * S * 12
+  let ht = rt_alloc(tbytes)
+  for i in range(0, S * 12) { do poke(ht + 8 * i, rt_untag(peek(tg + 16 + 8 * i))) }
+  let obytes = 8 * S
+  let ho = rt_alloc(obytes)
+  for i in range(0, S) { do poke(ho + 8 * i, 0 - 1) }
+  let nw = peek(wt + 8)
+  let wbytes = 4 * nw + 8
+  let hw = rt_zero(rt_alloc(wbytes), wbytes)
+  for i in range(0, nw) { do rt_poke32(hw + 4 * i, rt_untag(peek(wt + 16 + 8 * i))) }
+  let dt = rt_zero(rt_alloc(8), 8)
+  let dout = rt_zero(rt_alloc(8), 8)
+  let dw = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuMemAlloc_v2"), dt, tbytes)
+  do wcallp(rt_cu("cuMemAlloc_v2"), dout, obytes)
+  do wcallp(rt_cu("cuMemAlloc_v2"), dw, wbytes)
+  do wcallp(rt_cu11(), peek(dt), ht, tbytes)
+  do wcallp(rt_cu11(), peek(dout), ho, obytes)
+  do wcallp(rt_cu11(), peek(dw), hw, wbytes)
+  let vs = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vs, S)
+  let vl = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vl, rt_untag(lt))
+  let vb = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vb, rt_untag(bt))
+  let vn = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vn, N)
+  let vm = rt_zero(rt_alloc(8), 8)
+  do poke(vm, rt_untag(mt))
+  let params = rt_alloc(64)
+  do poke(params, dt)
+  do poke(params + 8, vs)
+  do poke(params + 16, vl)
+  do poke(params + 24, vb)
+  do poke(params + 32, vn)
+  do poke(params + 40, dout)
+  do poke(params + 48, vm)
+  do poke(params + 56, dw)
+  let g = (N + 255) // 256
+  let r = rt_u32(wcallp(rt_cu8(), peek(kfn), g, 1, 1, 256, 1, 1, 0, 0, params, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  let r = rt_u32(wcallp(rt_cu10()))
+  if r != 0 { return rt_tag(0 - 600 - r) }
+  do wcallp(rt_cu12(), ho, peek(dout), obytes)
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dt))
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dout))
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dw))
+  do wcallp(rt_cu("cuModuleUnload"), peek(mod))
+  do wcallp(rt_cu("cuCtxDestroy_v2"), peek(ctx))
+  let c = rt_arr(rt_tag(S))
+  for i in range(0, S) {
+    let v = peek(ho + 8 * i)
+    if v < 0 { let v = 0 - 1 }
+    do poke(c + 16 + 8 * i, rt_tag(v))
+  }
+  return c
+}
+
+# ---- gpu for (pic compiles the body to integer bytecode; here it becomes PTX, then one GPU thread per item) --------
+skill gpu_map(code, xs, a, n, caps, nvars, vid) -> Any {
+  if n <= 0 { return arr(0) }
+  # called by its runtime name (the builtin "gpu_run" is unknown to an older seed compiler)
+  return rt_gpu_run(gpu_ptx(code, nvars, vid), xs, a, n, caps)
+}
+
+skill gpu_reg(k) -> Any { return "%s" ++ str(k) }
+
+# one expression (postfix) up to the stop code -> [instructions, position after the stop]; the value ends in %s0
+skill gpu_pexpr(code, p, stop) -> Any {
+  let parts = []
+  let sp = 0
+  let q = p
+  while code[q] != stop {
+    let t = code[q]
+    if t == 2 or t == 3 or t == 4 {
+      let d = gpu_reg(sp)
+      if t == 2 { let parts = parts ++ ["mov.s64 " ++ d ++ ", %w" ++ str(code[q + 1]) ++ ";"] }
+      if t == 3 { let parts = parts ++ ["mov.s64 " ++ d ++ ", " ++ str(code[q + 1]) ++ ";"] }
+      if t == 4 { let parts = parts ++ ["ld.global.s64 " ++ d ++ ", [%a6+" ++ str(8 * code[q + 1]) ++ "];"] }
+      let sp = sp + 1
+      let q = q + 2
+    } else {
+      if t >= 30 {
+        let a = gpu_reg(sp - 1)
+        if t == 30 { let parts = parts ++ ["abs.s64 " ++ a ++ ", " ++ a ++ ";"] }
+        if t == 31 { let parts = parts ++ ["neg.s64 " ++ a ++ ", " ++ a ++ ";"] }
+        if t == 32 { let parts = parts ++ ["setp.eq.s64 %p3, " ++ a ++ ", 0;", "selp.s64 " ++ a ++ ", 1, 0, %p3;"] }
+      } else {
+        let a = gpu_reg(sp - 2)
+        let b = gpu_reg(sp - 1)
+        if t == 10 { let parts = parts ++ ["add.s64 " ++ a ++ ", " ++ a ++ ", " ++ b ++ ";"] }
+        if t == 11 { let parts = parts ++ ["sub.s64 " ++ a ++ ", " ++ a ++ ", " ++ b ++ ";"] }
+        if t == 12 { let parts = parts ++ ["mul.lo.s64 " ++ a ++ ", " ++ a ++ ", " ++ b ++ ";"] }
+        if t == 13 or t == 14 {
+          # floor division / modulo as in Pi; by zero -> 0
+          let parts = parts ++ ["setp.eq.s64 %p3, " ++ b ++ ", 0;", "@%p3 mov.s64 " ++ b ++ ", 1;", "div.s64 %t3, " ++ a ++ ", " ++ b ++ ";", "rem.s64 %t4, " ++ a ++ ", " ++ b ++ ";"]
+          let parts = parts ++ ["setp.ne.s64 %p4, %t4, 0;", "xor.b64 %t5, %t4, " ++ b ++ ";", "setp.lt.s64 %p5, %t5, 0;", "and.pred %p6, %p4, %p5;", "@%p6 sub.s64 %t3, %t3, 1;", "@%p6 add.s64 %t4, %t4, " ++ b ++ ";"]
+          if t == 13 { let parts = parts ++ ["mov.s64 " ++ a ++ ", %t3;"] } else { let parts = parts ++ ["mov.s64 " ++ a ++ ", %t4;"] }
+          let parts = parts ++ ["@%p3 mov.s64 " ++ a ++ ", 0;"]
+        }
+        if t >= 15 and t <= 20 {
+          let cmp = ["lt", "le", "gt", "ge", "eq", "ne"][t - 15]
+          let parts = parts ++ ["setp." ++ cmp ++ ".s64 %p3, " ++ a ++ ", " ++ b ++ ";", "selp.s64 " ++ a ++ ", 1, 0, %p3;"]
+        }
+        if t == 21 { let parts = parts ++ ["min.s64 " ++ a ++ ", " ++ a ++ ", " ++ b ++ ";"] }
+        if t == 22 { let parts = parts ++ ["max.s64 " ++ a ++ ", " ++ a ++ ", " ++ b ++ ";"] }
+        if t == 23 or t == 24 {
+          let op = "and"
+          if t == 24 { let op = "or" }
+          let parts = parts ++ ["setp.ne.s64 %p3, " ++ a ++ ", 0;", "setp.ne.s64 %p4, " ++ b ++ ", 0;", op ++ ".pred %p5, %p3, %p4;", "selp.s64 " ++ a ++ ", 1, 0, %p5;"]
+        }
+        let sp = sp - 1
+      }
+      let q = q + 1
+    }
+  }
+  return [join(parts, "\n"), q + 1]
+}
+
+# statements up to an end code (197 or 196) or the end -> [instructions, position, label counter]
+skill gpu_pstmts(code, p, lab) -> Any {
+  let parts = []
+  let q = p
+  let lb = lab
+  while q < len(code) and code[q] != 197 and code[q] != 196 {
+    let t = code[q]
+    if t == 100 {
+      let r = gpu_pexpr(code, q + 2, 199)
+      let parts = parts ++ [r[0], "mov.s64 %w" ++ str(code[q + 1]) ++ ", %s0;"]
+      let q = r[1]
+    }
+    if t == 101 {
+      let n = lb
+      let lb = lb + 1
+      let rc = gpu_pexpr(code, q + 1, 198)
+      let rb = gpu_pstmts(code, rc[1], lb)
+      let lb = rb[2]
+      let parts = parts ++ ["W" ++ str(n) ++ ":", rc[0], "setp.eq.s64 %p7, %s0, 0;", "@%p7 bra E" ++ str(n) ++ ";", rb[0], "bra W" ++ str(n) ++ ";", "E" ++ str(n) ++ ":"]
+      let q = rb[1] + 1
+    }
+    if t == 102 {
+      let n = lb
+      let lb = lb + 1
+      let rc = gpu_pexpr(code, q + 1, 198)
+      let rt = gpu_pstmts(code, rc[1], lb)
+      let re = gpu_pstmts(code, rt[1] + 1, rt[2])
+      let lb = re[2]
+      let parts = parts ++ [rc[0], "setp.eq.s64 %p7, %s0, 0;", "@%p7 bra F" ++ str(n) ++ ";", rt[0], "bra G" ++ str(n) ++ ";", "F" ++ str(n) ++ ":", re[0], "G" ++ str(n) ++ ":"]
+      let q = re[1] + 1
+    }
+  }
+  return [join(parts, "\n"), q, lb]
+}
+
+# the whole kernel "gmap": x = xs[i] (or a + i), the body, out[i] = the result variable
+skill gpu_ptx(code, nvars, vid) -> Any {
+  let k = ".version 6.0\n.target sm_50\n.address_size 64\n.visible .entry gmap(.param .u64 pX, .param .u64 pY, .param .u32 pN, .param .s64 pA, .param .u64 pC)\n{\n"
+  let k = k ++ ".reg .pred %p<8>;\n.reg .u32 %r<8>;\n.reg .u64 %a<12>;\n.reg .s64 %t<12>;\n.reg .s64 %s<48>;\n.reg .s64 %w<" ++ str(nvars + 1) ++ ">;\n"
+  let k = k ++ "mov.u32 %r1, %ctaid.x;\nmov.u32 %r2, %ntid.x;\nmov.u32 %r3, %tid.x;\nmad.lo.u32 %r4, %r1, %r2, %r3;\nld.param.u32 %r5, [pN];\nsetp.ge.u32 %p1, %r4, %r5;\n@%p1 bra DONE;\n"
+  let k = k ++ "cvt.u64.u32 %a3, %r4;\nld.param.s64 %t1, [pA];\ncvt.s64.u32 %t2, %r4;\nadd.s64 %w0, %t1, %t2;\n"
+  let k = k ++ "ld.param.u64 %a1, [pX];\nsetp.eq.u64 %p2, %a1, 0;\n@%p2 bra HAVEX;\ncvta.to.global.u64 %a1, %a1;\nshl.b64 %a4, %a3, 3;\nadd.u64 %a5, %a1, %a4;\nld.global.s64 %w0, [%a5];\nHAVEX:\n"
+  let k = k ++ "ld.param.u64 %a6, [pC];\ncvta.to.global.u64 %a6, %a6;\n"
+  for j in range(1, nvars) { let k = k ++ "mov.s64 %w" ++ str(j) ++ ", 0;\n" }
+  let k = k ++ gpu_pstmts(code, 0, 0)[0] ++ "\n"
+  let k = k ++ "ld.param.u64 %a7, [pY];\ncvta.to.global.u64 %a7, %a7;\nshl.b64 %a8, %a3, 3;\nadd.u64 %a9, %a7, %a8;\nst.global.s64 [%a9], %w" ++ str(vid) ++ ";\nDONE:\nret;\n}\n"
+  return k
+}
+
+# gpu_run(ptx, xs or null, a, n, outer integers): launch "gmap" over n threads -> an array of n integers
+skill rt_gpu_run(ptx, xs, at, nt, caps) -> Any {
+  let n = rt_untag(nt)
+  if rt_cu("cuInit") == 0 { return rt_tag(0 - 1) }
+  let r = rt_u32(wcallp(rt_cu("cuInit"), 0))
+  if r != 0 { return rt_tag(0 - 100 - r) }
+  let dev = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuDeviceGet"), dev, 0)
+  let ctx = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuCtxCreate_v2"), ctx, 0, rt_peek32(dev)))
+  if r != 0 { return rt_tag(0 - 200 - r) }
+  let mod = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleLoadData"), mod, rt_cstr(ptx)))
+  if r != 0 { return rt_tag(0 - 300 - r) }
+  let kfn = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleGetFunction"), kfn, peek(mod), rt_cstr("gmap")))
+  if r != 0 { return rt_tag(0 - 400 - r) }
+  let bytes = 8 * n
+  # the items (if any) and the outer integers, as 64-bit integers
+  let dx = rt_zero(rt_alloc(8), 8)
+  if xs != 0 {
+    let hx = rt_alloc(bytes)
+    for i in range(0, n) { do poke(hx + 8 * i, rt_untag(peek(xs + 16 + 8 * i))) }
+    do wcallp(rt_cu("cuMemAlloc_v2"), dx, bytes)
+    do wcallp(rt_cu11(), peek(dx), hx, bytes)
+  }
+  let nc = peek(caps + 8)
+  let cb = 8 * nc + 8
+  let hc = rt_zero(rt_alloc(cb), cb)
+  for i in range(0, nc) { do poke(hc + 8 * i, rt_untag(peek(caps + 16 + 8 * i))) }
+  let dc = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuMemAlloc_v2"), dc, cb)
+  do wcallp(rt_cu11(), peek(dc), hc, cb)
+  let dy = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuMemAlloc_v2"), dy, bytes)
+  let vn = rt_zero(rt_alloc(8), 8)
+  do rt_poke32(vn, n)
+  let va = rt_zero(rt_alloc(8), 8)
+  do poke(va, rt_untag(at))
+  let params = rt_alloc(40)
+  do poke(params, dx)
+  do poke(params + 8, dy)
+  do poke(params + 16, vn)
+  do poke(params + 24, va)
+  do poke(params + 32, dc)
+  let g = (n + 255) // 256
+  let r = rt_u32(wcallp(rt_cu8(), peek(kfn), g, 1, 1, 256, 1, 1, 0, 0, params, 0))
+  if r != 0 { return rt_tag(0 - 500 - r) }
+  let r = rt_u32(wcallp(rt_cu10()))
+  if r != 0 { return rt_tag(0 - 600 - r) }
+  let hy = rt_alloc(bytes)
+  do wcallp(rt_cu12(), hy, peek(dy), bytes)
+  if xs != 0 { do wcallp(rt_cu("cuMemFree_v2"), peek(dx)) }
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dc))
+  do wcallp(rt_cu("cuMemFree_v2"), peek(dy))
+  do wcallp(rt_cu("cuModuleUnload"), peek(mod))
+  do wcallp(rt_cu("cuCtxDestroy_v2"), peek(ctx))
+  let c = rt_arr(nt)
+  for i in range(0, n) { do poke(c + 16 + 8 * i, rt_tag(peek(hy + 8 * i))) }
+  return c
+}
+
+# ---- par for (the language's own parallel loop; pic desugars "par for x in xs -> v { B }" into these) -----------
+# a worker is this same program started again with "__par <id> <w> <W>" at the end of its arguments
+skill par_info() -> Any {
+  let i = 1
+  while arg(i) != null {
+    if arg(i) == "__par" { return [arg(i + 1), par_int(arg(i + 2)), par_int(arg(i + 3))] }
+    let i = i + 1
+  }
+  return null
+}
+
+skill par_int(t) -> Any {
+  let v = 0
+  for i in range(0, len(t)) {
+    let c = ord(slice(t, i, i + 1))
+    if c >= 48 and c <= 57 { let v = v * 10 + (c - 48) }
+  }
+  return v
+}
+
+# worker processes per par loop: 8 (the machine's heat limit; more cores are there, the cooling is not)
+skill par_workers() -> Any { return 8 }
+
+skill par_file(id, w) -> Any { return "out\\par_" ++ id ++ "_" ++ str(w) ++ ".txt" }
+
+# this program's own command line, each argument quoted
+skill par_cmd() -> Any {
+  let out = "\"" ++ arg(0) ++ "\""
+  let i = 1
+  while arg(i) != null {
+    let out = out ++ " \"" ++ arg(i) ++ "\""
+    let i = i + 1
+  }
+  return out
+}
+
+# the parent: start W workers, wait, read their files, put each item's value back in its place
+skill par_gather(id, n, nw) -> Any {
+  let hs = []
+  for w in range(0, nw) {
+    do write_file(par_file(id, w), "")
+    let hs = hs ++ [spawn(par_cmd() ++ " __par " ++ id ++ " " ++ str(w) ++ " " ++ str(nw))]
+  }
+  for h in hs { do wait(h, 360000000) }
+  let parts = []
+  for w in range(0, nw) {
+    let t = read_file(par_file(id, w))
+    let vals = []
+    if t != null {
+      let p = 0
+      while p < len(t) {
+        let r = par_dec(t, p)
+        let vals = append(vals, r[0])
+        let p = r[1]
+      }
+    }
+    let parts = parts ++ [vals]
+  }
+  let out = []
+  let blk = []
+  for i in range(0, n) {
+    let vs = parts[i % nw]
+    let k = i // nw
+    let v = null
+    if k < len(vs) { let v = vs[k] }
+    let blk = append(blk, v)
+    if len(blk) >= 1000 {
+      let out = out ++ blk
+      let blk = []
+    }
+  }
+  return out ++ blk
+}
+
+# values as self-delimiting text: n | i<int>; | r<real>; | b0/b1 | s<len>:<text> | l<n>:<items> | m<n>:<k v ...> | a<n>:<ints>
+skill par_enc(v) -> Any {
+  let t = typeof(v)
+  if t == "null" { return "n" }
+  if t == "int" { return "i" ++ str(v) ++ ";" }
+  if t == "real" { return "r" ++ str(v) ++ ";" }
+  if t == "text" { return "s" ++ str(len(v)) ++ ":" ++ v }
+  if t == "list" {
+    let parts = []
+    for x in v { let parts = append(parts, par_enc(x)) }
+    return "l" ++ str(len(v)) ++ ":" ++ join(parts, "")
+  }
+  if t == "map" {
+    let parts = []
+    for k in keys(v) { let parts = append(parts, par_enc(k) ++ par_enc(v[k])) }
+    return "m" ++ str(len(parts)) ++ ":" ++ join(parts, "")
+  }
+  if t == "array" {
+    let parts = []
+    for i in range(0, len(v)) { let parts = append(parts, str(aget(v, i)) ++ ";") }
+    return "a" ++ str(len(v)) ++ ":" ++ join(parts, "")
+  }
+  return "n"
+}
+
+skill par_upto(t, p, c) -> Any {
+  let q = p
+  while slice(t, q, q + 1) != c { let q = q + 1 }
+  return q
+}
+
+skill par_sint(t) -> Any {
+  if slice(t, 0, 1) == "-" { return 0 - par_int(t) }
+  return par_int(t)
+}
+
+# -> [value, position after it]
+skill par_dec(t, p) -> Any {
+  let c = slice(t, p, p + 1)
+  if c == "n" { return [null, p + 1] }
+  if c == "i" {
+    let q = par_upto(t, p + 1, ";")
+    return [par_sint(slice(t, p + 1, q)), q + 1]
+  }
+  if c == "r" {
+    let q = par_upto(t, p + 1, ";")
+    return [num(slice(t, p + 1, q)), q + 1]
+  }
+  let q = par_upto(t, p + 1, ":")
+  let n = par_int(slice(t, p + 1, q))
+  if c == "s" { return [slice(t, q + 1, q + 1 + n), q + 1 + n] }
+  if c == "l" {
+    let out = []
+    let r = [null, q + 1]
+    for i in range(0, n) {
+      let r = par_dec(t, r[1])
+      let out = append(out, r[0])
+    }
+    return [out, r[1]]
+  }
+  if c == "m" {
+    let out = {}
+    let r = [null, q + 1]
+    for i in range(0, n) {
+      let rk = par_dec(t, r[1])
+      let r = par_dec(t, rk[1])
+      let out = put(out, rk[0], r[0])
+    }
+    return [out, r[1]]
+  }
+  if c == "a" {
+    let out = arr(n)
+    let pos = q + 1
+    for i in range(0, n) {
+      let e = par_upto(t, pos, ";")
+      do aset(out, i, par_sint(slice(t, pos, e)))
+      let pos = e + 1
+    }
+    return [out, pos]
+  }
+  return [null, p + 1]
+}
+
+# fgwin(): the window in front (the one the user is working in) -> [left, top, right, bottom] in screen pixels
+skill rt_s32(v) -> Any {
+  if v >= 2147483648 { return v - 4294967296 }
+  return v
+}
+
+skill rt_fgwin() -> Any {
+  do wcallp(rt_proc("user32.dll", "SetProcessDPIAware"))
+  let h = wcallp(rt_proc("user32.dll", "GetForegroundWindow"))
+  let r = rt_zero(rt_alloc(16), 16)
+  do wcallp(rt_proc("user32.dll", "GetWindowRect"), h, r)
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(rt_s32(rt_peek32(r))))
+  let out = rt_append(out, rt_tag(rt_s32(rt_peek32(r + 4))))
+  let out = rt_append(out, rt_tag(rt_s32(rt_peek32(r + 8))))
+  return rt_append(out, rt_tag(rt_s32(rt_peek32(r + 12))))
+}
+
+# focus(window class): bring that app's window to the front (Windows lets a program do this right after a key
+# event, so an Alt tap goes first -- Alt alone does nothing in the app) -> true, or null if there is no such window
+skill rt_focus(cls) -> Any {
+  let h = wcallp(rt_proc("user32.dll", "FindWindowA"), rt_cstr(cls), 0)
+  if h == 0 { return 0 }
+  do wcallp(rt_proc("user32.dll", "keybd_event"), 18, 0, 0, 0)
+  do wcallp(rt_proc("user32.dll", "keybd_event"), 18, 0, 2, 0)
+  do wcallp(rt_proc("user32.dll", "ShowWindow"), h, 9)
+  do wcallp(rt_proc("user32.dll", "SetForegroundWindow"), h)
+  return 3
+}
+
+# mouse(x, y, button): move the pointer, then click (0 none, 1 left, 2 right) -- Pi's hands; guarded in senses.pi
+skill rt_mouse(xt, yt, bt) -> Any {
+  do wcallp(rt_proc("user32.dll", "SetProcessDPIAware"))
+  do wcallp(rt_proc("user32.dll", "SetCursorPos"), rt_untag(xt), rt_untag(yt))
+  let b = rt_untag(bt)
+  if b == 1 {
+    do wcallp(rt_proc("user32.dll", "mouse_event"), 2, 0, 0, 0, 0)
+    do wcallp(rt_proc("user32.dll", "mouse_event"), 4, 0, 0, 0, 0)
+  }
+  if b == 2 {
+    do wcallp(rt_proc("user32.dll", "mouse_event"), 8, 0, 0, 0, 0)
+    do wcallp(rt_proc("user32.dll", "mouse_event"), 16, 0, 0, 0, 0)
+  }
+  return 3
+}
+
+# key(virtual key code): press and release one key
+skill rt_key(vt) -> Any {
+  let v = rt_untag(vt)
+  do wcallp(rt_proc("user32.dll", "keybd_event"), v, 0, 0, 0)
+  do wcallp(rt_proc("user32.dll", "keybd_event"), v, 0, 2, 0)
+  return 3
+}
+
+# play(path of a .wav): Pi's voice, through winmm; returns when the sound has finished
+skill rt_play(path) -> Any {
+  let r = rt_u32(wcallp(rt_proc("winmm.dll", "PlaySoundA"), rt_cstr(path), 0, 131072))
+  if r == 0 { return 0 }
+  return 3
+}
+
+# ---- arrays of integers, changed in place (kind 8). Only integers go in, so freeing a region can never leave one
+# pointing at freed memory -- the same rule as the hash set. arr(n) is n zeros.
+skill rt_arr(nt) -> Any {
+  let n = rt_untag(nt)
+  let p = rt_alloc(16 + 8 * n)
+  do poke(p, 8)
+  do poke(p + 8, n)
+  for i in range(0, n) { do poke(p + 16 + 8 * i, 1) }
+  return p
+}
+
+skill rt_aget(a, it) -> Any {
+  let i = rt_untag(it)
+  if i < 0 or i >= peek(a + 8) { do rt_fail("aget: index out of range") }
+  return peek(a + 16 + 8 * i)
+}
+
+skill rt_aset(a, it, v) -> Any {
+  let i = rt_untag(it)
+  if i < 0 or i >= peek(a + 8) { do rt_fail("aset: index out of range") }
+  if v % 2 == 0 { do rt_fail("aset: arrays hold integers only") }
+  do poke(a + 16 + 8 * i, v)
+  return v
+}
+
+# ---- listdir(dir): the names in a directory (files and folders, without . and ..), or null if it cannot be read ----
+skill rt_listdir(dir) -> Any {
+  let n = peek(dir + 8)
+  let pat = rt_alloc(n + 3)
+  for i in range(0, n) { do pokeb(pat + i, peekb(dir + 16 + i)) }
+  do pokeb(pat + n, 92)
+  do pokeb(pat + n + 1, 42)
+  do pokeb(pat + n + 2, 0)
+  let fd = rt_alloc(400)
+  let h = wcall("FindFirstFileA", pat, fd)
+  if h == 0 - 1 { return 0 }
+  let out = rt_list_new(0)
+  let going = 1
+  while going == 1 {
+    let k = 0
+    while peekb(fd + 44 + k) != 0 { let k = k + 1 }
+    let dot = 0
+    if peekb(fd + 44) == 46 {
+      if k == 1 { let dot = 1 }
+      if k == 2 {
+        if peekb(fd + 45) == 46 { let dot = 1 }
+      }
+    }
+    if dot == 0 {
+      let t = rt_text_new(k)
+      for i in range(0, k) { do pokeb(t + 16 + i, peekb(fd + 44 + i)) }
+      let out = rt_append(out, t)
+    }
+    if rt_u32(wcall("FindNextFileA", h, fd)) == 0 { let going = 0 }
+  }
+  do wcall("FindClose", h)
+  return out
+}
+
+# ---- read_at(path, offset, n): up to n bytes of a file from byte offset (for files too big to read whole), null on failure
+skill rt_read_at(path, offt, nt) -> Any {
+  let off = rt_untag(offt)
+  let n = rt_untag(nt)
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 128, 0)
+  if h == 0 - 1 { return 0 }
+  if rt_u32(wcall("SetFilePointerEx", h, off, 0, 0)) == 0 {
+    do wcall("CloseHandle", h)
+    return 0
+  }
+  let s = rt_text_new(n)
+  do poke(gaddr(2), 0)
+  do wcall("ReadFile", h, s + 16, n, gaddr(2), 0)
+  let got = peek(gaddr(2)) % 4294967296
+  do wcall("CloseHandle", h)
+  do poke(s + 8, got)
+  return s
+}
+
+# ---- read_bytes(path, offset, n): up to n bytes of a file as an in-place integer array (one byte per entry) ----------
+skill rt_read_bytes(path, offt, nt) -> Any {
+  let t = rt_read_at(path, offt, nt)
+  if t == 0 { return 0 }
+  let n = peek(t + 8)
+  let p = rt_alloc(16 + 8 * n)
+  do poke(p, 8)
+  do poke(p + 8, n)
+  for i in range(0, n) { do poke(p + 16 + 8 * i, 2 * peekb(t + 16 + i) + 1) }
+  return p
+}
+
+# ---- arr_text(a, from, to): the bytes a[from..to) of an integer array as text ----------------------------------------
+skill rt_arr_text(a, ft, tt) -> Any {
+  let f = rt_untag(ft)
+  let e = rt_untag(tt)
+  let n = peek(a + 8)
+  if f < 0 { let f = 0 }
+  if e > n { let e = n }
+  if e < f { let e = f }
+  let t = rt_text_new(e - f)
+  for i in range(0, e - f) { do pokeb(t + 16 + i, rt_untag(peek(a + 16 + 8 * (f + i))) % 256) }
+  return t
+}

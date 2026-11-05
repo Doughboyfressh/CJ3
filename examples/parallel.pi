@@ -1,0 +1,45 @@
+# The CPU and the GPU at once: a network trains on the GPU while the CPU writes programs from examples.
+
+import "train.pi"
+
+skill gpu_job() -> Any {
+  return train_h(1000, 150, "gpu", 512)
+}
+
+# symbolic work for the CPU: Pi writes programs from examples
+skill cpu_job() -> Any {
+  return [
+    program([[2, 5], [3, 10], [4, 17]]).program,
+    program([["Ada Lovelace", "AL"], ["Alan Turing", "AT"]]).program,
+    program([[[1, 2, 3, 4], [4, 8]], [[5, 6], [12]]]).program,
+    program([[4, "even"], [7, "odd"], [10, "even"], [3, "odd"]]).program,
+    program([[[2, 4], 3], [[10, 0], 5], [[1, 2], 1.5]], 2).program,
+    program([[[3, 4], 25], [[1, 2], 5], [[2, 5], 29]], 2).program
+  ]
+}
+
+skill side_by_side() -> Any {
+  let a = profile()
+  let g = gpu_job()
+  let c = cpu_job()
+  let one_after_other = profile()
+  let r = parallel([fn() => gpu_job(), fn() => cpu_job()])
+  let at_once = profile()
+  return [one_after_other.wall_ms, at_once.wall_ms, r[0] == g, r[1] == c, r[1]]
+}
+
+# everything at once: the GPU job and each program search on its own CPU thread (7 threads)
+skill all_at_once() -> Any {
+  let a = profile()
+  let r = parallel([
+    fn() => gpu_job(),
+    fn() => program([[2, 5], [3, 10], [4, 17]]).program,
+    fn() => program([["Ada Lovelace", "AL"], ["Alan Turing", "AT"]]).program,
+    fn() => program([[[1, 2, 3, 4], [4, 8]], [[5, 6], [12]]]).program,
+    fn() => program([[4, "even"], [7, "odd"], [10, "even"], [3, "odd"]]).program,
+    fn() => program([[[2, 4], 3], [[10, 0], 5], [[1, 2], 1.5]], 2).program,
+    fn() => program([[[3, 4], 25], [[1, 2], 5], [[2, 5], 29]], 2).program
+  ])
+  let t = profile()
+  return [t.wall_ms, slice(r, 1, 7) == cpu_job()]
+}

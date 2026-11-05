@@ -1,0 +1,5 @@
+plain/curious solved of 60, rounds 0..7 then after round 7
+seed 31337: 10/10 13/14 17/18 23/22 26/29 26/33 27/35 31/38 -> final 31/38
+seed 2718: 10/10 13/13 17/19 18/21 22/22 28/31 33/32 34/33 -> final 37/35
+seed 1618: 10/10 13/13 18/15 24/21 26/24 29/24 33/27 34/31 -> final 36/31
+total final: plain 104, curious 104 (of 180)

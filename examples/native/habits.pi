@@ -1,0 +1,107 @@
+# habits: forms the brain wrote in its first programs that Pi did not accept (the fluency test, 2026-11-03), now Pi:
+# [0] * n, list comprehensions, print(a, b) / print("{} {}", a, b), 'single-quoted' text, a real exponent, {:b},
+# range(n) and range(a, b, step)
+skill edit_distance(a, b) -> Any {
+  let n = len(a)
+  let m = len(b)
+  let dp = [[0 for j in range(0, m + 1)] for i in range(0, n + 1)]
+  for i in range(0, n + 1) { dp[i][0] = i }
+  for j in range(0, m + 1) { dp[0][j] = j }
+  for i in range(1, n + 1) {
+    for j in range(1, m + 1) {
+      let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 }
+      dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    }
+  }
+  return dp[n][m]
+}
+
+skill double(x) -> Any { return x * 2 }
+skill add3(a, b, c) -> Any { return a + b + c }
+
+skill main() -> Any {
+  let ways = [0] * 101
+  ways[0] = 1
+  for c in [1, 5, 10, 25, 50] {
+    for i in range(c, 101) { ways[i] = ways[i] + ways[i - c] }
+  }
+  print("coins", ways[100], len([7] * 3), "ab" * 3, 2 * [1, 2])
+  print("Binary of {} is {}", 1000000, format("{:b}", 1000000))
+  print(format("{:x} {:o} {:08b} {:5b}|", 255, 8, 5, 3))
+  let s = 'one two "three"'
+  print(s, len('it\'s'), 'a' == "a")
+  let sq = [x * x for x in range(1, 6)]
+  let ev = [x for x in range(0, 20) if x % 3 == 0]
+  let pairs = [[a, b] for a in range(0, 3) for b in range(0, 2)]
+  print(sq, ev, pairs)
+  print(sum(x * x for x in range(0, 10)), edit_distance("kitten", "sitting"))
+  let n = 0
+  for k in range(1, 1000001) {
+    let r = round(k ^ (1.0 / 6.0))
+    if r ^ 6 == k { n += 1 }
+  }
+  print("sixth powers", n, 2 ^ 0.5 > 1.414, 4 ^ 0.5, 8 ^ 2.0, 0 ^ 0.5)
+  let down = []
+  for i in range(10, 0, 0 - 3) { down ++= [i] }
+  let up = []
+  for i in range(0, 10, 4) { up ++= [i] }
+  let t = 0
+  for i in range(5) { t += i }
+  let st = 2
+  let odd = []
+  for i in range(1, 10, st) { odd ++= [i] }
+  print(down, up, t, odd, range(10, 0, -4), range(3))
+  // set B's first programs: get(m, k, default), slice(s, a), x => e, && || !, True / False / None
+  let counts = {}
+  for w in split("the cat and the dog and the cat", " ") { counts[w] = get(counts, w, 0) + 1 }
+  print(counts["the"], counts["and"], get(counts, "fox", 0), get(counts, "fox"), get([1, 2], 1, 9))
+  print(slice("hello", 1), slice([1, 2, 3, 4], 2), slice("hello", 1, 3))
+  let sq2 = map([1, 2, 3], x => x * x)
+  let add = (a, b) => a + b
+  let one = () => 1
+  let inc = (v) => v + 1
+  print(sq2, add(2, 3), one(), inc(9), join(map([1, 0, 1], d => str(d)), ""))
+  let a2 = 3
+  let b2 = 0
+  print(a2 > 2 && b2 == 0, a2 < 2 || b2 == 0, !(a2 == 3), a2 != 3, True, False, None)
+  // set C: e as int (Rust); int() and float() as Python writes them
+  let big = 10 ^ 20 + 12345
+  print(sqrt(big) as int + 1, int(3.9), int(0 - 3.9), int("42") + 1, int(7), float(3) / 2, 7 as f64, 12 as str ++ "!")
+  print(int(1e20), int(0 - 2.5e19), int(2.0 ^ 70))
+  // set D: contains(map, key); method calls x.f(..); xs.append(v) on its own changes xs
+  let seen = {}
+  seen = put(seen, "a", true)
+  print(contains(seen, "a"), contains(seen, "b"), "{} + {} = {}".format(2, 3, 5), "-".join(["x", "y"]), ["p", "q"].join("+"))
+  let ws = "  Hi There  ".strip().lower().split(" ")
+  let xs = [3, 1, 2]
+  xs.append(9)
+  xs.push(0)
+  xs.extend([7, 8])
+  let ys = xs
+  ys.sort()
+  xs.reverse()
+  print(ws, xs, ys, xs.length, "abc".len(), [1, 2].size)
+  // a skill's name as a value
+  let f = add3
+  print(map([1, 2, 3], double), f(1, 2, 3), reduce([1, 2, 3], fn(a, b) => a + double(b), 0))
+  // {counts, total}: JavaScript's shorthand map
+  let counts = {"joy": 2}
+  let total = 3
+  let both = {counts, total}
+  print(both, {total}, {"k": 1, total})
+  // append(xs, v), put(m, k, v), sort(xs), reverse(xs) on their own change their first argument
+  let ps = []
+  let nn = 2
+  while len(ps) < 5 {
+    do append(ps, nn)
+    nn += 3
+  }
+  let mm2 = {}
+  put(mm2, "z", 26)
+  let zs = [3, 1, 2]
+  sort(zs)
+  let rs = [1, 2, 3]
+  do reverse(rs)
+  print(ps, mm2, zs, rs)
+  return "ok"
+}

@@ -1,0 +1,72 @@
+# The GPU in the language: "gpu for x in xs -> v { B }" compiles B to GPU code (one thread per item). Each test runs
+# the same body on the CPU (a plain for loop) and on the GPU and compares every value.
+#   out\gpulang.exe
+
+skill main() -> Any {
+  let out = []
+  # 1. an expression over 10 million items (a range: no input array)
+  let n = 10000000
+  let t0 = ticks()
+  gpu for x in range(0, n) -> v {
+    let v = (x * x + 3 * x) % 1000003
+  }
+  let tg = ticks() - t0
+  let t1 = ticks()
+  let ok = true
+  let i = 0
+  while i < n {
+    if aget(v, i) != (i * i + 3 * i) % 1000003 { let ok = false }
+    let i = i + 1
+  }
+  let tc = ticks() - t1
+  let out = append(out, "expression x 10M: GPU " ++ str(tg) ++ " ms, CPU check " ++ str(tc) ++ " ms, all equal: " ++ str(ok))
+  # 2. a loop inside every thread: Collatz steps for 1..1,000,000 (an outer integer `cap` read inside)
+  let cap = 1000
+  let t2 = ticks()
+  gpu for x in range(1, 1000001) -> steps {
+    let m = x
+    let steps = 0
+    while m != 1 and steps < cap {
+      if m % 2 == 0 { let m = m // 2 } else { let m = 3 * m + 1 }
+      let steps = steps + 1
+    }
+  }
+  let tg2 = ticks() - t2
+  let t3 = ticks()
+  let ok2 = true
+  let best = 0
+  let besti = 0
+  let x = 1
+  while x <= 1000000 {
+    let m = x
+    let s = 0
+    while m != 1 and s < cap {
+      if m % 2 == 0 { let m = m // 2 } else { let m = 3 * m + 1 }
+      let s = s + 1
+    }
+    if aget(steps, x - 1) != s { let ok2 = false }
+    if s > best {
+      let best = s
+      let besti = x
+    }
+    let x = x + 1
+  }
+  let tc2 = ticks() - t3
+  let out = append(out, "Collatz 1..1M: GPU " ++ str(tg2) ++ " ms, CPU " ++ str(tc2) ++ " ms, all equal: " ++ str(ok2) ++ " (longest: " ++ str(besti) ++ ", " ++ str(best) ++ " steps)")
+  # 3. a list as input, negative numbers, floor division and modulo, min/max/abs, if/else, and/or/not
+  let xs = [0 - 7, 0 - 1, 0, 3, 10, 0 - 22, 5]
+  gpu for x in xs -> rg {
+    let rg = x // 3 * 100 + x % 3
+    if x < 0 and not (x == 0 - 1) { let rg = rg + min(x, 0 - 5) } else { let rg = rg + max(abs(x), 4) }
+  }
+  let cpu = []
+  for x in xs {
+    let r = x // 3 * 100 + x % 3
+    if x < 0 and not (x == 0 - 1) { let r = r + min(x, 0 - 5) } else { let r = r + max(abs(x), 4) }
+    let cpu = append(cpu, r)
+  }
+  let gl = []
+  for k in range(0, len(xs)) { let gl = append(gl, aget(rg, k)) }
+  let out = append(out, "small list: GPU " ++ str(gl) ++ " CPU " ++ str(cpu) ++ " equal: " ++ str(str(gl) == str(cpu)))
+  return join(out, "\n")
+}

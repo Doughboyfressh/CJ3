@@ -1,0 +1,689 @@
+# langgrow: Pi grows its own language from its writers' compile failures ("build all", idea 4). One round of an
+# agent loop:
+#   perceive  every program the brain sent to the compiler, with the result: the run_pi calls in the chat logs and
+#             out\pi_compiles.txt (the brains append every compile there)
+#   decide    the most common compile error (its signature: the names and numbers taken out) still undecided
+#   act       learn a rule from the brain's own corrections: each failing program is diffed, token by token, with
+#             the next program of the same conversation that compiled; an edit made again and again, the names it
+#             kept made into variables, is a rule (examples/grown.pi: [name, pattern, replacement])
+#   verify    a compiler built with the rule must (a) take logged failing programs past that error, (b) give, for a
+#             construct taken from a real failure, exactly what the OLD compiler gives for that construct rewritten
+#             by the rule by hand -- the new form means the old one; that program becomes the rule's golden test --
+#             and (c) still reproduce itself and pass every golden program (test.cmd). Then the seed is rebuilt.
+#   remember  examples/grown_ledger.txt: every decision with its numbers; a decided rule is never tried again
+#   langgrow          one round
+#   langgrow --dry    perceive, decide and learn; build and change nothing
+import "brain.pi"
+
+skill GR_KEYWORDS() -> Any { return ["skill", "let", "if", "else", "while", "for", "in", "return", "do", "and", "or", "not", "true", "false", "null", "fn", "import", "reach", "break", "continue", "Any"] }
+skill GR_LEDGER() -> Any { return "examples\\grown_ledger.txt" }
+skill GR_RULES() -> Any { return "examples\\grown_rules.txt" }
+
+skill gr_kind(t) -> Any {
+  if len(t) == 0 { return "eof" }
+  let c = slice(t, 0, 1)
+  if contains("0123456789", c) { return "num" }
+  if c == "\"" or c == "'" { return "str" }
+  if contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", c) { return "id" }
+  return "sym"
+}
+
+# ---- perceive ------------------------------------------------------------------------------------------------------
+# Pi source -> tokens [text, start, end]; spaces and comments left out ("//" is a comment only first on its line)
+skill gr_lex(src) -> Any {
+  let cs = chars(src)
+  let n = len(cs)
+  let out = []
+  let idc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789"
+  let two = ["==", "!=", "<=", ">=", "->", "++", "=>", "&&", "||", "+=", "-=", "//"]
+  let i = 0
+  let first = true
+  while i < n {
+    let c = cs[i]
+    if c == "\n" {
+      first = true
+      i += 1
+    } else if c == " " or c == "\t" or c == "\r" {
+      i += 1
+    } else if c == "#" or (first and c == "/" and i + 1 < n and cs[i + 1] == "/") {
+      while i < n and cs[i] != "\n" { i += 1 }
+    } else {
+      first = false
+      let j = i + 1
+      if c == "\"" or c == "'" {
+        while j < n and cs[j] != c {
+          if cs[j] == "\\" { j += 1 }
+          j += 1
+        }
+        j = min(j + 1, n)
+      } else if contains(idc, c) {
+        while j < n and contains(idc, cs[j]) { j += 1 }
+      } else if i + 1 < n and contains(two, c ++ cs[i + 1]) {
+        j = i + 2
+      }
+      out ++= [[join(slice(cs, i, j), ""), i, j]]
+      i = j
+    }
+  }
+  return out
+}
+
+skill gr_texts(toks) -> Any {
+  let out = []
+  for t in toks { out ++= [t[0]] }
+  return out
+}
+
+# a tool response -> the compiler's message ("" when the program compiled), or null when it never reached the compiler
+skill gr_msg(resp) -> Any {
+  if brain_find(resp, "not run", 0) == 0 { return null }
+  let k = brain_find(resp, "compile error", 0)
+  if k < 0 { return "" }
+  let p = brain_find(resp, "pic: ", k)
+  if p < 0 { return trim(slice(resp, k, min(len(resp), k + 300))) }
+  return trim(split(slice(resp, p, len(resp)), "\n")[0])
+}
+
+# a chat log -> [code, msg] for each run_pi call that reached the compiler, in order
+skill gr_log_events(text) -> Any {
+  let out = []
+  let parts = split(text, "<parameter=code>\n")
+  for k in range(1, len(parts)) {
+    let ce = split(parts[k], "\n</parameter>")
+    let rest = join(slice(ce, 1, len(ce)), "\n</parameter>")
+    let tr = split(rest, "<tool_response>\n")
+    if len(tr) > 1 {
+      let m = gr_msg(split(tr[1], "\n</tool_response>")[0])
+      if m != null { out ++= [[ce[0], m]] }
+    }
+  }
+  return out
+}
+
+# out\pi_compiles.txt -> [code, msg]
+skill gr_file_events(text) -> Any {
+  let out = []
+  for rec in split(text, "=== end\n") {
+    let r = split(rec, "\n---\n")
+    if len(r) >= 2 {
+      let head = split(r[0], "\n")
+      let ok = trim(head[0]) == "=== ok"
+      let msg = if ok { "" } else { trim(join(slice(head, 1, len(head)), " ")) }
+      let code = join(slice(r, 1, len(r)), "\n---\n")
+      if slice(code, len(code) - 1, len(code)) == "\n" { code = slice(code, 0, len(code) - 1) }
+      out ++= [[code, msg]]
+    }
+  }
+  return out
+}
+
+# every source of programs -> a list of event lists (one per conversation log; pairs never cross logs)
+skill gr_sources() -> Any {
+  let out = []
+  let names = listdir("out")
+  if names == null { names = [] }
+  for nm in names {
+    if brain_find(nm, "chat_log", 0) >= 0 and slice(nm, len(nm) - 4, len(nm)) == ".txt" {
+      let t = read_file("out\\" ++ nm)
+      if t != null { out ++= [gr_log_events(t)] }
+    }
+  }
+  let f = read_file("out\\pi_compiles.txt")
+  if f != null { out ++= [gr_file_events(f)] }
+  return out
+}
+
+# a compiler message -> its kind: the quoted name and the position taken out
+skill gr_sig(msg) -> Any {
+  let m = msg
+  let k = brain_find(m, "pic: ", 0)
+  if k >= 0 { m = slice(m, k + 5, len(m)) }
+  m = split(split(m, "\n")[0], " -- ")[0]
+  let g = brain_find(m, " got ", 0)
+  if g >= 0 { m = slice(m, 0, g + 5) ++ "X" }
+  let u = brain_find(m, "unknown function ", 0)
+  if u >= 0 { m = slice(m, 0, u + 17) ++ "X()" }
+  let a = brain_find(m, " (after", 0)
+  if a >= 0 { m = slice(m, 0, a) }
+  return trim(m)
+}
+
+# ---- act: rules from the brain's corrections ---------------------------------------------------------------------
+# a, b token texts -> the edits [i0, i1, j0, j1] (a[i0..i1) became b[j0..j1)), by longest common subsequence
+skill gr_hunks(a, b) -> Any {
+  let n = len(a)
+  let m = len(b)
+  let p = 0
+  while p < n and p < m and a[p] == b[p] { p += 1 }
+  let s = 0
+  while s < n - p and s < m - p and a[n - 1 - s] == b[m - 1 - s] { s += 1 }
+  let N = n - p - s
+  let M = m - p - s
+  if N * M > 3000000 { return [] }
+  let W = M + 1
+  let L = arr((N + 1) * W)
+  let i = N - 1
+  while i >= 0 {
+    let j = M - 1
+    while j >= 0 {
+      if a[p + i] == b[p + j] { aset(L, i * W + j, aget(L, (i + 1) * W + j + 1) + 1) } else { aset(L, i * W + j, max(aget(L, (i + 1) * W + j), aget(L, i * W + j + 1))) }
+      j -= 1
+    }
+    i -= 1
+  }
+  let hunks = []
+  let open = false
+  let h0 = 0
+  let g0 = 0
+  i = 0
+  let j = 0
+  while i < N or j < M {
+    if i < N and j < M and a[p + i] == b[p + j] {
+      if open {
+        hunks ++= [[p + h0, p + i, p + g0, p + j]]
+        open = false
+      }
+      i += 1
+      j += 1
+    } else {
+      if not open {
+        open = true
+        h0 = i
+        g0 = j
+      }
+      if j < M and (i >= N or aget(L, i * W + j + 1) >= aget(L, (i + 1) * W + j)) { j += 1 } else { i += 1 }
+    }
+  }
+  if open { hunks ++= [[p + h0, p + N, p + g0, p + M]] }
+  return hunks
+}
+
+# one edit -> [pattern, replacement] with one token of context each side and the names the fix kept (as themselves
+# or as quoted text) made variables; null for edits too big to be a rule, or whose context is not a symbol
+skill gr_rule(a, b, h) -> Any {
+  let i0 = h[0]
+  let i1 = h[1]
+  let j0 = h[2]
+  let j1 = h[3]
+  if i1 - i0 < 1 or i1 - i0 > 3 or j1 - j0 < 1 or j1 - j0 > 6 or i0 < 1 or i1 >= len(a) { return null }
+  if gr_kind(a[i0 - 1]) != "sym" or gr_kind(a[i1]) != "sym" { return null }
+  let del = slice(a, i0, i1)
+  let ins = slice(b, j0, j1)
+  let vars = {}
+  let k = 1
+  for t in del {
+    if gr_kind(t) == "id" and not contains(GR_KEYWORDS(), t) and vars[t] == null {
+      let used = false
+      for u in ins {
+        if u == t or u == "\"" ++ t ++ "\"" or u == "'" ++ t ++ "'" { used = true }
+      }
+      if used {
+        vars = put(vars, t, "$id" ++ str(k))
+        k += 1
+      }
+    }
+  }
+  let pat = [a[i0 - 1]]
+  for t in del { pat ++= [if vars[t] != null { vars[t] } else { t }] }
+  pat ++= [a[i1]]
+  let rep = [a[i0 - 1]]
+  for u in ins {
+    let w = u
+    for nm in keys(vars) {
+      if u == nm { w = vars[nm] }
+      if u == "\"" ++ nm ++ "\"" or u == "'" ++ nm ++ "'" { w = "\"" ++ vars[nm] ++ "\"" }
+    }
+    rep ++= [w]
+  }
+  rep ++= [a[i1]]
+  for t in pat ++ rep {
+    if contains(t, " ") or contains(t, "\t") { return null }
+  }
+  if join(pat, " ") == join(rep, " ") { return null }
+  return [pat, rep]
+}
+
+skill gr_key(r) -> Any { return join(r[0], " ") ++ "  =>  " ++ join(r[1], " ") }
+
+# ---- the rules as data and as the compiler's grown.pi -----------------------------------------------------------
+# examples/grown_rules.txt: one rule a line, name TAB pattern TAB replacement (tokens joined by single spaces)
+skill gr_rules() -> Any {
+  let t = read_file(GR_RULES())
+  if t == null { return [] }
+  let out = []
+  for ln in split(t, "\n") {
+    let f = split(ln, "\t")
+    if len(f) == 3 { out ++= [[f[0], split(f[1], " "), split(f[2], " ")]] }
+  }
+  return out
+}
+
+skill gr_pistr(t) -> Any {
+  let out = []
+  for c in chars(t) {
+    if c == "\"" { out ++= ["\\\""] } else if c == "\\" { out ++= ["\\\\"] } else { out ++= [c] }
+  }
+  return "\"" ++ join(out, "") ++ "\""
+}
+
+skill gr_pilist(ts) -> Any {
+  let out = []
+  for t in ts { out ++= [gr_pistr(t)] }
+  return "[" ++ join(out, ", ") ++ "]"
+}
+
+# grown.pi for these rules (its header kept)
+skill gr_write_rules(rules) -> Any {
+  let old = read_file("examples\\grown.pi")
+  let head = split(old, "skill grown_rules()")[0]
+  let items = []
+  let lines = []
+  for r in rules {
+    items ++= ["    [" ++ gr_pistr(r[0]) ++ ", " ++ gr_pilist(r[1]) ++ ", " ++ gr_pilist(r[2]) ++ "]"]
+    lines ++= [r[0] ++ "\t" ++ join(r[1], " ") ++ "\t" ++ join(r[2], " ")]
+  }
+  write_file(GR_RULES(), join(lines, "\n"))
+  return write_file("examples\\grown.pi", head ++ "skill grown_rules() -> Any {\n  return [\n" ++ join(items, ",\n") ++ (if len(items) > 0 { "\n" } else { "" }) ++ "  ]\n}\n")
+}
+
+# ---- the rules applied to source text, as the compiler applies them to tokens (for the hand-rewritten form) ------
+skill gr_match(ts, i, pat) -> Any {
+  if i + len(pat) > len(ts) { return null }
+  let b = {}
+  for k in range(0, len(pat)) {
+    let pt = pat[k]
+    let tk = ts[i + k][0]
+    if slice(pt, 0, 1) == "$" {
+      let want = if slice(pt, 0, 3) == "$id" { "id" } else if slice(pt, 0, 4) == "$num" { "num" } else if slice(pt, 0, 4) == "$str" { "str" } else { "" }
+      if want != "" and gr_kind(tk) != want { return null }
+      if want == "str" and slice(tk, 0, 1) != "\"" { return null }
+      if b[pt] != null and b[pt] != tk { return null }
+      b = put(b, pt, tk)
+    } else if pt != tk {
+      return null
+    }
+  }
+  return b
+}
+
+skill gr_subst(t, b) -> Any {
+  if slice(t, 0, 1) == "$" and b[t] != null { return b[t] }
+  if len(t) > 3 and slice(t, 0, 2) == "\"$" {
+    let v = slice(t, 1, len(t) - 1)
+    if b[v] != null { return "\"" ++ b[v] ++ "\"" }
+  }
+  return t
+}
+
+# src with every rule applied left to right -> [the rewritten text, how many rewrites]
+skill gr_rewrite_text(src, rules) -> Any {
+  let ts = gr_lex(src)
+  let out = ""
+  let at = 0
+  let i = 0
+  let made = 0
+  while i < len(ts) {
+    let hit = null
+    for r in rules {
+      if hit == null {
+        let m = gr_match(ts, i, r[1])
+        if m != null { hit = [r, m] }
+      }
+    }
+    if hit == null {
+      i += 1
+    } else {
+      let reps = []
+      for t in hit[0][2] { reps ++= [gr_subst(t, hit[1])] }
+      out = out ++ slice(src, at, ts[i][1]) ++ join(reps, " ")
+      at = ts[i + len(hit[0][1]) - 1][2]
+      i += len(hit[0][1])
+      made += 1
+    }
+  }
+  return [out ++ slice(src, at, len(src)), made]
+}
+
+# ---- verify ------------------------------------------------------------------------------------------------------
+# compile src with compiler cc -> "" when it compiled, else the message
+skill gr_compile(cc, src, name) -> Any {
+  write_file("out\\" ++ name ++ ".pi", src)
+  write_file("out\\" ++ name ++ ".exe", "")
+  let h = rt_spawn_out(cc ++ " out\\" ++ name ++ ".pi out\\" ++ name ++ ".exe", "out\\" ++ name ++ "_cc.txt")
+  if h == null { return "the compiler did not start" }
+  let rc = wait(h, 120000)
+  if rc == 0 { return "" }
+  let m = read_file("out\\" ++ name ++ "_cc.txt")
+  return trim(if m == null { "failed" } else { m })
+}
+
+# run out\name.exe (10 s) -> its output, or null
+skill gr_run(name) -> Any {
+  let h = rt_spawn_out("out\\" ++ name ++ ".exe", "out\\" ++ name ++ "_out.txt")
+  if h == null { return null }
+  let rc = wait(h, 10000)
+  if rc == null {
+    rt_kill(h)
+    return null
+  }
+  return read_file("out\\" ++ name ++ "_out.txt")
+}
+
+# the program as the brain's compile saw it (its library first); web programs had sitelib too
+skill gr_full(code, web) -> Any {
+  let lib = hands_lib()
+  if web {
+    let sl = read_file("examples\\native\\sitelib.pi")
+    if sl != null { lib = lib ++ sl ++ "\n" }
+  }
+  return lib ++ code
+}
+
+# a construct from a real failure where the rule fires: the smallest bracketed span around the first match ->
+# [the construct as written, as rewritten by hand], or null
+skill gr_construct(code, rules) -> Any {
+  let ts = gr_lex(code)
+  for i in range(0, len(ts)) {
+    let hit = false
+    for r in rules {
+      if gr_match(ts, i, r[1]) != null { hit = true }
+    }
+    if hit {
+      // the opener before i that is still open at i, and its closer
+      let depth = 0
+      let k = i
+      let found = -1
+      while k >= 0 and found < 0 {
+        let t = ts[k][0]
+        if t == "}" or t == "]" or t == ")" { depth += 1 }
+        if t == "{" or t == "[" or t == "(" {
+          if depth == 0 { found = k } else { depth -= 1 }
+        }
+        k -= 1
+      }
+      if found >= 0 {
+        let d = 0
+        let e = found
+        let close = -1
+        while e < len(ts) and close < 0 {
+          let t = ts[e][0]
+          if t == "{" or t == "[" or t == "(" { d += 1 }
+          if t == "}" or t == "]" or t == ")" {
+            d -= 1
+            if d == 0 { close = e }
+          }
+          e += 1
+        }
+        if close > 0 and ts[found][0] != "(" {
+          let txt = slice(code, ts[found][1], ts[close][2])
+          if not contains(txt, "\n") { return [txt, gr_rewrite_text(txt, rules)[0]] }
+        }
+      }
+    }
+  }
+  return null
+}
+
+# the names a construct reads (not calls, not after a dot) -> let lines giving each a distinct number
+skill gr_decls(txt) -> Any {
+  let ts = gr_lex(txt)
+  let seen = []
+  let out = ""
+  for i in range(0, len(ts)) {
+    let t = ts[i][0]
+    let call = i + 1 < len(ts) and ts[i + 1][0] == "("
+    let dot = i > 0 and ts[i - 1][0] == "."
+    if gr_kind(t) == "id" and not contains(GR_KEYWORDS(), t) and not call and not dot and not contains(seen, t) {
+      seen ++= [t]
+      out = out ++ "  let " ++ t ++ " = " ++ str(len(seen)) ++ "\n"
+    }
+  }
+  return out
+}
+
+# a rule is decided when the ledger names it (alone, or in a family joined by " ; ")
+skill gr_ledger_has(key) -> Any {
+  let t = read_file(GR_LEDGER())
+  if t == null { return false }
+  for a in [" | ", " ; "] {
+    for b in [" | ", " ; "] {
+      if brain_find(t, a ++ key ++ b, 0) >= 0 { return true }
+    }
+  }
+  return false
+}
+
+skill gr_ledger_add(line) -> Any {
+  let t = read_file(GR_LEDGER())
+  if t == null { t = "# grown_ledger: every rule langgrow.pi decided, with its numbers (ADOPTED / REJECTED | signature | rule | ...)\n" }
+  print(line)
+  return write_file(GR_LEDGER(), t ++ line ++ "\n")
+}
+
+skill gr_count_golden() -> Any {
+  let n = 0
+  let names = listdir("examples\\native")
+  for nm in names {
+    if slice(nm, 0, 6) == "grown_" and slice(nm, len(nm) - 3, len(nm)) == ".pi" { n += 1 }
+  }
+  return n
+}
+
+skill main() -> Any {
+  let dry = arg(1) == "--dry"
+  // perceive
+  let srcs = gr_sources()
+  let counts = {}
+  let order = []
+  let nev = 0
+  for evs in srcs {
+    for e in evs {
+      nev += 1
+      if e[1] != "" {
+        let s = gr_sig(e[1])
+        if counts[s] == null { order ++= [s] }
+        counts = put(counts, s, if counts[s] == null { 1 } else { counts[s] + 1 })
+      }
+    }
+  }
+  print("perceive: " ++ str(nev) ++ " programs sent to the compiler, " ++ str(len(order)) ++ " kinds of failure")
+  // act: the brain's corrections -> rules, by failure kind
+  let support = {}
+  let sigof = {}
+  let rulekeys = []
+  let ruleof = {}
+  let examples = {}
+  for evs in srcs {
+    for i in range(0, len(evs)) {
+      if evs[i][1] != "" {
+        let s = gr_sig(evs[i][1])
+        let j = i + 1
+        let fix = -1
+        while j < len(evs) and j <= i + 6 and fix < 0 {
+          if evs[j][1] == "" { fix = j }
+          j += 1
+        }
+        examples = put(examples, s, (if examples[s] == null { [] } else { examples[s] }) ++ [evs[i][0]])
+        if fix >= 0 {
+          let a = gr_texts(gr_lex(evs[i][0]))
+          let b = gr_texts(gr_lex(evs[fix][0]))
+          for h in gr_hunks(a, b) {
+            let r = gr_rule(a, b, h)
+            if r != null {
+              let key = s ++ " || " ++ gr_key(r)
+              if support[key] == null {
+                rulekeys ++= [key]
+                ruleof = put(ruleof, key, r)
+                sigof = put(sigof, key, s)
+              }
+              support = put(support, key, if support[key] == null { 1 } else { support[key] + 1 })
+            }
+          }
+        }
+      }
+    }
+  }
+  // decide: failure kinds by how often they happen; each one's rules seen at least twice, most support first
+  let sigs = order
+  let ranked = []
+  while len(sigs) > 0 {
+    let b = 0
+    for i in range(1, len(sigs)) {
+      if counts[sigs[i]] > counts[sigs[b]] { b = i }
+    }
+    ranked ++= [sigs[b]]
+    sigs = slice(sigs, 0, b) ++ slice(sigs, b + 1, len(sigs))
+  }
+  for s in slice(ranked, 0, min(8, len(ranked))) { print("  " ++ format("{:>4}", str(counts[s])) ++ "  " ++ s) }
+  // the names in programs that compiled: a rule may name a word literally only if no working program uses it (a
+  // foreign keyword such as elif); an edit of the brain's own names is a change of logic, not of language
+  let used = {}
+  for evs in srcs {
+    for e in evs {
+      if e[1] == "" {
+        for t in gr_lex(e[0]) {
+          if gr_kind(t[0]) == "id" and used[t[0]] == null { used = put(used, t[0], 1) }
+        }
+      }
+    }
+  }
+  // families: the same edit at the same place after different left contexts ({ k: and , k: are one habit)
+  let fams = []
+  let famsup = {}
+  let members = {}
+  for key in rulekeys {
+    let r = ruleof[key]
+    let clean = true
+    for t in r[0] {
+      if slice(t, 0, 1) != "$" and gr_kind(t) == "id" and not contains(GR_KEYWORDS(), t) and used[t] != null { clean = false }
+    }
+    if clean and not gr_ledger_has(gr_key(r)) {
+      let core = sigof[key] ++ " || " ++ join(slice(r[0], 1, len(r[0])), " ") ++ " => " ++ join(slice(r[1], 1, len(r[1])), " ")
+      if famsup[core] == null {
+        fams ++= [core]
+        famsup = put(famsup, core, 0)
+        members = put(members, core, [])
+      }
+      famsup = put(famsup, core, famsup[core] + support[key])
+      members = put(members, core, members[core] ++ [key])
+    }
+  }
+  let pick = null
+  let picked = []
+  for s in ranked {
+    if pick == null {
+      let best = null
+      for core in fams {
+        if slice(core, 0, len(s) + 4) == s ++ " || " and famsup[core] >= 2 {
+          if best == null or famsup[core] > famsup[best] { best = core }
+        }
+      }
+      if best != null {
+        pick = s
+        picked = members[best]
+      }
+    }
+  }
+  if pick == null { return "decide: no failure kind has a rule the brain's own fixes show twice and that is still undecided" }
+  print("decide: \"" ++ pick ++ "\" (" ++ str(counts[pick]) ++ " failures); the rule family learned from the brain's fixes:")
+  for key in picked { print("  support " ++ str(support[key]) ++ ":  " ++ gr_key(ruleof[key])) }
+  if dry { return "dry run: nothing built or changed" }
+  // verify, all of this failure kind's rules together
+  let old_rules = gr_rules()
+  let old_text = read_file("examples\\grown.pi")
+  let k0 = len(old_rules)
+  let news = []
+  for key in picked { news ++= [["grown " ++ str(k0 + len(news) + 1) ++ ": " ++ pick, ruleof[key][0], ruleof[key][1]]] }
+  let keys_txt = join(map(picked, fn(key) => gr_key(ruleof[key])), " ; ")
+  gr_write_rules(old_rules ++ news)
+  // the compiler with the rule, built from examples\pic.pi itself (so its import of grown.pi resolves)
+  let h = rt_spawn_out("seed\\pic.exe examples\\pic.pi out\\gr_pic.exe", "out\\gr_pic_cc.txt")
+  let rc = if h == null { 1 } else { wait(h, 300000) }
+  if rc != 0 {
+    write_file("examples\\grown.pi", old_text)
+    gr_write_rules(old_rules)
+    return gr_ledger_add("REJECTED | " ++ pick ++ " | " ++ keys_txt ++ " | the compiler with the rule did not build")
+  }
+  // (a) logged failures of this kind: past the error with the rule?
+  let fixed = 0
+  let tried = 0
+  let exs = examples[pick]
+  for code in slice(exs, 0, min(12, len(exs))) {
+    let best = null
+    for web in [false, true] {
+      let before = gr_compile("out\\pic.exe", gr_full(code, web), "gr_old")
+      if gr_sig(before) == pick and best == null {
+        let after = gr_compile("out\\gr_pic.exe", gr_full(code, web), "gr_new")
+        best = gr_sig(after) != pick
+      }
+    }
+    if best != null {
+      tried += 1
+      if best { fixed += 1 }
+    }
+  }
+  print("verify (a): " ++ str(fixed) ++ " of " ++ str(tried) ++ " logged failures get past the error")
+  if fixed == 0 {
+    write_file("examples\\grown.pi", old_text)
+    gr_write_rules(old_rules)
+    return gr_ledger_add("REJECTED | " ++ pick ++ " | " ++ keys_txt ++ " | it fixed none of " ++ str(tried) ++ " logged failures")
+  }
+  // (b) the golden: a real failing construct; the OLD compiler on the hand-rewritten form gives the expected output
+  let newrules = []
+  for r in news { newrules ++= [r] }
+  let golden = null
+  let cons = []
+  for code in exs {
+    let c = gr_construct(code, newrules)
+    if c != null {
+      if contains(c[1], "(") { cons = cons ++ [c] } else { cons = [c] ++ cons }
+    }
+  }
+  for c in cons {
+    if golden == null {
+      if c != null {
+        let decls = gr_decls(c[1])
+        let newform = "skill main() -> Any {\n" ++ decls ++ "  return " ++ c[0] ++ "\n}\n"
+        let oldform = "skill main() -> Any {\n" ++ decls ++ "  return " ++ c[1] ++ "\n}\n"
+        if gr_compile("seed\\pic.exe", oldform, "gr_gold_old") == "" {
+          let want = gr_run("gr_gold_old")
+          let refuse = gr_compile("seed\\pic.exe", newform, "gr_gold_refused")
+          if want != null and len(trim(want)) > 0 and gr_sig(refuse) == pick and gr_compile("out\\gr_pic.exe", newform, "gr_gold_new") == "" {
+            let got = gr_run("gr_gold_new")
+            if got == want { golden = [newform, want, c[0], c[1]] }
+          }
+        }
+      }
+    }
+  }
+  if golden == null {
+    write_file("examples\\grown.pi", old_text)
+    gr_write_rules(old_rules)
+    return gr_ledger_add("REJECTED | " ++ pick ++ " | " ++ keys_txt ++ " | no real construct gave the same output as its hand-rewritten form")
+  }
+  let gn = "grown_" ++ str(gr_count_golden() + 1)
+  let gtext = "# " ++ gn ++ ": golden test of a rule langgrow.pi learned from the brain's own fixes (" ++ pick ++ ").\n# The form " ++ golden[2] ++ " must mean exactly " ++ golden[3] ++ " (the old compiler's output for it below).\n" ++ golden[0]
+  write_file("examples\\native\\" ++ gn ++ ".pi", gtext)
+  write_file("examples\\native\\golden\\" ++ gn ++ ".out", golden[1])
+  print("verify (b): golden " ++ gn ++ ": " ++ golden[2] ++ " == " ++ golden[3] ++ " -> " ++ trim(golden[1]))
+  // (c) the whole suite: the fixpoint and every golden program, the new one included
+  let ht = rt_spawn_out("cmd /c .\\test.cmd", "out\\gr_test.txt")
+  let rt2 = if ht == null { 1 } else { wait(ht, 1800000) }
+  let rep = read_file("out\\gr_test.txt")
+  if rep == null or brain_find(rep, "ALL PASS", 0) < 0 {
+    write_file("examples\\grown.pi", old_text)
+    gr_write_rules(old_rules)
+    // the candidate's golden out of the suite (moved aside, not deleted)
+    rt_move("examples\\native\\" ++ gn ++ ".pi", "out\\rejected_" ++ gn ++ ".pi")
+    rt_move("examples\\native\\golden\\" ++ gn ++ ".out", "out\\rejected_" ++ gn ++ ".out")
+    let why = if rep == null { "no report" } else { join(filter(split(rep, "\n"), fn(l) => brain_find(l, "FAIL", 0) >= 0), "; ") }
+    return gr_ledger_add("REJECTED | " ++ pick ++ " | " ++ keys_txt ++ " | test.cmd: " ++ trim(why))
+  }
+  print("verify (c): " ++ trim(split(rep, "ALL PASS")[1]))
+  // adopt: the seed and out\pic.exe (the brain's compiler) rebuilt with the rule
+  let hr = rt_spawn_out("cmd /c .\\build.cmd reseed", "out\\gr_reseed.txt")
+  if hr != null { wait(hr, 1800000) }
+  let hb = rt_spawn_out("cmd /c .\\build.cmd", "out\\gr_build.txt")
+  if hb != null { wait(hb, 600000) }
+  return gr_ledger_add("ADOPTED | " ++ pick ++ " | " ++ keys_txt ++ " | support " ++ join(map(picked, fn(key) => str(support[key])), "/") ++ ", " ++ str(fixed) ++ " of " ++ str(tried) ++ " logged failures fixed, golden " ++ gn ++ ", test.cmd ALL PASS")
+}

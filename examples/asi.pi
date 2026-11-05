@@ -1,0 +1,7 @@
+skill ask(q) -> Any { return answer(q) }
+skill choose_from(q, options) -> Any { return answer(q, options) }
+skill physics(q) -> Any { return formula(q) }
+skill algebra(m) -> Any { return equation(m) }
+skill everyday(q) -> Any { return fact(q) }
+skill next_terms(xs) -> Any { return sequence(xs) }
+skill heavier(a, b) -> Any { return get(fact("which is heavier, " ++ a ++ " or " ++ b ++ "?"), "answer") }

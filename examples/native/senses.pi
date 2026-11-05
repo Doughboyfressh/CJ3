@@ -1,0 +1,163 @@
+# Pi's senses and hands, in Pi, on the runtime's system calls (spawn/wait, screen, http, mouse, key, play).
+#   agents   -- agent(cmd, ms): start another Pi program and wait for it (shared memory = files)
+#   vision   -- see(step): the screen now, as [w, h, arr of 0xRRGGBB]; shades(img): a 10-level brightness grid
+#   images   -- bmp_write(path, w, h, pix): any picture Pi makes or sees, as a .bmp
+#   audio    -- tone(freq, ms, rate) and wav_write(path, samples, rate); voice(path) plays it
+#   video    -- frames_write(prefix, frames): a frame sequence (one .bmp per frame)
+#   browser  -- fetch(url): a web page over http/https (WinHTTP); no personal data ever goes in a request
+#   hands    -- click(x, y) / press(vk): ONLY when the program was started with the word "act"; otherwise Pi says
+#               what it would do. Tests never run with "act".
+
+skill put16(a, off, v) -> Any {
+  let u = (v % 65536 + 65536) % 65536
+  do aset(a, off, u % 256)
+  do aset(a, off + 1, u // 256)
+  return a
+}
+
+skill put32(a, off, v) -> Any {
+  let u = (v % 4294967296 + 4294967296) % 4294967296
+  do aset(a, off, u % 256)
+  do aset(a, off + 1, (u // 256) % 256)
+  do aset(a, off + 2, (u // 65536) % 256)
+  do aset(a, off + 3, u // 16777216)
+  return a
+}
+
+# a 24-bit bottom-up .bmp of w x h pixels (pix: arr of 0xRRGGBB, row by row from the top)
+skill bmp_write(path, w, h, pix) -> Any {
+  let row = (3 * w + 3) // 4 * 4
+  let size = 54 + row * h
+  let a = arr(size)
+  do aset(a, 0, 66)
+  do aset(a, 1, 77)
+  do put32(a, 2, size)
+  do put32(a, 10, 54)
+  do put32(a, 14, 40)
+  do put32(a, 18, w)
+  do put32(a, 22, h)
+  do put16(a, 26, 1)
+  do put16(a, 28, 24)
+  do put32(a, 34, row * h)
+  for y in range(0, h) {
+    let base = 54 + (h - 1 - y) * row
+    for x in range(0, w) {
+      let c = aget(pix, y * w + x)
+      do aset(a, base + 3 * x, c % 256)
+      do aset(a, base + 3 * x + 1, (c // 256) % 256)
+      do aset(a, base + 3 * x + 2, c // 65536)
+    }
+  }
+  return write_file(path, arr_text(a, 0, size))
+}
+
+skill put_tag(a, off, codes) -> Any {
+  for i in range(0, len(codes)) { do aset(a, off + i, codes[i]) }
+  return a
+}
+
+# 16-bit mono PCM .wav
+skill wav_write(path, samples, rate) -> Any {
+  let n = len(samples)
+  let size = 44 + 2 * n
+  let a = arr(size)
+  do put_tag(a, 0, [82, 73, 70, 70])
+  do put32(a, 4, size - 8)
+  do put_tag(a, 8, [87, 65, 86, 69, 102, 109, 116, 32])
+  do put32(a, 16, 16)
+  do put16(a, 20, 1)
+  do put16(a, 22, 1)
+  do put32(a, 24, rate)
+  do put32(a, 28, rate * 2)
+  do put16(a, 32, 2)
+  do put16(a, 34, 16)
+  do put_tag(a, 36, [100, 97, 116, 97])
+  do put32(a, 40, 2 * n)
+  for i in range(0, n) { do put16(a, 44 + 2 * i, aget(samples, i)) }
+  return write_file(path, arr_text(a, 0, size))
+}
+
+# a sine tone: freq Hz for ms milliseconds, with a short fade so it does not click
+skill tone(freq, ms, rate) -> Any {
+  let n = rate * ms // 1000
+  let a = arr(n)
+  let fade = rate // 100
+  for k in range(0, n) {
+    let amp = 9000
+    if k < fade { let amp = 9000 * k // fade }
+    if n - k < fade { let amp = 9000 * (n - k) // fade }
+    do aset(a, k, isin((360 * freq * k // rate) % 360, amp))
+  }
+  return a
+}
+
+# amp * sin(d degrees), integers only (Bhaskara I's approximation, error under 0.2%)
+skill isin(d, amp) -> Any {
+  let s = 1
+  let x = d
+  if x >= 180 {
+    let x = x - 180
+    let s = 0 - 1
+  }
+  let p = x * (180 - x)
+  return s * (4 * amp * p // (40500 - p))
+}
+
+skill voice(path) -> Any { return play(path) }
+
+skill see(step) -> Any { return screen(step) }
+
+# brightness in ten shades (0 dark .. 9 light): a grid Pi's perception (the ARC object layer) can read
+skill shades(img) -> Any {
+  let w = img[0]
+  let h = img[1]
+  let rows = []
+  for y in range(0, h) {
+    let r = []
+    for x in range(0, w) {
+      let c = aget(img[2], y * w + x)
+      let lum = (299 * (c // 65536) + 587 * ((c // 256) % 256) + 114 * (c % 256)) // 1000
+      let r = append(r, lum * 10 // 256)
+    }
+    let rows = append(rows, r)
+  }
+  return rows
+}
+
+skill frames_write(prefix, frames) -> Any {
+  let k = 0
+  for f in frames {
+    do bmp_write(prefix ++ str(1000 + k) ++ ".bmp", f[0], f[1], f[2])
+    let k = k + 1
+  }
+  return k
+}
+
+skill fetch(url) -> Any { return http(url) }
+
+skill agent(cmd, ms) -> Any {
+  let h = spawn(cmd)
+  if h == null { return null }
+  return wait(h, ms)
+}
+
+skill act_ok() -> Any {
+  let k = 1
+  while arg(k) != null {
+    if arg(k) == "act" { return true }
+    let k = k + 1
+  }
+  return false
+}
+
+skill click(x, y) -> Any {
+  if act_ok() { return mouse(x, y, 1) }
+  do print("  (hands are off: would click at " ++ str(x) ++ ", " ++ str(y) ++ ")")
+  return false
+}
+
+skill press(vk) -> Any {
+  if act_ok() { return key(vk) }
+  do print("  (hands are off: would press key " ++ str(vk) ++ ")")
+  return false
+}

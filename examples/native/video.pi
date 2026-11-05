@@ -1,0 +1,533 @@
+# video: Pi's frames as a real video file, with nothing between Pi and the graphics card. The driver's hardware encoder
+# (NVENC, part of the same driver as CUDA) is called directly, as CUDA is; the MP4 file around its output is written here.
+#   vid_open(path, w, h, fps, quality)  vid_frame(V, S)  vid_close(V)
+# S is what shade.pi's sh_open returned: its bytes buffer is the frame. quality: 1 (best) .. 51 (smallest); 18 is
+# already hard to tell from the original.
+import "audio.pi"
+
+# ---- the encoder --------------------------------------------------------------------------------------------------
+skill rt_vid_copy(d, s, n) -> Any {
+  for i in range(0, n) { do pokeb(d + i, peekb(s + i)) }
+  return 0
+}
+
+# A version word as the driver checks it: API version, the struct's own version, a fixed tag
+skill rt_nv_sv(api, n) -> Any { return bor(bor(api, shl(n, 16)), shl(7, 28)) }
+skill rt_nv_fn(nv, i) -> Any { return peek(peek(nv) + 8 + 8 * i) }
+skill rt_nv_enc(nv) -> Any { return peek(nv + 8) }
+skill rt_nv_api(nv) -> Any { return peek(nv + 16) }
+
+# a GUID: the three numbers, then its last 8 bytes as two 32-bit numbers read big-endian
+skill rt_nv_guid(p, a, b, c, hi, lo) -> Any {
+  do rt_poke32(p, a)
+  do pokeb(p + 4, band(b, 255))
+  do pokeb(p + 5, shr(b, 8))
+  do pokeb(p + 6, band(c, 255))
+  do pokeb(p + 7, shr(c, 8))
+  do pokeb(p + 8, band(shr(hi, 24), 255))
+  do pokeb(p + 9, band(shr(hi, 16), 255))
+  do pokeb(p + 10, band(shr(hi, 8), 255))
+  do pokeb(p + 11, band(hi, 255))
+  do pokeb(p + 12, band(shr(lo, 24), 255))
+  do pokeb(p + 13, band(shr(lo, 16), 255))
+  do pokeb(p + 14, band(shr(lo, 8), 255))
+  do pokeb(p + 15, band(lo, 255))
+  return p
+}
+
+# -> the encoder's handle block, or a negative number saying which step refused
+skill rt_nv_open(wt, ht, fpst, cqt, pitcht, devt) -> Any {
+  let w = rt_untag(wt)
+  let h = rt_untag(ht)
+  let pmax = rt_zero(rt_alloc(8), 8)
+  let f0 = rt_proc("nvEncodeAPI64.dll", "NvEncodeAPIGetMaxSupportedVersion")
+  if f0 == 0 { return rt_tag(0 - 1) }
+  let r = rt_u32(wcallp(f0, pmax))
+  if r != 0 { return rt_tag(0 - 1000 - r) }
+  let mx = rt_peek32(pmax)
+  let major = shr(mx, 4)
+  let minor = band(mx, 15)
+  if major < 13 { return rt_tag(0 - 2) }
+  if major > 13 or minor > 1 {
+    let major = 13
+    let minor = 1
+  }
+  let api = bor(major, shl(minor, 24))
+  let nv = rt_zero(rt_alloc(256), 256)
+  do poke(nv + 16, api)
+  let fl = rt_zero(rt_alloc(2552), 2552)
+  do rt_poke32(fl, rt_nv_sv(api, 2))
+  let r = rt_u32(wcallp(rt_proc("nvEncodeAPI64.dll", "NvEncodeAPICreateInstance"), fl))
+  if r != 0 { return rt_tag(0 - 2000 - r) }
+  do poke(nv, fl)
+  # a session on the GPU context this program already has
+  let ctx = rt_zero(rt_alloc(8), 8)
+  do wcallp(rt_cu("cuCtxGetCurrent"), ctx)
+  let op = rt_zero(rt_alloc(1552), 1552)
+  do rt_poke32(op, rt_nv_sv(api, 1))
+  do rt_poke32(op + 4, 1)
+  do poke(op + 8, peek(ctx))
+  do rt_poke32(op + 24, api)
+  let ep = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_nv_fn(nv, 29), op, ep))
+  if r != 0 { return rt_tag(0 - 3000 - r) }
+  let enc = peek(ep)
+  do poke(nv + 8, enc)
+  # H.264, the slowest and best preset, tuned for quality; it fills in the settings and only a few are changed
+  let gc = rt_nv_guid(rt_alloc(16), 1808279394, 20067, 19620, 2860850768, 4079089343)
+  let gp = rt_nv_guid(rt_alloc(16), 2223279122, 28529, 19475, 2468041698, 2213902708)
+  let pc = rt_zero(rt_alloc(16384), 16384)
+  do rt_poke32(pc, bor(rt_nv_sv(api, 5), shl(1, 31)))
+  do rt_poke32(pc + 8, bor(rt_nv_sv(api, 9), shl(1, 31)))
+  let r = rt_u32(wcallp(rt_nv_fn(nv, 39), enc, gc, gp, 1, pc))
+  if r != 0 { return rt_tag(0 - 4000 - r) }
+  let cfg = pc + 8
+  # no B-frames: each frame comes out as it goes in; forced keyframes rather than a fixed length
+  do rt_poke32(cfg + 20, 4294967295)
+  do rt_poke32(cfg + 24, 1)
+  # a constant quality, not a bitrate: variable rate with the target quality set and the average left open
+  do rt_poke32(cfg + 44, 1)
+  do rt_poke32(cfg + 60, 0)
+  do rt_poke32(cfg + 64, 240000000)
+  # adaptive quantisation on, look-ahead off (it would hold frames back)
+  let bits = rt_peek32(cfg + 76)
+  let bits = bor(bits, 8)
+  let bits = bor(bits, 256)
+  let bits = band(bits, 4294967263)
+  do rt_poke32(cfg + 76, bits)
+  do pokeb(cfg + 128, rt_untag(cqt))
+  do pokeb(cfg + 129, 0)
+  do pokeb(cfg + 130, 0)
+  do pokeb(cfg + 131, 0)
+  let ip = rt_zero(rt_alloc(1800), 1800)
+  do rt_poke32(ip, bor(rt_nv_sv(api, 7), shl(1, 31)))
+  do rt_vid_copy(ip + 4, gc, 16)
+  do rt_vid_copy(ip + 20, gp, 16)
+  do rt_poke32(ip + 36, w)
+  do rt_poke32(ip + 40, h)
+  do rt_poke32(ip + 44, w)
+  do rt_poke32(ip + 48, h)
+  do rt_poke32(ip + 52, rt_untag(fpst))
+  do rt_poke32(ip + 56, 1)
+  do rt_poke32(ip + 64, 1)
+  do poke(ip + 88, cfg)
+  do rt_poke32(ip + 96, w)
+  do rt_poke32(ip + 100, h)
+  do rt_poke32(ip + 136, 1)
+  let r = rt_u32(wcallp(rt_nv_fn(nv, 11), enc, ip))
+  if r != 0 { return rt_tag(0 - 5000 - r) }
+  # where the compressed frames land
+  let bb = rt_zero(rt_alloc(776), 776)
+  do rt_poke32(bb, rt_nv_sv(api, 1))
+  let r = rt_u32(wcallp(rt_nv_fn(nv, 14), enc, bb))
+  if r != 0 { return rt_tag(0 - 6000 - r) }
+  do poke(nv + 24, peek(bb + 16))
+  # the frames come from GPU memory, NV12
+  let rg = rt_zero(rt_alloc(1536), 1536)
+  do rt_poke32(rg, rt_nv_sv(api, 5))
+  do rt_poke32(rg + 4, 1)
+  do rt_poke32(rg + 8, w)
+  do rt_poke32(rg + 12, h)
+  do rt_poke32(rg + 16, rt_untag(pitcht))
+  do poke(rg + 24, rt_untag(devt))
+  do rt_poke32(rg + 40, 1)
+  let r = rt_u32(wcallp(rt_nv_fn(nv, 30), enc, rg))
+  if r != 0 { return rt_tag(0 - 7000 - r) }
+  do poke(nv + 32, peek(rg + 32))
+  do poke(nv + 40, w)
+  do poke(nv + 48, h)
+  do poke(nv + 56, rt_untag(pitcht))
+  return rt_tag(nv)
+}
+
+# the file a film is written to, straight through
+skill rt_vf_open(patht) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(patht), 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 { return rt_tag(0 - 1) }
+  return rt_tag(h)
+}
+skill rt_vf_mem(h, p, n) -> Any {
+  do wcall("WriteFile", h, p, n, gaddr(2), 0)
+  return n
+}
+skill rt_vf_text(ht, s) -> Any { return rt_tag(rt_vf_mem(rt_untag(ht), s + 16, peek(s + 8))) }
+skill rt_vf_at(ht, post) -> Any {
+  do wcallp(rt_proc("kernel32.dll", "SetFilePointerEx"), rt_untag(ht), rt_untag(post), 0, 0)
+  return rt_tag(0)
+}
+skill rt_vf_close(ht) -> Any {
+  do wcall("CloseHandle", rt_untag(ht))
+  return rt_tag(0)
+}
+
+# compressed bytes as a video file wants them: each unit with its length in front. The stream's two header units are
+# kept for the file's header. -> the bytes written
+skill rt_nal_emit(nv, h, p, n) -> Any {
+  let lenb = rt_alloc(8)
+  let out = 0
+  let i = 0
+  while i + 3 <= n {
+    if peekb(p + i) == 0 and peekb(p + i + 1) == 0 and peekb(p + i + 2) == 1 {
+      let a = i + 3
+      let j = a
+      let e = n
+      let more = 1
+      while more == 1 and j + 3 <= n {
+        if peekb(p + j) == 0 and peekb(p + j + 1) == 0 and peekb(p + j + 2) == 1 {
+          let e = j
+          let more = 0
+        } else {
+          let j = j + 1
+        }
+      }
+      # the zero before a four-byte start code belongs to no unit
+      while e > a and peekb(p + e - 1) == 0 { let e = e - 1 }
+      let ty = band(peekb(p + a), 31)
+      if ty == 7 and peek(nv + 64) == 0 {
+        let q = rt_alloc(e - a)
+        do rt_vid_copy(q, p + a, e - a)
+        do poke(nv + 64, q)
+        do poke(nv + 72, e - a)
+      }
+      if ty == 8 and peek(nv + 80) == 0 {
+        let q = rt_alloc(e - a)
+        do rt_vid_copy(q, p + a, e - a)
+        do poke(nv + 80, q)
+        do poke(nv + 88, e - a)
+      }
+      if ty != 7 and ty != 8 and ty != 9 and ty != 6 {
+        let m = e - a
+        do pokeb(lenb, band(shr(m, 24), 255))
+        do pokeb(lenb + 1, band(shr(m, 16), 255))
+        do pokeb(lenb + 2, band(shr(m, 8), 255))
+        do pokeb(lenb + 3, band(m, 255))
+        do rt_vf_mem(h, lenb, 4)
+        do rt_vf_mem(h, p + a, m)
+        let out = out + 4 + m
+      }
+      let i = e
+    } else {
+      let i = i + 1
+    }
+  }
+  return out
+}
+
+# one frame, already in the registered GPU memory -> the bytes it took in the file
+skill rt_nv_frame(nvt, ht, idxt, keyt) -> Any {
+  let nv = rt_untag(nvt)
+  let h = rt_untag(ht)
+  let api = rt_nv_api(nv)
+  let enc = rt_nv_enc(nv)
+  let mp = rt_zero(rt_alloc(1544), 1544)
+  do rt_poke32(mp, rt_nv_sv(api, 4))
+  do poke(mp + 16, peek(nv + 32))
+  let r = rt_u32(wcallp(rt_nv_fn(nv, 25), enc, mp))
+  if r != 0 { return rt_tag(0 - 100 - r) }
+  let mapped = peek(mp + 24)
+  let pc = rt_zero(rt_alloc(8192), 8192)
+  do rt_poke32(pc, bor(rt_nv_sv(api, 7), shl(1, 31)))
+  do rt_poke32(pc + 4, peek(nv + 40))
+  do rt_poke32(pc + 8, peek(nv + 48))
+  do rt_poke32(pc + 12, peek(nv + 56))
+  if rt_untag(keyt) != 0 { do rt_poke32(pc + 16, 6) }
+  do rt_poke32(pc + 20, rt_untag(idxt))
+  do poke(pc + 24, rt_untag(idxt))
+  do poke(pc + 40, mapped)
+  do poke(pc + 48, peek(nv + 24))
+  do rt_poke32(pc + 64, 1)
+  do rt_poke32(pc + 68, 1)
+  let r = rt_u32(wcallp(rt_nv_fn(nv, 16), enc, pc))
+  if r != 0 { return rt_tag(0 - 200 - r) }
+  let lk = rt_zero(rt_alloc(2048), 2048)
+  do rt_poke32(lk, bor(rt_nv_sv(api, 2), shl(1, 31)))
+  do poke(lk + 8, peek(nv + 24))
+  let r = rt_u32(wcallp(rt_nv_fn(nv, 17), enc, lk))
+  if r != 0 { return rt_tag(0 - 300 - r) }
+  let out = rt_nal_emit(nv, h, peek(lk + 56), rt_peek32(lk + 36))
+  do wcallp(rt_nv_fn(nv, 18), enc, peek(nv + 24))
+  do wcallp(rt_nv_fn(nv, 26), enc, mapped)
+  return rt_tag(out)
+}
+
+skill rt_nv_close(nvt) -> Any {
+  let nv = rt_untag(nvt)
+  let pc = rt_zero(rt_alloc(8192), 8192)
+  do rt_poke32(pc, bor(rt_nv_sv(rt_nv_api(nv), 7), shl(1, 31)))
+  do rt_poke32(pc + 16, 8)
+  do wcallp(rt_nv_fn(nv, 16), rt_nv_enc(nv), pc)
+  do wcallp(rt_nv_fn(nv, 31), rt_nv_enc(nv), peek(nv + 32))
+  do wcallp(rt_nv_fn(nv, 15), rt_nv_enc(nv), peek(nv + 24))
+  do wcallp(rt_nv_fn(nv, 27), rt_nv_enc(nv))
+  return rt_tag(0)
+}
+
+# the stream's header units, as text for the file header
+skill rt_nv_unit(nvt, offt) -> Any {
+  let nv = rt_untag(nvt)
+  let p = peek(nv + rt_untag(offt))
+  let n = peek(nv + rt_untag(offt) + 8)
+  let t = rt_text_new(n)
+  do rt_vid_copy(t + 16, p, n)
+  return t
+}
+
+# ---- RGB bytes -> what the encoder takes: a Y plane, then half-size interleaved U and V (BT.709, video range) --------
+skill vid_kernel() -> Any {
+  return ".version 7.0\n.target sm_80\n.address_size 64\n.entry pi_nv12 (.param .u64 prgb, .param .u64 pnv, .param .u32 pw, .param .u32 ph, .param .u32 ppitch, .param .u32 pbs)
+{
+.reg .u32 %u<32>;
+.reg .u64 %d<12>;
+.reg .f32 %f<24>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pw];
+ld.param.u32 %u1, [ph];
+ld.param.u32 %u2, [ppitch];
+ld.param.u32 %u3, [pbs];
+mov.u32 %u4, %ctaid.x;
+mov.u32 %u5, %tid.x;
+mul.lo.u32 %u4, %u4, %u3;
+add.u32 %u4, %u4, %u5;
+mul.lo.u32 %u6, %u0, %u1;
+setp.ge.u32 %p0, %u4, %u6;
+@%p0 exit;
+rem.u32 %u7, %u4, %u0;
+div.u32 %u8, %u4, %u0;
+ld.param.u64 %d0, [prgb];
+ld.param.u64 %d1, [pnv];
+mul.wide.u32 %d2, %u4, 3;
+add.u64 %d2, %d2, %d0;
+ld.global.u8 %u9, [%d2];
+ld.global.u8 %u10, [%d2+1];
+ld.global.u8 %u11, [%d2+2];
+cvt.rn.f32.u32 %f0, %u9;
+cvt.rn.f32.u32 %f1, %u10;
+cvt.rn.f32.u32 %f2, %u11;
+mul.f32 %f3, %f0, 0f3E59B3D0;
+fma.rn.f32 %f3, %f1, 0f3F371759, %f3;
+fma.rn.f32 %f3, %f2, 0f3D93DD98, %f3;
+mul.f32 %f3, %f3, 0f3F5BDBDC;
+add.f32 %f3, %f3, 0f41840000;
+cvt.rzi.u32.f32 %u12, %f3;
+min.u32 %u12, %u12, 235;
+mul.wide.u32 %d3, %u8, %u2;
+cvt.u64.u32 %d4, %u7;
+add.u64 %d3, %d3, %d4;
+add.u64 %d3, %d3, %d1;
+st.global.u8 [%d3], %u12;
+and.b32 %u13, %u7, 1;
+and.b32 %u14, %u8, 1;
+or.b32 %u13, %u13, %u14;
+setp.ne.u32 %p1, %u13, 0;
+@%p1 exit;
+add.u64 %d5, %d2, 3;
+mul.wide.u32 %d6, %u0, 3;
+add.u64 %d7, %d2, %d6;
+add.u64 %d8, %d7, 3;
+ld.global.u8 %u15, [%d5];
+ld.global.u8 %u16, [%d5+1];
+ld.global.u8 %u17, [%d5+2];
+add.u32 %u9, %u9, %u15;
+add.u32 %u10, %u10, %u16;
+add.u32 %u11, %u11, %u17;
+ld.global.u8 %u15, [%d7];
+ld.global.u8 %u16, [%d7+1];
+ld.global.u8 %u17, [%d7+2];
+add.u32 %u9, %u9, %u15;
+add.u32 %u10, %u10, %u16;
+add.u32 %u11, %u11, %u17;
+ld.global.u8 %u15, [%d8];
+ld.global.u8 %u16, [%d8+1];
+ld.global.u8 %u17, [%d8+2];
+add.u32 %u9, %u9, %u15;
+add.u32 %u10, %u10, %u16;
+add.u32 %u11, %u11, %u17;
+cvt.rn.f32.u32 %f0, %u9;
+cvt.rn.f32.u32 %f1, %u10;
+cvt.rn.f32.u32 %f2, %u11;
+mul.f32 %f0, %f0, 0f3E800000;
+mul.f32 %f1, %f1, 0f3E800000;
+mul.f32 %f2, %f2, 0f3E800000;
+mul.f32 %f4, %f0, 0fBDEAB368;
+fma.rn.f32 %f4, %f1, 0fBEC55326, %f4;
+fma.rn.f32 %f4, %f2, 0f3F000000, %f4;
+mul.f32 %f4, %f4, 0f3F60E0E1;
+add.f32 %f4, %f4, 0f43008000;
+mul.f32 %f5, %f0, 0f3F000000;
+fma.rn.f32 %f5, %f1, 0fBEE88CE7, %f5;
+fma.rn.f32 %f5, %f2, 0fBD3BB4A2, %f5;
+mul.f32 %f5, %f5, 0f3F60E0E1;
+add.f32 %f5, %f5, 0f43008000;
+cvt.rzi.u32.f32 %u18, %f4;
+cvt.rzi.u32.f32 %u19, %f5;
+min.u32 %u18, %u18, 240;
+min.u32 %u19, %u19, 240;
+mul.wide.u32 %d9, %u1, %u2;
+add.u64 %d9, %d9, %d1;
+shr.u32 %u20, %u8, 1;
+mul.wide.u32 %d10, %u20, %u2;
+add.u64 %d9, %d9, %d10;
+add.u64 %d9, %d9, %d4;
+st.global.u8 [%d9], %u18;
+st.global.u8 [%d9+1], %u19;
+exit;
+}
+"
+}
+
+# ---- MP4: lists of byte values, boxes around them ----------------------------------------------------------------------
+skill mp_be32(n) -> Any { return [(n // 16777216) % 256, (n // 65536) % 256, (n // 256) % 256, n % 256] }
+skill mp_be16(n) -> Any { return [(n // 256) % 256, n % 256] }
+skill mp_text(s) -> Any { return map(chars(s), fn(c) => ord(c)) }
+skill mp_box(name, body) -> Any { return mp_be32(len(body) + 8) ++ mp_text(name) ++ body }
+skill mp_zeros(n) -> Any { return map(range(0, n), fn(i) => 0) }
+skill mp_unit(t) -> Any { return map(chars(t), fn(c) => ord(c)) }
+skill mp_matrix() -> Any { return mp_be32(65536) ++ mp_zeros(12) ++ mp_be32(65536) ++ mp_zeros(12) ++ mp_be32(1073741824) }
+skill mp_bytes(xs) -> Any {
+  let a = arr(len(xs) + 1)
+  let i = 0
+  for x in xs {
+    aset(a, i, x)
+    i += 1
+  }
+  return arr_text(a, 0, len(xs))
+}
+
+# sizes: bytes of each frame; keys: 1-based numbers of the key frames; first: where the frames start in the file
+# the soundtrack's track: FLAC frames, one chunk, right after the box header
+skill mp_audio_trak(A, first, scale) -> Any {
+  let frames = A["frames"]
+  let count = len(A["sizes"])
+  let dur = frames * scale // 48000
+  let tkhd = mp_box("tkhd", [0, 0, 0, 3] ++ mp_zeros(8) ++ mp_be32(2) ++ mp_zeros(4) ++ mp_be32(dur) ++ mp_zeros(8) ++ mp_zeros(4) ++ mp_be16(256) ++ mp_zeros(2) ++ mp_matrix() ++ mp_zeros(8))
+  let mdhd = mp_box("mdhd", mp_zeros(4) ++ mp_zeros(8) ++ mp_be32(48000) ++ mp_be32(frames) ++ mp_be16(21956) ++ mp_zeros(2))
+  let hdlr = mp_box("hdlr", mp_zeros(8) ++ mp_text("soun") ++ mp_zeros(12) ++ mp_text("Pi sound") ++ [0])
+  let smhd = mp_box("smhd", mp_zeros(8))
+  let dinf = mp_box("dinf", mp_box("dref", mp_zeros(4) ++ mp_be32(1) ++ mp_box("url ", [0, 0, 0, 1])))
+  let dfla = mp_box("dfLa", mp_zeros(4) ++ [128, 0, 0, 34] ++ A["info"])
+  let flac = mp_box("fLaC", mp_zeros(6) ++ mp_be16(1) ++ mp_zeros(8) ++ mp_be16(2) ++ mp_be16(24) ++ mp_zeros(4) ++ mp_be16(48000) ++ mp_zeros(2) ++ dfla)
+  let stsd = mp_box("stsd", mp_zeros(4) ++ mp_be32(1) ++ flac)
+  let last = frames - (count - 1) * 4096
+  let stts = if last == 4096 { mp_box("stts", mp_zeros(4) ++ mp_be32(1) ++ mp_be32(count) ++ mp_be32(4096)) } else { mp_box("stts", mp_zeros(4) ++ mp_be32(2) ++ mp_be32(count - 1) ++ mp_be32(4096) ++ mp_be32(1) ++ mp_be32(last)) }
+  let stsc = mp_box("stsc", mp_zeros(4) ++ mp_be32(1) ++ mp_be32(1) ++ mp_be32(count) ++ mp_be32(1))
+  let szb = []
+  for z in A["sizes"] { szb = szb ++ mp_be32(z) }
+  let stsz = mp_box("stsz", mp_zeros(8) ++ mp_be32(count) ++ szb)
+  let stco = mp_box("stco", mp_zeros(4) ++ mp_be32(1) ++ mp_be32(first))
+  let stbl = mp_box("stbl", stsd ++ stts ++ stsc ++ stsz ++ stco)
+  let minf = mp_box("minf", smhd ++ dinf ++ stbl)
+  let mdia = mp_box("mdia", mdhd ++ hdlr ++ minf)
+  return [mp_box("trak", tkhd ++ mdia), dur]
+}
+
+skill mp_moov(w, h, fps, sizes, keys, first, sps, pps, A, afirst) -> Any {
+  let scale = 90000
+  let delta = scale // fps
+  let frames = len(sizes)
+  let dur = frames * delta
+  let at = if A != null { mp_audio_trak(A, afirst, scale) } else { null }
+  let longest = if at != null { max(dur, at[1]) } else { dur }
+  let mvhd = mp_box("mvhd", mp_zeros(4) ++ mp_zeros(8) ++ mp_be32(scale) ++ mp_be32(longest) ++ mp_be32(65536) ++ mp_be16(256) ++ mp_zeros(10) ++ mp_matrix() ++ mp_zeros(24) ++ mp_be32(3))
+  let tkhd = mp_box("tkhd", [0, 0, 0, 3] ++ mp_zeros(8) ++ mp_be32(1) ++ mp_zeros(4) ++ mp_be32(dur) ++ mp_zeros(8) ++ mp_zeros(8) ++ mp_matrix() ++ mp_be32(w * 65536) ++ mp_be32(h * 65536))
+  let mdhd = mp_box("mdhd", mp_zeros(4) ++ mp_zeros(8) ++ mp_be32(scale) ++ mp_be32(dur) ++ mp_be16(21956) ++ mp_zeros(2))
+  let hdlr = mp_box("hdlr", mp_zeros(8) ++ mp_text("vide") ++ mp_zeros(12) ++ mp_text("Pi video") ++ [0])
+  let vmhd = mp_box("vmhd", [0, 0, 0, 1] ++ mp_zeros(8))
+  let dinf = mp_box("dinf", mp_box("dref", mp_zeros(4) ++ mp_be32(1) ++ mp_box("url ", [0, 0, 0, 1])))
+  let s = mp_unit(sps)
+  let p = mp_unit(pps)
+  let avcc = mp_box("avcC", [1, s[1], s[2], s[3], 255, 225] ++ mp_be16(len(s)) ++ s ++ [1] ++ mp_be16(len(p)) ++ p)
+  // the colours are BT.709, video range, as the conversion above made them
+  let colr = mp_box("colr", mp_text("nclx") ++ mp_be16(1) ++ mp_be16(1) ++ mp_be16(1) ++ [0])
+  let avc1 = mp_box("avc1", mp_zeros(6) ++ mp_be16(1) ++ mp_zeros(16) ++ mp_be16(w) ++ mp_be16(h) ++ mp_be32(4718592) ++ mp_be32(4718592) ++ mp_zeros(4) ++ mp_be16(1) ++ mp_zeros(32) ++ mp_be16(24) ++ [255, 255] ++ avcc ++ colr)
+  let stsd = mp_box("stsd", mp_zeros(4) ++ mp_be32(1) ++ avc1)
+  let stts = mp_box("stts", mp_zeros(4) ++ mp_be32(1) ++ mp_be32(frames) ++ mp_be32(delta))
+  let stsc = mp_box("stsc", mp_zeros(4) ++ mp_be32(1) ++ mp_be32(1) ++ mp_be32(frames) ++ mp_be32(1))
+  let szb = []
+  for z in sizes { szb = szb ++ mp_be32(z) }
+  let stsz = mp_box("stsz", mp_zeros(8) ++ mp_be32(frames) ++ szb)
+  let stco = mp_box("stco", mp_zeros(4) ++ mp_be32(1) ++ mp_be32(first))
+  let kb = []
+  for k in keys { kb = kb ++ mp_be32(k) }
+  let stss = mp_box("stss", mp_zeros(4) ++ mp_be32(len(keys)) ++ kb)
+  let stbl = mp_box("stbl", stsd ++ stts ++ stsc ++ stsz ++ stco ++ stss)
+  let minf = mp_box("minf", vmhd ++ dinf ++ stbl)
+  let mdia = mp_box("mdia", mdhd ++ hdlr ++ minf)
+  let trak = mp_box("trak", tkhd ++ mdia)
+  return mp_box("moov", mvhd ++ trak ++ (if at != null { at[0] } else { [] }))
+}
+
+# ---- a film ----------------------------------------------------------------------------------------------------------
+# the piece, compressed, ready to go in a film
+skill vid_audio(score, src, wet) -> Any {
+  let r = au_pcm(score, src, wet)
+  let f = rt_flac(r[0], r[1])
+  let sizes = []
+  let mf = 0
+  for i in range(0, f[3]) {
+    let z = rt_fl_size(f[2], i)
+    sizes = append(sizes, z)
+    mf = max(mf, z)
+  }
+  return {"buf": f[0], "bytes": f[1], "sizes": sizes, "frames": r[1], "info": fl_streaminfo(r[1], mf)}
+}
+skill rt_vf_host(ht, pt, nt) -> Any { return rt_tag(rt_vf_mem(rt_untag(ht), rt_untag(pt), rt_untag(nt))) }
+
+skill vid_open(path, S, fps, quality, A) -> Any {
+  let w = S["w"]
+  let h = S["h"]
+  if w % 2 != 0 or h % 2 != 0 { fail("a video's width and height must be even") }
+  let pitch = (w + 255) // 256 * 256
+  let dev = rt_gpu_alloc(pitch * h + pitch * h // 2)
+  if dev < 0 { fail("not enough GPU memory for the video frame") }
+  let nv = rt_nv_open(w, h, fps, quality, pitch, dev)
+  if nv < 0 { fail("the hardware encoder refused to start: " ++ str(nv)) }
+  let mod = rt_sh_module(vid_kernel(), "out\\shade_log.txt")
+  if mod < 0 { fail("the driver refused the colour conversion: " ++ read_file("out\\shade_log.txt")) }
+  let fh = rt_vf_open(path)
+  if fh < 0 { fail("cannot write " ++ path) }
+  let ftyp = mp_bytes(mp_box("ftyp", mp_text("isom") ++ mp_be32(512) ++ mp_text("isomiso2avc1mp41")))
+  rt_vf_text(fh, ftyp)
+  // the frames' box: its size is known only at the end, so it uses the 16-byte form and is filled in then
+  rt_vf_text(fh, mp_bytes(mp_be32(1) ++ mp_text("mdat") ++ mp_zeros(8)))
+  let hdr = len(ftyp) + 16
+  // the sound goes first in the box, the frames after it
+  let ab = 0
+  if A != null {
+    rt_vf_host(fh, A["buf"], A["bytes"])
+    ab = A["bytes"]
+  }
+  return {"nv": nv, "fh": fh, "dev": dev, "pitch": pitch, "k": rt_gpu_fn(mod, "pi_nv12"), "w": w, "h": h, "fps": fps, "sizes": rt_sh_box([]), "keys": rt_sh_box([]), "n": arr(2), "hdr": hdr, "A": A, "ab": ab}
+}
+
+# S's bytes buffer as the next frame -> its compressed size
+skill vid_frame(V, S) -> Any {
+  let w = V["w"]
+  let h = V["h"]
+  let bs = 256
+  let r = rt_gpu_launch(V["k"], (w * h + bs - 1) // bs, bs, [S["bytes"], V["dev"], w, h, V["pitch"], bs])
+  if r != 0 { fail("the colour conversion failed: " ++ str(r)) }
+  let i = aget(V["n"], 0)
+  let key = i % (2 * V["fps"]) == 0
+  let z = rt_nv_frame(V["nv"], V["fh"], i, if key { 1 } else { 0 })
+  if z < 0 { fail("the hardware encoder stopped at frame " ++ str(i) ++ ": " ++ str(z)) }
+  rt_sh_set(V["sizes"], append(rt_sh_get(V["sizes"]), z))
+  if key { rt_sh_set(V["keys"], append(rt_sh_get(V["keys"]), i + 1)) }
+  aset(V["n"], 0, i + 1)
+  aset(V["n"], 1, aget(V["n"], 1) + z)
+  return z
+}
+
+skill vid_close(V) -> Any {
+  rt_nv_close(V["nv"])
+  let total = aget(V["n"], 1)
+  let moov = mp_moov(V["w"], V["h"], V["fps"], rt_sh_get(V["sizes"]), rt_sh_get(V["keys"]), V["hdr"] + V["ab"], rt_nv_unit(V["nv"], 64), rt_nv_unit(V["nv"], 80), V["A"], V["hdr"])
+  let fh = V["fh"]
+  rt_vf_text(fh, mp_bytes(moov))
+  // back to fill in the size of the frames' box
+  let at = V["hdr"] - 8
+  rt_vf_at(fh, at)
+  let size = total + V["ab"] + 16
+  rt_vf_text(fh, mp_bytes(mp_be32(size // 4294967296) ++ mp_be32(size % 4294967296)))
+  rt_vf_close(fh)
+  return total
+}

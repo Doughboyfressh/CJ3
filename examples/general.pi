@@ -1,0 +1,69 @@
+# Pi as a general language: loops, lists, maps, text -- and its solvers inside them.
+
+skill sum_of_squares(n) -> Any {
+  let total = 0
+  for i in range(1, n + 1) {
+    let total = total + i * i
+  }
+  return total
+}
+
+skill fizzbuzz(n) -> Any {
+  let out = []
+  for i in range(1, n + 1) {
+    if i - 15 * floor(i / 15) == 0 {
+      let out = append(out, "FizzBuzz")
+    } else {
+      if i - 3 * floor(i / 3) == 0 {
+        let out = append(out, "Fizz")
+      } else {
+        if i - 5 * floor(i / 5) == 0 {
+          let out = append(out, "Buzz")
+        } else {
+          let out = append(out, str(i))
+        }
+      }
+    }
+  }
+  return join(out, " ")
+}
+
+skill collatz(n) -> Any {
+  let steps = 0
+  while n != 1 {
+    if n - 2 * floor(n / 2) == 0 {
+      let n = n / 2
+    } else {
+      let n = 3 * n + 1
+    }
+    let steps = steps + 1
+  }
+  return steps
+}
+
+skill word_count(text) -> Any {
+  let counts = {}
+  for w in split(lower(text)) {
+    let seen = counts[w]
+    if seen == null {
+      let counts = put(counts, w, 1)
+    } else {
+      let counts = put(counts, w, seen + 1)
+    }
+  }
+  return counts
+}
+
+skill answer_all(questions) -> Any {
+  let report = []
+  for q in questions {
+    let r = answer(q)
+    let report = append(report, q ++ " -> " ++ r.answer)
+  }
+  return report
+}
+
+skill solve_for_energy() -> Any {
+  let e = formula("A 2 kg ball moves at 3 m/s. What is its kinetic energy?").answer
+  return equation("2 x = " ++ e)
+}

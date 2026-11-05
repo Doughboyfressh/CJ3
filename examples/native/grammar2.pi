@@ -1,0 +1,610 @@
+# Grammar, step 2: phrases by compression (no rules given). Text becomes a stream of word classes (grammar1.pi's 64,
+# plus "rare word" and "sentence end"); then, again and again, the most frequent pair of neighbouring symbols becomes
+# a new symbol -- a phrase rule X -> A B (Re-Pair: grammar-based compression). Phrases are built of phrases, so a
+# hierarchy grows by itself; nothing is merged across a sentence end.
+# Checked on held-out Wikipedia (never counted): bits per word, four ways -- classes alone, class pairs, phrases
+# alone, phrase pairs. If the phrases are real structure, they compress unseen text better.
+#   out\grammar2.exe [rules] [train words]    -> out\phrases.txt (rule ::: expansion in class names ::: count)
+
+skill NC() -> Any { return 256 }
+# tokens after the classes: a name (rare word with a capital), a sentence end, a rare lower-case word; rules after
+skill NAME() -> Any { return NC() }
+skill END() -> Any { return NC() + 1 }
+skill RARE() -> Any { return NC() + 2 }
+skill FIRST() -> Any { return NC() + 3 }
+
+skill wkey2(w) -> Any {
+  let h = 0
+  for i in range(0, len(w)) { let h = (h * 31 + ord(slice(w, i, i + 1))) % 1000000007 }
+  return h * 64 + len(w) + 1
+}
+
+skill vocab_table(vocab) -> Any {
+  let hsz = 131072
+  let hk = arr(hsz)
+  let hv = arr(hsz)
+  for i in range(0, len(vocab)) {
+    let k = wkey2(vocab[i])
+    let s = k % hsz
+    while aget(hk, s) != 0 { let s = (s + 1) % hsz }
+    do aset(hk, s, k)
+    do aset(hv, s, i + 1)
+  }
+  return [hk, hv, hsz]
+}
+
+# a file -> class tokens (0..63 a class, 64 a rare word with a capital -- a name, 65 a sentence end, 66 a rare lower-case word), and word counts per vocabulary id
+skill class_stream(path, tab, cls, maxw, wcount) -> Any {
+  let hk = tab[0]
+  let hv = tab[1]
+  let hsz = tab[2]
+  let out = arr(maxw)
+  let n = 0
+  let bb = read_bytes(path, 0, maxw * 7)
+  let nb = len(bb)
+  let i = 0
+  let wh = 0
+  let wl = 0
+  let last = END()
+  let cap = false
+  while i < nb and n < maxw - 1 {
+    let c = aget(bb, i)
+    let lc = c
+    if c >= 65 and c <= 90 { let lc = c + 32 }
+    if lc >= 97 and lc <= 122 {
+      if wl == 0 { let cap = c >= 65 and c <= 90 }
+      let wh = (wh * 31 + lc) % 1000000007
+      let wl = wl + 1
+    } else {
+      if wl > 0 {
+        let k = wh * 64 + wl + 1
+        let s = k % hsz
+        let id = 0 - 1
+        let look = true
+        while look {
+          let hkk = aget(hk, s)
+          if hkk == 0 { let look = false } else {
+            if hkk == k {
+              let id = aget(hv, s) - 1
+              let look = false
+            } else { let s = (s + 1) % hsz }
+          }
+        }
+        let t = NAME()
+        if cap == false { let t = RARE() }
+        if id >= 0 {
+          let t = aget(cls, id)
+          if t < 0 { let t = NAME() }
+          if wcount != null { do aset(wcount, id, aget(wcount, id) + 1) }
+        }
+        do aset(out, n, t)
+        let n = n + 1
+        let last = t
+        let wh = 0
+        let wl = 0
+      }
+      if (c == 46 or c == 10 or c == 33 or c == 63) and last != END() {
+        do aset(out, n, END())
+        let n = n + 1
+        let last = END()
+      }
+    }
+    let i = i + 1
+  }
+  return [out, n]
+}
+
+# one rule applied over a stream in place: every a b (left to right) becomes x -> the new length
+skill replace_pair(seq, n, a, b, x) -> Any {
+  let i = 0
+  let j = 0
+  while i < n {
+    if i + 1 < n and aget(seq, i) == a and aget(seq, i + 1) == b {
+      do aset(seq, j, x)
+      let i = i + 2
+    } else {
+      do aset(seq, j, aget(seq, i))
+      let i = i + 1
+    }
+    let j = j + 1
+  }
+  return j
+}
+
+# Re-Pair: up to m rules, each the most frequent neighbouring pair (seen 50 times at least) -> [rules, new length]
+skill repair(seq, n0, m, smax) -> Any {
+  let n = n0
+  let rules = []
+  let cnt = arr(smax * smax)
+  let next = FIRST()
+  let going = true
+  while going and len(rules) < m {
+    for k in range(0, smax * smax) { do aset(cnt, k, 0) }
+    let i = 0
+    while i + 1 < n {
+      let a = aget(seq, i)
+      let b = aget(seq, i + 1)
+      if a != END() and b != END() { do aset(cnt, a * smax + b, aget(cnt, a * smax + b) + 1) }
+      let i = i + 1
+    }
+    let best = 0
+    for k in range(0, next * smax) {
+      if aget(cnt, k) > aget(cnt, best) { let best = k }
+    }
+    if aget(cnt, best) < 50 { let going = false } else {
+      let a = best // smax
+      let b = best % smax
+      let rules = append(rules, [next, a, b, aget(cnt, best)])
+      let n = replace_pair(seq, n, a, b, next)
+      let next = next + 1
+    }
+  }
+  return [rules, n]
+}
+
+# ---- bits per word on held-out text ---------------------------------------------------------------------------
+# unigram and pair (bigram) codes for a symbol stream, trained on one stream, scored on another (add-one smoothing)
+skill code_bits(train, ntr, test, nte, nsym) -> Any {
+  let uc = arr(nsym)
+  let bc = arr(nsym * nsym)
+  let rowc = arr(nsym)
+  for i in range(0, ntr) {
+    let s = aget(train, i)
+    do aset(uc, s, aget(uc, s) + 1)
+    if i > 0 {
+      let p = aget(train, i - 1)
+      do aset(bc, p * nsym + s, aget(bc, p * nsym + s) + 1)
+      do aset(rowc, p, aget(rowc, p) + 1)
+    }
+  }
+  let bu = 0.0
+  let bb = 0.0
+  for i in range(0, nte) {
+    let s = aget(test, i)
+    let bu = bu - log2((aget(uc, s) + 1) * 1.0 / (ntr + nsym))
+    if i > 0 {
+      let p = aget(test, i - 1)
+      let bb = bb - log2((aget(bc, p * nsym + s) + 1) * 1.0 / (aget(rowc, p) + nsym))
+    } else { let bb = bb - log2((aget(uc, s) + 1) * 1.0 / (ntr + nsym)) }
+  }
+  return [bu, bb]
+}
+
+skill copy_arr(a, n) -> Any {
+  let b = arr(n)
+  for i in range(0, n) { do aset(b, i, aget(a, i)) }
+  return b
+}
+
+# ---- readable rules: a class is named by its two most common words ------------------------------------------------
+skill class_names(vocab, cls, wcount) -> Any {
+  let names = []
+  for c in range(0, NC()) {
+    let b1 = 0 - 1
+    let b2 = 0 - 1
+    for t in range(0, len(vocab)) {
+      if aget(cls, t) == c {
+        if b1 < 0 or aget(wcount, t) > aget(wcount, b1) {
+          let b2 = b1
+          let b1 = t
+        } else {
+          if b2 < 0 or aget(wcount, t) > aget(wcount, b2) { let b2 = t }
+        }
+      }
+    }
+    let nm = "?"
+    if b1 >= 0 { let nm = vocab[b1] }
+    if b2 >= 0 { let nm = nm ++ "/" ++ vocab[b2] }
+    let names = append(names, nm)
+  }
+  return append(append(append(names, "NAME"), "."), "rare")
+}
+
+skill expand(sym, rules, names) -> Any {
+  if sym < FIRST() { return "[" ++ names[sym] ++ "]" }
+  let r = rules[sym - FIRST()]
+  return expand(r[1], rules, names) ++ " " ++ expand(r[2], rules, names)
+}
+
+# ---- the grammar test --------------------------------------------------------------------------------------------
+# a file -> [word ids (vocab id; -1 a name, -2 a rare lower-case word), class tokens], both with 65 / -9 at sentence ends
+skill both_streams(path, tab, cls, maxw) -> Any {
+  let hk = tab[0]
+  let hv = tab[1]
+  let hsz = tab[2]
+  let wout = arr(maxw)
+  let cout = arr(maxw)
+  let n = 0
+  let bb = read_bytes(path, 0, maxw * 7)
+  let nb = len(bb)
+  let i = 0
+  let wh = 0
+  let wl = 0
+  let cap = false
+  let last = END()
+  while i < nb and n < maxw - 1 {
+    let c = aget(bb, i)
+    let lc = c
+    if c >= 65 and c <= 90 { let lc = c + 32 }
+    if lc >= 97 and lc <= 122 {
+      if wl == 0 { let cap = c >= 65 and c <= 90 }
+      let wh = (wh * 31 + lc) % 1000000007
+      let wl = wl + 1
+    } else {
+      if wl > 0 {
+        let k = wh * 64 + wl + 1
+        let s = k % hsz
+        let id = 0 - 1
+        let look = true
+        while look {
+          let hkk = aget(hk, s)
+          if hkk == 0 { let look = false } else {
+            if hkk == k {
+              let id = aget(hv, s) - 1
+              let look = false
+            } else { let s = (s + 1) % hsz }
+          }
+        }
+        let t = NAME()
+        let w = 0 - 1
+        if cap == false {
+          let t = RARE()
+          let w = 0 - 2
+        }
+        if id >= 0 {
+          let w = id
+          let t = aget(cls, id)
+          if t < 0 { let t = NAME() }
+        }
+        do aset(wout, n, w)
+        do aset(cout, n, t)
+        let n = n + 1
+        let last = t
+        let wh = 0
+        let wl = 0
+      }
+      if (c == 46 or c == 10 or c == 33 or c == 63) and last != END() {
+        do aset(wout, n, 0 - 9)
+        do aset(cout, n, END())
+        let n = n + 1
+        let last = END()
+      }
+    }
+    let i = i + 1
+  }
+  return [wout, cout, n]
+}
+
+# word ids as model symbols: vocab id, then V = a name, V+1 = a rare word, V+2 = a sentence end
+skill wsym(w, V) -> Any {
+  if w >= 0 { return w }
+  if w == 0 - 1 { return V }
+  if w == 0 - 2 { return V + 1 }
+  return V + 2
+}
+
+# the word-pair model: counts of (previous, next) in a hash on flat arrays, word counts, total
+skill word_pairs(ws, n, V) -> Any {
+  let hsz = 16777216
+  let hk = arr(hsz)
+  let hc = arr(hsz)
+  let uc = arr(V + 3)
+  for i in range(0, n) {
+    let s = wsym(aget(ws, i), V)
+    do aset(uc, s, aget(uc, s) + 1)
+    if i > 0 {
+      let key = wsym(aget(ws, i - 1), V) * (V + 3) + s + 1
+      let slot = key % hsz
+      while aget(hk, slot) != 0 and aget(hk, slot) != key { let slot = (slot + 1) % hsz }
+      do aset(hk, slot, key)
+      do aset(hc, slot, aget(hc, slot) + 1)
+    }
+  }
+  return [hk, hc, uc, n, hsz]
+}
+
+skill pair_count(wp, p, s, V) -> Any {
+  let key = p * (V + 3) + s + 1
+  let slot = key % wp[4]
+  while aget(wp[0], slot) != 0 {
+    if aget(wp[0], slot) == key { return aget(wp[1], slot) }
+    let slot = (slot + 1) % wp[4]
+  }
+  return 0
+}
+
+# bits of a word sequence (with sentence ends around it) under the word-pair model (interpolated with frequency)
+skill bits_words(seq, wp, V) -> Any {
+  let b = 0.0
+  let prev = V + 2
+  for s in append(seq, V + 2) {
+    let cp = aget(wp[2], prev)
+    let pp = 0.0
+    if cp > 0 { let pp = pair_count(wp, prev, s, V) * 1.0 / cp }
+    let pu = (aget(wp[2], s) + 1) * 1.0 / (wp[3] + V + 3)
+    let b = b - log2(0.8 * pp + 0.2 * pu)
+    let prev = s
+  }
+  return b
+}
+
+# the COMBINED model: exact word pairs where seen (0.6), Pi's class structure to generalise (0.3: the next word's
+# class given the previous word's class, times the word's share of its class), word frequency (0.1). Fixed weights.
+skill bits_combined(ws, cs, wp, cp, ctot, V) -> Any {
+  let b = 0.0
+  let pw = V + 2
+  let pc = END()
+  let nsym = FIRST()
+  let wl = append(ws, V + 2)
+  let cl = append(cs, END())
+  for i in range(0, len(wl)) {
+    let w = wl[i]
+    let c = cl[i]
+    let cpw = aget(wp[2], pw)
+    let pp = 0.0
+    if cpw > 0 { let pp = pair_count(wp, pw, w, V) * 1.0 / cpw }
+    let pcc = (aget(cp[0], pc * nsym + c) + 1) * 1.0 / (aget(cp[1], pc) + nsym)
+    let pwc = 1.0
+    if w < V { let pwc = (aget(wp[2], w) + 1) * 1.0 / (aget(ctot, c) + 1) }
+    let pu = (aget(wp[2], w) + 1) * 1.0 / (wp[3] + V + 3)
+    let b = b - log2(0.6 * pp + 0.3 * pcc * pwc + 0.1 * pu)
+    let pw = w
+    let pc = c
+  }
+  return b
+}
+
+# bits of a symbol sequence under a pair model (counts bc, row totals rowc, nsym symbols), sentence ends around it
+skill bits_pairs(seq, bc, rowc, nsym) -> Any {
+  let b = 0.0
+  let prev = END()
+  for s in append(seq, END()) {
+    let b = b - log2((aget(bc, prev * nsym + s) + 1) * 1.0 / (aget(rowc, prev) + nsym))
+    let prev = s
+  }
+  return b
+}
+
+skill pair_counts(seq, n, nsym) -> Any {
+  let bc = arr(nsym * nsym)
+  let rowc = arr(nsym)
+  for i in range(1, n) {
+    let p = aget(seq, i - 1)
+    let s = aget(seq, i)
+    do aset(bc, p * nsym + s, aget(bc, p * nsym + s) + 1)
+    do aset(rowc, p, aget(rowc, p) + 1)
+  }
+  return [bc, rowc]
+}
+
+# the phrase rules over one sentence's class tokens (sentence ends kept around it), as a list
+skill compress(toks, rules) -> Any {
+  let a = arr(len(toks) + 2)
+  do aset(a, 0, END())
+  for i in range(0, len(toks)) { do aset(a, i + 1, toks[i]) }
+  do aset(a, len(toks) + 1, END())
+  let n = len(toks) + 2
+  for r in rules { let n = replace_pair(a, n, r[1], r[2], r[0]) }
+  let out = []
+  for i in range(1, n - 1) { let out = append(out, aget(a, i)) }
+  return out
+}
+
+skill shuffle(xs, seed) -> Any {
+  let a = xs
+  let s = seed
+  let i = len(a) - 1
+  while i > 0 {
+    let s = (s * 1103515245 + 12345) % 2147483648
+    let j = (s // 65536) % (i + 1)
+    let t = a[i]
+    let a = slice(a, 0, i) ++ [a[j]] ++ slice(a, i + 1, len(a))
+    let a = slice(a, 0, j) ++ [t] ++ slice(a, j + 1, len(a))
+    let i = i - 1
+  }
+  return a
+}
+
+skill grammar_test(vocab, cls, tab, m) -> Any {
+  let V = len(vocab)
+  let files = sort(listdir("out\\wiki"))
+  # training: file 0; the test: file 406 (never used for anything)
+  let tr = both_streams("out\\wiki\\" ++ files[0], tab, cls, 6000000)
+  let te = both_streams("out\\wiki\\" ++ files[406], tab, cls, 3000000)
+  let wp = word_pairs(tr[0], tr[2], V)
+  let cp = pair_counts(tr[1], tr[2], FIRST())
+  let ctot = arr(FIRST())
+  for i in range(0, tr[2]) { do aset(ctot, aget(tr[1], i), aget(ctot, aget(tr[1], i)) + 1) }
+  let trs = copy_arr(tr[1], tr[2])
+  let smax = FIRST() + m
+  let rp = repair(trs, tr[2], m, smax)
+  let rules = rp[0]
+  let pp = pair_counts(trs, rp[1], smax)
+  # the held-out sentences of 6..20 words
+  let sents = []
+  let cw = []
+  let cc = []
+  for i in range(0, te[2]) {
+    let w = aget(te[0], i)
+    if w == 0 - 9 {
+      if len(cw) >= 6 and len(cw) <= 20 and len(sents) < 2000 { let sents = append(sents, [cw, cc]) }
+      let cw = []
+      let cc = []
+    } else {
+      let cw = append(cw, wsym(w, V))
+      let cc = append(cc, aget(te[1], i))
+    }
+  }
+  # test A: real against the same words scrambled
+  let ra = [0, 0, 0, 0]
+  # predictive power on the real held-out sentences: total bits and words, counting against combined
+  let tbw = 0.0
+  let tbm = 0.0
+  let twords = 0
+  let k = 0
+  for s in sents {
+    let k = k + 1
+    let order = []
+    for i in range(0, len(s[0])) { let order = append(order, i) }
+    let sh = shuffle(order, 7919 * k)
+    let w2 = []
+    let c2 = []
+    for i in sh {
+      let w2 = append(w2, s[0][i])
+      let c2 = append(c2, s[1][i])
+    }
+    let real_w = bits_words(s[0], wp, V)
+    let scr_w = bits_words(w2, wp, V)
+    let real_c = bits_pairs(s[1], cp[0], cp[1], FIRST())
+    let scr_c = bits_pairs(c2, cp[0], cp[1], FIRST())
+    let real_p = bits_pairs(compress(s[1], rules), pp[0], pp[1], smax)
+    let scr_p = bits_pairs(compress(c2, rules), pp[0], pp[1], smax)
+    let real_m = bits_combined(s[0], s[1], wp, cp, ctot, V)
+    let scr_m = bits_combined(w2, c2, wp, cp, ctot, V)
+    if real_c < scr_c { let ra = [ra[0] + 2, ra[1], ra[2], ra[3]] }
+    if real_c == scr_c { let ra = [ra[0] + 1, ra[1], ra[2], ra[3]] }
+    if real_p < scr_p { let ra = [ra[0], ra[1] + 2, ra[2], ra[3]] }
+    if real_p == scr_p { let ra = [ra[0], ra[1] + 1, ra[2], ra[3]] }
+    if real_w < scr_w { let ra = [ra[0], ra[1], ra[2] + 2, ra[3]] }
+    if real_w == scr_w { let ra = [ra[0], ra[1], ra[2] + 1, ra[3]] }
+    if real_m < scr_m { let ra = [ra[0], ra[1], ra[2], ra[3] + 2] }
+    if real_m == scr_m { let ra = [ra[0], ra[1], ra[2], ra[3] + 1] }
+    let tbw = tbw + real_w
+    let tbm = tbm + real_m
+    let twords = twords + len(s[0]) + 1
+  }
+  let ns = len(sents)
+  let out = "TEST A, real sentence against the same words scrambled (" ++ str(ns) ++ " held-out sentences of 6-20 words):\n"
+  let out = out ++ "  word frequency 50% (the same words: it cannot tell)\n"
+  let out = out ++ "  Pi's class pairs " ++ str(ra[0] * 50 // ns) ++ "%, Pi's phrase pairs " ++ str(ra[1] * 50 // ns) ++ "%, plain word pairs (counting) " ++ str(ra[2] * 50 // ns) ++ "%, COMBINED " ++ str(ra[3] * 50 // ns) ++ "%\n"
+  let out = out ++ "PREDICTING the real held-out sentences (" ++ str(twords) ++ " words), bits per word: counting " ++ str(tbw / twords) ++ ", COMBINED " ++ str(tbm / twords) ++ "\n"
+  # test B: agreement -- he/she/it is|was against are|were, they/we are|were against is|was
+  let ids = []
+  for w in ["he", "she", "it", "they", "we", "is", "are", "was", "were"] {
+    let f = 0 - 1
+    for t in range(0, V) {
+      if vocab[t] == w { let f = t }
+    }
+    let ids = append(ids, f)
+  }
+  let sing = [ids[0], ids[1], ids[2]]
+  let plur = [ids[3], ids[4]]
+  let rb = [0, 0, 0, 0]
+  let nb = 0
+  for s in sents {
+    let ws = s[0]
+    for i in range(0, len(ws) - 1) {
+      let a = ws[i]
+      let b = ws[i + 1]
+      let swap = 0 - 1
+      let issing = a == sing[0] or a == sing[1] or a == sing[2]
+      let isplur = a == plur[0] or a == plur[1]
+      if issing and b == ids[5] { let swap = ids[6] }
+      if issing and b == ids[7] { let swap = ids[8] }
+      if isplur and b == ids[6] { let swap = ids[5] }
+      if isplur and b == ids[8] { let swap = ids[7] }
+      if swap >= 0 and nb < 1000 {
+        let nb = nb + 1
+        let bad = slice(ws, 0, i + 1) ++ [swap] ++ slice(ws, i + 2, len(ws))
+        let badc = slice(s[1], 0, i + 1) ++ [aget(cls, swap)] ++ slice(s[1], i + 2, len(s[1]))
+        let rw = bits_words(ws, wp, V)
+        let bw = bits_words(bad, wp, V)
+        let rc = bits_pairs(s[1], cp[0], cp[1], FIRST())
+        let bc2 = bits_pairs(badc, cp[0], cp[1], FIRST())
+        let rph = bits_pairs(compress(s[1], rules), pp[0], pp[1], smax)
+        let bph = bits_pairs(compress(badc, rules), pp[0], pp[1], smax)
+        let rm = bits_combined(ws, s[1], wp, cp, ctot, V)
+        let bm = bits_combined(bad, badc, wp, cp, ctot, V)
+        if rc < bc2 { let rb = [rb[0] + 2, rb[1], rb[2], rb[3]] }
+        if rc == bc2 { let rb = [rb[0] + 1, rb[1], rb[2], rb[3]] }
+        if rph < bph { let rb = [rb[0], rb[1] + 2, rb[2], rb[3]] }
+        if rph == bph { let rb = [rb[0], rb[1] + 1, rb[2], rb[3]] }
+        if rw < bw { let rb = [rb[0], rb[1], rb[2] + 2, rb[3]] }
+        if rw == bw { let rb = [rb[0], rb[1], rb[2] + 1, rb[3]] }
+        if rm < bm { let rb = [rb[0], rb[1], rb[2], rb[3] + 2] }
+        if rm == bm { let rb = [rb[0], rb[1], rb[2], rb[3] + 1] }
+      }
+    }
+  }
+  let out = out ++ "TEST B, agreement (" ++ str(nb) ++ " held-out pairs: \"he is\" against \"he are\", \"they were\" against \"they was\"...):\n"
+  if nb > 0 { let out = out ++ "  Pi's class pairs " ++ str(rb[0] * 50 // nb) ++ "%, Pi's phrase pairs " ++ str(rb[1] * 50 // nb) ++ "%, plain word pairs (counting) " ++ str(rb[2] * 50 // nb) ++ "%, COMBINED " ++ str(rb[3] * 50 // nb) ++ "%\n" }
+  let isc = aget(cls, ids[5])
+  let arc = aget(cls, ids[6])
+  return out ++ "  (is and are are in class " ++ str(isc) ++ " and " ++ str(arc) ++ ": a model that sees only classes cannot tell them apart if they share one)"
+}
+
+skill main() -> Any {
+  if arg(1) == "test" {
+    let vocab = split(read_file("out\\vocab.txt"), "\n")
+    let cls = arr(len(vocab))
+    let cl = split(read_file("out\\classes.txt"), "\n")
+    for i in range(0, len(cl)) {
+      let p = split(cl[i], " ")
+      if len(p) == 2 { do aset(cls, i, num(p[1])) }
+    }
+    let t0 = ticks()
+    let r = grammar_test(vocab, cls, vocab_table(vocab), 300)
+    return r ++ "\n(" ++ str((ticks() - t0) // 1000) ++ " s)"
+  }
+  let m = 300
+  if arg(1) != null { let m = num(arg(1)) }
+  let ntrain = 6000000
+  if arg(2) != null { let ntrain = num(arg(2)) }
+  let t0 = ticks()
+  let vocab = split(read_file("out\\vocab.txt"), "\n")
+  let cls = arr(len(vocab))
+  let cl = split(read_file("out\\classes.txt"), "\n")
+  for i in range(0, len(cl)) {
+    let p = split(cl[i], " ")
+    if len(p) == 2 { do aset(cls, i, num(p[1])) }
+  }
+  let tab = vocab_table(vocab)
+  let files = sort(listdir("out\\wiki"))
+  let wcount = arr(len(vocab))
+  let tr = class_stream("out\\wiki\\" ++ files[0], tab, cls, ntrain, wcount)
+  let te = class_stream("out\\wiki\\" ++ files[405], tab, cls, 2000000, null)
+  let t1 = ticks()
+  # before any rule: classes alone and class pairs
+  let base = code_bits(tr[0], tr[1], te[0], te[1], FIRST())
+  let words_te = te[1]
+  # the rules, learned on the training stream
+  let trs = copy_arr(tr[0], tr[1])
+  let smax = FIRST() + m
+  let rp = repair(trs, tr[1], m, smax)
+  let rules = rp[0]
+  let ntr2 = rp[1]
+  let t2 = ticks()
+  # the same rules, in order, over the held-out stream
+  let tes = copy_arr(te[0], te[1])
+  let nte2 = te[1]
+  for r in rules { let nte2 = replace_pair(tes, nte2, r[1], r[2], r[0]) }
+  let ph = code_bits(trs, ntr2, tes, nte2, smax)
+  let t3 = ticks()
+  let names = class_names(vocab, cls, wcount)
+  let lines = []
+  for r in rules { let lines = append(lines, "P" ++ str(r[0]) ++ " ::: " ++ expand(r[0], rules, names) ++ " ::: " ++ str(r[3])) }
+  do write_file("out\\phrases.txt", join(lines, "\n"))
+  let out = str(len(rules)) ++ " phrase rules learned from " ++ str(tr[1]) ++ " tokens in " ++ str((t2 - t1) // 1000) ++ " s (streams " ++ str((t1 - t0) // 1000) ++ " s, test " ++ str((t3 - t2) // 1000) ++ " s)\n"
+  # how much of the held-out text is outside the vocabulary (names, rare words)
+  let nname = 0
+  let nrare = 0
+  for i in range(0, te[1]) {
+    let t = aget(te[0], i)
+    if t == NAME() { let nname = nname + 1 }
+    if t == RARE() { let nrare = nrare + 1 }
+  }
+  let out = out ++ "held-out outside the vocabulary of " ++ str(len(vocab)) ++ " words: names " ++ str(100 * nname // te[1]) ++ "%, rare lower-case words " ++ str(100 * nrare // te[1]) ++ "%\n"
+  let out = out ++ "held-out (" ++ str(words_te) ++ " tokens never counted), bits per token:\n"
+  let out = out ++ "  classes alone " ++ str(base[0] / words_te) ++ ", class pairs " ++ str(base[1] / words_te) ++ "\n"
+  let out = out ++ "  phrases alone " ++ str(ph[0] / words_te) ++ ", phrase pairs " ++ str(ph[1] / words_te) ++ "  (held-out shrank to " ++ str(nte2) ++ " symbols)\n"
+  let out = out ++ "some phrases, longest first among the first 60:\n"
+  let shown = 0
+  for r in slice(rules, 0, min(60, len(rules))) {
+    let e = expand(r[0], rules, names)
+    if len(split(e, "]")) > 4 and shown < 12 {
+      let out = out ++ "  " ++ e ++ "   (" ++ str(r[3]) ++ "x)\n"
+      let shown = shown + 1
+    }
+  }
+  return out
+}

@@ -1,0 +1,559 @@
+# Pi reads: letters learned from Windows' own font engine (render), then text read back from pixels.
+#   learn     -- every printable character, drawn alone in a font and size, becomes a template: its ink as an 8x8
+#                grid (0..255 per cell), its shape (width per 100 of height), and where it sits in the line (top and
+#                bottom per 100 of the line's band, the band measured on "Hg": capital top to descender bottom)
+#   read      -- a line's ink columns split it into marks; each mark is the nearest template (grid difference plus
+#                shape and position differences); a gap wider than a fifth of the band is a space
+# No outside model: the font engine only DRAWS; what a letter looks like is learned here from what it drew.
+
+skill dark(img) -> Any {
+  let n = img[0] * img[1]
+  let a = arr(n)
+  for i in range(0, n) {
+    let c = aget(img[2], i)
+    let lum = (299 * (c // 65536) + 587 * ((c // 256) % 256) + 114 * (c % 256)) // 1000
+    do aset(a, i, 255 - lum)
+  }
+  return a
+}
+
+skill ink_t() -> Any { return 80 }
+
+# the ink of any box of a picture, whatever its colours: the background is the box's most common brightness, and
+# ink is how far each pixel is from it, stretched to the full 0..255 (white on blue, black on grey, grey on black...)
+skill box_ink_any(img, x0, y0, x1, y1) -> Any {
+  let W = img[0]
+  let w = max(1, x1 - x0 + 1)
+  let h = max(1, y1 - y0 + 1)
+  let a = arr(w * h)
+  let hist = arr(256)
+  for y in range(0, h) {
+    for x in range(0, w) {
+      let c = aget(img[2], (y0 + y) * W + x0 + x)
+      let lum = (299 * (c // 65536) + 587 * ((c // 256) % 256) + 114 * (c % 256)) // 1000
+      do aset(a, y * w + x, lum)
+      do aset(hist, lum, aget(hist, lum) + 1)
+    }
+  }
+  let bg = 0
+  for v in range(0, 256) {
+    if aget(hist, v) > aget(hist, bg) { let bg = v }
+  }
+  let mx = 1
+  for i in range(0, w * h) { let mx = max(mx, oabs(aget(a, i) - bg)) }
+  let mx = max(mx, 40)
+  for i in range(0, w * h) { do aset(a, i, oabs(aget(a, i) - bg) * 255 // mx) }
+  return [w, h, a]
+}
+
+# the printable character with this code (32..126)
+skill chr(code) -> Any {
+  let t = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+  return slice(t, code - 32, code - 31)
+}
+
+# marks of a line: runs of columns holding ink -> [[x0, y0, x1, y1]] (rows trimmed to the ink)
+skill marks(d, w, x0, y0, x1, y1) -> Any {
+  let out = []
+  let x = x0
+  while x <= x1 {
+    let has = false
+    for y in range(y0, y1 + 1) {
+      if aget(d, y * w + x) > ink_t() { let has = true }
+    }
+    if has {
+      let sx = x
+      let going = true
+      while going and x <= x1 {
+        let any = false
+        for y in range(y0, y1 + 1) {
+          if aget(d, y * w + x) > ink_t() { let any = true }
+        }
+        if any { let x = x + 1 } else { let going = false }
+      }
+      let ex = x - 1
+      let ty = y1
+      let by = y0
+      for yy in range(y0, y1 + 1) {
+        for xx in range(sx, ex + 1) {
+          if aget(d, yy * w + xx) > ink_t() {
+            if yy < ty { let ty = yy }
+            if yy > by { let by = yy }
+          }
+        }
+      }
+      let out = append(out, [sx, ty, ex, by])
+    } else { let x = x + 1 }
+  }
+  return out
+}
+
+# the 8x8 ink grid of a mark (each cell the mean darkness of its pixels)
+skill grid8(d, w, m) -> Any {
+  let mw = m[2] - m[0] + 1
+  let mh = m[3] - m[1] + 1
+  let sum = arr(64)
+  let cnt = arr(64)
+  for y in range(m[1], m[3] + 1) {
+    let gy = (y - m[1]) * 8 // mh
+    for x in range(m[0], m[2] + 1) {
+      let gx = (x - m[0]) * 8 // mw
+      let k = gy * 8 + gx
+      do aset(sum, k, aget(sum, k) + aget(d, y * w + x))
+      do aset(cnt, k, aget(cnt, k) + 1)
+    }
+  }
+  let g = []
+  for k in range(0, 64) {
+    if aget(cnt, k) == 0 { let g = append(g, 0) } else { let g = append(g, aget(sum, k) // aget(cnt, k)) }
+  }
+  return g
+}
+
+skill feat(d, w, m, btop, bh) -> Any {
+  let mw = m[2] - m[0] + 1
+  let mh = m[3] - m[1] + 1
+  return [grid8(d, w, m), mw * 100 // mh, (m[1] - btop) * 100 // bh, (m[3] - btop) * 100 // bh]
+}
+
+# the band of a font and size: from the top of "H" to the bottom of "g"
+skill band_of(size, font) -> Any {
+  let img = render("Hg", size, font)
+  let d = dark(img)
+  let ms = marks(d, img[0], 0, 0, img[0] - 1, img[1] - 1)
+  # the same rule as every line read (line_band): templates and lines must measure position alike
+  return line_band(ms)
+}
+
+# -> templates [char, grid, aspect, top, bottom, font] for every printable character in this font and size
+skill learn_font(size, font) -> Any {
+  let band = band_of(size, font)
+  let out = []
+  for code in range(33, 127) {
+    let ch = chr(code)
+    let img = render(ch, size, font)
+    let d = dark(img)
+    let ms = marks(d, img[0], 0, 0, img[0] - 1, img[1] - 1)
+    if len(ms) == 1 {
+      let f = feat(d, img[0], ms[0], band[0], band[1])
+      let out = append(out, [ch, f[0], f[1], f[2], f[3], font])
+    }
+  }
+  return out
+}
+
+skill oabs(v) -> Any {
+  if v < 0 { return 0 - v }
+  return v
+}
+
+skill tdist(f, t) -> Any {
+  let s = 0
+  let g = f[0]
+  let tg = t[1]
+  for k in range(0, 64) { let s = s + oabs(g[k] - tg[k]) }
+  return s + 40 * oabs(f[1] - t[2]) + 30 * oabs(f[2] - t[3]) + 30 * oabs(f[3] - t[4])
+}
+
+# a line's band, measured the way type is: from the top of its tallest letters to where "g" would end below the
+# baseline (the baseline: where most marks end). Measuring from the line's own lowest ink made the same letter sit
+# differently in "Paste" (a p hangs below) and in "Save" (nothing does).
+skill line_band(ms) -> Any {
+  let cnt = []
+  let top = ms[0][1]
+  for m in ms {
+    if m[1] < top { let top = m[1] }
+  }
+  # the most common bottom is the baseline
+  let base = ms[0][3]
+  let bestc = 0
+  for m in ms {
+    let c = 0
+    for q in ms {
+      if q[3] == m[3] { let c = c + 1 }
+    }
+    if c > bestc or (c == bestc and m[3] < base) {
+      let bestc = c
+      let base = m[3]
+    }
+  }
+  let cap = max(1, base - top + 1)
+  return [top, max(1, cap * 13 // 10)]
+}
+
+# read one line of text lying inside the box (x0..x1, y0..y1) of a darkness map (lex: Pi's vocabulary, or null)
+skill read_line_lex(d, w, x0, y0, x1, y1, temps, lex) -> Any {
+  let ms = marks(d, w, x0, y0, x1, y1)
+  if len(ms) == 0 { return "" }
+  let band = line_band(ms)
+  let bt = band[0]
+  let bh = band[1]
+  # a space is a gap clearly wider than this line's usual gap between letters (monospace fonts leave wide gaps
+  # around narrow letters, so a fixed share of the band is not enough)
+  let gaps = []
+  for i in range(1, len(ms)) { let gaps = append(gaps, ms[i][0] - ms[i - 1][2] - 1) }
+  let gaps = sort(gaps)
+  let space = gap_split(gaps, bh)
+  if lex == null {
+    let out = ""
+    let prev = 0 - 1
+    for m in ms {
+      if prev >= 0 and m[0] - prev - 1 > space { let out = out ++ " " }
+      let out = out ++ read_mark(d, w, m, bt, bh, temps)
+      let prev = m[2]
+    }
+    return out
+  }
+  # with words: every mark keeps its few likeliest readings; each word is the cheapest combination that is a word
+  # Pi knows, unless that costs much more than the cheapest combination of all (the eye still outranks the lexicon)
+  let words = []
+  let cur = []
+  let prev = 0 - 1
+  for m in ms {
+    if prev >= 0 and m[0] - prev - 1 > space {
+      let words = append(words, cur)
+      let cur = []
+    }
+    let cur = append(cur, mark_opts(d, w, m, bt, bh, temps))
+    let prev = m[2]
+  }
+  let words = append(words, cur)
+  let out = []
+  for wd in words { let out = append(out, best_word(wd, lex)) }
+  return join(out, " ")
+}
+
+skill read_line(d, w, x0, y0, x1, y1, temps) -> Any { return read_line_lex(d, w, x0, y0, x1, y1, temps, null) }
+
+# learning letters from the screen itself: read a line, and for every word read with confidence -- a whole known word,
+# letters only, 4 or more, one mark per letter (no guessed splits) -- each mark becomes a new template of its letter,
+# in the screen's own rendering -> the new templates
+skill harvest_line(d, w, x0, y0, x1, y1, temps, lex) -> Any {
+  let ms = marks(d, w, x0, y0, x1, y1)
+  if len(ms) < 4 { return [] }
+  let band = line_band(ms)
+  let bt = band[0]
+  let bh = band[1]
+  let gaps = []
+  for i in range(1, len(ms)) { let gaps = append(gaps, ms[i][0] - ms[i - 1][2] - 1) }
+  let space = gap_split(sort(gaps), bh)
+  # words as runs of marks
+  let groups = []
+  let cur = []
+  let prev = 0 - 1
+  for m in ms {
+    if prev >= 0 and m[0] - prev - 1 > space {
+      let groups = append(groups, cur)
+      let cur = []
+    }
+    let cur = append(cur, m)
+    let prev = m[2]
+  }
+  let groups = append(groups, cur)
+  let out = []
+  for g in groups {
+    if len(g) >= 4 {
+      let opts = []
+      for m in g { let opts = append(opts, nearest_k(d, w, m, bt, bh, temps, 3)) }
+      let wd = best_word(opts, lex)
+      let all_letters = len(wd) == len(g)
+      if all_letters {
+        for i in range(0, len(wd)) {
+          if is_letter(ord(slice(wd, i, i + 1))) == false { let all_letters = false }
+        }
+      }
+      if all_letters {
+        if hset_has(lex, word_key(lower(wd))) {
+          for i in range(0, len(g)) {
+            let f = feat(d, w, g[i], bt, bh)
+            let out = append(out, [slice(wd, i, i + 1), f[0], f[1], f[2], f[3], "screen"])
+          }
+        }
+      }
+    }
+  }
+  return out
+}
+
+# the k likeliest distinct characters for one mark -> [[char, distance]] (cheapest first)
+skill nearest_k(d, w, m, bt, bh, temps, k) -> Any {
+  let f = feat(d, w, m, bt, bh)
+  # the best distance per character code, changed in place (a list rebuilt per template ran out of the heap)
+  let bd = arr(128)
+  for t in temps {
+    let dd = tdist(f, t) + 1
+    let c = ord(t[0])
+    if aget(bd, c) == 0 or dd < aget(bd, c) { do aset(bd, c, dd) }
+  }
+  let out = []
+  for r in range(0, k) {
+    let bi = 0 - 1
+    for c in range(33, 127) {
+      if aget(bd, c) > 0 {
+        if bi < 0 { let bi = c } else {
+          if aget(bd, c) < aget(bd, bi) { let bi = c }
+        }
+      }
+    }
+    if bi >= 0 {
+      let out = append(out, [chr(bi), aget(bd, bi) - 1])
+      do aset(bd, bi, 0)
+    }
+  }
+  return out
+}
+
+# a mark's readings: its 3 likeliest letters, and the split reading if it may be touching letters
+skill mark_opts(d, w, m, bt, bh, temps) -> Any {
+  let opts = nearest_k(d, w, m, bt, bh, temps, 3)
+  let mw = m[2] - m[0] + 1
+  if mw * 100 // bh >= 45 {
+    let sp = split_mark(d, w, m, bt, bh, temps)
+    if sp != null { let opts = append(opts, sp) }
+  }
+  return opts
+}
+
+# the letter runs of a word must each be a word Pi knows (single letters, digits and punctuation pass)
+skill is_word(s, lex) -> Any {
+  let run = ""
+  let i = 0
+  let n = len(s)
+  while i <= n {
+    let c = 0
+    if i < n { let c = ord(slice(s, i, i + 1)) }
+    let letter = (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+    if letter { let run = run ++ slice(s, i, i + 1) } else {
+      if len(run) >= 2 {
+        if hset_has(lex, word_key(lower(run))) == false { return false }
+      }
+      let run = ""
+    }
+    let i = i + 1
+  }
+  return true
+}
+
+skill word_key(s) -> Any {
+  let h = 0
+  for i in range(0, len(s)) { let h = (h * 31 + ord(slice(s, i, i + 1))) % 1000000007 }
+  return h * 64 + len(s) + 1
+}
+
+# beam over the marks of one word (50 kept), then the cheapest reading that is a word
+skill best_word(marks_opts, lex) -> Any {
+  let beam = [["", 0]]
+  for opts in marks_opts {
+    let nb = []
+    for b in beam {
+      for o in opts { let nb = append(nb, [b[0] ++ o[0], b[1] + o[1]]) }
+    }
+    let beam = cheapest(nb, 50)
+  }
+  let c0 = beam[0]
+  # first: a reading that is all letters (edge punctuation aside) and one whole known word ("C|ose" -> "Close":
+  # a stray mark inside a word cuts it into runs that each pass on their own)
+  for b in beam {
+    if b[1] <= c0[1] * 13 // 10 + 3000 {
+      if clean_word(b[0], lex) { return b[0] }
+    }
+  }
+  for b in beam {
+    if b[1] <= c0[1] * 13 // 10 + 3000 {
+      if is_word(b[0], lex) { return b[0] }
+    }
+  }
+  return c0[0]
+}
+
+skill is_letter(c) -> Any { return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) }
+
+skill clean_word(s, lex) -> Any {
+  let a = 0
+  let e = len(s)
+  while a < e and is_letter(ord(slice(s, a, a + 1))) == false { let a = a + 1 }
+  while e > a and is_letter(ord(slice(s, e - 1, e))) == false { let e = e - 1 }
+  if e - a < 2 { return false }
+  for i in range(a, e) {
+    if is_letter(ord(slice(s, i, i + 1))) == false { return false }
+  }
+  return hset_has(lex, word_key(lower(slice(s, a, e))))
+}
+
+skill cheapest(items, k) -> Any {
+  let out = []
+  let used = arr(len(items) + 1)
+  for r in range(0, min(k, len(items))) {
+    let bi = 0 - 1
+    for i in range(0, len(items)) {
+      if aget(used, i) == 0 {
+        if bi < 0 { let bi = i } else {
+          if items[i][1] < items[bi][1] { let bi = i }
+        }
+      }
+    }
+    do aset(used, bi, 1)
+    let out = append(out, items[bi])
+  }
+  return out
+}
+
+# Pi's vocabulary (out\lexicon.txt, from its own Wikipedia data) as a set of word keys
+skill load_lex(path) -> Any {
+  let t = read_file(path)
+  if t == null { return null }
+  let s = hset(1048576)
+  for line in split(t, "\n") {
+    let sp = split(line, " ")
+    if len(sp) == 2 { do hset_add(s, word_key(sp[0])) }
+  }
+  return s
+}
+
+# the gaps of a line fall into two groups, between letters and between words: the split that separates the two
+# groups best (Otsu's rule, on the gaps themselves -- nothing tuned to a font); a gap above it is a space. If the two
+# groups are not clearly apart (the upper not at least twice the lower), the line is one word.
+skill gap_split(gaps, bh) -> Any {
+  let n = len(gaps)
+  if n < 2 { return bh }
+  let tot = 0
+  for g in gaps { let tot = tot + g }
+  let bestv = 0 - 1
+  let thr = bh
+  let lo = 0
+  for k in range(1, n) {
+    let lo = lo + gaps[k - 1]
+    let hi = tot - lo
+    let n1 = k
+    let n2 = n - k
+    # between-group separation n1 n2 (m2 - m1)^2, scaled to stay in integers: (n1*hi - n2*lo)^2 / (n1 n2)
+    let diff = n1 * hi - n2 * lo
+    let v = diff * diff // (n1 * n2)
+    if v > bestv and gaps[k] > gaps[k - 1] {
+      let m1 = lo // n1
+      let m2 = hi // n2
+      if m2 >= 2 * m1 + 1 {
+        let bestv = v
+        let thr = gaps[k - 1]
+      }
+    }
+  }
+  return thr
+}
+
+# the nearest template to one mark -> [char, distance]
+skill nearest(d, w, m, bt, bh, temps) -> Any {
+  let f = feat(d, w, m, bt, bh)
+  let best = "?"
+  let bd = 0 - 1
+  for t in temps {
+    let dd = tdist(f, t)
+    if bd < 0 or dd < bd {
+      let bd = dd
+      let best = t[0]
+    }
+  }
+  return [best, bd]
+}
+
+skill col_ink(d, w, x, y0, y1) -> Any {
+  let s = 0
+  for y in range(y0, y1 + 1) { let s = s + aget(d, y * w + x) }
+  return s
+}
+
+# rows of a column range trimmed to the ink -> a mark, or null if there is no ink
+skill trim_mark(d, w, xa, xb, y0, y1) -> Any {
+  let ty = y1 + 1
+  let by = y0 - 1
+  for y in range(y0, y1 + 1) {
+    for x in range(xa, xb + 1) {
+      if aget(d, y * w + x) > ink_t() {
+        if y < ty { let ty = y }
+        if y > by { let by = y }
+      }
+    }
+  }
+  if by < ty { return null }
+  return [xa, ty, xb, by]
+}
+
+# one mark may be several touching letters: cut at its thinnest columns and keep the reading the templates like best
+# (each extra letter costs a little, so a clean single letter is not cut)
+skill read_mark(d, w, m, bt, bh, temps) -> Any {
+  let one = nearest(d, w, m, bt, bh, temps)
+  let mw = m[2] - m[0] + 1
+  if mw * 100 // bh < 45 { return one[0] }
+  let sp = split_mark(d, w, m, bt, bh, temps)
+  if sp != null {
+    if sp[1] < one[1] { return sp[0] }
+  }
+  return one[0]
+}
+
+# the best reading of a mark as touching letters -> [text, cost] (cost: the letters' distances plus a little for each
+# letter beyond the first), or null when the mark has no thin columns to cut at
+skill split_mark(d, w, m, bt, bh, temps) -> Any {
+  # cut points: columns of low ink that are local minima
+  let mx = 0
+  for x in range(m[0], m[2] + 1) { let mx = max(mx, col_ink(d, w, x, m[1], m[3])) }
+  let cuts = [m[0]]
+  for x in range(m[0] + 2, m[2]) {
+    let c = col_ink(d, w, x, m[1], m[3])
+    if c * 2 < mx and c <= col_ink(d, w, x - 1, m[1], m[3]) and c <= col_ink(d, w, x + 1, m[1], m[3]) { let cuts = append(cuts, x) }
+  }
+  let cuts = append(cuts, m[2] + 1)
+  let nc = len(cuts)
+  if nc <= 2 { return null }
+  # best[i]: the cheapest reading of the mark up to cut i -> [cost, text]
+  let penalty = 2500
+  let best = [[0, ""]]
+  for i in range(1, nc) {
+    let bc = 0 - 1
+    let bs = ""
+    for j in range(0, i) {
+      if best[j][0] >= 0 {
+        let sm = trim_mark(d, w, cuts[j], cuts[i] - 1, m[1], m[3])
+        if sm != null {
+          let r = nearest(d, w, sm, bt, bh, temps)
+          let c = best[j][0] + r[1] + penalty
+          if bc < 0 or c < bc {
+            let bc = c
+            let bs = best[j][1] ++ r[0]
+          }
+        }
+      }
+    }
+    let best = append(best, [bc, bs])
+  }
+  if best[nc - 1][0] < 0 { return null }
+  return [best[nc - 1][1], best[nc - 1][0] - penalty]
+}
+
+skill read_image(img, temps) -> Any {
+  let d = dark(img)
+  return read_line(d, img[0], 0, 0, img[0] - 1, img[1] - 1, temps)
+}
+
+skill read_image_lex(img, temps, lex) -> Any {
+  let d = dark(img)
+  return read_line_lex(d, img[0], 0, 0, img[0] - 1, img[1] - 1, temps, lex)
+}
+
+# edit distance (characters to insert, delete or change)
+skill edits(a, b) -> Any {
+  let n = len(a)
+  let m = len(b)
+  let prev = []
+  for j in range(0, m + 1) { let prev = append(prev, j) }
+  for i in range(1, n + 1) {
+    let cur = [i]
+    for j in range(1, m + 1) {
+      let c = 1
+      if slice(a, i - 1, i) == slice(b, j - 1, j) { let c = 0 }
+      let cur = append(cur, min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + c))
+    }
+    let prev = cur
+  }
+  return prev[m]
+}

@@ -1,0 +1,62 @@
+# flashbatch QFILE OUTFILE MODE [maxt]: Pi's brain (Qwen3.8 Flash Next) on a batch of questions (separated by
+# @@@TEXT@@@), each from a fresh state, for measuring what Pi adds to the model.
+#   MODE alone  the plain chat (no system message), thinking open, up to maxt tokens -- the model by itself
+#   MODE hands  the deployed brain (fb_turn: the tools card, run_pi, compile while writing, inline Pi, drafts), from
+#               the system message's state, up to maxt generated tokens
+# Records, written after each question (handseval.py's format):
+#   "tokens|programs|ms|finished\n<the answer>@@@ALL@@@<the whole text>@@@TH@@@@@@REC@@@"
+import "flashbrain.pi"
+
+skill main() -> Any {
+  let qs = split(read_file(arg(1)), "@@@TEXT@@@")
+  let mode = arg(3)
+  let maxt = if arg(4) != null { int(arg(4)) } else { 10000 }
+  let fb = fb_open_x(false, false)
+  if typeof(fb) == "text" { return fb }
+  fb = put(fb, "turnmax", maxt)
+  let fl = fb["fl"]
+  let om = fb["om"]
+  let out = ""
+  let k = 0
+  for q in qs {
+    if len(trim(q)) > 0 {
+      let mm = mark()
+      let t0 = ticks()
+      let rec = ""
+      if mode == "alone" {
+        fl_reset(fl)
+        let s = brain_ids(fb["br"], "<|im_start|>user\n" ++ trim(q) ++ "<|im_end|>\n<|im_start|>assistant\n<think>\n")
+        let top = fb_feed(fb, s, 0)
+        let text = ""
+        let n = 0
+        let fin = false
+        while n < maxt and not fin and len(s) + 4 < FL_MAXPOS() {
+          let v = top[0][1]
+          if v == 248046 or v == 248044 {
+            fin = true
+          } else {
+            text = text ++ show(token(om, v))
+            s ++= [v]
+            top = fl_forward_k(fl, s, len(s) - 1, len(s) - 1, 1, false, 1)
+            n += 1
+          }
+        }
+        let parts = split(text, "</think>")
+        let ans = if len(parts) > 1 { parts[len(parts) - 1] } else { "" }
+        rec = str(n) ++ "|0|" ++ str(ticks() - t0) ++ "|" ++ (if fin { "true" } else { "false" }) ++ "\n" ++ ans ++ "@@@ALL@@@" ++ text ++ "@@@TH@@@@@@REC@@@"
+      } else {
+        fb_restore(fl, fb["snap"])
+        aset(fb["engn"], 0, len(fb["sys"]))
+        let r = fb_turn(fb, fb["sys"], trim(q))
+        let seq = r[0]
+        let fin = seq[len(seq) - 1] == 248046
+        rec = str(r[3]) ++ "|" ++ str(r[4]) ++ "|" ++ str(ticks() - t0) ++ "|" ++ (if fin { "true" } else { "false" }) ++ "\n" ++ r[1] ++ "@@@ALL@@@" ++ r[2] ++ "@@@TH@@@@@@REC@@@"
+      }
+      out = release(mm, out ++ rec)
+      write_file(arg(2), out)
+      k += 1
+      print("question " ++ str(k) ++ " done in " ++ str((ticks() - t0) // 1000) ++ " s")
+    }
+  }
+  return "flashbatch: " ++ str(k) ++ " questions (" ++ mode ++ ")"
+}

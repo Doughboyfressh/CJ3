@@ -1,0 +1,348 @@
+# Parquet, read by Pi: no outside library. The parts:
+#   Thrift compact protocol (the metadata's encoding): varints, zigzag, field headers, lists, structs
+#   the footer: row groups, and for each the pages of one column
+#   Snappy decompression: literals and copies (1, 2 or 4-byte offsets)
+#   pages: dictionary, data v1 and v2; definition levels; PLAIN byte arrays; RLE/bit-packed dictionary indices
+# pq_open(path, column) -> [path, size, row groups [[offset, compressed size, codec, rows] for the named column]]
+# pq_texts(pf, g) -> the column's texts in row group g (nulls skipped)
+
+# ---- Thrift compact protocol on a byte arr -------------------------------------------------------------------
+skill tvarint(b, p) -> Any {
+  let v = 0
+  let mul = 1
+  let q = p
+  let going = true
+  while going {
+    let c = aget(b, q)
+    let v = v + (c % 128) * mul
+    let mul = mul * 128
+    let q = q + 1
+    if c < 128 { let going = false }
+  }
+  return [v, q]
+}
+
+skill unzig(v) -> Any {
+  if v % 2 == 0 { return v // 2 }
+  return 0 - (v + 1) // 2
+}
+
+# one value of thrift type t at p -> [value, next p]. Structs are lists of [field id, value]
+skill tread(b, p, t) -> Any {
+  if t == 1 { return [true, p] }
+  if t == 2 { return [false, p] }
+  if t == 3 { return [aget(b, p), p + 1] }
+  if t == 4 or t == 5 or t == 6 {
+    let r = tvarint(b, p)
+    return [unzig(r[0]), r[1]]
+  }
+  if t == 7 { return [0, p + 8] }
+  if t == 8 {
+    let r = tvarint(b, p)
+    return [arr_text(b, r[1], r[1] + r[0]), r[1] + r[0]]
+  }
+  if t == 9 or t == 10 {
+    let h = aget(b, p)
+    let size = h // 16
+    let et = h % 16
+    let q = p + 1
+    if size == 15 {
+      let r = tvarint(b, q)
+      let size = r[0]
+      let q = r[1]
+    }
+    let out = []
+    for i in range(0, size) {
+      if et == 1 or et == 2 {
+        let out = append(out, aget(b, q) == 1)
+        let q = q + 1
+      } else {
+        let r = tread(b, q, et)
+        let out = append(out, r[0])
+        let q = r[1]
+      }
+    }
+    return [out, q]
+  }
+  if t == 11 {
+    let r = tvarint(b, p)
+    let size = r[0]
+    let q = r[1]
+    if size == 0 { return [[], q] }
+    let kv = aget(b, q)
+    let q = q + 1
+    let out = []
+    for i in range(0, size) {
+      let a = tread(b, q, kv // 16)
+      let c = tread(b, a[1], kv % 16)
+      let out = append(out, [a[0], c[0]])
+      let q = c[1]
+    }
+    return [out, q]
+  }
+  if t == 12 {
+    let out = []
+    let q = p
+    let last = 0
+    let going = true
+    while going {
+      let h = aget(b, q)
+      let q = q + 1
+      if h == 0 { let going = false } else {
+        let delta = h // 16
+        let ft = h % 16
+        let id = last + delta
+        if delta == 0 {
+          let r = tvarint(b, q)
+          let id = unzig(r[0])
+          let q = r[1]
+        }
+        let last = id
+        let r = tread(b, q, ft)
+        let out = append(out, [id, r[0]])
+        let q = r[1]
+      }
+    }
+    return [out, q]
+  }
+  return [null, p]
+}
+
+skill tget(st, id) -> Any {
+  if st == null { return null }
+  for f in st {
+    if f[0] == id { return f[1] }
+  }
+  return null
+}
+
+# ---- Snappy ------------------------------------------------------------------------------------------------------
+# b[p .. p+n) is one Snappy block -> arr of its bytes
+skill snappy(b, p, n) -> Any {
+  let r = tvarint(b, p)
+  let ulen = r[0]
+  let q = r[1]
+  let end = p + n
+  let out = arr(ulen)
+  let o = 0
+  while q < end {
+    let tag = aget(b, q)
+    let q = q + 1
+    let kind = tag % 4
+    if kind == 0 {
+      let len = tag // 4 + 1
+      if len > 60 {
+        let nb = len - 60
+        let len = 0
+        let mul = 1
+        for k in range(0, nb) {
+          let len = len + aget(b, q + k) * mul
+          let mul = mul * 256
+        }
+        let len = len + 1
+        let q = q + nb
+      }
+      let k = 0
+      while k < len {
+        do aset(out, o + k, aget(b, q + k))
+        let k = k + 1
+      }
+      let o = o + len
+      let q = q + len
+    } else {
+      let len = 0
+      let off = 0
+      if kind == 1 {
+        let len = 4 + (tag // 4) % 8
+        let off = (tag // 32) * 256 + aget(b, q)
+        let q = q + 1
+      }
+      if kind == 2 {
+        let len = tag // 4 + 1
+        let off = aget(b, q) + 256 * aget(b, q + 1)
+        let q = q + 2
+      }
+      if kind == 3 {
+        let len = tag // 4 + 1
+        let off = aget(b, q) + 256 * aget(b, q + 1) + 65536 * aget(b, q + 2) + 16777216 * aget(b, q + 3)
+        let q = q + 4
+      }
+      # byte by byte: a copy may overlap what it is writing
+      let k = 0
+      while k < len {
+        do aset(out, o + k, aget(out, o - off + k))
+        let k = k + 1
+      }
+      let o = o + len
+    }
+  }
+  return out
+}
+
+# ---- the RLE / bit-packed hybrid (definition levels, dictionary indices) -----------------------------------------
+skill pow2i(k) -> Any {
+  let v = 1
+  for i in range(0, k) { let v = v * 2 }
+  return v
+}
+
+# -> [values (count of them at most), next p]
+skill rle_hybrid(b, p, end, bw, count) -> Any {
+  let out = []
+  let q = p
+  let bytes_per = (bw + 7) // 8
+  while q < end and len(out) < count {
+    let r = tvarint(b, q)
+    let h = r[0]
+    let q = r[1]
+    if h % 2 == 0 {
+      let run = h // 2
+      let v = 0
+      let mul = 1
+      for k in range(0, bytes_per) {
+        let v = v + aget(b, q + k) * mul
+        let mul = mul * 256
+      }
+      let q = q + bytes_per
+      let k = 0
+      while k < run and len(out) < count {
+        let out = append(out, v)
+        let k = k + 1
+      }
+    } else {
+      let groups = h // 2
+      let nbits = groups * 8 * bw
+      let bitpos = 0
+      let k = 0
+      while k < groups * 8 {
+        let v = 0
+        for j in range(0, bw) {
+          let bit = bitpos + j
+          let byte = aget(b, q + bit // 8)
+          let v = v + ((byte // pow2i(bit % 8)) % 2) * pow2i(j)
+        }
+        let bitpos = bitpos + bw
+        if len(out) < count { let out = append(out, v) }
+        let k = k + 1
+      }
+      let q = q + (nbits + 7) // 8
+    }
+  }
+  return [out, q]
+}
+
+# PLAIN byte arrays: n of them (4-byte length, then bytes) -> [texts, next p]
+skill plain_texts(b, p, n, end) -> Any {
+  let out = []
+  let q = p
+  let k = 0
+  while k < n and q + 4 <= end {
+    let len = aget(b, q) + 256 * aget(b, q + 1) + 65536 * aget(b, q + 2) + 16777216 * aget(b, q + 3)
+    let out = append(out, arr_text(b, q + 4, q + 4 + len))
+    let q = q + 4 + len
+    let k = k + 1
+  }
+  return [out, q]
+}
+
+# ---- the footer, and one column's row groups ------------------------------------------------------------------------
+skill le32(b, p) -> Any { return aget(b, p) + 256 * aget(b, p + 1) + 65536 * aget(b, p + 2) + 16777216 * aget(b, p + 3) }
+
+skill pq_open(path, column) -> Any {
+  let fm = fmap(path)
+  if fm == null { return null }
+  let size = fm[1]
+  let tail = read_bytes(path, size - 8, 8)
+  let mlen = le32(tail, 0)
+  let mb = read_bytes(path, size - 8 - mlen, mlen)
+  let meta = tread(mb, 0, 12)[0]
+  let groups = []
+  for rg in tget(meta, 4) {
+    for cc in tget(rg, 1) {
+      let cm = tget(cc, 3)
+      let pathl = tget(cm, 3)
+      if pathl != null {
+        if pathl[len(pathl) - 1] == column {
+          let start = tget(cm, 9)
+          let dict = tget(cm, 11)
+          if dict != null {
+            if dict > 0 and dict < start { let start = dict }
+          }
+          let groups = append(groups, [start, tget(cm, 7), tget(cm, 4), tget(rg, 3)])
+        }
+      }
+    }
+  }
+  return [path, size, groups]
+}
+
+# a page's payload, decompressed when its column is Snappy (codec 1)
+skill page_bytes(b, q, csize, usize, codec) -> Any {
+  if codec == 1 { return snappy(b, q, csize) }
+  let out = arr(csize)
+  for k in range(0, csize) { do aset(out, k, aget(b, q + k)) }
+  return out
+}
+
+# the texts of row group g
+skill pq_texts(pf, g) -> Any {
+  let rg = pf[2][g]
+  let b = read_bytes(pf[0], rg[0], rg[1])
+  let end = rg[1]
+  let p = 0
+  let dict = []
+  let out = []
+  while p < end {
+    let hr = tread(b, p, 12)
+    let ph = hr[0]
+    let q = hr[1]
+    let ptype = tget(ph, 1)
+    let usize = tget(ph, 2)
+    let csize = tget(ph, 3)
+    if ptype == 2 {
+      let page = page_bytes(b, q, csize, usize, rg[2])
+      let dh = tget(ph, 7)
+      let dict = plain_texts(page, 0, tget(dh, 1), usize)[0]
+    }
+    if ptype == 0 {
+      let page = page_bytes(b, q, csize, usize, rg[2])
+      let dh = tget(ph, 5)
+      let nv = tget(dh, 1)
+      let enc = tget(dh, 2)
+      # definition levels: a 4-byte length, then RLE (bit width 1): 1 = a value, 0 = null
+      let dl = le32(page, 0)
+      let defs = rle_hybrid(page, 4, 4 + dl, 1, nv)[0]
+      let nn = 0
+      for d in defs { let nn = nn + d }
+      let vp = 4 + dl
+      if enc == 0 { let out = out ++ plain_texts(page, vp, nn, usize)[0] } else {
+        let bw = aget(page, vp)
+        let ix = rle_hybrid(page, vp + 1, usize, bw, nn)[0]
+        for i in ix { let out = append(out, dict[i]) }
+      }
+    }
+    if ptype == 3 {
+      let dh = tget(ph, 8)
+      let nv = tget(dh, 1)
+      let nulls = tget(dh, 2)
+      let enc = tget(dh, 4)
+      let dlen = tget(dh, 5)
+      let rlen = tget(dh, 6)
+      let comp = tget(dh, 7)
+      let lv = dlen + rlen
+      let vals = null
+      if comp == false or rg[2] == 0 {
+        let vals = arr(usize - lv)
+        for k in range(0, usize - lv) { do aset(vals, k, aget(b, q + lv + k)) }
+      } else { let vals = snappy(b, q + lv, csize - lv) }
+      let nn = nv - nulls
+      if enc == 0 { let out = out ++ plain_texts(vals, 0, nn, len(vals))[0] } else {
+        let bw = aget(vals, 0)
+        let ix = rle_hybrid(vals, 1, len(vals), bw, nn)[0]
+        for i in ix { let out = append(out, dict[i]) }
+      }
+    }
+    let p = q + csize
+  }
+  return out
+}

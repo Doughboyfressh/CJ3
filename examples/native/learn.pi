@@ -1,0 +1,633 @@
+# Pi grows its own language. Pi solves problems by searching for the smallest program that explains the examples,
+# as induce.pi does, but here the search also uses WORDS that Pi invented itself. After each round Pi looks at
+# everything it has solved, finds the piece whose naming would shorten the total description most (minimum
+# description length), and adds it to its vocabulary. Words build on earlier words. Each round, hard problems
+# become short sentences in Pi's own growing language, so the next round reaches further for the same cost.
+# Every answer is expanded back to plain Pi and run by interp.pi on unseen inputs before it counts. The
+# vocabulary is written to a file in Pi's own notation and read back the next time it starts (agent memory).
+#   out\learn.exe [vocabulary-file]
+import "interp.pi"
+
+# ---- trees -------------------------------------------------------------------------------------------------
+# ["v","x"] ["q",n] ["p",k] (a word's parameter) ["op",name,[args]] ["w",index,[args]] (a learned word)
+
+skill opnames() -> Any { return ["+", "-", "*", "//", "%", "max", "min"] }
+skill commutes(c) -> Any { return c == 0 or c == 2 or c == 5 or c == 6 }
+
+skill apply2(c, a, b) -> Any {
+  if c == 0 { return a + b }
+  if c == 1 { return a - b }
+  if c == 2 { return a * b }
+  if c == 3 { return a // b }
+  if c == 4 { return a % b }
+  if c == 5 {
+    if a >= b { return a }
+    return b
+  }
+  if a <= b { return a }
+  return b
+}
+
+skill tsize(t) -> Any {
+  let h = t[0]
+  if h == "v" or h == "q" or h == "p" { return 1 }
+  let s = 1
+  for a in t[2] { let s = s + tsize(a) }
+  return s
+}
+
+skill arity(body) -> Any {
+  let h = body[0]
+  if h == "p" { return body[1] + 1 }
+  if h == "v" or h == "q" { return 0 }
+  let m = 0
+  for a in body[2] { let m = max(m, arity(a)) }
+  return m
+}
+
+skill uses_y(t) -> Any {
+  let h = t[0]
+  if h == "v" { return t[1] == "y" }
+  if h == "q" or h == "p" { return false }
+  for a in t[2] {
+    if uses_y(a) { return true }
+  }
+  return false
+}
+
+# evaluate a tree on scalars without allocating; null on division by zero
+skill sev(t, a, b, x, y, lib) -> Any {
+  let h = t[0]
+  if h == "q" { return t[1] }
+  if h == "v" {
+    if t[1] == "x" { return x }
+    return y
+  }
+  if h == "p" {
+    if t[1] == 0 { return a }
+    return b
+  }
+  let args = t[2]
+  let u = 0
+  let w = 0
+  if len(args) > 0 {
+    let u = sev(args[0], a, b, x, y, lib)
+    if u == null { return null }
+  }
+  if len(args) > 1 {
+    let w = sev(args[1], a, b, x, y, lib)
+    if w == null { return null }
+  }
+  if h == "w" { return sev(lib[t[1]], u, w, x, y, lib) }
+  let n = t[1]
+  if n == "neg" { return 0 - u }
+  if n == "+" { return u + w }
+  if n == "-" { return u - w }
+  if n == "*" { return u * w }
+  if n == "//" or n == "%" {
+    if w == 0 { return null }
+    if n == "//" { return u // w }
+    return u % w
+  }
+  if n == "max" { return max(u, w) }
+  return min(u, w)
+}
+
+# replace parameters by argument trees
+skill subst(t, args) -> Any {
+  let h = t[0]
+  if h == "p" { return args[t[1]] }
+  if h == "v" or h == "q" { return t }
+  let out = []
+  for a in t[2] { let out = append(out, subst(a, args)) }
+  return [h, t[1], out]
+}
+
+# a word-form tree -> plain Pi (no learned words)
+skill expand(t, lib) -> Any {
+  let h = t[0]
+  if h == "v" or h == "q" or h == "p" { return t }
+  let out = []
+  for a in t[2] { let out = append(out, expand(a, lib)) }
+  if h == "w" { return expand(subst(lib[t[1]], out), lib) }
+  return [h, t[1], out]
+}
+
+skill show(t) -> Any {
+  let h = t[0]
+  if h == "v" { return t[1] }
+  if h == "q" { return str(t[1]) }
+  if h == "p" { return ["a", "b"][t[1]] }
+  let parts = []
+  for a in t[2] { let parts = append(parts, show(a)) }
+  if h == "w" { return "w" ++ str(t[1]) ++ "(" ++ join(parts, ", ") ++ ")" }
+  if t[1] == "neg" { return "-" ++ parts[0] }
+  if t[1] == "max" or t[1] == "min" { return t[1] ++ "(" ++ parts[0] ++ ", " ++ parts[1] ++ ")" }
+  return "(" ++ parts[0] ++ " " ++ t[1] ++ " " ++ parts[1] ++ ")"
+}
+
+# ---- Pi's own notation for its vocabulary (prefix, one word per line) ----------------------------------------
+skill ser(t) -> Any {
+  let h = t[0]
+  if h == "v" { return t[1] }
+  if h == "q" { return str(t[1]) }
+  if h == "p" { return "p" ++ str(t[1]) }
+  let parts = []
+  if h == "w" { let parts = ["w" ++ str(t[1])] } else { let parts = [t[1]] }
+  for a in t[2] { let parts = append(parts, ser(a)) }
+  return join(parts, " ")
+}
+
+# -> [tree, next position]
+skill parse_at(toks, i, lib) -> Any {
+  let k = toks[i]
+  if k == "x" or k == "y" { return [["v", k], i + 1] }
+  if k == "p0" { return [["p", 0], i + 1] }
+  if k == "p1" { return [["p", 1], i + 1] }
+  if contains("0123456789", slice(k, 0, 1)) { return [["q", num(k)], i + 1] }
+  let n = 2
+  let head = ["op", k]
+  if k == "neg" { let n = 1 }
+  if slice(k, 0, 1) == "w" and len(k) > 1 {
+    let idx = num(slice(k, 1, len(k)))
+    let n = arity(lib[idx])
+    let head = ["w", idx]
+  }
+  let args = []
+  let j = i + 1
+  for q in range(0, n) {
+    let r = parse_at(toks, j, lib)
+    let args = append(args, r[0])
+    let j = r[1]
+  }
+  return [[head[0], head[1], args], j]
+}
+
+skill load_lib(text) -> Any {
+  let lib = []
+  for line in split(text, "\n") {
+    let line = trim(line)
+    if line != "" { let lib = append(lib, parse_at(split(line, " "), 0, lib)[0]) }
+  }
+  return lib
+}
+
+skill save_lib(lib) -> Any {
+  let lines = []
+  for b in lib { let lines = append(lines, ser(b)) }
+  return join(lines, "\n")
+}
+
+# ---- search with the vocabulary ------------------------------------------------------------------------------
+skill mix1(h, v) -> Any { return (h * 1000003 + v % 1073741789 + 1) % 1073741789 }
+skill mix2(h, v) -> Any { return (h * 999983 + v % 1073741783 + 7) % 1073741783 }
+
+skill gl_push(g, x) -> Any {
+  let cur = append(g[1], x)
+  if len(cur) >= 64 { return [append(g[0], cur), []] }
+  return [g[0], cur]
+}
+skill gl_items(g) -> Any {
+  let out = []
+  for c in g[0] { let out = out ++ c }
+  return out ++ g[1]
+}
+
+skill verify(tree, vars, held) -> Any {
+  for ex in held {
+    let env = {}
+    for i in range(0, len(vars)) { let env = put(env, vars[i], ex[0][i]) }
+    let r = ev(tree, env, {}, 100000)
+    if r[0] == 0 { return false }
+    if r[1] != ex[1] { return false }
+  }
+  return true
+}
+
+# consider one candidate; -> ["hit", tree] / "new" / "dup"
+skill offer(seen, vec, target, tree, vars, held, lib) -> Any {
+  let h1 = 0
+  let h2 = 0
+  for v in vec {
+    let h1 = mix1(h1, v)
+    let h2 = mix2(h2, v)
+  }
+  if hset_add(seen, h1 * 1073741783 + h2) == false { return "dup" }
+  if vec == target {
+    if verify(expand(tree, lib), vars, held) { return ["hit", tree] }
+  }
+  return "new"
+}
+
+# -> [word-form tree or null, candidates kept]
+skill solve(train, held, nvars, lib, maxsize, cap) -> Any {
+  let vars = slice(["x", "y"], 0, nvars)
+  let n = len(train)
+  let xs = []
+  let ys = []
+  let target = []
+  for ex in train {
+    let xs = append(xs, ex[0][0])
+    if nvars > 1 { let ys = append(ys, ex[0][1]) } else { let ys = append(ys, 0) }
+    let target = append(target, ex[1])
+  }
+  let seen = hset(2 * cap + 1)
+  let total = 0
+  # usable words: no y in one-variable problems
+  let words = []
+  for i in range(0, len(lib)) {
+    if nvars > 1 or uses_y(lib[i]) == false { let words = append(words, [i, arity(lib[i])]) }
+  }
+  let leaves = []
+  for i in range(0, nvars) { let leaves = append(leaves, ["v", vars[i]]) }
+  for c in [0, 1, 2, 3] { let leaves = append(leaves, ["q", c]) }
+  for wd in words {
+    if wd[1] == 0 { let leaves = append(leaves, ["w", wd[0], []]) }
+  }
+  let l1 = [[], []]
+  for lf in leaves {
+    let vec = []
+    for j in range(0, n) { let vec = append(vec, sev(lf, 0, 0, xs[j], ys[j], lib)) }
+    let r = offer(seen, vec, target, lf, vars, held, lib)
+    if typeof(r) == "list" { return [r[1], total] }
+    if r == "new" {
+      let l1 = gl_push(l1, [lf, vec])
+      let total = total + 1
+    }
+  }
+  let levels = [[], gl_items(l1)]
+  for s in range(2, maxsize + 1) {
+    let cur = [[], []]
+    for a in levels[s - 1] {
+      if total < cap {
+        let vec = []
+        for j in range(0, n) { let vec = append(vec, 0 - a[1][j]) }
+        let tree = ["op", "neg", [a[0]]]
+        let r = offer(seen, vec, target, tree, vars, held, lib)
+        if typeof(r) == "list" { return [r[1], total] }
+        if r == "new" {
+          let cur = gl_push(cur, [tree, vec])
+          let total = total + 1
+        }
+      }
+    }
+    for c in range(0, 7) {
+      for sa in range(1, s - 1) {
+        let sb = s - 1 - sa
+        if commutes(c) == false or sa <= sb {
+          let la = levels[sa]
+          let lb = levels[sb]
+          for ia in range(0, len(la)) {
+            let a = la[ia]
+            let start = 0
+            if commutes(c) and sa == sb { let start = ia }
+            for ib in range(start, len(lb)) {
+              if total < cap {
+                let b = lb[ib]
+                let ok = true
+                for j in range(0, n) {
+                  if (c == 3 or c == 4) and b[1][j] == 0 { let ok = false }
+                }
+                if ok {
+                  let vec = []
+                  for j in range(0, n) { let vec = append(vec, apply2(c, a[1][j], b[1][j])) }
+                  let tree = ["op", opnames()[c], [a[0], b[0]]]
+                  let r = offer(seen, vec, target, tree, vars, held, lib)
+                  if typeof(r) == "list" { return [r[1], total] }
+                  if r == "new" {
+                    let cur = gl_push(cur, [tree, vec])
+                    let total = total + 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    # Pi's own words: a word costs 1, plus its arguments
+    for wd in words {
+      if wd[1] == 1 {
+        for a in levels[s - 1] {
+          if total < cap {
+            let vec = []
+            let ok = true
+            for j in range(0, n) {
+              if ok {
+                let v = sev(lib[wd[0]], a[1][j], 0, xs[j], ys[j], lib)
+                if v == null { let ok = false } else { let vec = append(vec, v) }
+              }
+            }
+            if ok {
+              let tree = ["w", wd[0], [a[0]]]
+              let r = offer(seen, vec, target, tree, vars, held, lib)
+              if typeof(r) == "list" { return [r[1], total] }
+              if r == "new" {
+                let cur = gl_push(cur, [tree, vec])
+                let total = total + 1
+              }
+            }
+          }
+        }
+      }
+      if wd[1] == 2 {
+        for sa in range(1, s - 1) {
+          for a in levels[sa] {
+            for b in levels[s - 1 - sa] {
+              if total < cap {
+                let vec = []
+                let ok = true
+                for j in range(0, n) {
+                  if ok {
+                    let v = sev(lib[wd[0]], a[1][j], b[1][j], xs[j], ys[j], lib)
+                    if v == null { let ok = false } else { let vec = append(vec, v) }
+                  }
+                }
+                if ok {
+                  let tree = ["w", wd[0], [a[0], b[0]]]
+                  let r = offer(seen, vec, target, tree, vars, held, lib)
+                  if typeof(r) == "list" { return [r[1], total] }
+                  if r == "new" {
+                    let cur = gl_push(cur, [tree, vec])
+                    let total = total + 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    let levels = append(levels, gl_items(cur))
+  }
+  return [null, total]
+}
+
+# ---- learning words: minimum description length -------------------------------------------------------------
+# match a word body against a tree; binds is a list of 2 (null = unbound); -> binds or null
+skill wmatch(body, t, binds) -> Any {
+  let h = body[0]
+  if h == "p" {
+    let k = body[1]
+    if binds[k] == null { return slice(binds, 0, k) ++ [t] ++ slice(binds, k + 1, 2) }
+    if binds[k] == t { return binds }
+    return null
+  }
+  if h != t[0] { return null }
+  if h == "v" or h == "q" {
+    if body[1] == t[1] { return binds }
+    return null
+  }
+  if body[1] != t[1] { return null }
+  let ba = body[2]
+  let ta = t[2]
+  if len(ba) != len(ta) { return null }
+  let bs = binds
+  for i in range(0, len(ba)) {
+    let bs = wmatch(ba[i], ta[i], bs)
+    if bs == null { return null }
+  }
+  return bs
+}
+
+# rewrite every use of word idx (top-down)
+skill rw(t, idx, body, k) -> Any {
+  let h = t[0]
+  if h == "v" or h == "q" or h == "p" { return t }
+  let bs = wmatch(body, t, [null, null])
+  if bs != null {
+    let args = []
+    for i in range(0, k) { let args = append(args, rw(bs[i], idx, body, k)) }
+    return ["w", idx, args]
+  }
+  let out = []
+  for a in t[2] { let out = append(out, rw(a, idx, body, k)) }
+  return [h, t[1], out]
+}
+
+# variables become parameters, in order of appearance; -> [body, var->param map]
+skill abstract_vars(t, m) -> Any {
+  let h = t[0]
+  if h == "v" {
+    if m[t[1]] != null { return [["p", m[t[1]]], m] }
+    let k = len(keys(m))
+    return [["p", k], put(m, t[1], k)]
+  }
+  if h == "q" or h == "p" { return [t, m] }
+  let out = []
+  for a in t[2] {
+    let r = abstract_vars(a, m)
+    let out = append(out, r[0])
+    let m = r[1]
+  }
+  return [[h, t[1], out], m]
+}
+
+skill subtrees(t, acc) -> Any {
+  if t[0] == "op" or t[0] == "w" {
+    let acc = append(acc, t)
+    for a in t[2] { let acc = subtrees(a, acc) }
+  }
+  return acc
+}
+
+skill candidates(sols, lib) -> Any {
+  let seen = {}
+  let out = []
+  let known = {}
+  for b in lib { let known = put(known, ser(b), true) }
+  for s in sols {
+    for t in subtrees(s, []) {
+      let forms = [abstract_vars(t, {})[0]]
+      # one argument held open, the rest kept as they are
+      for i in range(0, len(t[2])) {
+        let args = []
+        for j in range(0, len(t[2])) {
+          if j == i { let args = append(args, ["p", 0]) } else { let args = append(args, t[2][j]) }
+        }
+        let forms = append(forms, [t[0], t[1], args])
+      }
+      for f in forms {
+        let key = ser(f)
+        if seen[key] == null and known[key] == null and tsize(f) >= 3 and arity(f) >= 1 {
+          let seen = put(seen, key, true)
+          let out = append(out, f)
+        }
+      }
+    }
+  }
+  return out
+}
+
+skill total_size(sols) -> Any {
+  let s = 0
+  for t in sols { let s = s + tsize(t) }
+  return s
+}
+
+# add up to `most` words, each the one that shortens the whole description the most; -> [lib, sols, new words]
+skill learn(lib, sols, most) -> Any {
+  let added = []
+  for step in range(0, most) {
+    let base = total_size(sols)
+    let best = null
+    let bestgain = 0
+    for f in candidates(sols, lib) {
+      let idx = len(lib)
+      let k = arity(f)
+      let uses = 0
+      let after = tsize(f)
+      for t in sols {
+        let r = rw(t, idx, f, k)
+        if r != t { let uses = uses + 1 }
+        let after = after + tsize(r)
+      }
+      let gain = base - after
+      if uses >= 2 and gain > bestgain {
+        let best = f
+        let bestgain = gain
+      }
+    }
+    if best != null {
+      let idx = len(lib)
+      let lib = append(lib, best)
+      let ns = []
+      for t in sols { let ns = append(ns, rw(t, idx, best, arity(best))) }
+      let sols = ns
+      let added = append(added, [idx, bestgain])
+    }
+  }
+  return [lib, sols, added]
+}
+
+# ---- the agent ---------------------------------------------------------------------------------------------
+skill problems() -> Any {
+  return [
+    ["x^2", fn(x) => x * x],
+    ["x^2 + 1", fn(x) => x * x + 1],
+    ["x^3", fn(x) => x * x * x],
+    ["(x+1)^2", fn(x) => (x + 1) * (x + 1)],
+    ["x^2 + x", fn(x) => x * x + x],
+    ["x^4", fn(x) => x * x * x * x],
+    ["x^4 + 1", fn(x) => x * x * x * x + 1],
+    ["x^5", fn(x) => x * x * x * x * x],
+    ["x^6", fn(x) => x * x * x * x * x * x],
+    ["(x^2+1)^2", fn(x) => (x * x + 1) * (x * x + 1)],
+    ["x^8", fn(x) => x * x * x * x * x * x * x * x],
+    ["(x^2+x)^2", fn(x) => (x * x + x) * (x * x + x)],
+    ["(x+1)^4", fn(x) => (x + 1) * (x + 1) * (x + 1) * (x + 1)],
+    ["x^9", fn(x) => x * x * x * x * x * x * x * x * x],
+    ["x^8 + 1", fn(x) => x * x * x * x * x * x * x * x + 1],
+    ["((x^2+1)^2+1)^2", fn(x) => ((x * x + 1) * (x * x + 1) + 1) * ((x * x + 1) * (x * x + 1) + 1)],
+    ["(x+1)^6", fn(x) => (x + 1) * (x + 1) * (x + 1) * (x + 1) * (x + 1) * (x + 1)],
+    ["x^12", fn(x) => x * x * x * x * x * x * x * x * x * x * x * x]
+  ]
+}
+
+# never learned from: these measure whether Pi's words carry over to problems it has not seen
+skill unseen() -> Any {
+  return [
+    ["x^7", fn(x) => x * x * x * x * x * x * x],
+    ["x^10", fn(x) => x * x * x * x * x * x * x * x * x * x],
+    ["(x+1)^3", fn(x) => (x + 1) * (x + 1) * (x + 1)],
+    ["x^4 + x^2", fn(x) => x * x * x * x + x * x],
+    ["x^6 + 1", fn(x) => x * x * x * x * x * x + 1],
+    ["(x^2+1)^3", fn(x) => (x * x + 1) * (x * x + 1) * (x * x + 1)],
+    ["(x+2)^4", fn(x) => (x + 2) * (x + 2) * (x + 2) * (x + 2)],
+    ["x^3 + 1", fn(x) => x * x * x + 1],
+    ["x^16", fn(x) => x * x * x * x * x * x * x * x * x * x * x * x * x * x * x * x],
+    ["x^5 + x", fn(x) => x * x * x * x * x + x]
+  ]
+}
+
+skill examples_of(f, xs) -> Any {
+  let out = []
+  for x in xs { let out = append(out, [[x], f(x)]) }
+  return out
+}
+
+# one pass over the problems with a vocabulary; -> [solved trees (or null) per problem, total candidates]
+skill attempt(ps, lib, maxsize, cap) -> Any {
+  let tx = [0 - 3, 0 - 2, 0 - 1, 0, 1, 2, 3, 4]
+  let hx = [5, 6, 7, 0 - 5, 0 - 4]
+  let res = []
+  let work = 0
+  for p in ps {
+    let f = p[1]
+    let m = mark()
+    let r = solve(examples_of(f, tx), examples_of(f, hx), 1, lib, maxsize, cap)
+    let r = release(m, r)
+    let res = append(res, r[0])
+    let work = work + r[1]
+  }
+  return [res, work]
+}
+
+skill count_solved(res) -> Any {
+  let c = 0
+  for r in res {
+    if r != null { let c = c + 1 }
+  }
+  return c
+}
+
+skill main() -> Any {
+  let maxsize = 7
+  let cap = 60000
+  let mem = arg(1)
+  let lib = []
+  if mem != null {
+    let text = read_file(mem)
+    if text != null { let lib = load_lib(text) }
+  }
+  let ps = problems()
+  let out = "Pi starts with " ++ str(len(lib)) ++ " words of its own.\n"
+  let base = attempt(ps, [], maxsize, cap)
+  let res = base[0]
+  if len(lib) > 0 { let res = attempt(ps, lib, maxsize, cap)[0] }
+  let round = 1
+  let going = true
+  while going {
+    let sols = []
+    for r in res {
+      if r != null { let sols = append(sols, r) }
+    }
+    let out = out ++ "round " ++ str(round) ++ ": solved " ++ str(count_solved(res)) ++ " of " ++ str(len(ps)) ++ "\n"
+    let l = learn(lib, sols, 3)
+    if len(l[2]) == 0 or round >= 6 {
+      let going = false
+    } else {
+      let lib = l[0]
+      for a in l[2] {
+        let out = out ++ "  new word w" ++ str(a[0]) ++ "(" ++ slice("ab", 0, arity(lib[a[0]])) ++ ") = " ++ show(lib[a[0]]) ++ "   (saves " ++ str(a[1]) ++ ")\n"
+      }
+      if mem != null { do write_file(mem, save_lib(lib)) }
+      let res = attempt(ps, lib, maxsize, cap)[0]
+      let round = round + 1
+    }
+  }
+  let final = attempt(ps, lib, maxsize, cap)
+  let out = out ++ "\nwhat Pi says, in its own words (each expanded and checked on unseen inputs):\n"
+  for i in range(0, len(ps)) {
+    let r = final[0][i]
+    if r == null {
+      let out = out ++ "  " ++ ps[i][0] ++ ": not yet\n"
+    } else {
+      let out = out ++ "  " ++ ps[i][0] ++ ": " ++ show(r) ++ "  (size " ++ str(tsize(r)) ++ ", plain Pi size " ++ str(tsize(expand(r, lib))) ++ ")\n"
+    }
+  }
+  let out = out ++ "\nlearning problems -- without its words: " ++ str(count_solved(base[0])) ++ " of " ++ str(len(ps)) ++ ", with " ++ str(len(lib)) ++ " words: " ++ str(count_solved(final[0])) ++ "\n"
+  let us = unseen()
+  let u0 = attempt(us, [], maxsize, cap)
+  let u1 = attempt(us, lib, maxsize, cap)
+  let out = out ++ "\nproblems Pi never learned from:\n"
+  for i in range(0, len(us)) {
+    let a = "not found"
+    if u0[0][i] != null { let a = show(u0[0][i]) }
+    let b = "not found"
+    if u1[0][i] != null { let b = show(u1[0][i]) }
+    let out = out ++ "  " ++ us[i][0] ++ ":  without words: " ++ a ++ "   with words: " ++ b ++ "\n"
+  }
+  let out = out ++ "unseen -- without its words: " ++ str(count_solved(u0[0])) ++ " of " ++ str(len(us)) ++ ", with its words: " ++ str(count_solved(u1[0])) ++ " of " ++ str(len(us))
+  return out
+}

@@ -1,0 +1,1 @@
+skill main() -> Any { return 0 }

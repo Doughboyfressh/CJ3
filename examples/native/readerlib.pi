@@ -1,0 +1,549 @@
+# The self-taught reader's shared code (reader.pi, nnread.pi): facts, articles, sentence features, counting.
+import "slots.pi"
+import "readmodel.pi"
+
+skill SRC() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\pairs\\wikipedia_pairs.jsonl" }
+
+skill rd_field(t, key) -> Any {
+  let parts = split(t, "\"" ++ key ++ "\": ")
+  if len(parts) < 2 { return null }
+  let r = parts[1]
+  if slice(r, 0, 1) == "\"" {
+    let e = 1
+    while e < len(r) {
+      if slice(r, e, e + 1) == "\"" and slice(r, e - 1, e) != "\\" { return slice(r, 1, e) }
+      let e = e + 1
+    }
+  }
+  return null
+}
+
+skill rd_int(s) -> Any {
+  let v = 0
+  for i in range(0, len(s)) {
+    let c = ord(slice(s, i, i + 1))
+    if c >= 48 and c <= 57 { let v = v * 10 + (c - 48) }
+  }
+  return v
+}
+
+skill rd_two(i) -> Any {
+  if i < 10 { return "0" ++ str(i) }
+  return str(i)
+}
+
+# candidates: runs of capitalised words (with of / de / van / von / da / la / del inside), and years
+skill rd_spans(ws) -> Any {
+  let out = []
+  let i = 0
+  while i < len(ws) {
+    if sl_year(ws[i]) {
+      let out = append(out, [i, i + 1])
+      let i = i + 1
+    } else {
+      if sl_cap(ws[i]) {
+        let j = i + 1
+        let going = true
+        while going and j < len(ws) {
+          if sl_cap(ws[j]) { let j = j + 1 } else {
+            let lw = ws[j]
+            if (lw == "of" or lw == "de" or lw == "van" or lw == "von" or lw == "da" or lw == "la" or lw == "del") and j + 1 < len(ws) {
+              if sl_cap(ws[j + 1]) { let j = j + 2 } else { let going = false }
+            } else { let going = false }
+          }
+        }
+        let out = append(out, [i, j])
+        let i = j
+      } else { let i = i + 1 }
+    }
+  }
+  return out
+}
+
+# ---- the facts: [relation index, subject, value words joined lower-case (a year for dates)] -------------------------
+skill read_facts(off, mb, maxn, rl) -> Any {
+  let out = []
+  let chunk = 8000000
+  let pos = off
+  let carry = ""
+  while pos < off + mb * 1000000 and len(out) < maxn {
+    let m = mark()
+    let b = read_bytes(SRC(), pos, chunk)
+    let n = 0
+    if b != null { let n = len(b) }
+    let ls = split(carry ++ arr_text(b, 0, n), "\n")
+    let got = []
+    for i in range(0, len(ls) - 1) {
+      let r = rd_field(ls[i], "relation")
+      let ri = 0 - 1
+      if r != null {
+        for k in range(0, len(rl)) {
+          if rl[k] == r { let ri = k }
+        }
+      }
+      if ri >= 0 {
+        let s = rd_field(ls[i], "subject_label")
+        let v = rd_field(ls[i], "value")
+        if s != null and v != null {
+          let vw = sl_words(v)
+          if len(vw) > 0 {
+            if r == "date_of_birth" or r == "date_of_death" or r == "inception" { let vw = [slice(vw[0], 0, 4)] }
+            let got = append(got, [ri, s, lower(join(vw, " "))])
+          }
+        }
+      }
+    }
+    let keep = release(m, [ls[len(ls) - 1], got])
+    let carry = keep[0]
+    let out = out ++ keep[1]
+    if n < chunk { let pos = off + mb * 1000000 } else { let pos = pos + n }
+  }
+  return out
+}
+
+# facts.txt (subject ||| relation ||| value) -> [train, tune, test] split BY SUBJECT (key % 50: 7 test, 13 tune),
+# subjects of any practice exam or final (out\\heldout_subjects.txt) left out entirely
+skill read_facts_txt(maxn, rl) -> Any {
+  let ex = hset(65536)
+  let ht = read_file("out\\heldout_subjects.txt")
+  if ht != null {
+    for l in split(ht, "\n") { do hset_add(ex, sl_key(l)) }
+  }
+  # three lists built in blocks of 50,000 (appending one by one to a growing list is quadratic)
+  let bl = [[], [], []]
+  let cur = [[], [], []]
+  let ntr = 0
+  let t = read_file("out\\facts.txt")
+  let dropped = 0
+  for line in split(t, "\n") {
+    let m = mark()
+    let p = split(line, " ||| ")
+    let item = null
+    if len(p) == 3 {
+      let ri = 0 - 1
+      for k in range(0, len(rl)) {
+        if rl[k] == p[1] { let ri = k }
+      }
+      if ri >= 0 {
+        let vw = sl_words(p[2])
+        if len(vw) > 0 and len(p[0]) >= 2 {
+          if p[1] == "date_of_birth" or p[1] == "date_of_death" or p[1] == "inception" { let vw = [slice(vw[0], 0, 4)] }
+          let item = [ri, p[0], lower(join(vw, " "))]
+        }
+      }
+    }
+    let item = release(m, item)
+    if item != null {
+      let k = sl_key(lower(item[1]))
+      if hset_has(ex, k) { let dropped = dropped + 1 } else {
+        let w = 0
+        if k % 50 == 13 { let w = 1 }
+        if k % 50 == 7 { let w = 2 }
+        if w > 0 or ntr < maxn {
+          if w == 0 { let ntr = ntr + 1 }
+          let c = append(cur[w], item)
+          if len(c) >= 50000 {
+            let bl = slice(bl, 0, w) ++ [append(bl[w], c)] ++ slice(bl, w + 1, 3)
+            let c = []
+          }
+          let cur = slice(cur, 0, w) ++ [c] ++ slice(cur, w + 1, 3)
+        }
+      }
+    }
+  }
+  let res = []
+  for w in range(0, 3) {
+    let all = []
+    for b in append(bl[w], cur[w]) { let all = all ++ b }
+    let res = append(res, all)
+  }
+  do print("facts.txt: train " ++ str(len(res[0])) ++ ", tune " ++ str(len(res[1])) ++ ", test " ++ str(len(res[2])) ++ " (by subject); " ++ str(dropped) ++ " facts of held-out subjects left out")
+  return res
+}
+
+skill fact_item(line, rl) -> Any {
+  let p = split(line, " ||| ")
+  if len(p) != 3 { return null }
+  let ri = 0 - 1
+  for k in range(0, len(rl)) {
+    if rl[k] == p[1] { let ri = k }
+  }
+  if ri < 0 { return null }
+  let vw = sl_words(p[2])
+  if len(vw) == 0 or len(p[0]) < 2 { return null }
+  if p[1] == "date_of_birth" or p[1] == "date_of_death" or p[1] == "inception" { let vw = [slice(vw[0], 0, 4)] }
+  return [ri, p[0], lower(join(vw, " "))]
+}
+
+skill excluded() -> Any {
+  let ex = hset(65536)
+  let ht = read_file("out\\heldout_subjects.txt")
+  if ht != null {
+    for l in split(ht, "\n") { do hset_add(ex, sl_key(l)) }
+  }
+  return ex
+}
+
+skill stream_facts(rl, mode, which, cap, w, nw, maxn, need, ix, t) -> Any {
+  let ex = excluded()
+  let out = []
+  let ntr = 0
+  let used = 0
+  let mt = mark()
+  let lines = split(read_file("out\\facts.txt"), "\n")
+  for line in lines {
+    let m = mark()
+    let item = fact_item(line, rl)
+    let keepl = 0
+    if item != null {
+      let k = sl_key(lower(item[1]))
+      if hset_has(ex, k) == false {
+        let sp = 0
+        if k % 50 == 13 { let sp = 1 }
+        if k % 50 == 7 { let sp = 2 }
+        if mode == 0 and sp == which and len(out) < cap {
+          let out = append(out, item)
+          let keepl = 1
+        }
+        if sp == 0 {
+          let ntr = ntr + 1
+          if ntr <= maxn and (ntr - 1) % nw == w {
+            if mode == 1 { do hset_add(need, k) }
+            if mode == 2 { let used = used + learn_one(item, ix, t) }
+          }
+        }
+      }
+    }
+    if keepl == 0 { do release(m, 0) }
+  }
+  if mode == 0 { return out }
+  return used
+}
+
+# ---- the subjects' articles: one pass over the index shards, keeping only the subjects needed -------------------
+skill article_index(facts) -> Any {
+  let need = hset(4194304)
+  for f in facts { do hset_add(need, sl_key(lower(f[1]))) }
+  return article_index_h(need)
+}
+
+skill article_index_h(need) -> Any {
+  let hsz = 2097152
+  let hk = arr(hsz)
+  let hp = arr(hsz)
+  let ho = arr(hsz)
+  let hl = arr(hsz)
+  for k in range(0, 256) {
+    let m = mark()
+    let t = read_file("out\\wikiidx\\s" ++ str(k) ++ ".txt")
+    if t != null {
+      for line in split(t, "\n") {
+        let ml = mark()
+        let p = split(line, " ||| ")
+        if len(p) == 4 {
+          let key = sl_key(p[0])
+          if hset_has(need, key) {
+            let s = key % hsz
+            while aget(hk, s) != 0 and aget(hk, s) != key { let s = (s + 1) % hsz }
+            if aget(hk, s) == 0 {
+              do aset(hk, s, key)
+              do aset(hp, s, rd_int(slice(p[1], 0, 2)) * 100 + rd_int(slice(p[1], 3, 5)))
+              do aset(ho, s, rd_int(p[2]))
+              do aset(hl, s, rd_int(p[3]))
+            }
+          }
+        }
+        do release(ml, 0)
+      }
+    }
+    do release(m, 0)
+  }
+  return [hk, hp, ho, hl, hsz]
+}
+
+# the subject's article as sentences [[words, paragraph number, sentence number]] (at most 300 sentences), or null
+skill article(ix, subject) -> Any {
+  let key = sl_key(lower(subject))
+  let s = key % ix[4]
+  while aget(ix[0], s) != 0 and aget(ix[0], s) != key { let s = (s + 1) % ix[4] }
+  if aget(ix[0], s) != key { return null }
+  let pc = aget(ix[1], s)
+  let b = read_bytes("out\\wiki\\" ++ rd_two(pc // 100) ++ "_" ++ rd_two(pc % 100) ++ ".txt", aget(ix[2], s), aget(ix[3], s))
+  if b == null { return null }
+  let out = []
+  let k = 0
+  let si = 0
+  for para in split(arr_text(b, 0, len(b)), "\n") {
+    if len(para) >= 40 and len(out) < 300 {
+      let k = k + 1
+      for sn in split(para, ". ") {
+        let ws = sl_words(sn)
+        if len(ws) >= 4 and len(out) < 300 {
+          let out = append(out, [ws, k, si])
+          let si = si + 1
+        }
+      }
+    }
+  }
+  return out
+}
+
+skill bucket(n) -> Any {
+  if n <= 1 { return "1" }
+  if n <= 2 { return "2" }
+  if n <= 5 { return "5" }
+  if n <= 15 { return "15" }
+  return "far"
+}
+
+# a sentence's features for the sentence model: word stems, positions, whether it names the subject
+skill sent_feats(ws, para, si, subj1) -> Any {
+  let out = ["P" ++ bucket(para), "I" ++ bucket(si + 1)]
+  let named = false
+  for w in ws {
+    let lw = lower(w)
+    let out = append(out, slice(lw, 0, 6))
+    if lw == subj1 { let named = true }
+  }
+  if named { let out = append(out, "SUBJ") }
+  return out
+}
+
+# does the sentence hold the value (its words in a row)?
+skill holds(ws, vw) -> Any {
+  let i = 0
+  while i + len(vw) <= len(ws) {
+    let ok = true
+    let k = 0
+    while ok and k < len(vw) {
+      if lower(ws[i + k]) != vw[k] { let ok = false }
+      let k = k + 1
+    }
+    if ok { return true }
+    let i = i + 1
+  }
+  return false
+}
+
+skill cnt_add(t, key, which) -> Any {
+  let s = key % t[3]
+  while aget(t[0], s) != 0 and aget(t[0], s) != key { let s = (s + 1) % t[3] }
+  do aset(t[0], s, key)
+  do aset(t[which], s, aget(t[which], s) + 1)
+  return 0
+}
+
+# log ratio of a feature for relation ri: in stating sentences vs in the others
+skill sent_lr(t, ri, f) -> Any {
+  let key = sl_key(str(ri) ++ "|" ++ f)
+  let s = key % t[3]
+  while aget(t[0], s) != 0 and aget(t[0], s) != key { let s = (s + 1) % t[3] }
+  let a = 0
+  let b = 0
+  if aget(t[0], s) == key {
+    let a = aget(t[1], s)
+    let b = aget(t[2], s)
+  }
+  return log2((a + 1) * 1.0 / (aget(t[4], ri) + 100)) - log2((b + 1) * 1.0 / (aget(t[5], ri) + 100))
+}
+
+# the candidates of a sentence (names, or years for date relations), not the subject's own words
+skill sent_cands(ws, isdate, qset, subjl) -> Any {
+  let cs = []
+  for sp in rd_spans(ws) {
+    let c = lower(join(slice(ws, sp[0], sp[1]), " "))
+    let keepc = true
+    if isdate and sl_year(ws[sp[0]]) == false { let keepc = false }
+    if isdate == false and sl_year(ws[sp[0]]) { let keepc = false }
+    for q in qset {
+      if c == q { let keepc = false }
+    }
+    if c == subjl { let keepc = false }
+    if keepc { let cs = append(cs, join(slice(ws, sp[0], sp[1]), " ")) }
+  }
+  return cs
+}
+
+skill cand_lr(t, ri, f) -> Any {
+  let key = sl_key(str(ri) ++ "|" ++ f)
+  let s = key % t[3]
+  while aget(t[0], s) != 0 and aget(t[0], s) != key { let s = (s + 1) % t[3] }
+  let a = 0
+  let b = 0
+  if aget(t[0], s) == key {
+    let a = aget(t[1], s)
+    let b = aget(t[2], s)
+  }
+  return log2((a + 1) * 1.0 / (aget(t[6], ri) + 100)) - log2((b + 1) * 1.0 / (aget(t[7], ri) + 100))
+}
+
+skill learn(facts, ix, t) -> Any {
+  let used = 0
+  for f in facts { let used = used + learn_one(f, ix, t) }
+  return used
+}
+
+skill learn_one(f, ix, t) -> Any {
+  if true {
+    let m = mark()
+    let ss = article(ix, f[1])
+    let u = 0
+    if ss != null {
+      let vw = split(f[2], " ")
+      let subj1 = lower(sl_words(f[1])[0])
+      let anyp = false
+      for x in ss {
+        if holds(x[0], vw) { let anyp = true }
+      }
+      if anyp {
+        let u = 1
+        let qset = []
+        for w in sl_words(f[1]) { let qset = append(qset, lower(w)) }
+        let isdate = f[0] == 2 or f[0] == 3 or f[0] == 19
+        let ak = 0
+        for x in ss {
+          let cs = sent_cands(x[0], isdate, qset, lower(f[1]))
+          for j in range(0, len(cs)) {
+            let ak = ak + 1
+            let which = 2
+            if lower(cs[j]) == f[2] { let which = 1 }
+            do cnt_add(t, sl_key(str(f[0]) ++ "|CK" ++ bucket(ak)), which)
+            do cnt_add(t, sl_key(str(f[0]) ++ "|CJ" ++ bucket(j + 1)), which)
+            do aset(t[5 + which], f[0], aget(t[5 + which], f[0]) + 1)
+          }
+        }
+        for x in ss {
+          let which = 2
+          if holds(x[0], vw) { let which = 1 }
+          for ft in sent_feats(x[0], x[1], x[2], subj1) { do cnt_add(t, sl_key(str(f[0]) ++ "|" ++ ft), which) }
+          do aset(t[3 + which], f[0], aget(t[3 + which], f[0]) + 1)
+        }
+      }
+    }
+    do release(m, 0)
+    return u
+  }
+  return 0
+}
+
+# test one fact -> [reachable, Pi right, most-frequent right, first-name right] (0/1 each), or null (no article)
+skill dotv(a, b) -> Any {
+  let s = 0.0
+  for i in range(0, len(a)) { let s = s + a[i] * b[i] }
+  return s
+}
+
+# the combiner: an averaged perceptron over the candidates' evidence vectors (questions = lists of [vec, right, name])
+skill combine(qs, epochs) -> Any {
+  let w = [1.0, 1.0, 0.0, 0.0, 0.0]
+  let acc = [0.0, 0.0, 0.0, 0.0, 0.0]
+  for e in range(0, epochs) {
+    for q in qs {
+      let g = 0 - 1
+      for i in range(0, len(q)) {
+        if g < 0 and q[i][1] == 1 { let g = i }
+      }
+      if g >= 0 {
+        let b = 0
+        let bs = dotv(w, q[0][0])
+        for i in range(1, len(q)) {
+          let v = dotv(w, q[i][0])
+          if v > bs {
+            let bs = v
+            let b = i
+          }
+        }
+        if q[b][1] == 0 {
+          let w2 = []
+          for k in range(0, 5) { let w2 = append(w2, w[k] + 0.1 * (q[g][0][k] - q[b][0][k])) }
+          let w = w2
+        }
+      }
+      let a2 = []
+      for k in range(0, 5) { let a2 = append(a2, acc[k] + w[k]) }
+      let acc = a2
+    }
+  }
+  return acc
+}
+
+skill test_one(f, ix, t, sm, lam, cpos, wts) -> Any {
+  let ss = article(ix, f[1])
+  if ss == null { return null }
+  let vw = split(f[2], " ")
+  let subj = sl_words(f[1])
+  let subj1 = lower(subj[0])
+  let qset = []
+  for w in subj { let qset = append(qset, lower(w)) }
+  let isdate = f[0] == 2 or f[0] == 3 or f[0] == 19
+  let names = []
+  let counts = []
+  let best = ""
+  let bs = 0.0
+  let first = ""
+  let reach = 0
+  let ak = 0
+  let vecs = []
+  for x in ss {
+    let ws = x[0]
+    let cs = sent_cands(ws, isdate, qset, lower(f[1]))
+    if len(cs) > 0 {
+      let sc = 0.0
+      for ft in sent_feats(ws, x[1], x[2], subj1) { let sc = sc + sent_lr(t, f[0], ft) }
+      let sls = []
+      if sm != null and f[0] < len(sl_rels()) { let sls = sl_sentence(sm, f[0], join(ws, " "), cs, qset) }
+      for i in range(0, len(cs)) {
+        let c = lower(cs[i])
+        if first == "" { let first = c }
+        if c == f[2] { let reach = 1 }
+        let ak = ak + 1
+        let slv = 0.0
+        if len(sls) > i {
+          if sls[i] != null { let slv = sls[i] }
+        }
+        let vk = cand_lr(t, f[0], "CK" ++ bucket(ak))
+        let vj = cand_lr(t, f[0], "CJ" ++ bucket(i + 1))
+        let vec = [sc, slv, vk, vj, 1.0]
+        let isr = 0
+        if c == f[2] { let isr = 1 }
+        let vecs = append(vecs, [vec, isr, c])
+        let tot = sc + lam * slv
+        if cpos { let tot = tot + vk + vj }
+        if wts != null { let tot = dotv(wts, vec) }
+        if best == "" or tot > bs {
+          let bs = tot
+          let best = c
+        }
+        let k = 0 - 1
+        for j in range(0, len(names)) {
+          if names[j] == c { let k = j }
+        }
+        if k < 0 {
+          let names = append(names, c)
+          let counts = append(counts, 1)
+        } else { let counts = slice(counts, 0, k) ++ [counts[k] + 1] ++ slice(counts, k + 1, len(counts)) }
+      }
+    }
+  }
+  let mf = ""
+  let mc = 0
+  for j in range(0, len(names)) {
+    if counts[j] > mc {
+      let mc = counts[j]
+      let mf = names[j]
+    }
+  }
+  let r1 = 0
+  if best == f[2] { let r1 = 1 }
+  let r2 = 0
+  if mf == f[2] { let r2 = 1 }
+  let r3 = 0
+  if first == f[2] { let r3 = 1 }
+  return [reach, r1, r2, r3, vecs]
+}
+
+skill pc(a, n) -> Any {
+  if n == 0 { return "-" }
+  return str(100 * a // n) ++ "%"
+}
+

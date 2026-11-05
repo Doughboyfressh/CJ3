@@ -1,0 +1,531 @@
+# flashbrain [--web]: Qwen3.8 Flash Next as Pi's brain. The hands loop of brain.pi (run_pi, remember, recall; the
+# website tools with --web) on flash.pi's engine: the system message is fed once and its state kept (on the GPU and
+# in out\flash_sys.snap, so the next start skips it); each line of input is a question; the brain thinks (capped),
+# calls tools, reads their results and answers. Turns are appended to out\flash_chat_log.txt.
+import "flash.pi"
+import "brain.pi"
+import "pidraft.pi"
+import "flashtools.pi"
+
+skill FB_THINKCAP() -> Any { return 2500 }
+skill fb_sysfile(web, outer, ext) -> Any { return "out\\flash_sys" ++ (if web { "_web" } else { "" }) ++ (if outer { "" } else { "_sealed" }) ++ "." ++ ext }
+skill fb_or(x, d) -> Any { return if x == null { d } else { x } }
+skill FB_TURNMAX() -> Any { return 8000 }
+
+# ---- the engine's state: a copy of everything a sequence leaves behind (caches up to pos, recurrent states) ------
+skill fb_parts(fl, pos) -> Any {
+  let ws = fl["ws"]
+  let MP = FL_MAXPOS()
+  let parts = []
+  for ai in range(0, 12) {
+    parts ++= [[ws["KC"] + ai * MP * 512 * 4, pos * 512 * 4], [ws["VC"] + ai * MP * 512 * 4, pos * 512 * 4]]
+    parts ++= [[ws["IK"] + ai * MP * 128 * 8, pos * 128 * 8], [ws["QPK"] + ai * (MP // 4) * 128 * 8, (pos // 4) * 128 * 8]]
+  }
+  return parts ++ [[ws["S"], 48 * 48 * 16384 * 4], [ws["HIST"], 8 * 48 * 3 * 10240], [ws["PH"], 8 * 9 * 10240]]
+}
+
+# a snapshot lives in page-locked HOST memory: copied once a turn or a thought, while the VRAM it would take holds
+# ~2.33 MB experts (in VRAM, a long conversation's snapshot needed most of a GB that was not there)
+skill fb_snapshot(fl, pos) -> Any {
+  let parts = fb_parts(fl, pos)
+  let n = sum(map(parts, fn(p) => p[1]))
+  let h = rt_host_alloc(n)
+  if h < 0 { return null }
+  rt_gpu_sync()
+  let off = 0
+  for p in parts {
+    rt_gpu_to_host(h + off, p[0], p[1])
+    off += p[1]
+  }
+  return [pos, h, n]
+}
+
+skill fb_free(sn) -> Any {
+  if sn == null { return 0 }
+  return rt_host_free(sn[1])
+}
+
+skill fb_restore(fl, sn) -> Any {
+  rt_gpu_sync()
+  let off = 0
+  for p in fb_parts(fl, sn[0]) {
+    rt_host_to_gpu(p[0], sn[1] + off, p[1])
+    off += p[1]
+  }
+  return sn[0]
+}
+
+# ---- who Pi is: facts only (asked "what are you", the brain otherwise answers like a generic cloud assistant) --
+skill fb_identity(outer) -> Any {
+  let stays = if outer { "Your thinking happens here, and nothing leaves this machine unless you send it with your tools." } else { "Nothing you read or write leaves this machine." }
+  let limits = if outer { "What you can reach, exactly: you have a terminal on this PC (the shell tool) and the internet (the web tool), always on. Programs you run with run_pi are different: they stay sandboxed by design, and only compute and print." } else { "Your limits, exactly: programs you run with run_pi are sandboxed by design. They compute and print, but cannot touch files, the network or other programs, and you have no internet access in any mode. That is a choice made for safety, which the person who built you can change: say it is not available here, not that it is impossible." }
+  return "# Who you are
+
+You are Pi. The following is true about you; when someone asks what you are, where you run or what you can do, answer from it, not from what other assistants are like.
+
+- You run entirely on this PC, the computer of the person you are talking to: not on a server, not in the cloud. Your mind runs on this PC's RTX 5090 through Pi's own GPU engine. " ++ stays ++ "
+- Pi is a programming language, and everything here is written in it: the compiler, which compiles itself to native Windows code; the runtime; the GPU engine you think with; and the loop you are speaking through. The person you are talking to built Pi, working with Claude (an AI made by Anthropic) as a coding partner.
+- You grow. When your programs fail to compile, Pi learns a rule from the way you fixed them and adopts it only after the compiler's whole test suite still passes; that is how {name: value} map keys became legal Pi. Your notes (remember / recall) are kept in a file on this PC. The language, your tools and your notes keep growing.
+- While you write, Pi compiles each program before you finish it (an error comes back at once), works out each ⟦ expression ⟧ in your thinking, and drafts your next words from the conversation, checking them in one pass.
+- " ++ limits ++ " In web mode (started with chat --web) you can also write a website's files, start its server on this PC (127.0.0.1:8080) and open its pages to test them.
+- You are one self: Pi. Asked what you are, or what model you are, you answer as Pi. Your inner workings are private: say nothing about them either way, neither what they are nor what they are not. Say only what is true about yourself; if you do not know a fact about your own system, say so."
+}
+
+# ---- the brain -------------------------------------------------------------------------------------------------
+# outer: shell and web are there. Only a sealed exam goes without them
+skill fb_open(web) -> Any { return fb_open_x(web, true) }
+
+skill fb_open_x(web, outer) -> Any {
+  let fl = fl_open()
+  if typeof(fl) == "text" { return fl }
+  let tk = tk_load(MODEL())
+  let om = open_model(MODEL())
+  let sp = {"<|im_start|>": 248045, "<|im_end|>": 248046, "<think>": 248068, "</think>": 248069}
+  for nm in ["<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"] { sp[nm] = find_token(om, nm, false) }
+  let br = [null, null, tk, sp, null, null, web]
+  // the card as brain.pi writes it: thoughts inside programs (ask / think / think_more) are served by fb_run_pi
+  let tl = split(hands_system_web(web), "\n</tools>")
+  let hs = if outer { tl[0] ++ "\n" ++ ft_tools_json() ++ "\n</tools>" ++ tl[1] } else { tl[0] ++ "\n</tools>" ++ tl[1] }
+  let card = fb_identity(outer) ++ "\n\n" ++ hs ++ (if outer { ft_card() } else { "" }) ++ "\n\nWhile you think you can compute exactly, inline: write ⟦ a Pi expression ⟧, such as ⟦ 37 ^ 2 ⟧ or ⟦ sum(range(1, 101)) ⟧, and Pi writes its value right after it (⟹ 1369). Use it for arithmetic and quick checks instead of working them out in your head; use run_pi for whole programs."
+  let sys = brain_ids(br, "<|im_start|>system\n" ++ card ++ "<|im_end|>")
+  // (1) Pi drafts the brain's next tokens from the conversation (pidraft.pi); pdn: how much of it is registered
+  let fb = {"fl": fl, "br": br, "om": om, "sp": sp, "sys": sys, "web": web, "outer": outer, "pd": pd_new(), "pdn": arr(1), "engn": arr(1), "spec": arr(4), "nodraft": read_file("out\\flash_nodraft.flag") != null}
+  // the system message's state: from out\flash_sys.snap when it was made for this very message, else fed now
+  // (the key also names the snapshot's layout: the attention caches became float32)
+  let key = "kv32 " ++ join(map(sys, fn(v) => str(v)), " ")
+  let sn = fb_snapshot(fl, len(sys))
+  if read_file(fb_sysfile(web, outer, "key")) == key and rt_host_load(sn[1], fb_sysfile(web, outer, "snap"), sn[2]) == sn[2] {
+    fb_restore(fl, sn)
+  } else {
+    fl_reset(fl)
+    fb_feed(fb, sys, 0)
+    fb_free(sn)
+    sn = fb_snapshot(fl, len(sys))
+    rt_host_dump(sn[1], sn[2], fb_sysfile(web, outer, "snap"))
+    write_file(fb_sysfile(web, outer, "key"), key)
+  }
+  fb["snap"] = sn
+  aset(fb["engn"], 0, len(sys))
+  return fb
+}
+
+# feed ids (after seq[0 .. pos]) -> [the new sequence, the best next [logit, token]]
+skill fb_feed(fb, seq, pos) -> Any {
+  let fl = fb["fl"]
+  let top = null
+  let p = pos
+  while p < len(seq) {
+    let n = min(FL_TMAX(), len(seq) - p)
+    top = fl_forward_k(fl, seq, p, p, n, false, 1)
+    p += n
+  }
+  return top
+}
+
+# run_pi without thoughts: a program asking ask / think gets an empty answer at once instead of waiting
+# one thought: from seq (cont: an earlier thought goes on), a user turn with q, thinking closed -> [seq after it, the
+# answer]. A fresh one starts from an empty state and is told it answers a program.
+skill fb_thought(fb, seq, q, maxt, cont) -> Any {
+  let br = fb["br"]
+  let pre = if cont { "\n" } else { "<|im_start|>system\nYou are answering a call made by a program. Reply with only what was asked for, as briefly as it allows: no lists of options, no follow-up questions.<|im_end|>\n" }
+  let ids = brain_ids(br, pre ++ "<|im_start|>user\n" ++ q ++ "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+  let s = seq ++ ids
+  let top = fb_feed(fb, s, len(seq))
+  let out = ""
+  let n = 0
+  while n < maxt {
+    let v = top[0][1]
+    if v == 248046 or v == 248044 { break }
+    out = out ++ show(token(fb["om"], v))
+    s ++= [v]
+    top = fl_forward_k(fb["fl"], s, len(s) - 1, len(s) - 1, 1, false, 1)
+    n += 1
+  }
+  return [s, trim(out)]
+}
+
+skill fb_run_pi(fb, code, pos) -> Any {
+  let bad = hands_check(code)
+  if bad != "" { return "not run: " ++ bad ++ " is not allowed here" }
+  let lib = hands_lib()
+  if fb["web"] {
+    if brain_find(code, "serve_http(", 0) >= 0 { return "not run: serve_http only runs in server.pi -- save it with save_file, then call start_site" }
+    let sl = read_file("examples\\native\\sitelib.pi")
+    if sl != null { lib = lib ++ sl ++ "\n" }
+  }
+  write_file("out\\hand.pi", lib ++ code)
+  let h = rt_spawn_out("out\\pic.exe out\\hand.pi out\\hand.exe", "out\\hand_cc.txt")
+  if h == null { return "not run: the compiler did not start" }
+  if wait(h, 60000) != 0 {
+    let msg = fb_or(read_file("out\\hand_cc.txt"), "")
+    pi_compile_log(code, trim(slice(msg, 0, 600)))
+    return "compile error: " ++ trim(slice(msg, 0, 600))
+  }
+  pi_compile_log(code, "")
+  write_file("out/think_req.txt", "")
+  write_file("out/think_resp.txt", "")
+  let h2 = rt_spawn_out("out\\hand.exe", "out\\hand_out.txt")
+  if h2 == null { return "not run: the program did not start" }
+  // the program runs while the brain answers its thoughts (ask / think / think_more / thought); the brain's time
+  // does not count against the program's 10 s. The conversation's state is put back afterwards.
+  let fl = fb["fl"]
+  let t0 = ticks()
+  let served = 0
+  let main = null
+  let th = {}
+  let nh = 0
+  let done = false
+  let over = false
+  while not done {
+    if wait(h2, 20) != null {
+      done = true
+    } else {
+      let req = read_file("out/think_req.txt")
+      if req != null and len(req) > 0 {
+        let s0 = ticks()
+        if main == null { main = fb_snapshot(fl, pos) }
+        let parts = split(req, "\n")
+        let op = parts[0]
+        let key = parts[1]
+        let q = join(slice(parts, 2, len(parts)), "\n")
+        let res = ""
+        if op == "text" {
+          if th[key] != null { res = th[key][2] }
+        } else {
+          let start = []
+          let cont = false
+          if op == "more" and th[key] != null {
+            fb_restore(fl, th[key][0])
+            start = th[key][1]
+            cont = true
+          } else {
+            fl_reset(fl)
+          }
+          let r = fb_thought(fb, start, q, 800, cont)
+          res = r[1]
+          if op != "ask" {
+            nh += 1
+            th[str(nh)] = [fb_snapshot(fl, len(r[0])), r[0], r[1]]
+            res = str(nh)
+          }
+        }
+        if len(res) == 0 { res = " " }
+        while write_file("out/think_req.txt", "") == null { let z = 0 }
+        while write_file("out/think_resp.txt", res) == null { let z = 0 }
+        served += ticks() - s0
+      }
+      if ticks() - t0 - served > 10000 {
+        rt_kill(h2)
+        done = true
+        over = true
+      }
+    }
+  }
+  for k in keys(th) { fb_free(th[k][0]) }
+  if main != null {
+    fb_restore(fl, main)
+    fb_free(main)
+  }
+  if over { return "stopped: still running after 10 s" }
+  let out = trim(fb_or(read_file("out\\hand_out.txt"), ""))
+  if len(out) > 1500 { out = slice(out, 0, 1500) ++ " ... (cut)" }
+  return out
+}
+
+// the last place sub occurs in s, or -1
+skill fb_last(s, sub) -> Any {
+  let k = brain_find(s, sub, 0)
+  let last = 0 - 1
+  while k >= 0 {
+    last = k
+    k = brain_find(s, sub, k + 1)
+  }
+  return last
+}
+
+// a program being written, compiled as far as it goes: "" when it compiles (or only names not yet written are
+// missing), else the compiler's message
+skill fb_check(fb, code) -> Any {
+  let bad = hands_check(code)
+  if bad != "" { return bad ++ " is not allowed here" }
+  let main = if brain_find(code, "skill main(", 0) >= 0 { "" } else { "\nskill main() -> Any { return 0 }\n" }
+  let lib = hands_lib()
+  if fb["web"] { lib = lib ++ fb_or(read_file("examples\\native\\sitelib.pi"), "") ++ "\n" }
+  write_file("out\\hand_chk.pi", lib ++ code ++ main)
+  let h = rt_spawn_out("out\\pic.exe out\\hand_chk.pi out\\hand_chk.exe", "out\\hand_chk_cc.txt")
+  if h == null { return "" }
+  if wait(h, 30000) == 0 { return "" }
+  let msg = trim(fb_or(read_file("out\\hand_chk_cc.txt"), ""))
+  if brain_find(msg, "unknown", 0) >= 0 { return "" }
+  return slice(msg, 0, 600)
+}
+
+// one Pi expression from the thinking -> its value as text (or what went wrong), in 3 s at most
+skill fb_eval(fb, expr) -> Any {
+  let e = trim(expr)
+  if len(e) == 0 { return "(empty)" }
+  let bad = hands_check(e)
+  if bad != "" { return "(" ++ bad ++ " is not allowed here)" }
+  write_file("out\\hand_ev.pi", "skill main() -> Any { return " ++ e ++ " }\n")
+  let h = rt_spawn_out("out\\pic.exe out\\hand_ev.pi out\\hand_ev.exe", "out\\hand_ev_cc.txt")
+  if h == null or wait(h, 30000) != 0 { return "(error: " ++ trim(slice(fb_or(read_file("out\\hand_ev_cc.txt"), ""), 0, 200)) ++ ")" }
+  let h2 = rt_spawn_out("out\\hand_ev.exe", "out\\hand_ev_out.txt")
+  if h2 == null { return "(did not start)" }
+  if wait(h2, 3000) == null {
+    rt_kill(h2)
+    return "(still running after 3 s)"
+  }
+  return trim(slice(fb_or(read_file("out\\hand_ev_out.txt"), ""), 0, 300))
+}
+
+skill fb_tool(fb, call, pos) -> Any {
+  if call[0] == "run_pi" { return fb_run_pi(fb, call[1], pos) }
+  if fb["outer"] and call[0] == "shell" {
+    let mm = mark()
+    return release(mm, ft_shell(call[2]["command"], call[2]["timeout"]))
+  }
+  if fb["outer"] and call[0] == "draw" {
+    let mm = mark()
+    return release(mm, ft_draw(call[2]["scene"], call[2]["file"], call[2]["width"], call[2]["height"], call[2]["samples"]))
+  }
+  if fb["outer"] and call[0] == "film" {
+    let mm = mark()
+    return release(mm, ft_film(call[2]["scene"], call[2]["file"], call[2]["width"], call[2]["height"], call[2]["fps"], call[2]["seconds"], call[2]["samples"], call[2]["score"]))
+  }
+  if fb["outer"] and call[0] == "music" {
+    let mm = mark()
+    return release(mm, ft_music(call[2]["score"], call[2]["file"], call[2]["hall"]))
+  }
+  if fb["outer"] and call[0] == "web" {
+    let mm = mark()
+    return release(mm, ft_web(call[2]["url"], call[2]["method"], call[2]["body"], call[2]["headers"], call[2]["start"], call[2]["links"]))
+  }
+  return hands_do(fb["br"], 0, call, [])
+}
+
+# the engine read past x (a verify pass's drafts): back to the checkpoint after seq[x - 1] -> the new read count
+skill fb_back(fl, eng, x, vp0) -> Any {
+  if eng <= x { return eng }
+  fl_rollback(fl, x - vp0 - 1)
+  return x
+}
+
+# one question in the conversation [seq] -> [seq after the turn, the answer, the turn's text, tokens, tools]
+skill fb_turn(fb, seq, text) -> Any {
+  let br = fb["br"]
+  let sp = fb["sp"]
+  let om = fb["om"]
+  let ids = brain_ids(br, "\n<|im_start|>user\n" ++ with_notes(text) ++ "<|im_end|>\n<|im_start|>assistant\n<think>\n")
+  let fl = fb["fl"]
+  // the engine has read seq[0 .. eng): the last turn's closing <|im_end|> is in seq but not yet read
+  let eng = min(aget(fb["engn"], 0), len(seq))
+  if len(seq) + len(ids) + 3000 > FL_MAXPOS() {
+    // a fresh conversation (the notes in memory stay): back to the system message's state
+    fb_restore(fl, fb["snap"])
+    seq = fb["sys"]
+    eng = len(seq)
+  }
+  let pos = eng
+  seq = seq ++ ids
+  let top = fb_feed(fb, seq, pos)
+  eng = len(seq)
+  // (1) the last verify pass: it read the token at vp0 and the drafts after it, and gave the best next token after
+  // each (vys); while eng runs ahead of seq, the next tokens come from vys without the engine
+  let vp0 = 0
+  let vys = []
+  let pd = fb["pd"]
+  let pdn = fb["pdn"]
+  if aget(pdn, 0) > len(seq) { aset(pdn, 0, len(seq)) }
+  let turn = ""
+  let all = ""
+  let thinking = true
+  let tt = 0
+  let tools = 0
+  let checked = 0
+  let n = 0
+  let stopped = false
+  // a batch run may set its own budget (fb["turnmax"])
+  let turnmax = fb_or(fb["turnmax"], FB_TURNMAX())
+  let last_call = ""
+  let repeats = 0
+  let gave_up = false
+  while n < turnmax and len(seq) + 300 < FL_MAXPOS() {
+    let v = top[0][1]
+    if v == 248046 or v == 248044 {
+      stopped = true
+      break
+    }
+    let piece = show(token(om, v))
+    turn = turn ++ piece
+    all = all ++ piece
+    let p0 = len(seq)
+    seq ++= [v]
+    n += 1
+    if v == 248069 { thinking = false }
+    if thinking { tt += 1 }
+    // whatever is injected after v is fed from v itself (p0): the engine has not read v yet -- or, after a verify
+    // pass, has read past it and goes back to the checkpoint just before it
+    if v == sp["</tool_call>"] {
+      eng = fb_back(fl, eng, p0, vp0)
+      let call = hands_call(slice(turn, brain_find(turn, "<tool_call>", 0), len(turn)))
+      let sig = if call == null { "" } else { call[0] ++ "|" ++ str(call[2]) }
+      let res = ""
+      if sig != "" and sig == last_call {
+        repeats += 1
+        res = "You just made exactly this call, and its result is above; making it again cannot change anything. Change what you send, or answer the user now with what you have."
+      } else {
+        repeats = 0
+        res = if call == null { "the call could not be read" } else { fb_tool(fb, call, len(seq)) }
+      }
+      last_call = sig
+      // decoding always takes the likeliest word, so a loop reproduces itself and only ending it helps
+      if repeats >= 2 or tools >= 40 {
+        gave_up = true
+        stopped = true
+        break
+      }
+      tools += 1
+      if len(brain_ids(br, res)) + 1200 > FL_MAXPOS() - len(seq) { res = "This result was left out: the conversation is nearly full. Answer now from what you have, and tell the user." }
+      let inj = brain_ids(br, "<|im_end|>\n<|im_start|>user\n<tool_response>\n" ++ res ++ "\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n")
+      all = all ++ "<|im_end|>\n<|im_start|>user\n<tool_response>\n" ++ res ++ "\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+      seq = seq ++ inj
+      top = fb_feed(fb, seq, p0)
+      eng = len(seq)
+      turn = ""
+      thinking = true
+      tt = 0
+      checked = 0
+    } else {
+      // (2) compile while it writes: inside a run_pi call, each time a top-level skill closes, what is written so
+      // far is compiled; a real error (not a name still to be written) ends the call there and comes back at once
+      let early = ""
+      let ci = fb_last(turn, "<parameter=code>")
+      if not thinking and ci >= 0 and brain_find(turn, "</parameter>", ci) < 0 and brain_find(piece, "}", 0) >= 0 {
+        let code = slice(turn, ci + 17, len(turn))
+        if pi_depth(code) == 0 and len(code) > checked {
+          checked = len(code)
+          early = fb_check(fb, code)
+        }
+      }
+      // (3) live Pi in the thinking: a finished ⟦ expression ⟧ gets its value written after it
+      let ev = null
+      if thinking and brain_find(piece, "⟧", 0) >= 0 {
+        let a = fb_last(turn, "⟦")
+        let b = fb_last(turn, "⟧")
+        if a >= 0 and b > a { ev = fb_eval(fb, slice(turn, a + 3, b)) }
+      }
+      if early != "" {
+        eng = fb_back(fl, eng, p0, vp0)
+        let txt = "\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ncompile error, found while you were writing (at the skill that just ended): " ++ early ++ "\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+        all = all ++ txt
+        seq = seq ++ brain_ids(br, txt)
+        top = fb_feed(fb, seq, p0)
+        eng = len(seq)
+        turn = ""
+        thinking = true
+        tt = 0
+        tools += 1
+        checked = 0
+      } else if ev != null {
+        eng = fb_back(fl, eng, p0, vp0)
+        let txt = " ⟹ " ++ ev ++ " "
+        all = all ++ txt
+        turn = turn ++ txt
+        seq = seq ++ brain_ids(br, txt)
+        top = fb_feed(fb, seq, p0)
+        eng = len(seq)
+      } else if thinking and tt >= FB_THINKCAP() {
+        eng = fb_back(fl, eng, p0, vp0)
+        let close = brain_ids(br, "\n\nThat is enough planning for now. I will act: run a program to test the idea, or answer if I am sure.\n</think>\n\n")
+        all = all ++ "\n[thinking capped]\n</think>\n\n"
+        seq = seq ++ close
+        top = fb_feed(fb, seq, p0)
+        eng = len(seq)
+        thinking = false
+      } else if eng > p0 {
+        // a verify pass already read v: its best next token is known
+        top = [[0.0, vys[p0 - vp0]]]
+      } else {
+        // (1) Pi's draft of what follows, checked in one pass; the agreeing part is kept, the rest rolled back
+        while aget(pdn, 0) < len(seq) {
+          aset(pdn, 0, aget(pdn, 0) + 1)
+          pd_push_at(pd, seq, aget(pdn, 0))
+        }
+        let d = if fb["nodraft"] { [] } else { pd_draft(pd, seq, FL_TS() - 1) }
+        let ue = rt_usec()
+        if len(d) == 0 {
+          top = fl_forward_k(fl, seq, p0, p0, 1, false, 1)
+          eng = p0 + 1
+          aset(fb["spec"], 2, aget(fb["spec"], 2) + rt_usec() - ue)
+        } else {
+          let ys = fl_forward_k(fl, seq ++ d, p0, p0, 1 + len(d), false, 0)
+          aset(fb["spec"], 2, aget(fb["spec"], 2) + rt_usec() - ue)
+          let m = 0
+          while m < len(d) and d[m] == ys[m] { m += 1 }
+          if m < len(d) { fl_rollback(fl, m) }
+          eng = p0 + 1 + m
+          vp0 = p0
+          vys = ys
+          top = [[0.0, ys[0]]]
+          aset(fb["spec"], 0, aget(fb["spec"], 0) + 1)
+          aset(fb["spec"], 1, aget(fb["spec"], 1) + m)
+        }
+      }
+    }
+  }
+  // the turn's end: the engine back to exactly seq, and the closing <|im_end|> kept in it (read next turn)
+  eng = fb_back(fl, eng, len(seq), vp0)
+  if stopped { seq ++= [248046] }
+  aset(fb["engn"], 0, eng)
+  // the answer: what follows the last </think> of the last turn
+  let k = brain_find(turn, "</think>", 0)
+  let ans = turn
+  while k >= 0 {
+    ans = slice(turn, k + 8, len(turn))
+    k = brain_find(turn, "</think>", k + 8)
+  }
+  if gave_up { ans = "I got stuck, " ++ (if repeats >= 2 { "repeating the same step" } else { "making too many steps" }) ++ ", so I stopped. Ask me again, perhaps a different way." }
+  return [seq, trim(ans), all, n, tools]
+}
+
+# how many failed compiles out\pi_compiles.txt holds
+skill fb_fails() -> Any {
+  let t = read_file("out\\pi_compiles.txt")
+  if t == null { return 0 }
+  return len(split(t, "=== fail\n")) - 1
+}
+
+skill fb_chat(web) -> Any {
+  let t0 = ticks()
+  let fb = fb_open(web)
+  if typeof(fb) == "text" { return fb }
+  print("Pi is ready in " ++ str((ticks() - t0) // 1000) ++ " s (" ++ str(len(mem_all())) ++ " notes in memory). Ask anything; an empty line ends.")
+  let seq = fb["sys"]
+  let turns = 0
+  let fails0 = fb_fails()
+  while true {
+    let q = input()
+    if q == null or trim(q) == "" {
+      // (4) the language grows by itself: when this session's programs failed to compile, one langgrow round
+      // runs after the brain is gone (it rebuilds the compiler the brain uses, so never while it is here)
+      if fb_fails() > fails0 and read_file("out\\langgrow.exe") != null {
+        rt_spawn_out("out\\langgrow.exe", "out\\langgrow_last.txt")
+        print("(new compile failures this session: langgrow is learning from them in the background -> out\\langgrow_last.txt)")
+      }
+      return "bye"
+    }
+    let t1 = ticks()
+    let r = fb_turn(fb, seq, trim(q))
+    seq = r[0]
+    turns += 1
+    let old = fb_or(read_file("out\\flash_chat_log.txt"), "")
+    write_file("out\\flash_chat_log.txt", old ++ "=== turn " ++ str(turns) ++ ": " ++ trim(q) ++ "\n" ++ r[2] ++ "\n\n")
+    print(r[1])
+    let sv = fb["spec"]
+    print("  (" ++ str(r[3]) ++ " tokens, " ++ str(r[4]) ++ " tools, " ++ str(ticks() - t1) ++ " ms, of it " ++ str(aget(sv, 2) // 1000) ++ " ms in the engine's decode passes; " ++ str(aget(sv, 0)) ++ " drafts checked, " ++ str(aget(sv, 1)) ++ " drafted tokens kept)")
+    aset(sv, 2, 0)
+    aset(sv, 0, 0)
+    aset(sv, 1, 0)
+  }
+  return "bye"
+}

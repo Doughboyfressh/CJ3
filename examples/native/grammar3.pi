@@ -1,0 +1,432 @@
+# Grammar, step 3: who and what. Pi learns WHERE the answer sits in a sentence, per relation, from its aligned facts
+# (data\pairs\wikipedia_pairs.jsonl: each Wikidata fact with the Wikipedia sentence that states it, so the answer's
+# words are known). No rules: for every name or year in the sentence, Pi counts its surroundings -- the word or two
+# before it, the word after it (frequent words exact, the rest as Pi's 256 classes), and where it is from the subject
+# (side and distance) -- as evidence for "this is the answer" when it is, and against when it is another name.
+# Test, on held-out facts from other articles: given the sentence, its subject and the relation, pick the answer
+# among all the names and years in the sentence; against the first name, the name nearest the subject, and chance.
+#   out\grammar3.exe [train MB] [test MB]
+
+skill SRC() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\pairs\\wikipedia_pairs.jsonl" }
+
+skill rels() -> Any { return ["place_of_birth", "place_of_death", "date_of_birth", "date_of_death", "director", "author", "founder", "composer", "performer", "producer", "publisher", "developer", "record_label", "country", "capital", "headquarters_location", "spouse", "educated_at", "member_of_political_party", "inception", "creator", "manufacturer", "located_in_the_administrative_territorial_entity", "member_of_sports_team"] }
+
+skill wkey2(w) -> Any {
+  let h = 0
+  for i in range(0, len(w)) { let h = (h * 31 + ord(slice(w, i, i + 1))) % 1000000007 }
+  return h * 64 + len(w) + 1
+}
+
+skill field(t, key) -> Any {
+  let parts = split(t, "\"" ++ key ++ "\": ")
+  if len(parts) < 2 { return null }
+  let r = parts[1]
+  if slice(r, 0, 1) == "\"" {
+    let e = 1
+    while e < len(r) {
+      if slice(r, e, e + 1) == "\"" and slice(r, e - 1, e) != "\\" { return slice(r, 1, e) }
+      let e = e + 1
+    }
+    return null
+  }
+  return null
+}
+
+skill is_alnum(c) -> Any { return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) }
+
+skill words_of(s) -> Any {
+  let out = []
+  let n = len(s)
+  let i = 0
+  while i < n {
+    while i < n and is_alnum(ord(slice(s, i, i + 1))) == false { let i = i + 1 }
+    let a = i
+    while i < n and is_alnum(ord(slice(s, i, i + 1))) { let i = i + 1 }
+    if i > a { let out = append(out, slice(s, a, i)) }
+  }
+  return out
+}
+
+skill is_cap(w) -> Any {
+  let c = ord(slice(w, 0, 1))
+  return c >= 65 and c <= 90
+}
+
+skill is_year(w) -> Any {
+  if len(w) != 4 { return false }
+  for i in range(0, 4) {
+    let c = ord(slice(w, i, i + 1))
+    if c < 48 or c > 57 { return false }
+  }
+  return true
+}
+
+# ---- the vocabulary and classes (steps 1-2) ---------------------------------------------------------------------
+skill load_tab() -> Any {
+  let vocab = split(read_file("out\\vocab.txt"), "\n")
+  let cls = arr(len(vocab))
+  let cl = split(read_file("out\\classes.txt"), "\n")
+  for i in range(0, len(cl)) {
+    let p = split(cl[i], " ")
+    if len(p) == 2 { do aset(cls, i, num(p[1])) }
+  }
+  let hsz = 131072
+  let hk = arr(hsz)
+  let hv = arr(hsz)
+  for i in range(0, len(vocab)) {
+    let k = wkey2(vocab[i])
+    let s = k % hsz
+    while aget(hk, s) != 0 { let s = (s + 1) % hsz }
+    do aset(hk, s, k)
+    do aset(hv, s, i + 1)
+  }
+  return [hk, hv, hsz, cls]
+}
+
+skill word_id(tab, w) -> Any {
+  let k = wkey2(lower(w))
+  let s = k % tab[2]
+  while aget(tab[0], s) != 0 {
+    if aget(tab[0], s) == k { return aget(tab[1], s) - 1 }
+    let s = (s + 1) % tab[2]
+  }
+  return 0 - 1
+}
+
+# a word as context: a frequent word exactly, else its class, a name / rare word / a year otherwise
+skill ctx_tok(tab, w) -> Any {
+  if is_year(w) { return "Y" }
+  let id = word_id(tab, w)
+  if id >= 0 and id < 500 { return "w" ++ lower(w) }
+  if id >= 0 { return "c" ++ str(aget(tab[3], id)) }
+  if is_cap(w) { return "N" }
+  return "r"
+}
+
+# ---- candidates: runs of capitalised words (with of / de / van / von / da / la / del inside), and years -----------
+skill spans(ws) -> Any {
+  let out = []
+  let i = 0
+  while i < len(ws) {
+    if is_year(ws[i]) {
+      let out = append(out, [i, i + 1])
+      let i = i + 1
+    } else {
+      if is_cap(ws[i]) {
+        let j = i + 1
+        let going = true
+        while going and j < len(ws) {
+          if is_cap(ws[j]) { let j = j + 1 } else {
+            let lw = ws[j]
+            if (lw == "of" or lw == "de" or lw == "van" or lw == "von" or lw == "da" or lw == "la" or lw == "del") and j + 1 < len(ws) {
+              if is_cap(ws[j + 1]) { let j = j + 2 } else { let going = false }
+            } else { let going = false }
+          }
+        }
+        let out = append(out, [i, j])
+        let i = j
+      } else { let i = i + 1 }
+    }
+  }
+  return out
+}
+
+skill span_text(ws, sp) -> Any { return lower(join(slice(ws, sp[0], sp[1]), " ")) }
+
+skill find_seq(a, b) -> Any {
+  if len(b) == 0 { return 0 - 1 }
+  let i = 0
+  while i + len(b) <= len(a) {
+    let ok = true
+    let k = 0
+    while ok and k < len(b) {
+      if lower(a[i + k]) != lower(b[k]) { let ok = false }
+      let k = k + 1
+    }
+    if ok { return i }
+    let i = i + 1
+  }
+  return 0 - 1
+}
+
+skill dist_bucket(d) -> Any {
+  if d <= 1 { return "1" }
+  if d <= 2 { return "2" }
+  if d <= 5 { return "5" }
+  if d <= 10 { return "10" }
+  return "far"
+}
+
+# the features of a candidate span
+skill feats(toks, sp, subj) -> Any {
+  let a = sp[0]
+  let b = sp[1]
+  let l1 = "^"
+  if a >= 1 { let l1 = toks[a - 1] }
+  let l2 = "^"
+  if a >= 2 { let l2 = toks[a - 2] }
+  let r1 = "$"
+  if b < len(toks) { let r1 = toks[b] }
+  let side = "after"
+  let d = a - subj[1]
+  if b <= subj[0] {
+    let side = "before"
+    let d = subj[0] - b
+  }
+  return ["L1 " ++ l1, "L2 " ++ l2 ++ " " ++ l1, "R1 " ++ r1, "S " ++ side ++ " " ++ dist_bucket(d)]
+}
+
+# one fact -> [relation index, spans, the answer's span index, features per span, subject span] or null (unusable)
+skill example(t, tab, rl) -> Any {
+  let r = field(t, "relation")
+  if r == null { return null }
+  let ri = 0 - 1
+  for i in range(0, len(rl)) {
+    if rl[i] == r { let ri = i }
+  }
+  if ri < 0 { return null }
+  let s = field(t, "subject_label")
+  let v = field(t, "value")
+  let sent = field(t, "sentence")
+  if s == null or v == null or sent == null { return null }
+  let ws = words_of(sent)
+  if len(ws) < 4 or len(ws) > 60 { return null }
+  let sw = words_of(s)
+  let a = find_seq(ws, sw)
+  if a < 0 { return null }
+  let subj = [a, a + len(sw)]
+  let vw = words_of(v)
+  if len(vw) == 0 { return null }
+  if r == "date_of_birth" or r == "date_of_death" or r == "inception" { let vw = [slice(vw[0], 0, 4)] }
+  let vt = lower(join(vw, " "))
+  let sps = []
+  for sp in spans(ws) {
+    # the subject itself is no answer
+    if sp[1] <= subj[0] or sp[0] >= subj[1] { let sps = append(sps, sp) }
+  }
+  if len(sps) < 2 { return null }
+  let ans = 0 - 1
+  for i in range(0, len(sps)) {
+    if span_text(ws, sps[i]) == vt { let ans = i }
+  }
+  if ans < 0 { return null }
+  let toks = []
+  for w in ws { let toks = append(toks, ctx_tok(tab, w)) }
+  let fs = []
+  for sp in sps { let fs = append(fs, feats(toks, sp, subj)) }
+  return [ri, sps, ans, fs, subj]
+}
+
+# ---- the evidence table: (relation, feature) -> [for, against] counts on flat arrays --------------------------------
+skill slot(hk, hsz, key) -> Any {
+  let s = key % hsz
+  while aget(hk, s) != 0 and aget(hk, s) != key { let s = (s + 1) % hsz }
+  return s
+}
+
+skill score_span(ev, ri, fs, totp, totn) -> Any {
+  let sc = 0.0
+  for f in fs {
+    let key = wkey2(str(ri) ++ "|" ++ f)
+    let s = slot(ev[0], ev[3], key)
+    let p = 0
+    let n = 0
+    if aget(ev[0], s) == key {
+      let p = aget(ev[1], s)
+      let n = aget(ev[2], s)
+    }
+    let sc = sc + log2((p + 1) * 1.0 / (aget(totp, ri) + 1000)) - log2((n + 1) * 1.0 / (aget(totn, ri) + 1000))
+  }
+  return sc
+}
+
+# stream the facts in [off, off + mb MB): learn from each usable example, or test on it (res: n, Pi, first, nearest,
+# chance x 1,000,000)
+skill run_range(off, mb, tab, rl, ev, totp, totn, learn, res) -> Any {
+  let chunk = 8000000
+  let pos = off
+  let carry = ""
+  let used = 0
+  let featlog = []
+  while pos < off + mb * 1000000 {
+    let m = mark()
+    let b = read_bytes(SRC(), pos, chunk)
+    let n = 0
+    if b != null { let n = len(b) }
+    let ls = split(carry ++ arr_text(b, 0, n), "\n")
+    let got = [0, 0, 0, 0, 0]
+    let u = 0
+    let fresh = []
+    let seen = arr(1)
+    for i in range(0, len(ls) - 1) {
+      let ex = example(ls[i], tab, rl)
+      if ex != null {
+        let u = u + 1
+        let ri = ex[0]
+        if learn {
+          for k in range(0, len(ex[1])) {
+            for f in ex[3][k] {
+              let key = wkey2(str(ri) ++ "|" ++ f)
+              let s = slot(ev[0], ev[3], key)
+              if aget(ev[0], s) == 0 { do aset(seen, 0, 1) }
+              if aget(ev[0], s) == 0 and len(ev) > 4 { let fresh = append(fresh, [ri, f]) }
+              do aset(ev[0], s, key)
+              if k == ex[2] {
+                do aset(ev[1], s, aget(ev[1], s) + 1)
+                do aset(totp, ri, aget(totp, ri) + 1)
+              } else {
+                do aset(ev[2], s, aget(ev[2], s) + 1)
+                do aset(totn, ri, aget(totn, ri) + 1)
+              }
+            }
+          }
+        } else {
+          let best = 0
+          let bs = 0.0
+          let near = 0
+          let nd = 1000
+          for k in range(0, len(ex[1])) {
+            let sc = score_span(ev, ri, ex[3][k], totp, totn)
+            if k == 0 or sc > bs {
+              let bs = sc
+              let best = k
+            }
+            let sp = ex[1][k]
+            let d = sp[0] - ex[4][1]
+            if sp[1] <= ex[4][0] { let d = ex[4][0] - sp[1] }
+            if d < nd {
+              let nd = d
+              let near = k
+            }
+          }
+          let ok1 = 0
+          if best == ex[2] { let ok1 = 1 }
+          let ok2 = 0
+          if ex[2] == 0 { let ok2 = 1 }
+          let ok3 = 0
+          if near == ex[2] { let ok3 = 1 }
+          let got = [got[0] + 1, got[1] + ok1, got[2] + ok2, got[3] + ok3, got[4] + 1000000 // len(ex[1])]
+          do aset(res, 5 + 2 * ri, aget(res, 5 + 2 * ri) + 1)
+          do aset(res, 6 + 2 * ri, aget(res, 6 + 2 * ri) + ok1)
+        }
+      }
+    }
+    let keep = release(m, [ls[len(ls) - 1], got, u, fresh])
+    let carry = keep[0]
+    if learn { do aset(ev[4], 0, aget(ev[4], 0) + 0) }
+    if learn and len(keep[3]) > 0 { let featlog = featlog ++ [keep[3]] }
+    let used = used + keep[2]
+    if learn == false {
+      for q in range(0, 5) { do aset(res, q, aget(res, q) + keep[1][q]) }
+    }
+    if n < chunk { let pos = off + mb * 1000000 } else { let pos = pos + n }
+  }
+  if learn { return [used, featlog] }
+  return used
+}
+
+# learn on [0, mb MB) and write the table for the research agent (slots.pi): totals, then "ri|feature ||| for ||| against"
+# for features seen 3+ times
+skill save(mb) -> Any {
+  let t0 = ticks()
+  let tab = load_tab()
+  let rl = rels()
+  let hsz = 8388608
+  let ev = [arr(hsz), arr(hsz), arr(hsz), hsz, arr(1)]
+  let totp = arr(len(rl))
+  let totn = arr(len(rl))
+  let lr = run_range(0, mb, tab, rl, ev, totp, totn, true, null)
+  let a = []
+  let b = []
+  for i in range(0, len(rl)) {
+    let a = append(a, str(aget(totp, i)))
+    let b = append(b, str(aget(totn, i)))
+  }
+  let blocks = [join(a, " "), join(b, " ")]
+  let kept = 0
+  for blk in lr[1] {
+    let m = mark()
+    let lines = []
+    for fe in blk {
+      let k = str(fe[0]) ++ "|" ++ fe[1]
+      let sl = slot(ev[0], ev[3], wkey2(k))
+      let p = aget(ev[1], sl)
+      let n = aget(ev[2], sl)
+      if p + n >= 3 { let lines = append(lines, k ++ " ||| " ++ str(p) ++ " ||| " ++ str(n)) }
+    }
+    let keep = release(m, [join(lines, "\n"), len(lines)])
+    if keep[1] > 0 { let blocks = append(blocks, keep[0]) }
+    let kept = kept + keep[1]
+  }
+  do write_file("out\\slots.txt", join(blocks, "\n"))
+  return "learned from " ++ str(lr[0]) ++ " facts (" ++ str(mb) ++ " MB), kept " ++ str(kept) ++ " slot features -> out\\slots.txt in " ++ str((ticks() - t0) // 1000) ++ " s"
+}
+
+skill main() -> Any {
+  if arg(1) == "save" {
+    let mb = 900
+    if arg(2) != null { let mb = num(arg(2)) }
+    return save(mb)
+  }
+  let trmb = 300
+  if arg(1) != null { let trmb = num(arg(1)) }
+  let temb = 40
+  if arg(2) != null { let temb = num(arg(2)) }
+  let t0 = ticks()
+  let tab = load_tab()
+  let rl = rels()
+  let hsz = 8388608
+  let ev = [arr(hsz), arr(hsz), arr(hsz), hsz, arr(1)]
+  let totp = arr(len(rl))
+  let totn = arr(len(rl))
+  # learn on the start of the file; test on facts from articles far later in it (never learned from)
+  let lr = run_range(0, trmb, tab, rl, ev, totp, totn, true, null)
+  let ntr = lr[0]
+  let t1 = ticks()
+  let res = arr(5 + 2 * len(rl))
+  let nte = run_range(1000000000, temb, tab, rl, ev, totp, totn, false, res)
+  let t2 = ticks()
+  let n = aget(res, 0)
+  let out = "learned from " ++ str(ntr) ++ " facts (" ++ str(trmb) ++ " MB) in " ++ str((t1 - t0) // 1000) ++ " s; tested on " ++ str(n) ++ " held-out facts from other articles in " ++ str((t2 - t1) // 1000) ++ " s\n"
+  let out = out ++ "pick the answer among all the names and years in the sentence (2 or more):\n"
+  let out = out ++ "  chance " ++ str(aget(res, 4) // max(1, n) // 10000) ++ "%, the first name " ++ str(100 * aget(res, 2) // max(1, n)) ++ "%, the name nearest the subject " ++ str(100 * aget(res, 3) // max(1, n)) ++ "%, PI'S LEARNED SLOTS " ++ str(100 * aget(res, 1) // max(1, n)) ++ "%"
+  let out = out ++ "\nper relation (held out, 100+ facts):\n"
+  for ri in range(0, len(rl)) {
+    let nr = aget(res, 5 + 2 * ri)
+    if nr >= 100 { let out = out ++ "  " ++ rl[ri] ++ " " ++ str(100 * aget(res, 6 + 2 * ri) // nr) ++ "% of " ++ str(nr) ++ "\n" }
+  }
+  let out = out ++ "the strongest learned patterns (seen 30+ times as the answer):\n"
+  for want in [0, 2, 4, 5, 16] {
+    let best = []
+    for blk in lr[1] {
+      for fe in blk {
+        if fe[0] == want {
+          let key = wkey2(str(want) ++ "|" ++ fe[1])
+          let sl = slot(ev[0], ev[3], key)
+          let pc = aget(ev[1], sl)
+          let nc = aget(ev[2], sl)
+          if pc >= 30 {
+            let sc = log2((pc + 1) * 1.0 / (aget(totp, want) + 1000)) - log2((nc + 1) * 1.0 / (aget(totn, want) + 1000))
+            let best = append(best, [sc, fe[1]])
+          }
+        }
+      }
+    }
+    let shown = []
+    for r in range(0, 4) {
+      let bi = 0 - 1
+      for i in range(0, len(best)) {
+        let taken = false
+        for x in shown {
+          if x == best[i][1] { let taken = true }
+        }
+        if taken == false {
+          if bi < 0 or best[i][0] > best[bi][0] { let bi = i }
+        }
+      }
+      if bi >= 0 { let shown = append(shown, best[bi][1]) }
+    }
+    let out = out ++ "  " ++ rl[want] ++ ": " ++ join(shown, " | ") ++ "\n"
+  }
+  return out
+}

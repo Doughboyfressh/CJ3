@@ -1,0 +1,363 @@
+# Pi's GGUF library: the file's structure, the exact fixed-point dequantizer (Q4_K, Q6_K, F32), rows, tokens.
+# (arr_text(b, from, to) takes an END position, not a length)
+
+skill u32(b, p) -> Any { return aget(b, p) + 256 * aget(b, p + 1) + 65536 * aget(b, p + 2) + 16777216 * aget(b, p + 3) }
+skill u64(b, p) -> Any { return u32(b, p) + 4294967296 * u32(b, p + 4) }
+
+skill tname(t) -> Any {
+  let names = ["F32", "F16", "Q4_0", "Q4_1", "?4", "?5", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S", "IQ2_S", "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16"]
+  if t >= 0 and t < len(names) { return names[t] }
+  return "type" ++ str(t)
+}
+
+# one metadata value at p -> [short text, position after it, count if it is an array]
+skill value(b, p, vt) -> Any {
+  if vt == 0 or vt == 1 or vt == 7 { return [str(aget(b, p)), p + 1, 0] }
+  if vt == 2 or vt == 3 { return [str(aget(b, p) + 256 * aget(b, p + 1)), p + 2, 0] }
+  if vt == 4 or vt == 5 { return [str(u32(b, p)), p + 4, 0] }
+  if vt == 6 { return ["(f32)", p + 4, 0] }
+  if vt == 10 or vt == 11 { return [str(u64(b, p)), p + 8, 0] }
+  if vt == 12 { return ["(f64)", p + 8, 0] }
+  if vt == 8 {
+    let n = u64(b, p)
+    let t = arr_text(b, p + 8, p + 8 + imin(n, 120))
+    return [t, p + 8 + n, 0]
+  }
+  if vt == 9 {
+    let et = u32(b, p)
+    let n = u64(b, p + 4)
+    let q = p + 12
+    let first = []
+    let i = 0
+    while i < n {
+      let r = value(b, q, et)
+      if i < 3 { let first = append(first, r[0]) }
+      let q = r[1]
+      let i = i + 1
+    }
+    return ["[" ++ str(n) ++ " x " ++ join(first, " | ") ++ " ...]", q, n]
+  }
+  return ["?", p, 0]
+}
+
+skill imin(a, b) -> Any {
+  if a < b { return a }
+  return b
+}
+
+skill find_any(s, subs) -> Any {
+  for x in subs {
+    if len(split(s, x)) > 1 { return true }
+  }
+  return false
+}
+
+# ---- the model's numbers, decoded exactly in fixed point (Pi has no real -> integer conversion, so it never makes
+# reals): every weight as an integer x 2^24 --------------------------------------------------------------------------
+skill S() -> Any { return 24 }
+
+skill rd_int(s) -> Any {
+  let v = 0
+  for i in range(0, len(s)) {
+    let c = ord(slice(s, i, i + 1))
+    if c >= 48 and c <= 57 { let v = v * 10 + (c - 48) }
+  }
+  return v
+}
+
+skill pow2(k) -> Any {
+  let v = 1
+  for i in range(0, k) { let v = v * 2 }
+  return v
+}
+
+# a half-precision float -> [M, E] with value = M x 2^E
+skill f16(b, p) -> Any {
+  let h = aget(b, p) + 256 * aget(b, p + 1)
+  let e = (h // 1024) % 32
+  let f = h % 1024
+  let m = f
+  let ex = 0 - 24
+  if e > 0 {
+    let m = 1024 + f
+    let ex = e - 25
+  }
+  if h >= 32768 { let m = 0 - m }
+  return [m, ex]
+}
+
+# x x 2^k, rounded (k may be negative)
+skill shl(x, k) -> Any {
+  # zero (and anything shifted below 2^-62) is 0: a huge 2^-k would overflow 63 bits and divide by zero
+  if x == 0 or k < 0 - 62 { return 0 }
+  if k >= 0 { return x * pow2(k) }
+  let d = pow2(0 - k)
+  return (x + d // 2) // d
+}
+
+# Q4_K: blocks of 256 = d (f16), dmin (f16), 12 bytes of 6-bit scales and mins, 128 bytes of 4-bit values
+skill scale_min(b, q, j) -> Any {
+  if j < 4 { return [aget(b, q + j) % 64, aget(b, q + j + 4) % 64] }
+  let sc = aget(b, q + j + 4) % 16 + 16 * (aget(b, q + j - 4) // 64)
+  let mn = aget(b, q + j + 4) // 16 + 16 * (aget(b, q + j) // 64)
+  return [sc, mn]
+}
+
+skill deq_q4k(b, p, nblocks, out, o) -> Any {
+  for bl in range(0, nblocks) {
+    let base = p + 144 * bl
+    let d = f16(b, base)
+    let dm = f16(b, base + 2)
+    let qs = base + 16
+    let y = o + 256 * bl
+    for ch in range(0, 4) {
+      let s1 = scale_min(b, base + 4, 2 * ch)
+      let s2 = scale_min(b, base + 4, 2 * ch + 1)
+      for l in range(0, 32) {
+        let q = aget(b, qs + 32 * ch + l)
+        do aset(out, y + 64 * ch + l, shl(d[0] * s1[0] * (q % 16), d[1] + S()) - shl(dm[0] * s1[1], dm[1] + S()))
+        do aset(out, y + 64 * ch + 32 + l, shl(d[0] * s2[0] * (q // 16), d[1] + S()) - shl(dm[0] * s2[1], dm[1] + S()))
+      }
+    }
+  }
+  return out
+}
+
+# Q6_K: blocks of 256 = 128 bytes low 4 bits, 64 bytes high 2 bits, 16 signed 8-bit scales, d (f16)
+skill s8(v) -> Any {
+  if v >= 128 { return v - 256 }
+  return v
+}
+
+skill deq_q6k(b, p, nblocks, out, o) -> Any {
+  for bl in range(0, nblocks) {
+    let base = p + 210 * bl
+    let d = f16(b, base + 208)
+    for half in range(0, 2) {
+      let ql = base + 64 * half
+      let qh = base + 128 + 32 * half
+      let sc = base + 192 + 8 * half
+      let y = o + 256 * bl + 128 * half
+      for l in range(0, 32) {
+        let is = l // 16
+        let h = aget(b, qh + l)
+        let q1 = aget(b, ql + l) % 16 + 16 * (h % 4) - 32
+        let q2 = aget(b, ql + l + 32) % 16 + 16 * ((h // 4) % 4) - 32
+        let q3 = aget(b, ql + l) // 16 + 16 * ((h // 16) % 4) - 32
+        let q4 = aget(b, ql + l + 32) // 16 + 16 * ((h // 64) % 4) - 32
+        do aset(out, y + l, shl(d[0] * s8(aget(b, sc + is)) * q1, d[1] + S()))
+        do aset(out, y + l + 32, shl(d[0] * s8(aget(b, sc + is + 2)) * q2, d[1] + S()))
+        do aset(out, y + l + 64, shl(d[0] * s8(aget(b, sc + is + 4)) * q3, d[1] + S()))
+        do aset(out, y + l + 96, shl(d[0] * s8(aget(b, sc + is + 6)) * q4, d[1] + S()))
+      }
+    }
+  }
+  return out
+}
+
+# ---- the file: [tensors [name, dims, type, offset], data start, tokens (chunks of 1000)] ---------------------------
+skill open_model(path) -> Any {
+  let b = read_bytes(path, 0, 64000000)
+  let nt = u64(b, 8)
+  let nkv = u64(b, 16)
+  let p = 24
+  let align = 32
+  let toks = []
+  for i in range(0, nkv) {
+    let kl = u64(b, p)
+    let key = arr_text(b, p + 8, p + 8 + kl)
+    let vt = u32(b, p + 8 + kl)
+    if key == "general.alignment" { let align = u32(b, p + 12 + kl) }
+    if key == "tokenizer.ggml.tokens" {
+      let n = u64(b, p + 16 + kl)
+      let q = p + 24 + kl
+      let blk = []
+      for j in range(0, n) {
+        let sl = u64(b, q)
+        let blk = append(blk, arr_text(b, q + 8, q + 8 + sl))
+        let q = q + 8 + sl
+        if len(blk) >= 1000 {
+          let toks = append(toks, blk)
+          let blk = []
+        }
+      }
+      let toks = append(toks, blk)
+      let p = q
+    } else { let p = value(b, p + 12 + kl, vt)[1] }
+  }
+  let tens = []
+  for i in range(0, nt) {
+    let nl = u64(b, p)
+    let name = arr_text(b, p + 8, p + 8 + nl)
+    let q = p + 8 + nl
+    let nd = u32(b, q)
+    let dims = []
+    for d in range(0, nd) { let dims = append(dims, u64(b, q + 4 + 8 * d)) }
+    let q = q + 4 + 8 * nd
+    let tens = append(tens, [name, dims, u32(b, q), u64(b, q + 4)])
+    let p = q + 12
+  }
+  return [tens, ((p + align - 1) // align) * align, toks, path]
+}
+
+skill tensor(m, name) -> Any {
+  for t in m[0] {
+    if t[0] == name { return t }
+  }
+  return null
+}
+
+skill token(m, i) -> Any { return m[2][i // 1000][i % 1000] }
+
+# row r of a 2-D tensor (Q4_K or Q6_K), decoded -> an array of integers x 2^24
+skill row(m, t, r) -> Any {
+  let n = t[1][0]
+  let nb = n // 256
+  let bpb = 144
+  if t[2] == 14 { let bpb = 210 }
+  let b = read_bytes(m[3], m[1] + t[3] + r * nb * bpb, nb * bpb)
+  let out = arr(n)
+  if t[2] == 12 { do deq_q4k(b, 0, nb, out, 0) }
+  if t[2] == 14 { do deq_q6k(b, 0, nb, out, 0) }
+  return out
+}
+
+# faster Q4_K for many rows: the scale and shift fixed once per 32 weights (same numbers as deq_q4k)
+skill deq_q4k_fast(b, p, nblocks, out, o) -> Any {
+  for bl in range(0, nblocks) {
+    let base = p + 144 * bl
+    let d = f16(b, base)
+    let dm = f16(b, base + 2)
+    let qs = base + 16
+    let y = o + 256 * bl
+    for sub in range(0, 8) {
+      let ch = sub // 2
+      let sm = scale_min(b, base + 4, sub)
+      let a = d[0] * sm[0]
+      let k = d[1] + S()
+      let mterm = shl(dm[0] * sm[1], dm[1] + S())
+      let pw = pow2(abs(k))
+      let hi = sub % 2 == 1
+      let l = 0
+      while l < 32 {
+        let q = aget(b, qs + 32 * ch + l)
+        if hi { let q = q // 16 } else { let q = q % 16 }
+        let v = a * q
+        if k >= 0 { let v = v * pw } else { let v = (v + pw // 2) // pw }
+        do aset(out, y + 32 * sub + l, v - mterm)
+        let l = l + 1
+      }
+    }
+  }
+  return out
+}
+
+# a whole-word token: the byte-level space marker (U+0120, bytes 196 160) then 3+ lower-case letters
+skill word_token(t) -> Any {
+  if len(t) < 5 { return false }
+  if ord(slice(t, 0, 1)) != 196 or ord(slice(t, 1, 2)) != 160 { return false }
+  for i in range(2, len(t)) {
+    let c = ord(slice(t, i, i + 1))
+    if c < 97 or c > 122 { return false }
+  }
+  return true
+}
+
+# the model's word map: the vectors of whole-word tokens (the first `limit` of them), and their lengths
+skill word_map(m, limit) -> Any {
+  let t = tensor(m, "token_embd.weight")
+  let n = t[1][0]
+  let ids = []
+  let words = []
+  let i = 0
+  let nv = t[1][1]
+  while i < nv and len(ids) < limit {
+    let tk = token(m, i)
+    if word_token(tk) {
+      let ids = append(ids, i)
+      let words = append(words, slice(tk, 2, len(tk)))
+    }
+    let i = i + 1
+  }
+  let k = len(ids)
+  let vecs = arr(k * n)
+  let norms = []
+  let rowb = (n // 256) * 144
+  for j in range(0, k) {
+    let mm = mark()
+    let b = read_bytes(m[3], m[1] + t[3] + ids[j] * rowb, rowb)
+    do release(mm, deq_q4k_fast(b, 0, n // 256, vecs, j * n))
+  }
+  for j in range(0, k) {
+    let s = 0
+    let base = j * n
+    let q = 0
+    while q < n {
+      let v = aget(vecs, base + q) // 4096
+      let s = s + v * v
+      let q = q + 1
+    }
+    let norms = append(norms, s)
+  }
+  return [words, vecs, norms, n]
+}
+
+# the nearest words to a word, by cosine in the model's own space
+skill nearest(wm, w, k) -> Any {
+  let qi = 0 - 1
+  for i in range(0, len(wm[0])) {
+    if wm[0][i] == w { let qi = i }
+  }
+  if qi < 0 { return w ++ ": not a whole-word token" }
+  let n = wm[3]
+  let best = []
+  for j in range(0, len(wm[0])) {
+    if j != qi {
+      let s = 0
+      let a = qi * n
+      let b = j * n
+      let q = 0
+      while q < n {
+        let s = s + (aget(wm[1], a + q) // 4096) * (aget(wm[1], b + q) // 4096)
+        let q = q + 1
+      }
+      let c = s * 1.0 / sqrt(wm[2][qi] * 1.0 * wm[2][j] + 1.0)
+      if len(best) < k or c > best[len(best) - 1][0] {
+        let best = ins_sorted(best, [c, wm[0][j]], k)
+      }
+    }
+  }
+  let out = []
+  for x in best { let out = append(out, x[1]) }
+  return w ++ ": " ++ join(out, ", ")
+}
+
+skill ins_sorted(xs, x, k) -> Any {
+  let out = []
+  let placed = false
+  for y in xs {
+    if placed == false and x[0] > y[0] {
+      let out = append(out, x)
+      let placed = true
+    }
+    if len(out) < k { let out = append(out, y) }
+  }
+  if placed == false and len(out) < k { let out = append(out, x) }
+  return slice(out, 0, k)
+}
+
+# an IEEE float32 at p -> its value x 2^S (rounded)
+skill f32s(b, p, sc) -> Any {
+  let bits = u32(b, p)
+  let e = (bits // 8388608) % 256
+  let f = bits % 8388608
+  let m = f
+  let ex = 0 - 149
+  if e > 0 {
+    let m = 8388608 + f
+    let ex = e - 150
+  }
+  if bits >= 2147483648 { let m = 0 - m }
+  return shl(m, ex + sc)
+}
+

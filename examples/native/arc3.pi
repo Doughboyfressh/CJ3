@@ -1,0 +1,787 @@
+# Pi plays ARC-AGI-3. Each game is an unknown interactive world: Pi sees only 64x64 frames of colours 0..15 and a
+# list of available actions, and must work out how to finish its levels. Pi knows nothing about any game in
+# advance (no game's code is read -- only frames through the REST API, like a player).
+#
+# The agent loop, every step:  perceive (frame -> state)  decide  act (HTTP)  verify (state, levels)  remember.
+#   - every distinct frame is a state; Pi remembers, for each state, what every action it tried led to
+#   - decide: an action never tried here; otherwise the shortest remembered path to a state that still has
+#     untried actions; otherwise start over
+#   - in click games the actions are "click this object": Pi segments the frame into same-colour objects and
+#     clicks one cell of each, instead of all 4096 cells
+#   - a level finished is kept: the graph carries on into the next level, and after a game over Pi resets and
+#     walks back along what it knows
+#
+#   out\arc3.exe [game ids, comma separated | all] [actions per game]      (needs the ARC-AGI-3 server on :8001)
+import "json.pi"
+
+skill http(method, path, obj) -> Any {
+  let body = ""
+  if obj != null { let body = json_text(obj) }
+  let req = method ++ " " ++ path ++ " HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " ++ str(len(body)) ++ "\r\n\r\n" ++ body
+  let r = tcp("127.0.0.1", 8001, req)
+  if r == null { return null }
+  let parts = split(r, "\r\n\r\n")
+  if len(parts) < 2 { return null }
+  return json_parse(join(slice(parts, 1, len(parts)), "\r\n\r\n"))
+}
+
+skill mix1(h, v) -> Any { return (h * 1000003 + v + 1) % 1073741789 }
+skill mix2(h, v) -> Any { return (h * 999983 + v + 7) % 1073741783 }
+
+# the last frame of a response into the grid array; -> its state key
+skill load_grid(resp, grid, mask) -> Any {
+  let frames = resp["frame"]
+  if frames == null or len(frames) == 0 { return 0 - 1 }
+  let f = frames[len(frames) - 1]
+  let h1 = 0
+  let h2 = 0
+  for y in range(0, 64) {
+    let row = f[y]
+    for x in range(0, 64) {
+      let v = row[x]
+      do aset(grid, y * 64 + x, v)
+      if aget(mask, y * 64 + x) == 0 {
+        let h1 = mix1(h1, v)
+        let h2 = mix2(h2, v)
+      }
+    }
+  }
+  return h1 * 1073741783 + h2
+}
+
+# same-colour objects (4-connected); -> click targets [x, y], smallest objects first (up to 120), the largest (background) left out
+skill objects(grid, limit) -> Any {
+  let seen = arr(4096)
+  let queue = arr(4096)
+  let comps = []
+  for start in range(0, 4096) {
+    if aget(seen, start) == 0 {
+      let c = aget(grid, start)
+      do aset(seen, start, 1)
+      do aset(queue, 0, start)
+      let qh = 0
+      let qt = 1
+      while qh < qt {
+        let p = aget(queue, qh)
+        let qh = qh + 1
+        let py = p // 64
+        let px = p % 64
+        for d in [[0 - 1, 0], [1, 0], [0, 0 - 1], [0, 1]] {
+          let nx = px + d[0]
+          let ny = py + d[1]
+          if nx >= 0 and nx < 64 and ny >= 0 and ny < 64 {
+            let q = ny * 64 + nx
+            if aget(seen, q) == 0 and aget(grid, q) == c {
+              do aset(seen, q, 1)
+              do aset(queue, qt, q)
+              let qt = qt + 1
+            }
+          }
+        }
+      }
+      let mid = aget(queue, qt // 2)
+      let comps = append(comps, [qt, mid % 64, mid // 64])
+    }
+  }
+  let big = 0
+  for c in comps { let big = max(big, c[0]) }
+  let out = []
+  for size in range(1, big) {
+    for c in comps {
+      if c[0] == size and len(out) < limit { let out = append(out, [c[1], c[2]]) }
+    }
+  }
+  return out
+}
+
+# the actions Pi can take in a state: [action number, x, y]
+skill actions_of(avail, grid) -> Any {
+  let acts = []
+  for a in avail {
+    if a != 6 and a != 0 { let acts = append(acts, [a, 0, 0]) }
+  }
+  for a in avail {
+    if a == 6 {
+      for o in objects(grid, 40) { let acts = append(acts, [6, o[0], o[1]]) }
+    }
+  }
+  return acts
+}
+
+skill all_clicks(grid) -> Any {
+  let out = objects(grid, 4096)
+  for y in range(0, 16) {
+    for x in range(0, 16) { let out = append(out, [4 * x + 2, 4 * y + 2]) }
+  }
+  return out
+}
+
+# stuck in a state that is fully explored: give it the next batch of click targets; -> how many were added
+skill widen(w, node, grid, avail) -> Any {
+  let clicks = false
+  for a in avail {
+    if a == 6 { let clicks = true }
+  }
+  if clicks == false { return 0 }
+  let k = aget(w["acount"], node)
+  let simple = 0
+  for i in range(0, k) {
+    if aget(w["acode"], node * MAXA() + i) // 4096 != 6 { let simple = simple + 1 }
+  }
+  let all = all_clicks(grid)
+  let added = 0
+  let i = k - simple
+  while i < len(all) and added < 60 and k + added < MAXA() {
+    let c = all[i]
+    do aset(w["acode"], node * MAXA() + k + added, 6 * 4096 + c[1] * 64 + c[0])
+    let added = added + 1
+    let i = i + 1
+  }
+  do aset(w["acount"], node, k + added)
+  return added
+}
+
+# colour counts of a frame (16 colours) into h
+skill hist(grid, h) -> Any {
+  for c in range(0, 16) { do aset(h, c, 0) }
+  for i in range(0, 4096) { do aset(h, aget(grid, i), aget(h, aget(grid, i)) + 1) }
+  return h
+}
+
+skill hist_delta(a, b) -> Any {
+  let parts = []
+  for c in range(0, 16) {
+    let d = aget(b, c) - aget(a, c)
+    if d != 0 { let parts = append(parts, str(c) ++ ":" ++ str(d)) }
+  }
+  return join(parts, " ")
+}
+
+skill MAXN() { return 2500 }
+skill MAXA() -> Any { return 400 }
+
+# the remembered world of one game
+skill new_world() -> Any {
+  return {"keys": arr(32768), "vals": arr(32768), "edges": arr(MAXN() * MAXA()), "acode": arr(MAXN() * MAXA()), "acount": arr(MAXN()), "n": 0,
+    "stamp": arr(MAXN()), "prev": arr(MAXN()), "pact": arr(MAXN()), "queue": arr(MAXN()), "bfs": 0,
+    "dist": arr(MAXN()), "nh": arr(MAXN() * 16)}
+}
+
+# state key -> node index (or -1)
+skill find_node(w, key) -> Any {
+  let ks = w["keys"]
+  let i = (key % 32768 + 32768) % 32768
+  for probe in range(0, 32768) {
+    let v = aget(w["vals"], i)
+    if v == 0 { return 0 - 1 }
+    if aget(ks, i) == key { return v - 1 }
+    let i = (i + 1) % 32768
+  }
+  return 0 - 1
+}
+
+skill add_node(w, key, acts, grid) -> Any {
+  let idx = w["n"]
+  for i in range(0, 4096) {
+    let c = aget(grid, i)
+    do aset(w["nh"], idx * 16 + c, aget(w["nh"], idx * 16 + c) + 1)
+  }
+  let i = (key % 32768 + 32768) % 32768
+  while aget(w["vals"], i) != 0 { let i = (i + 1) % 32768 }
+  do aset(w["keys"], i, key)
+  do aset(w["vals"], i, idx + 1)
+  let k = min(len(acts), MAXA())
+  do aset(w["acount"], idx, k)
+  for a in range(0, k) {
+    let act = acts[a]
+    do aset(w["acode"], idx * MAXA() + a, act[0] * 4096 + act[2] * 64 + act[1])
+  }
+  return put(w, "n", idx + 1)
+}
+
+skill untried(w, node) -> Any {
+  for a in range(0, aget(w["acount"], node)) {
+    if aget(w["edges"], node * MAXA() + a) == 0 { return a }
+  }
+  return 0 - 1
+}
+
+# ---- inference: what finished the last level, and where that points now ----------------------------------------
+# a win teaches a direction: which colours grew and which shrank between the level's start and its end. Progress of a
+# state = how far its colour counts have moved in that direction since this level began.
+skill progress(w, u, goal, hstart) -> Any {
+  let p = 0
+  for c in range(0, 16) {
+    let g = aget(goal, c)
+    if g != 0 { let p = p + g * (aget(w["nh"], u * 16 + c) - aget(hstart, c)) }
+  }
+  return p
+}
+
+# best-first: among this level's remembered states that still have untried actions, the one furthest along the goal
+# direction (a step of distance costs 2); -> [first action index (-2 = act here), stamp] or [-1, stamp]
+skill plan_goal(w, from, goal, hstart, first) -> Any {
+  let st = w["stamp"]
+  let mark = w["bfs"] + 1
+  do aset(st, from, mark)
+  do aset(w["queue"], 0, from)
+  do aset(w["dist"], from, 0)
+  let qh = 0
+  let qt = 1
+  let best = 0 - 1
+  let bestv = 0
+  while qh < qt {
+    let u = aget(w["queue"], qh)
+    let qh = qh + 1
+    if u >= first and untried(w, u) >= 0 {
+      let v = progress(w, u, goal, hstart) - 2 * aget(w["dist"], u)
+      if best < 0 or v > bestv {
+        let best = u
+        let bestv = v
+      }
+    }
+    for a in range(0, aget(w["acount"], u)) {
+      let d = aget(w["edges"], u * MAXA() + a) - 1
+      if d >= 0 and d < w["n"] {
+        if aget(st, d) != mark {
+          do aset(st, d, mark)
+          do aset(w["prev"], d, u)
+          do aset(w["pact"], d, a)
+          do aset(w["dist"], d, aget(w["dist"], u) + 1)
+          do aset(w["queue"], qt, d)
+          let qt = qt + 1
+        }
+      }
+    }
+  }
+  if best < 0 { return [0 - 1, mark] }
+  if best == from { return [0 - 2, mark] }
+  let v = best
+  while aget(w["prev"], v) != from { let v = aget(w["prev"], v) }
+  return [aget(w["pact"], v), mark]
+}
+
+# breadth-first over remembered moves to the nearest state with an untried action; -> first action index or -1
+skill plan(w, from) -> Any {
+  let st = w["stamp"]
+  let mark = w["bfs"] + 1
+  do aset(st, from, mark)
+  do aset(w["queue"], 0, from)
+  let qh = 0
+  let qt = 1
+  while qh < qt {
+    let u = aget(w["queue"], qh)
+    let qh = qh + 1
+    if u != from and untried(w, u) >= 0 {
+      # walk back to the first move
+      let v = u
+      while aget(w["prev"], v) != from { let v = aget(w["prev"], v) }
+      return [aget(w["pact"], v), mark]
+    }
+    for a in range(0, aget(w["acount"], u)) {
+      let d = aget(w["edges"], u * MAXA() + a) - 1
+      if d >= 0 and d < w["n"] {
+        if aget(st, d) != mark {
+          do aset(st, d, mark)
+          do aset(w["prev"], d, u)
+          do aset(w["pact"], d, a)
+          do aset(w["queue"], qt, d)
+          let qt = qt + 1
+        }
+      }
+    }
+  }
+  return [0 - 1, mark]
+}
+
+skill act_body(gid, card, guid, a) -> Any {
+  let b = {"game_id": gid, "card_id": card, "guid": guid}
+  if a[0] == 6 {
+    let b = put(b, "x", a[1])
+    let b = put(b, "y", a[2])
+  }
+  return b
+}
+
+# one step's response, reduced to what the agent keeps: [state text, levels, key, actions or null, guid, win levels]
+# a state, once Pi knows which object is "me": where I am, plus how much of each colour the (unmasked) world holds.
+# Things that merely move about (enemies, animation) stop making every moment a new place.
+skill obj_key(grid, mask, mecol) -> Any {
+  let h = arr(16)
+  let sx = 0
+  let sy = 0
+  let n = 0
+  for i in range(0, 4096) {
+    if aget(mask, i) == 0 {
+      let c = aget(grid, i)
+      do aset(h, c, aget(h, c) + 1)
+      if c == mecol {
+        let sx = sx + i % 64
+        let sy = sy + i // 64
+        let n = n + 1
+      }
+    }
+  }
+  let h1 = 17
+  let h2 = 31
+  if n > 0 {
+    let h1 = mix1(h1, sx // n)
+    let h2 = mix2(h2, sy // n)
+  }
+  for c in range(0, 16) {
+    let h1 = mix1(h1, aget(h, c))
+    let h2 = mix2(h2, aget(h, c))
+  }
+  return h1 * 1073741783 + h2
+}
+
+# OFF: tried 2026-11-01 -- states shrank (dc22 492 -> 129, tr87 893 -> 215) but ls20 lost its level (44 states merged
+# places that differ) and nothing gained: 11 -> 10 of 183. Kept for the next, finer object state.
+skill OBJSTATES() -> Any { return false }
+
+skill skey(grid, mask, mecol) -> Any {
+  if mecol >= 0 and OBJSTATES() { return obj_key(grid, mask, mecol) }
+  return hash_grid(grid, mask)
+}
+
+skill take(resp, grid, w, mask, mecol) -> Any {
+  if resp == null { return null }
+  let key = load_grid(resp, grid, mask)
+  if mecol >= 0 and OBJSTATES() { let key = obj_key(grid, mask, mecol) }
+  let acts = null
+  if find_node(w, key) < 0 { let acts = actions_of(resp["available_actions"], grid) }
+  return [resp["state"], resp["levels_completed"], key, acts, resp["guid"], resp["win_levels"], resp["available_actions"]]
+}
+
+skill hash_grid(grid, mask) -> Any {
+  let h1 = 0
+  let h2 = 0
+  for i in range(0, 4096) {
+    if aget(mask, i) == 0 {
+      let h1 = mix1(h1, aget(grid, i))
+      let h2 = mix2(h2, aget(grid, i))
+    }
+  }
+  return h1 * 1073741783 + h2
+}
+
+# what changed between two frames: count it per row and per column; -> cells changed
+skill note_change(grid, prev, rowc, colc, cellc) -> Any {
+  let rows = arr(64)
+  let cols = arr(64)
+  let n = 0
+  for i in range(0, 4096) {
+    if aget(grid, i) != aget(prev, i) {
+      let n = n + 1
+      do aset(cellc, i, aget(cellc, i) + 1)
+      do aset(rows, i // 64, 1)
+      do aset(cols, i % 64, 1)
+    }
+  }
+  if n > 0 {
+    for k in range(0, 64) {
+      do aset(rowc, k, aget(rowc, k) + aget(rows, k))
+      do aset(colc, k, aget(colc, k) + aget(cols, k))
+    }
+  }
+  for i in range(0, 4096) { do aset(prev, i, aget(grid, i)) }
+  return n
+}
+
+# bookkeeping = rows or columns that change in nearly every move that changes anything (counters, energy bars, clocks)
+# -> how many cells are now masked
+skill learn_mask(rowc, colc, cellc, moves, mask) -> Any {
+  let n = 0
+  for i in range(0, 4096) {
+    let r = i // 64
+    let c = i % 64
+    # only near the frame's edges, where status bars live -- a player walking along a row must stay visible
+    let edge_row = r < 6 or r >= 58
+    let edge_col = c < 6 or c >= 58
+    # (a per-cell "changes in nearly every move" rule was tried and removed: in click puzzles it hid the board itself)
+    if (edge_row and aget(rowc, r) * 100 >= 85 * moves) or (edge_col and aget(colc, c) * 100 >= 85 * moves) {
+      do aset(mask, i, 1)
+      let n = n + 1
+    } else {
+      do aset(mask, i, 0)
+    }
+  }
+  return n
+}
+
+# ---- core knowledge: objects and an agent (Spelke) -----------------------------------------------------------------
+# count, and summed x and y, of every colour in the frame
+skill colour_stats(grid, cnt, sx, sy) -> Any {
+  for c in range(0, 16) {
+    do aset(cnt, c, 0)
+    do aset(sx, c, 0)
+    do aset(sy, c, 0)
+  }
+  for i in range(0, 4096) {
+    let c = aget(grid, i)
+    do aset(cnt, c, aget(cnt, c) + 1)
+    do aset(sx, c, aget(sx, c) + i % 64)
+    do aset(sy, c, aget(sy, c) + i // 64)
+  }
+  return cnt
+}
+
+# same-colour objects with their colour: [size, x, y, colour] (x, y = a cell of the object)
+skill components(grid) -> Any {
+  let seen = arr(4096)
+  let queue = arr(4096)
+  let comps = []
+  for start in range(0, 4096) {
+    if aget(seen, start) == 0 {
+      let c = aget(grid, start)
+      do aset(seen, start, 1)
+      do aset(queue, 0, start)
+      let qh = 0
+      let qt = 1
+      while qh < qt {
+        let p = aget(queue, qh)
+        let qh = qh + 1
+        let py = p // 64
+        let px = p % 64
+        for d in [[0 - 1, 0], [1, 0], [0, 0 - 1], [0, 1]] {
+          let nx = px + d[0]
+          let ny = py + d[1]
+          if nx >= 0 and nx < 64 and ny >= 0 and ny < 64 {
+            let q = ny * 64 + nx
+            if aget(seen, q) == 0 and aget(grid, q) == c {
+              do aset(seen, q, 1)
+              do aset(queue, qt, q)
+              let qt = qt + 1
+            }
+          }
+        }
+      }
+      let mid = aget(queue, qt // 2)
+      let comps = append(comps, [qt, mid % 64, mid // 64, c])
+    }
+  }
+  return comps
+}
+
+# things worth walking to: objects that are not "me" and not the background, rarest colour first; -> [[x, y]]
+skill targets_of(grid, mecol) -> Any {
+  let cnt = arr(16)
+  do colour_stats(grid, cnt, arr(16), arr(16))
+  let bg = 0
+  for c in range(0, 16) {
+    if aget(cnt, c) > aget(cnt, bg) { let bg = c }
+  }
+  let comps = components(grid)
+  let out = []
+  let order = []
+  for c in range(0, 16) {
+    if aget(cnt, c) > 0 and c != bg and c != mecol { let order = append(order, aget(cnt, c) * 16 + c) }
+  }
+  for key in sort(order) {
+    let c = key % 16
+    for o in comps {
+      if o[3] == c and o[0] <= 200 and len(out) < 12 { let out = append(out, [o[1], o[2]]) }
+    }
+  }
+  return out
+}
+
+skill play(gid, card, budget) -> Any {
+  let grid = arr(4096)
+  let prev = arr(4096)
+  let mask = arr(4096)
+  let rowc = arr(64)
+  let colc = arr(64)
+  let cellc = arr(4096)
+  let moves = 0
+  let noops = 0
+  let widened = 0
+  let selfs = 0
+  let masked = 0
+  let w = new_world()
+  let m = mark()
+  let r = take(http("POST", "/api/cmd/RESET", {"game_id": gid, "card_id": card}), grid, w, mask, 0 - 1)
+  let r = release(m, r)
+  if r == null { return [gid, 0, 0, 0, "no server"] }
+  let guid = r[4]
+  let wins = r[5]
+  let best = r[1]
+  let w = add_node(w, r[2], r[3], grid)
+  for i in range(0, 4096) { do aset(prev, i, aget(grid, i)) }
+  let avail = r[6]
+  let cur = 0
+  let steps = 0
+  let resets = 0
+  let state = r[0]
+  let hstart = hist(grid, arr(16))
+  let hbefore = arr(16)
+  let goal = arr(16)
+  let guesses = 0
+  let guided = 0
+  let lvl_first = 0
+  let lvl_steps = 0
+  let wins_seen = []
+  # the agent prior: which colour is "me" (moves when Pi acts, keeps its size), and how each action moves it
+  let bc = arr(16)
+  let bx = arr(16)
+  let by = arr(16)
+  let ac = arr(16)
+  let ax = arr(16)
+  let ay = arr(16)
+  let score = arr(16)
+  let mvx = arr(128)
+  let mvy = arr(128)
+  let mvn = arr(128)
+  let mecol = 0 - 1
+  let targets = []
+  let ti = 0
+  let tsteps = 0
+  let walked = 0
+  let rebuild = false
+  while steps < budget and state != "WIN" {
+    do hist(grid, hbefore)
+    do colour_stats(grid, bc, bx, by)
+    let a = untried(w, cur)
+    if guesses > 0 {
+      # a goal has been inferred: go where it points (this level's states only)
+      let p = plan_goal(w, cur, goal, hstart, lvl_first)
+      let w = put(w, "bfs", p[1])
+      if p[0] >= 0 { let a = p[0] }
+      if p[0] == 0 - 1 { let a = 0 - 1 }
+      let guided = guided + 1
+    }
+    # an agent acts toward goals: walk "me" to the next thing worth touching, by the moves it has learned
+    if mecol >= 0 and aget(bc, mecol) > 0 and state != "GAME_OVER" {
+      let mx = aget(bx, mecol) // aget(bc, mecol)
+      let my = aget(by, mecol) // aget(bc, mecol)
+      let skipping = true
+      while skipping {
+        if ti >= len(targets) {
+          let skipping = false
+        } else {
+          if abs(targets[ti][0] - mx) + abs(targets[ti][1] - my) <= 2 or tsteps > 50 {
+            let ti = ti + 1
+            let tsteps = 0
+          } else {
+            let skipping = false
+          }
+        }
+      }
+      if ti < len(targets) {
+        let tx = targets[ti][0]
+        let ty = targets[ti][1]
+        let pick = 0 - 1
+        let bestd = abs(tx - mx) + abs(ty - my)
+        for i in range(0, aget(w["acount"], cur)) {
+          let an = aget(w["acode"], cur * MAXA() + i) // 4096
+          if an >= 1 and an <= 7 and an != 6 {
+            let n = aget(mvn, an * 16 + mecol)
+            if n > 0 and aget(w["edges"], cur * MAXA() + i) != cur + 1 {
+              let px = mx + aget(mvx, an * 16 + mecol) // n
+              let py = my + aget(mvy, an * 16 + mecol) // n
+              let dd = abs(tx - px) + abs(ty - py)
+              if dd < bestd {
+                let pick = i
+                let bestd = dd
+              }
+            }
+          }
+        }
+        if pick >= 0 {
+          let a = pick
+          let tsteps = tsteps + 1
+          let walked = walked + 1
+        } else {
+          let tsteps = tsteps + 5
+        }
+      }
+    }
+    if a < 0 {
+      let p = plan(w, cur)
+      let w = put(w, "bfs", p[1])
+      let a = p[0]
+    }
+    # nothing remembered is left to try: first widen what Pi may do here (more click targets)
+    if a < 0 and state != "GAME_OVER" {
+      let m2 = mark()
+      let got = widen(w, cur, grid, avail)
+      do release(m2, 0)
+      if got > 0 {
+        let a = untried(w, cur)
+        let widened = widened + got
+      }
+    }
+    # then a varied action -- never one already known to lead straight back here
+    if a < 0 and state != "GAME_OVER" and aget(w["acount"], cur) > 0 {
+      let k = aget(w["acount"], cur)
+      let pick = (steps * 7919 + resets * 104729) // 13 % k
+      let tries = 0
+      while tries < k and aget(w["edges"], cur * MAXA() + pick) == cur + 1 {
+        let pick = (pick + 1) % k
+        let tries = tries + 1
+      }
+      let a = pick
+    }
+    let m = mark()
+    let resp = null
+    if a < 0 or state == "GAME_OVER" {
+      let resp = http("POST", "/api/cmd/RESET", {"game_id": gid, "card_id": card, "guid": guid})
+      let resets = resets + 1
+    } else {
+      let code = aget(w["acode"], cur * MAXA() + a)
+      let act = [code // 4096, code % 64, code % 4096 // 64]
+      let resp = http("POST", "/api/cmd/ACTION" ++ str(act[0]), act_body(gid, card, guid, act))
+    }
+    let r = take(resp, grid, w, mask, mecol)
+    let r = release(m, r)
+    if r == null { return [gid, best, wins, steps, "lost the server"] }
+    let steps = steps + 1
+    let avail = r[6]
+    # learn the agent: colours that kept their size but shifted are candidates for "me"; remember each action's shift
+    if a >= 0 and state != "GAME_OVER" {
+      let an = aget(w["acode"], cur * MAXA() + a) // 4096
+      if an != 6 {
+        do colour_stats(grid, ac, ax, ay)
+        for c in range(0, 16) {
+          let n = aget(bc, c)
+          # an agent is a small thing: a colour covering much of the screen is scenery, even if its average drifts
+          if n > 0 and n <= 300 and aget(ac, c) == n {
+            let dxs = aget(ax, c) - aget(bx, c)
+            let dys = aget(ay, c) - aget(by, c)
+            if dxs != 0 or dys != 0 {
+              let dx = 0
+              if dxs > 0 { let dx = max(1, dxs // n) }
+              if dxs < 0 { let dx = 0 - max(1, (0 - dxs) // n) }
+              let dy = 0
+              if dys > 0 { let dy = max(1, dys // n) }
+              if dys < 0 { let dy = 0 - max(1, (0 - dys) // n) }
+              do aset(score, c, aget(score, c) + 1)
+              do aset(mvx, an * 16 + c, aget(mvx, an * 16 + c) + dx)
+              do aset(mvy, an * 16 + c, aget(mvy, an * 16 + c) + dy)
+              do aset(mvn, an * 16 + c, aget(mvn, an * 16 + c) + 1)
+            }
+          }
+        }
+        if mecol < 0 {
+          let bestc = 0 - 1
+          for c in range(0, 16) {
+            if aget(score, c) >= 4 {
+              if bestc < 0 { let bestc = c } else {
+                if aget(score, c) > aget(score, bestc) { let bestc = c }
+              }
+            }
+          }
+          if bestc >= 0 {
+            let mecol = bestc
+            let rebuild = OBJSTATES()
+            let m3 = mark()
+            let t = targets_of(grid, mecol)
+            let targets = release(m3, t)
+            let ti = 0
+            let tsteps = 0
+          }
+        }
+      }
+    }
+    if a >= 0 and state != "GAME_OVER" {
+      if note_change(grid, prev, rowc, colc, cellc) > 0 { let moves = moves + 1 } else { let noops = noops + 1 }
+    } else {
+      for i in range(0, 4096) { do aset(prev, i, aget(grid, i)) }
+    }
+    let d = find_node(w, r[2])
+    if d < 0 {
+      if w["n"] < MAXN() - 1 {
+        let w = add_node(w, r[2], r[3], grid)
+        let d = w["n"] - 1
+      } else {
+        let d = cur
+      }
+    }
+    if a >= 0 and state != "GAME_OVER" {
+      do aset(w["edges"], cur * MAXA() + a, d + 1)
+      if d == cur { let selfs = selfs + 1 }
+    }
+    let cur = d
+    let state = r[0]
+    let lvl_steps = lvl_steps + 1
+    if r[1] > best {
+      # a level finished: how did the world differ from that level's start, just before the winning move?
+      let wins_seen = append(wins_seen, "L" ++ str(r[1]) ++ " in " ++ str(lvl_steps) ++ " [" ++ hist_delta(hstart, hbefore) ++ "]")
+      # the inferred goal: the direction of that change (summed over every level finished so far)
+      for c in range(0, 16) {
+        let dd = aget(hbefore, c) - aget(hstart, c)
+        if dd > 0 { do aset(goal, c, aget(goal, c) + 1) }
+        if dd < 0 { do aset(goal, c, aget(goal, c) - 1) }
+      }
+      let guesses = guesses + 1
+      let lvl_first = d
+      do hist(grid, hstart)
+      let lvl_steps = 0
+      let best = r[1]
+      if mecol >= 0 {
+        let m3 = mark()
+        let t = targets_of(grid, mecol)
+        let targets = release(m3, t)
+        let ti = 0
+        let tsteps = 0
+      }
+    }
+    if rebuild {
+      let w = new_world()
+      let w = add_node(w, skey(grid, mask, mecol), actions_of(avail, grid), grid)
+      let cur = 0
+      let lvl_first = 0
+      let rebuild = false
+    }
+    # after a warm-up, and again later: decide what is bookkeeping and remember the world through that lens
+    if (steps == 40 or steps == 120 or steps == 300 or steps == 600) and moves >= 10 {
+      let nm = learn_mask(rowc, colc, cellc, moves, mask)
+      if nm != masked {
+        let masked = nm
+        let w = new_world()
+        let w = add_node(w, skey(grid, mask, mecol), actions_of(avail, grid), grid)
+        let cur = 0
+        let lvl_first = 0
+      }
+    }
+  }
+  return [gid, best, wins, steps, str(w["n"]) ++ " states, " ++ str(masked) ++ " ignored, " ++ str(noops) ++ " no-ops, " ++ str(selfs) ++ " self, " ++ str(widened) ++ " widened, " ++ str(resets) ++ " resets, " ++ str(guided) ++ " guided, me " ++ str(mecol) ++ ", walked " ++ str(walked) ++ ", ended " ++ state ++ ") wins: " ++ join(wins_seen, "; ") ++ " ("]
+}
+
+skill main() -> Any {
+  let which = arg(1)
+  let budget = 300
+  if arg(2) != null { let budget = num(arg(2)) }
+  let games = []
+  let listing = http("GET", "/api/games", null)
+  if listing == null { return "The ARC-AGI-3 server is not running (C:\\Users\\Dough\\arc3_env\\serve.py)." }
+  for g in listing {
+    let id = split(g["game_id"], "-")[0]
+    # the full id (with its version) -- the server keeps a running game under exactly that name
+    if which == null or which == "all" or contains("," ++ which ++ ",", "," ++ id ++ ",") { let games = append(games, g["game_id"]) }
+  }
+  # outrc3.exe all 1000 k n : play only every n-th game, starting at the k-th (to run n players side by side)
+  if arg(4) != null {
+    let k = num(arg(3))
+    let n = num(arg(4))
+    let mine = []
+    let gs = sort(games)
+    for i in range(0, len(gs)) {
+      if i % n == k { let mine = append(mine, gs[i]) }
+    }
+    let games = mine
+  }
+  let card = http("POST", "/api/scorecard/open", {})["card_id"]
+  let total = 0
+  let possible = 0
+  let solved = 0
+  for gid in sort(games) {
+    let r = play(gid, card, budget)
+    do print(split(r[0], "-")[0] ++ ": levels " ++ str(r[1]) ++ " of " ++ str(r[2]) ++ " in " ++ str(r[3]) ++ " actions (" ++ r[4] ++ ")")
+    let total = total + r[1]
+    let possible = possible + r[2]
+    if r[1] == r[2] and r[2] > 0 { let solved = solved + 1 }
+  }
+  do http("POST", "/api/scorecard/close", {"card_id": card})
+  return "Pi finished " ++ str(total) ++ " of " ++ str(possible) ++ " levels; " ++ str(solved) ++ " of " ++ str(len(games)) ++ " games won (" ++ str(budget) ++ " actions per game)."
+}

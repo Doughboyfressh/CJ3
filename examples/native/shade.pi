@@ -1,0 +1,1854 @@
+# shade: Pi on the GPU. A program in a small dialect of Pi -- the same skill / let / if / while / for / return, the same
+# operators, no type names -- compiles here to GPU code (PTX) at run time, and runs once per pixel or per sample.
+#   values: integers, reals (float32), truths, and vectors [x, y, z]; + - * / work on vectors and mix with numbers
+#   a skill works for whatever it is given: each combination of argument types is compiled on its own
+#   let x = 0 and then x = x + 0.5 makes x a real everywhere; x = some vector makes it a vector
+# sh_compile(source) -> PTX text. A mistake in the source ends the program with its line number and what is wrong, so
+# whoever wrote it can fix it.
+import "shadelib.pi"
+
+# ---- a cell whose contents can change (Pi's lists and maps are values) --------------------------------------------
+skill rt_sh_box(v) -> Any {
+  let p = rt_alloc(8)
+  do poke(p, v)
+  return rt_tag(p)
+}
+skill rt_sh_get(b) -> Any { return peek(rt_untag(b)) }
+skill rt_sh_set(b, v) -> Any {
+  do poke(rt_untag(b), v)
+  return v
+}
+
+skill sh_err(line, msg) -> Any {
+  if line > 1000000 { return fail("shader: " ++ msg) }
+  return fail("shader, line " ++ str(line) ++ ": " ++ msg)
+}
+
+# ---- words --------------------------------------------------------------------------------------------------------
+skill sh_alpha(c) -> Any { return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 }
+skill sh_digit(c) -> Any { return c >= 48 and c <= 57 }
+
+skill sh_tokens(src, base) -> Any {
+  let ts = []
+  let ln = []
+  let n = len(src)
+  let i = 0
+  let line = base + 1
+  let fresh = true
+  while i < n {
+    let c = ord(src[i])
+    if c == 10 {
+      line += 1
+      fresh = true
+      i += 1
+    } else if c == 32 or c == 9 or c == 13 or c == 59 {
+      i += 1
+    } else if c == 35 or (fresh and c == 47 and i + 1 < n and ord(src[i + 1]) == 47) {
+      while i < n and ord(src[i]) != 10 { i += 1 }
+    } else {
+      fresh = false
+      let j = i + 1
+      if sh_alpha(c) {
+        while j < n and (sh_alpha(ord(src[j])) or sh_digit(ord(src[j]))) { j += 1 }
+      } else if sh_digit(c) or (c == 46 and i + 1 < n and sh_digit(ord(src[i + 1]))) {
+        while j < n and (sh_digit(ord(src[j])) or ord(src[j]) == 46) { j += 1 }
+        if j < n and (ord(src[j]) == 101 or ord(src[j]) == 69) {
+          let k = j + 1
+          if k < n and (ord(src[k]) == 43 or ord(src[k]) == 45) { k += 1 }
+          if k < n and sh_digit(ord(src[k])) {
+            j = k
+            while j < n and sh_digit(ord(src[j])) { j += 1 }
+          }
+        }
+      } else if i + 1 < n and contains(["==", "!=", "<=", ">=", "->", "+=", "-=", "*=", "/=", "//"], slice(src, i, i + 2)) {
+        j = i + 2
+      }
+      ts = append(ts, slice(src, i, j))
+      ln = append(ln, line)
+      i = j
+      // 1.5f: the f is a habit from other languages
+      if sh_digit(c) and i < n and ord(src[i]) == 102 and (i + 1 >= n or not sh_alpha(ord(src[i + 1]))) { i += 1 }
+    }
+  }
+  return [ts, ln, arr(1)]
+}
+
+skill sh_t(ps) -> Any {
+  let p = aget(ps[2], 0)
+  return if p < len(ps[0]) { ps[0][p] } else { "" }
+}
+skill sh_ln(ps) -> Any {
+  let p = min(aget(ps[2], 0), len(ps[1]) - 1)
+  return ps[1][p]
+}
+skill sh_adv(ps) -> Any { return aset(ps[2], 0, aget(ps[2], 0) + 1) }
+skill sh_eat(ps, t) -> Any {
+  if sh_t(ps) == t {
+    sh_adv(ps)
+    return true
+  }
+  return false
+}
+skill sh_need(ps, t) -> Any {
+  if not sh_eat(ps, t) { sh_err(sh_ln(ps), "expected " ++ t ++ " but found " ++ sh_t(ps)) }
+  return 0
+}
+skill sh_name(ps) -> Any {
+  let t = sh_t(ps)
+  if len(t) == 0 or not sh_alpha(ord(t[0])) { sh_err(sh_ln(ps), "expected a name but found " ++ t) }
+  sh_adv(ps)
+  return t
+}
+
+# ---- expressions: lists whose first item says what they are --------------------------------------------------------
+skill sh_prec(op) -> Any {
+  if op == "or" { return 1 }
+  if op == "and" { return 2 }
+  if contains(["<", "<=", ">", ">=", "==", "!="], op) { return 3 }
+  if op == "+" or op == "-" { return 4 }
+  if contains(["*", "/", "//", "%"], op) { return 5 }
+  if op == "^" { return 6 }
+  return 0
+}
+
+skill sh_binary(ps, minp) -> Any {
+  let a = sh_unary(ps)
+  while true {
+    let op = sh_t(ps)
+    let pr = sh_prec(op)
+    if pr == 0 or pr < minp { break }
+    let line = sh_ln(ps)
+    sh_adv(ps)
+    let b = sh_binary(ps, if op == "^" { pr } else { pr + 1 })
+    a = ["bin", op, a, b, line]
+  }
+  return a
+}
+
+skill sh_unary(ps) -> Any {
+  let line = sh_ln(ps)
+  if sh_eat(ps, "-") { return ["neg", sh_binary(ps, 6), line] }
+  if sh_eat(ps, "+") { return sh_binary(ps, 6) }
+  if sh_eat(ps, "not") or sh_eat(ps, "!") { return ["not", sh_binary(ps, 3), line] }
+  return sh_postfix(ps)
+}
+
+skill sh_postfix(ps) -> Any {
+  let e = sh_primary(ps)
+  while true {
+    let line = sh_ln(ps)
+    if sh_eat(ps, ".") {
+      e = ["mem", e, sh_name(ps), line]
+    } else if sh_eat(ps, "[") {
+      let t = sh_t(ps)
+      sh_adv(ps)
+      sh_need(ps, "]")
+      if t != "0" and t != "1" and t != "2" { sh_err(line, "a vector's parts are [0], [1] and [2]") }
+      e = ["mem", e, if t == "0" { "x" } else if t == "1" { "y" } else { "z" }, line]
+    } else {
+      break
+    }
+  }
+  return e
+}
+
+skill sh_args(ps, close) -> Any {
+  let args = []
+  while sh_t(ps) != close {
+    args = append(args, sh_binary(ps, 1))
+    if not sh_eat(ps, ",") { break }
+  }
+  sh_need(ps, close)
+  return args
+}
+
+skill sh_primary(ps) -> Any {
+  let line = sh_ln(ps)
+  let t = sh_t(ps)
+  if t == "" { sh_err(line, "the program ends in the middle of an expression") }
+  let c = ord(t[0])
+  if sh_digit(c) or c == 46 {
+    sh_adv(ps)
+    return ["num", t, line]
+  }
+  if t == "(" {
+    sh_adv(ps)
+    let e = sh_binary(ps, 1)
+    sh_need(ps, ")")
+    return e
+  }
+  if t == "[" {
+    sh_adv(ps)
+    let items = sh_args(ps, "]")
+    if len(items) != 3 { sh_err(line, "a vector has 3 parts, this has " ++ str(len(items))) }
+    return ["vec", items[0], items[1], items[2], line]
+  }
+  if t == "true" or t == "false" {
+    sh_adv(ps)
+    return ["bool", t == "true", line]
+  }
+  if t == "if" {
+    sh_adv(ps)
+    let cond = sh_binary(ps, 1)
+    let th = sh_block(ps)
+    sh_need(ps, "else")
+    let el = if sh_t(ps) == "if" { [["expr", sh_primary(ps), line]] } else { sh_block(ps) }
+    return ["ifx", cond, th, el, line]
+  }
+  if sh_alpha(c) {
+    sh_adv(ps)
+    if sh_eat(ps, "(") { return ["call", t, sh_args(ps, ")"), line] }
+    return ["id", t, line]
+  }
+  sh_err(line, "this cannot start an expression: " ++ t)
+  return null
+}
+
+# ---- statements ---------------------------------------------------------------------------------------------------
+skill sh_block(ps) -> Any {
+  sh_need(ps, "{")
+  let out = []
+  while sh_t(ps) != "}" {
+    if sh_t(ps) == "" { sh_err(sh_ln(ps), "a { was never closed") }
+    out = append(out, sh_stmt(ps))
+  }
+  sh_adv(ps)
+  return out
+}
+
+skill sh_stmt(ps) -> Any {
+  let line = sh_ln(ps)
+  let t = sh_t(ps)
+  if t == "let" or t == "var" {
+    sh_adv(ps)
+    let nm = sh_name(ps)
+    if sh_eat(ps, ":") { sh_adv(ps) }
+    sh_need(ps, "=")
+    return ["let", nm, sh_binary(ps, 1), line]
+  }
+  if t == "if" {
+    sh_adv(ps)
+    let cond = sh_binary(ps, 1)
+    let th = sh_block(ps)
+    let el = []
+    if sh_eat(ps, "else") {
+      el = if sh_t(ps) == "if" { [sh_stmt(ps)] } else { sh_block(ps) }
+    }
+    return ["if", cond, th, el, line]
+  }
+  if t == "while" {
+    sh_adv(ps)
+    let cond = sh_binary(ps, 1)
+    return ["while", cond, sh_block(ps), line]
+  }
+  if t == "for" {
+    sh_adv(ps)
+    let nm = sh_name(ps)
+    sh_need(ps, "in")
+    sh_need(ps, "range")
+    sh_need(ps, "(")
+    let rg = sh_args(ps, ")")
+    if len(rg) < 1 or len(rg) > 2 { sh_err(line, "range takes 1 or 2 numbers") }
+    let a = if len(rg) == 2 { rg[0] } else { ["num", "0", line] }
+    let b = if len(rg) == 2 { rg[1] } else { rg[0] }
+    return ["for", nm, a, b, sh_block(ps), line]
+  }
+  if t == "return" {
+    sh_adv(ps)
+    if sh_t(ps) == "}" { return ["ret", null, line] }
+    return ["ret", sh_binary(ps, 1), line]
+  }
+  if t == "break" or t == "continue" {
+    sh_adv(ps)
+    return [t, line]
+  }
+  let e = sh_binary(ps, 1)
+  let op = sh_t(ps)
+  if contains(["=", "+=", "-=", "*=", "/="], op) {
+    sh_adv(ps)
+    let v = sh_binary(ps, 1)
+    if op != "=" { v = ["bin", slice(op, 0, 1), e, v, line] }
+    if e[0] == "id" { return ["let", e[1], v, line] }
+    if e[0] == "mem" and e[1][0] == "id" { return ["setm", e[1][1], e[2], v, line] }
+    sh_err(line, "only a name or a part of one can be given a value")
+  }
+  return ["expr", e, line]
+}
+
+# the whole program -> [skills: name -> [params, body, line], constants: name -> expression]
+skill sh_parse(src, fns, consts, base) -> Any {
+  let ps = sh_tokens(src, base)
+  while sh_t(ps) != "" {
+    let line = sh_ln(ps)
+    if sh_eat(ps, "skill") or sh_eat(ps, "fn") {
+      let nm = sh_name(ps)
+      sh_need(ps, "(")
+      let params = []
+      while sh_t(ps) != ")" {
+        params = append(params, sh_name(ps))
+        if sh_eat(ps, ":") { sh_adv(ps) }
+        if not sh_eat(ps, ",") { break }
+      }
+      sh_need(ps, ")")
+      if sh_eat(ps, "->") { sh_adv(ps) }
+      fns = put(fns, nm, [params, sh_block(ps), line])
+    } else if sh_eat(ps, "let") {
+      let nm = sh_name(ps)
+      sh_need(ps, "=")
+      consts = put(consts, nm, sh_binary(ps, 1))
+    } else {
+      sh_err(line, "only skills and let can stand at the top level, not " ++ sh_t(ps))
+    }
+  }
+  return [fns, consts]
+}
+
+# ---- numbers ------------------------------------------------------------------------------------------------------
+skill sh_real(t) -> Any {
+  let m = 0.0
+  let scale = 0
+  let i = 0
+  let n = len(t)
+  let seen = false
+  while i < n and ord(t[i]) != 101 and ord(t[i]) != 69 {
+    let c = ord(t[i])
+    if c == 46 {
+      seen = true
+    } else {
+      m = m * 10.0 + float(c - 48)
+      if seen { scale -= 1 }
+    }
+    i += 1
+  }
+  if i < n {
+    let neg = false
+    i += 1
+    if ord(t[i]) == 45 { neg = true }
+    if ord(t[i]) == 45 or ord(t[i]) == 43 { i += 1 }
+    let e = 0
+    while i < n {
+      e = e * 10 + ord(t[i]) - 48
+      i += 1
+    }
+    scale += if neg { 0 - e } else { e }
+  }
+  while scale > 0 {
+    m = m * 10.0
+    scale -= 1
+  }
+  while scale < 0 {
+    m = m / 10.0
+    scale += 1
+  }
+  return m
+}
+
+# a real as PTX writes it exactly: 0f and its 8 hex digits
+skill sh_f32(x) -> Any {
+  if x == 0.0 { return "0f00000000" }
+  let s = 0
+  if x < 0.0 {
+    s = 2147483648
+    x = 0.0 - x
+  }
+  let e = 0
+  while x >= 2.0 {
+    x = x / 2.0
+    e += 1
+  }
+  while x < 1.0 {
+    x = x * 2.0
+    e -= 1
+  }
+  let m = int((x - 1.0) * 8388608.0 + 0.5)
+  if m >= 8388608 {
+    m = 0
+    e += 1
+  }
+  if e < 0 - 126 { return "0f00000000" }
+  let bits = s + (e + 127) * 8388608 + m
+  let hx = "0123456789ABCDEF"
+  let out = "0f"
+  for k in [28, 24, 20, 16, 12, 8, 4, 0] {
+    out = out ++ hx[(bits // 2 ^ k) % 16]
+  }
+  return out
+}
+
+# ---- the code of one skill being compiled -----------------------------------------------------------------------
+# C: the whole program -- skills, constants, compiled forms. F: one skill in compilation: code, counters, variables.
+skill sh_nf(F) -> Any {
+  let k = aget(F["n"], 0)
+  aset(F["n"], 0, k + 1)
+  return "%f" ++ str(k)
+}
+skill sh_ni(F) -> Any {
+  let k = aget(F["n"], 1)
+  aset(F["n"], 1, k + 1)
+  return "%i" ++ str(k)
+}
+skill sh_np(F) -> Any {
+  let k = aget(F["n"], 2)
+  aset(F["n"], 2, k + 1)
+  return "%p" ++ str(k)
+}
+skill sh_nl(F) -> Any {
+  let k = aget(F["n"], 3)
+  aset(F["n"], 3, k + 1)
+  return "L" ++ str(k)
+}
+skill sh_nk(F) -> Any {
+  let k = aget(F["n"], 4)
+  aset(F["n"], 4, k + 1)
+  return k
+}
+skill em(F, s) -> Any { return rt_sh_set(F["code"], append(rt_sh_get(F["code"]), s)) }
+
+skill sh_rank(t) -> Any {
+  if t == "i" { return 1 }
+  if t == "f" { return 2 }
+  if t == "v" { return 3 }
+  return 0
+}
+
+skill sh_tname(t) -> Any {
+  if t == "i" { return "an integer" }
+  if t == "f" { return "a real" }
+  if t == "v" { return "a vector" }
+  if t == "b" { return "a truth" }
+  return "nothing"
+}
+
+skill sh_tof(F, v, line) -> Any {
+  if v[0] == "f" { return v }
+  if v[0] == "i" {
+    let d = sh_nf(F)
+    em(F, "cvt.rn.f32.s32 " ++ d ++ ", " ++ v[1] ++ ";\n")
+    return ["f", d]
+  }
+  sh_err(line, "a number was needed here, not " ++ sh_tname(v[0]))
+  return null
+}
+
+skill sh_tov(F, v, line) -> Any {
+  if v[0] == "v" { return v }
+  let f = sh_tof(F, v, line)
+  return ["v", f[1], f[1], f[1]]
+}
+
+skill sh_as(F, v, t, line) -> Any {
+  if v[0] == t { return v }
+  if t == "f" { return sh_tof(F, v, line) }
+  if t == "v" { return sh_tov(F, v, line) }
+  if t == "b" { return sh_truth(F, v, line) }
+  sh_err(line, sh_tname(v[0]) ++ " cannot become " ++ sh_tname(t))
+  return null
+}
+
+# a number as a truth: not zero
+skill sh_truth(F, v, line) -> Any {
+  if v[0] == "b" { return v }
+  let p = sh_np(F)
+  if v[0] == "i" {
+    em(F, "setp.ne.s32 " ++ p ++ ", " ++ v[1] ++ ", 0;\n")
+    return ["b", p]
+  }
+  if v[0] == "f" {
+    em(F, "setp.ne.f32 " ++ p ++ ", " ++ v[1] ++ ", 0f00000000;\n")
+    return ["b", p]
+  }
+  sh_err(line, sh_tname(v[0]) ++ " cannot be true or false")
+  return null
+}
+
+# regs of a new variable of type t
+skill sh_newvar(F, t) -> Any {
+  if t == "f" { return ["f", sh_nf(F)] }
+  if t == "i" { return ["i", sh_ni(F)] }
+  if t == "b" { return ["b", sh_np(F)] }
+  return ["v", sh_nf(F), sh_nf(F), sh_nf(F)]
+}
+
+skill sh_mov(F, d, s) -> Any {
+  if d[0] == "f" { return em(F, "mov.f32 " ++ d[1] ++ ", " ++ s[1] ++ ";\n") }
+  if d[0] == "i" { return em(F, "mov.s32 " ++ d[1] ++ ", " ++ s[1] ++ ";\n") }
+  if d[0] == "b" { return em(F, "mov.pred " ++ d[1] ++ ", " ++ s[1] ++ ";\n") }
+  em(F, "mov.f32 " ++ d[1] ++ ", " ++ s[1] ++ ";\n")
+  em(F, "mov.f32 " ++ d[2] ++ ", " ++ s[2] ++ ";\n")
+  return em(F, "mov.f32 " ++ d[3] ++ ", " ++ s[3] ++ ";\n")
+}
+
+# one instruction with a new real as its result
+skill sh_u(F, op, a) -> Any {
+  let d = sh_nf(F)
+  em(F, op ++ " " ++ d ++ ", " ++ a ++ ";\n")
+  return d
+}
+skill sh_b(F, op, a, b) -> Any {
+  let d = sh_nf(F)
+  em(F, op ++ " " ++ d ++ ", " ++ a ++ ", " ++ b ++ ";\n")
+  return d
+}
+skill sh_ib(F, op, a, b) -> Any {
+  let d = sh_ni(F)
+  em(F, op ++ " " ++ d ++ ", " ++ a ++ ", " ++ b ++ ";\n")
+  return d
+}
+skill sh_ii(F, op, a) -> Any {
+  let d = sh_ni(F)
+  em(F, op ++ " " ++ d ++ ", " ++ a ++ ";\n")
+  return d
+}
+skill sh_fma(F, a, b, c) -> Any {
+  let d = sh_nf(F)
+  em(F, "fma.rn.f32 " ++ d ++ ", " ++ a ++ ", " ++ b ++ ", " ++ c ++ ";\n")
+  return d
+}
+
+# a real or a vector, part by part
+skill sh_each1(F, op, v, line) -> Any {
+  if v[0] == "v" { return ["v", sh_u(F, op, v[1]), sh_u(F, op, v[2]), sh_u(F, op, v[3])] }
+  let f = sh_tof(F, v, line)
+  return ["f", sh_u(F, op, f[1])]
+}
+skill sh_each2(F, op, a, b, line) -> Any {
+  if a[0] == "v" or b[0] == "v" {
+    let x = sh_tov(F, a, line)
+    let y = sh_tov(F, b, line)
+    return ["v", sh_b(F, op, x[1], y[1]), sh_b(F, op, x[2], y[2]), sh_b(F, op, x[3], y[3])]
+  }
+  let x = sh_tof(F, a, line)
+  let y = sh_tof(F, b, line)
+  return ["f", sh_b(F, op, x[1], y[1])]
+}
+
+# x times a fixed real
+skill sh_scale1(F, x, k) -> Any {
+  let c = sh_nf(F)
+  em(F, "mov.f32 " ++ c ++ ", " ++ k ++ ";\n")
+  return sh_b(F, "mul.f32", x, c)
+}
+
+# e^x and ln x through the GPU's own base-2 forms
+skill sh_exp1(F, x) -> Any { return sh_u(F, "ex2.approx.f32", sh_scale1(F, x, "0f3FB8AA3B")) }
+skill sh_log1(F, x) -> Any { return sh_scale1(F, sh_u(F, "lg2.approx.f32", x), "0f3F317218") }
+
+# a / b rounded down, a % b taking b's sign (as Pi's integers do)
+skill sh_idiv(F, a, b) -> Any {
+  let q = sh_ib(F, "div.s32", a, b)
+  let r = sh_ib(F, "rem.s32", a, b)
+  let x = sh_ib(F, "xor.b32", r, b)
+  let p = sh_np(F)
+  let z = sh_np(F)
+  em(F, "setp.lt.s32 " ++ p ++ ", " ++ x ++ ", 0;\nsetp.ne.s32 " ++ z ++ ", " ++ r ++ ", 0;\nand.pred " ++ p ++ ", " ++ p ++ ", " ++ z ++ ";\n@" ++ p ++ " sub.s32 " ++ q ++ ", " ++ q ++ ", 1;\n")
+  return q
+}
+skill sh_imod(F, a, b) -> Any {
+  let r = sh_ib(F, "rem.s32", a, b)
+  let x = sh_ib(F, "xor.b32", r, b)
+  let p = sh_np(F)
+  let z = sh_np(F)
+  em(F, "setp.lt.s32 " ++ p ++ ", " ++ x ++ ", 0;\nsetp.ne.s32 " ++ z ++ ", " ++ r ++ ", 0;\nand.pred " ++ p ++ ", " ++ p ++ ", " ++ z ++ ";\n@" ++ p ++ " add.s32 " ++ r ++ ", " ++ r ++ ", " ++ b ++ ";\n")
+  return r
+}
+
+skill sh_bin(C, F, op, a, b, line) -> Any {
+  if op == "and" or op == "or" {
+    let x = sh_truth(F, a, line)
+    let y = sh_truth(F, b, line)
+    let p = sh_np(F)
+    em(F, op ++ ".pred " ++ p ++ ", " ++ x[1] ++ ", " ++ y[1] ++ ";\n")
+    return ["b", p]
+  }
+  if op == "^" { return sh_callv(C, F, "pow", [a, b], line) }
+  if contains(["<", "<=", ">", ">=", "==", "!="], op) {
+    let cc = if op == "<" { "lt" } else if op == "<=" { "le" } else if op == ">" { "gt" } else if op == ">=" { "ge" } else if op == "==" { "eq" } else { "ne" }
+    if a[0] == "b" and b[0] == "b" {
+      let p = sh_np(F)
+      let s = sh_np(F)
+      em(F, "xor.pred " ++ p ++ ", " ++ a[1] ++ ", " ++ b[1] ++ ";\n")
+      em(F, (if op == "==" { "not.pred " ++ s ++ ", " ++ p } else { "mov.pred " ++ s ++ ", " ++ p }) ++ ";\n")
+      return ["b", s]
+    }
+    if a[0] == "v" or b[0] == "v" or a[0] == "b" or b[0] == "b" { sh_err(line, sh_tname(a[0]) ++ " and " ++ sh_tname(b[0]) ++ " cannot be compared with " ++ op) }
+    let p = sh_np(F)
+    if a[0] == "i" and b[0] == "i" {
+      em(F, "setp." ++ cc ++ ".s32 " ++ p ++ ", " ++ a[1] ++ ", " ++ b[1] ++ ";\n")
+    } else {
+      let x = sh_tof(F, a, line)
+      let y = sh_tof(F, b, line)
+      em(F, "setp." ++ cc ++ ".f32 " ++ p ++ ", " ++ x[1] ++ ", " ++ y[1] ++ ";\n")
+    }
+    return ["b", p]
+  }
+  if a[0] == "b" or b[0] == "b" { sh_err(line, "arithmetic on a truth") }
+  if a[0] == "i" and b[0] == "i" {
+    if op == "+" { return ["i", sh_ib(F, "add.s32", a[1], b[1])] }
+    if op == "-" { return ["i", sh_ib(F, "sub.s32", a[1], b[1])] }
+    if op == "*" { return ["i", sh_ib(F, "mul.lo.s32", a[1], b[1])] }
+    if op == "//" { return ["i", sh_idiv(F, a[1], b[1])] }
+    if op == "%" { return ["i", sh_imod(F, a[1], b[1])] }
+  }
+  if op == "+" { return sh_each2(F, "add.f32", a, b, line) }
+  if op == "-" { return sh_each2(F, "sub.f32", a, b, line) }
+  if op == "*" { return sh_each2(F, "mul.f32", a, b, line) }
+  if op == "/" { return sh_each2(F, "div.rn.f32", a, b, line) }
+  if op == "//" {
+    let q = sh_each2(F, "div.rn.f32", a, b, line)
+    return sh_each1(F, "cvt.rmi.f32.f32", q, line)
+  }
+  if op == "%" {
+    let q = sh_each2(F, "div.rn.f32", a, b, line)
+    let fl = sh_each1(F, "cvt.rmi.f32.f32", q, line)
+    return sh_each2(F, "sub.f32", a, sh_each2(F, "mul.f32", b, fl, line), line)
+  }
+  sh_err(line, "unknown operator " ++ op)
+  return null
+}
+
+# ---- what the GPU does by itself ------------------------------------------------------------------------------------
+skill sh_rnd(F) -> Any {
+  let s = sh_ni(F)
+  let t = sh_ni(F)
+  let a = sh_ni(F)
+  let b = sh_ni(F)
+  let d = sh_nf(F)
+  em(F, "ld.u32 " ++ s ++ ", [%d0];\nmul.lo.u32 " ++ t ++ ", " ++ s ++ ", 747796405;\nadd.u32 " ++ t ++ ", " ++ t ++ ", 2891336453;\nst.u32 [%d0], " ++ t ++ ";\n")
+  em(F, "shr.u32 " ++ a ++ ", " ++ s ++ ", 28;\nadd.u32 " ++ a ++ ", " ++ a ++ ", 4;\nshr.u32 " ++ b ++ ", " ++ s ++ ", " ++ a ++ ";\nxor.b32 " ++ b ++ ", " ++ b ++ ", " ++ s ++ ";\nmul.lo.u32 " ++ b ++ ", " ++ b ++ ", 277803737;\nshr.u32 " ++ a ++ ", " ++ b ++ ", 22;\nxor.b32 " ++ b ++ ", " ++ b ++ ", " ++ a ++ ";\nshr.u32 " ++ b ++ ", " ++ b ++ ", 8;\n")
+  em(F, "cvt.rn.f32.u32 " ++ d ++ ", " ++ b ++ ";\nmul.f32 " ++ d ++ ", " ++ d ++ ", 0f33800000;\n")
+  return ["f", d]
+}
+
+skill sh_load_f(F, off) -> Any {
+  let d = sh_nf(F)
+  em(F, "ld.f32 " ++ d ++ ", [%d0+" ++ str(off) ++ "];\n")
+  return ["f", d]
+}
+
+# -> the value, or null when the name is not one of these
+skill sh_builtin(C, F, name, vs, line) -> Any {
+  let n = len(vs)
+  if n == 1 {
+    let v = vs[0]
+    if name == "sqrt" { return sh_each1(F, "sqrt.rn.f32", v, line) }
+    if name == "sin" { return sh_each1(F, "sin.approx.f32", v, line) }
+    if name == "cos" { return sh_each1(F, "cos.approx.f32", v, line) }
+    if name == "floor" { return sh_each1(F, "cvt.rmi.f32.f32", v, line) }
+    if name == "ceil" { return sh_each1(F, "cvt.rpi.f32.f32", v, line) }
+    if name == "round" { return sh_each1(F, "cvt.rni.f32.f32", v, line) }
+    if name == "trunc" { return sh_each1(F, "cvt.rzi.f32.f32", v, line) }
+    if name == "abs" {
+      if v[0] == "i" { return ["i", sh_ii(F, "abs.s32", v[1])] }
+      return sh_each1(F, "abs.f32", v, line)
+    }
+    if name == "exp" {
+      if v[0] == "v" { return ["v", sh_exp1(F, v[1]), sh_exp1(F, v[2]), sh_exp1(F, v[3])] }
+      return ["f", sh_exp1(F, sh_tof(F, v, line)[1])]
+    }
+    if name == "log" {
+      if v[0] == "v" { return ["v", sh_log1(F, v[1]), sh_log1(F, v[2]), sh_log1(F, v[3])] }
+      return ["f", sh_log1(F, sh_tof(F, v, line)[1])]
+    }
+    if name == "fract" {
+      let fl = sh_each1(F, "cvt.rmi.f32.f32", v, line)
+      return sh_each2(F, "sub.f32", v, fl, line)
+    }
+    if name == "float" { return sh_tof(F, v, line) }
+    if name == "int" {
+      if v[0] == "i" { return v }
+      if v[0] == "b" {
+        let d = sh_ni(F)
+        em(F, "selp.s32 " ++ d ++ ", 1, 0, " ++ v[1] ++ ";\n")
+        return ["i", d]
+      }
+      let d = sh_ni(F)
+      em(F, "cvt.rzi.s32.f32 " ++ d ++ ", " ++ sh_tof(F, v, line)[1] ++ ";\n")
+      return ["i", d]
+    }
+    if name == "vec3" or name == "vec" { return sh_tov(F, v, line) }
+    if name == "tbl" {
+      if v[0] != "i" { sh_err(line, "tbl takes an integer") }
+      let d = sh_ni(F)
+      em(F, "ld.u64 %d1, [%d0+24];\nmul.wide.s32 %d2, " ++ v[1] ++ ", 4;\nadd.u64 %d1, %d1, %d2;\nld.global.s32 " ++ d ++ ", [%d1];\n")
+      return ["i", d]
+    }
+  }
+  if n == 2 {
+    let a = vs[0]
+    let b = vs[1]
+    if name == "phase" {
+      if b[0] != "i" { sh_err(line, "phase(frequency, sample number)") }
+      let f = sh_tof(F, a, line)
+      let d = sh_nf(F)
+      let rr = sh_nf(F)
+      em(F, "ld.f32 " ++ rr ++ ", [%d0+8];\ncvt.f64.f32 %x0, " ++ f[1] ++ ";\ncvt.rn.f64.s32 %x1, " ++ b[1] ++ ";\ncvt.f64.f32 %x2, " ++ rr ++ ";\nmul.f64 %x0, %x0, %x1;\ndiv.rn.f64 %x0, %x0, %x2;\ncvt.rmi.f64.f64 %x1, %x0;\nsub.f64 %x0, %x0, %x1;\ncvt.rn.f32.f64 " ++ d ++ ", %x0;\n")
+      return ["f", d]
+    }
+    if name == "min" or name == "max" {
+      if a[0] == "i" and b[0] == "i" { return ["i", sh_ib(F, name ++ ".s32", a[1], b[1])] }
+      return sh_each2(F, name ++ ".f32", a, b, line)
+    }
+    if name == "xor" { return ["i", sh_ib(F, "xor.b32", a[1], b[1])] }
+    if name == "band" { return ["i", sh_ib(F, "and.b32", a[1], b[1])] }
+    if name == "bor" { return ["i", sh_ib(F, "or.b32", a[1], b[1])] }
+    if name == "shl" { return ["i", sh_ib(F, "shl.b32", a[1], b[1])] }
+    if name == "shr" { return ["i", sh_ib(F, "shr.u32", a[1], b[1])] }
+    if name == "dot" {
+      let x = sh_tov(F, a, line)
+      let y = sh_tov(F, b, line)
+      let d = sh_b(F, "mul.f32", x[1], y[1])
+      d = sh_fma(F, x[2], y[2], d)
+      return ["f", sh_fma(F, x[3], y[3], d)]
+    }
+    if name == "cross" {
+      let x = sh_tov(F, a, line)
+      let y = sh_tov(F, b, line)
+      let cx = sh_b(F, "sub.f32", sh_b(F, "mul.f32", x[2], y[3]), sh_b(F, "mul.f32", x[3], y[2]))
+      let cy = sh_b(F, "sub.f32", sh_b(F, "mul.f32", x[3], y[1]), sh_b(F, "mul.f32", x[1], y[3]))
+      let cz = sh_b(F, "sub.f32", sh_b(F, "mul.f32", x[1], y[2]), sh_b(F, "mul.f32", x[2], y[1]))
+      return ["v", cx, cy, cz]
+    }
+  }
+  if n == 3 and (name == "vec3" or name == "vec") {
+    let x = sh_tof(F, vs[0], line)
+    let y = sh_tof(F, vs[1], line)
+    let z = sh_tof(F, vs[2], line)
+    return ["v", x[1], y[1], z[1]]
+  }
+  if n == 0 {
+    if name == "rnd" or name == "random" { return sh_rnd(F) }
+    if name == "time" { return sh_load_f(F, 4) }
+    if name == "width" { return sh_load_f(F, 8) }
+    if name == "height" { return sh_load_f(F, 12) }
+    if name == "frame" {
+      let d = sh_ni(F)
+      em(F, "ld.s32 " ++ d ++ ", [%d0+16];\n")
+      return ["i", d]
+    }
+  }
+  return null
+}
+
+# ---- calls: each combination of argument types of a skill is compiled once -----------------------------------------
+skill sh_mangle(name, ts) -> Any { return "f_" ++ name ++ "_" ++ join(ts, "") }
+
+skill sh_callv(C, F, name, vs, line) -> Any {
+  let d = rt_sh_get(C["fns"])[name]
+  if d == null {
+    let r = sh_builtin(C, F, name, vs, line)
+    if r != null { return r }
+    sh_err(line, "there is no skill called " ++ name ++ " taking " ++ str(len(vs)) ++ " arguments")
+  }
+  if len(d[0]) != len(vs) {
+    if line > 1000000 {
+      let o = rt_sh_get(C["lib"])[name]
+      sh_err(line, "your skill " ++ name ++ " takes " ++ str(len(d[0])) ++ " arguments, but the renderer calls it with " ++ str(len(vs)) ++ (if o != null { ": it must be " ++ name ++ "(" ++ join(o[0], ", ") ++ ")" } else { "" }))
+    }
+    sh_err(line, name ++ " takes " ++ str(len(d[0])) ++ " arguments, given " ++ str(len(vs)))
+  }
+  let ts = map(vs, fn(v) => v[0])
+  let rt = sh_compile_fn(C, name, ts, line)
+  let fname = sh_mangle(name, ts)
+  em(F, "{\n.param .u64 c0;\nst.param.u64 [c0], %d0;\n")
+  let args = "c0"
+  let k = 1
+  for v in vs {
+    if v[0] == "f" or v[0] == "i" {
+      let ty = if v[0] == "f" { "f32" } else { "s32" }
+      em(F, ".param ." ++ ty ++ " c" ++ str(k) ++ ";\nst.param." ++ ty ++ " [c" ++ str(k) ++ "], " ++ v[1] ++ ";\n")
+      args = args ++ ", c" ++ str(k)
+      k += 1
+    } else if v[0] == "b" {
+      let t = sh_ni(F)
+      em(F, "selp.s32 " ++ t ++ ", 1, 0, " ++ v[1] ++ ";\n.param .s32 c" ++ str(k) ++ ";\nst.param.s32 [c" ++ str(k) ++ "], " ++ t ++ ";\n")
+      args = args ++ ", c" ++ str(k)
+      k += 1
+    } else if v[0] == "v" {
+      for j in [1, 2, 3] {
+        em(F, ".param .f32 c" ++ str(k) ++ ";\nst.param.f32 [c" ++ str(k) ++ "], " ++ v[j] ++ ";\n")
+        args = args ++ ", c" ++ str(k)
+        k += 1
+      }
+    } else {
+      sh_err(line, "an argument of " ++ name ++ " gives no value")
+    }
+  }
+  let out = ["n"]
+  if rt == "n" {
+    em(F, "call.uni " ++ fname ++ ", (" ++ args ++ ");\n}\n")
+    return out
+  }
+  em(F, ".param .align 4 .b8 r[" ++ str(if rt == "v" { 12 } else { 4 }) ++ "];\ncall.uni (r), " ++ fname ++ ", (" ++ args ++ ");\n")
+  if rt == "f" {
+    let d0 = sh_nf(F)
+    em(F, "ld.param.f32 " ++ d0 ++ ", [r];\n")
+    out = ["f", d0]
+  } else if rt == "i" or rt == "b" {
+    let d0 = sh_ni(F)
+    em(F, "ld.param.s32 " ++ d0 ++ ", [r];\n")
+    out = ["i", d0]
+  } else {
+    let x = sh_nf(F)
+    let y = sh_nf(F)
+    let z = sh_nf(F)
+    em(F, "ld.param.f32 " ++ x ++ ", [r];\nld.param.f32 " ++ y ++ ", [r+4];\nld.param.f32 " ++ z ++ ", [r+8];\n")
+    out = ["v", x, y, z]
+  }
+  em(F, "}\n")
+  if rt == "b" {
+    let p = sh_np(F)
+    em(F, "setp.ne.s32 " ++ p ++ ", " ++ out[1] ++ ", 0;\n")
+    return ["b", p]
+  }
+  return out
+}
+
+skill sh_expr(C, F, e) -> Any {
+  let t = e[0]
+  if t == "num" {
+    let s = e[1]
+    let isreal = false
+    for c in chars(s) {
+      if c == "." or c == "e" or c == "E" { isreal = true }
+    }
+    if isreal {
+      let d = sh_nf(F)
+      em(F, "mov.f32 " ++ d ++ ", " ++ sh_f32(sh_real(s)) ++ ";\n")
+      return ["f", d]
+    }
+    let d = sh_ni(F)
+    em(F, "mov.s32 " ++ d ++ ", " ++ s ++ ";\n")
+    return ["i", d]
+  }
+  if t == "id" {
+    let nm = e[1]
+    let v = rt_sh_get(F["vars"])[nm]
+    if v != null { return v }
+    let k = rt_sh_get(C["consts"])[nm]
+    if k != null { return sh_expr(C, F, k) }
+    if contains(["time", "width", "height", "frame"], nm) { return sh_builtin(C, F, nm, [], e[2]) }
+    if nm == "rate" { return sh_load_f(F, 8) }
+    sh_err(e[2], "nothing called " ++ nm ++ " has been given a value")
+  }
+  if t == "bool" {
+    let z = sh_ni(F)
+    let p = sh_np(F)
+    em(F, "mov.s32 " ++ z ++ ", 0;\nsetp.eq.s32 " ++ p ++ ", " ++ z ++ ", " ++ (if e[1] { "0" } else { "1" }) ++ ";\n")
+    return ["b", p]
+  }
+  if t == "bin" {
+    let a = sh_expr(C, F, e[2])
+    let b = sh_expr(C, F, e[3])
+    return sh_bin(C, F, e[1], a, b, e[4])
+  }
+  if t == "neg" {
+    let a = sh_expr(C, F, e[1])
+    if a[0] == "i" { return ["i", sh_ii(F, "neg.s32", a[1])] }
+    return sh_each1(F, "neg.f32", a, e[2])
+  }
+  if t == "not" {
+    let a = sh_truth(F, sh_expr(C, F, e[1]), e[2])
+    let p = sh_np(F)
+    em(F, "not.pred " ++ p ++ ", " ++ a[1] ++ ";\n")
+    return ["b", p]
+  }
+  if t == "vec" {
+    let x = sh_tof(F, sh_expr(C, F, e[1]), e[4])
+    let y = sh_tof(F, sh_expr(C, F, e[2]), e[4])
+    let z = sh_tof(F, sh_expr(C, F, e[3]), e[4])
+    return ["v", x[1], y[1], z[1]]
+  }
+  if t == "mem" {
+    let a = sh_expr(C, F, e[1])
+    let m = e[2]
+    let k = if m == "x" or m == "r" { 1 } else if m == "y" or m == "g" { 2 } else if m == "z" or m == "b" { 3 } else { 0 }
+    if m == "xyz" or m == "rgb" { return a }
+    if k == 0 { sh_err(e[3], "a vector has x y z (or r g b), not " ++ m) }
+    if a[0] == "v" { return ["f", a[k]] }
+    if a[0] == "f" or a[0] == "i" {
+      if k == 1 { return a }
+      let d = sh_nf(F)
+      em(F, "mov.f32 " ++ d ++ ", 0f00000000;\n")
+      return ["f", d]
+    }
+    sh_err(e[3], "a truth has no parts")
+  }
+  if t == "call" {
+    let vs = []
+    for a in e[2] { vs = append(vs, sh_expr(C, F, a)) }
+    return sh_callv(C, F, e[1], vs, e[3])
+  }
+  if t == "ifx" {
+    let p = sh_truth(F, sh_expr(C, F, e[1]), e[4])
+    let le = sh_nl(F)
+    let lz = sh_nl(F)
+    let tag = "?" ++ str(e[4]) ++ "_" ++ str(sh_nk(F))
+    em(F, "@!" ++ p[1] ++ " bra " ++ le ++ ";\n")
+    let a = sh_block_v(C, F, e[2], e[4])
+    let want = rt_sh_get(F["force"])[tag]
+    let rtype = if want != null { want } else { a[0] }
+    if sh_rank(rtype) < sh_rank(a[0]) { rtype = a[0] }
+    let d = sh_newvar(F, rtype)
+    sh_mov(F, d, sh_as(F, a, rtype, e[4]))
+    em(F, "bra " ++ lz ++ ";\n" ++ le ++ ":\n")
+    let b = sh_block_v(C, F, e[3], e[4])
+    if sh_rank(b[0]) > sh_rank(rtype) {
+      rt_sh_set(F["force"], put(rt_sh_get(F["force"]), tag, b[0]))
+      aset(F["again"], 0, 1)
+    } else {
+      sh_mov(F, d, sh_as(F, b, rtype, e[4]))
+    }
+    em(F, lz ++ ":\n")
+    return d
+  }
+  sh_err(0, "cannot compile " ++ str(t))
+  return null
+}
+
+# a block that ends in an expression -> its value
+skill sh_block_v(C, F, ss, line) -> Any {
+  let n = len(ss)
+  if n > 0 and ss[n - 1][0] == "if" and len(ss[n - 1][3]) > 0 {
+    // the last thing is itself an if with two sides: it is the value
+    let s = ss[n - 1]
+    sh_stmts(C, F, slice(ss, 0, n - 1))
+    return sh_expr(C, F, ["ifx", s[1], s[2], s[3], s[4]])
+  }
+  if n == 0 or ss[n - 1][0] != "expr" { sh_err(line, "each side of an if used as a value must end in a value") }
+  sh_stmts(C, F, slice(ss, 0, n - 1))
+  return sh_expr(C, F, ss[n - 1][1])
+}
+
+skill sh_stmts(C, F, ss) -> Any {
+  for s in ss { sh_stmt_gen(C, F, s) }
+  return 0
+}
+
+skill sh_stmt_gen(C, F, s) -> Any {
+  let t = s[0]
+  if t == "let" {
+    let nm = s[1]
+    let line = s[3]
+    let v = sh_expr(C, F, s[2])
+    if v[0] == "n" { sh_err(line, "this gives no value") }
+    let vars = rt_sh_get(F["vars"])
+    let cur = vars[nm]
+    let want = rt_sh_get(F["force"])[nm]
+    if cur == null {
+      let ty = v[0]
+      if want != null and sh_rank(want) > sh_rank(ty) { ty = want }
+      let d = sh_newvar(F, ty)
+      sh_mov(F, d, sh_as(F, v, ty, line))
+      rt_sh_set(F["vars"], put(vars, nm, d))
+      return 0
+    }
+    if cur[0] == v[0] or sh_rank(v[0]) < sh_rank(cur[0]) {
+      if cur[0] != v[0] and (cur[0] == "b" or v[0] == "b") { sh_err(line, nm ++ " was " ++ sh_tname(cur[0]) ++ " and cannot become " ++ sh_tname(v[0])) }
+      sh_mov(F, cur, sh_as(F, v, cur[0], line))
+      return 0
+    }
+    if sh_rank(cur[0]) == 0 or sh_rank(v[0]) == 0 { sh_err(line, nm ++ " was " ++ sh_tname(cur[0]) ++ " and cannot become " ++ sh_tname(v[0])) }
+    // a wider value than the variable has been: the whole skill is compiled again with the variable that wide
+    rt_sh_set(F["force"], put(rt_sh_get(F["force"]), nm, v[0]))
+    aset(F["again"], 0, 1)
+    return 0
+  }
+  if t == "setm" {
+    let cur = rt_sh_get(F["vars"])[s[1]]
+    if cur == null { sh_err(s[4], "nothing called " ++ s[1] ++ " has been given a value") }
+    if cur[0] != "v" { sh_err(s[4], s[1] ++ " is " ++ sh_tname(cur[0]) ++ ", which has no parts") }
+    let m = s[2]
+    let k = if m == "x" or m == "r" { 1 } else if m == "y" or m == "g" { 2 } else if m == "z" or m == "b" { 3 } else { 0 }
+    if k == 0 { sh_err(s[4], "a vector has x y z (or r g b), not " ++ m) }
+    let v = sh_tof(F, sh_expr(C, F, s[3]), s[4])
+    em(F, "mov.f32 " ++ cur[k] ++ ", " ++ v[1] ++ ";\n")
+    return 0
+  }
+  if t == "expr" {
+    sh_expr(C, F, s[1])
+    return 0
+  }
+  if t == "if" {
+    let p = sh_truth(F, sh_expr(C, F, s[1]), s[4])
+    let le = sh_nl(F)
+    em(F, "@!" ++ p[1] ++ " bra " ++ le ++ ";\n")
+    sh_stmts(C, F, s[2])
+    if len(s[3]) > 0 {
+      let lz = sh_nl(F)
+      em(F, "bra " ++ lz ++ ";\n" ++ le ++ ":\n")
+      sh_stmts(C, F, s[3])
+      em(F, lz ++ ":\n")
+    } else {
+      em(F, le ++ ":\n")
+    }
+    return 0
+  }
+  if t == "while" {
+    let top = sh_nl(F)
+    let end = sh_nl(F)
+    em(F, top ++ ":\n")
+    let p = sh_truth(F, sh_expr(C, F, s[1]), s[3])
+    em(F, "@!" ++ p[1] ++ " bra " ++ end ++ ";\n")
+    let keep = rt_sh_get(F["loop"])
+    rt_sh_set(F["loop"], [top, end])
+    sh_stmts(C, F, s[2])
+    rt_sh_set(F["loop"], keep)
+    em(F, "bra " ++ top ++ ";\n" ++ end ++ ":\n")
+    return 0
+  }
+  if t == "for" {
+    let line = s[5]
+    let a = sh_expr(C, F, s[2])
+    let b = sh_expr(C, F, s[3])
+    if a[0] != "i" or b[0] != "i" { sh_err(line, "range counts in integers") }
+    let bound = sh_newvar(F, "i")
+    sh_mov(F, bound, b)
+    let vars = rt_sh_get(F["vars"])
+    let v = vars[s[1]]
+    if v == null or v[0] != "i" {
+      v = sh_newvar(F, "i")
+      rt_sh_set(F["vars"], put(vars, s[1], v))
+    }
+    sh_mov(F, v, a)
+    let top = sh_nl(F)
+    let cont = sh_nl(F)
+    let end = sh_nl(F)
+    let p = sh_np(F)
+    em(F, top ++ ":\nsetp.ge.s32 " ++ p ++ ", " ++ v[1] ++ ", " ++ bound[1] ++ ";\n@" ++ p ++ " bra " ++ end ++ ";\n")
+    let keep = rt_sh_get(F["loop"])
+    rt_sh_set(F["loop"], [cont, end])
+    sh_stmts(C, F, s[4])
+    rt_sh_set(F["loop"], keep)
+    em(F, cont ++ ":\nadd.s32 " ++ v[1] ++ ", " ++ v[1] ++ ", 1;\nbra " ++ top ++ ";\n" ++ end ++ ":\n")
+    return 0
+  }
+  if t == "break" or t == "continue" {
+    let lp = rt_sh_get(F["loop"])
+    if lp == null { sh_err(s[1], t ++ " outside a loop") }
+    em(F, "bra " ++ (if t == "break" { lp[1] } else { lp[0] }) ++ ";\n")
+    return 0
+  }
+  if t == "ret" {
+    if s[1] == null {
+      em(F, "ret;\n")
+      return 0
+    }
+    let v = sh_expr(C, F, s[1])
+    let line = s[2]
+    if v[0] == "n" { sh_err(line, "this returns nothing") }
+    let cur = rt_sh_get(F["rett"])
+    let want = rt_sh_get(F["force"])["<ret>"]
+    let ty = cur
+    if ty == null {
+      ty = if want != null and sh_rank(want) > sh_rank(v[0]) { want } else { v[0] }
+      rt_sh_set(F["rett"], ty)
+    }
+    if sh_rank(v[0]) > sh_rank(ty) {
+      rt_sh_set(F["force"], put(rt_sh_get(F["force"]), "<ret>", v[0]))
+      aset(F["again"], 0, 1)
+      return 0
+    }
+    if ty != v[0] and (ty == "b" or v[0] == "b") { sh_err(line, "this skill returned " ++ sh_tname(ty) ++ " earlier, and " ++ sh_tname(v[0]) ++ " here") }
+    let x = sh_as(F, v, ty, line)
+    if ty == "v" {
+      em(F, "st.param.f32 [func_retval0], " ++ x[1] ++ ";\nst.param.f32 [func_retval0+4], " ++ x[2] ++ ";\nst.param.f32 [func_retval0+8], " ++ x[3] ++ ";\n")
+    } else if ty == "f" {
+      em(F, "st.param.f32 [func_retval0], " ++ x[1] ++ ";\n")
+    } else if ty == "i" {
+      em(F, "st.param.s32 [func_retval0], " ++ x[1] ++ ";\n")
+    } else {
+      let t2 = sh_ni(F)
+      em(F, "selp.s32 " ++ t2 ++ ", 1, 0, " ++ x[1] ++ ";\nst.param.s32 [func_retval0], " ++ t2 ++ ";\n")
+    }
+    em(F, "ret;\n")
+    return 0
+  }
+  sh_err(0, "cannot compile the statement " ++ str(t))
+  return 0
+}
+
+skill sh_regs(n) -> Any {
+  let nf = aget(n, 0) + 1
+  let ni = aget(n, 1) + 1
+  let np = aget(n, 2) + 1
+  return ".reg .f32 %f<" ++ str(nf) ++ ">;\n.reg .s32 %i<" ++ str(ni) ++ ">;\n.reg .pred %p<" ++ str(np) ++ ">;\n.reg .u64 %d<3>;\n.reg .f64 %x<3>;\n"
+}
+
+# name with these argument types: compiled unless it already is -> its return type
+skill sh_compile_fn(C, name, ts, line) -> Any {
+  let fname = sh_mangle(name, ts)
+  let seen = rt_sh_get(C["spec"])[fname]
+  if seen == "?" { sh_err(line, name ++ " calls itself: skills on the GPU cannot be recursive") }
+  if seen != null { return seen }
+  rt_sh_set(C["spec"], put(rt_sh_get(C["spec"]), fname, "?"))
+  let d = rt_sh_get(C["fns"])[name]
+  let force = rt_sh_box({})
+  let done = false
+  let F = null
+  while not done {
+    F = {"code": rt_sh_box([]), "n": arr(5), "vars": rt_sh_box({}), "force": force, "again": arr(1), "loop": rt_sh_box(null), "rett": rt_sh_box(null)}
+    em(F, "ld.param.u64 %d0, [a0];\n")
+    let k = 1
+    let i = 0
+    for pn in d[0] {
+      let ty = ts[i]
+      let want = rt_sh_get(force)[pn]
+      if ty == "f" or ty == "i" {
+        let r = if ty == "f" { sh_nf(F) } else { sh_ni(F) }
+        let tn = if ty == "f" { "f32" } else { "s32" }
+        em(F, "ld.param." ++ tn ++ " " ++ r ++ ", [a" ++ str(k) ++ "];\n")
+        k += 1
+        let v = [ty, r]
+        if want != null and sh_rank(want) > sh_rank(ty) {
+          let dv = sh_newvar(F, want)
+          sh_mov(F, dv, sh_as(F, v, want, line))
+          v = dv
+        }
+        rt_sh_set(F["vars"], put(rt_sh_get(F["vars"]), pn, v))
+      } else if ty == "b" {
+        let r = sh_ni(F)
+        let p = sh_np(F)
+        em(F, "ld.param.s32 " ++ r ++ ", [a" ++ str(k) ++ "];\nsetp.ne.s32 " ++ p ++ ", " ++ r ++ ", 0;\n")
+        k += 1
+        rt_sh_set(F["vars"], put(rt_sh_get(F["vars"]), pn, ["b", p]))
+      } else {
+        let x = sh_nf(F)
+        let y = sh_nf(F)
+        let z = sh_nf(F)
+        em(F, "ld.param.f32 " ++ x ++ ", [a" ++ str(k) ++ "];\nld.param.f32 " ++ y ++ ", [a" ++ str(k + 1) ++ "];\nld.param.f32 " ++ z ++ ", [a" ++ str(k + 2) ++ "];\n")
+        k += 3
+        rt_sh_set(F["vars"], put(rt_sh_get(F["vars"]), pn, ["v", x, y, z]))
+      }
+      i += 1
+    }
+    sh_stmts(C, F, d[1])
+    done = aget(F["again"], 0) == 0
+  }
+  let rt = rt_sh_get(F["rett"])
+  if rt == null { rt = "n" }
+  let ps = ".param .u64 a0"
+  let k = 1
+  for ty in ts {
+    if ty == "f" {
+      ps = ps ++ ", .param .f32 a" ++ str(k)
+      k += 1
+    } else if ty == "v" {
+      ps = ps ++ ", .param .f32 a" ++ str(k) ++ ", .param .f32 a" ++ str(k + 1) ++ ", .param .f32 a" ++ str(k + 2)
+      k += 3
+    } else {
+      ps = ps ++ ", .param .s32 a" ++ str(k)
+      k += 1
+    }
+  }
+  let head = ".func " ++ (if rt == "n" { "" } else { "(.param .align 4 .b8 func_retval0[" ++ str(if rt == "v" { 12 } else { 4 }) ++ "]) " }) ++ fname ++ " (" ++ ps ++ ")"
+  rt_sh_set(C["decls"], append(rt_sh_get(C["decls"]), head ++ ";\n"))
+  rt_sh_set(C["defs"], append(rt_sh_get(C["defs"]), head ++ "\n{\n" ++ sh_regs(F["n"]) ++ join(rt_sh_get(F["code"]), "") ++ "ret;\n}\n"))
+  rt_sh_set(C["spec"], put(rt_sh_get(C["spec"]), fname, rt))
+  return rt
+}
+
+# ---- the kernels ----------------------------------------------------------------------------------------------------
+# pi_render: one sample of pixel(x, y) in every thread of a tile, added into the float picture
+# pi_tone: the picture averaged and through tonemap(c), dithered, as 3 bytes a pixel
+skill sh_kernels() -> Any {
+  let render = ".entry pi_render (.param .u64 pfb, .param .u32 pw, .param .u32 ph, .param .u32 px0, .param .u32 py0, .param .u32 ptw, .param .u32 pth, .param .u32 pframe, .param .u32 pus, .param .u32 pshut, .param .u32 pbs)
+{
+.reg .u32 %u<24>;
+.reg .u64 %d<8>;
+.reg .f32 %f<12>;
+.reg .pred %p<4>;
+.local .align 4 .b8 lstate[32];
+ld.param.u32 %u0, [ptw];
+ld.param.u32 %u1, [pth];
+ld.param.u32 %u2, [pbs];
+mov.u32 %u3, %ctaid.x;
+mov.u32 %u4, %tid.x;
+mul.lo.u32 %u3, %u3, %u2;
+add.u32 %u3, %u3, %u4;
+mul.lo.u32 %u5, %u0, %u1;
+setp.ge.u32 %p0, %u3, %u5;
+@%p0 exit;
+rem.u32 %u6, %u3, %u0;
+div.u32 %u7, %u3, %u0;
+ld.param.u32 %u8, [px0];
+ld.param.u32 %u9, [py0];
+add.u32 %u6, %u6, %u8;
+add.u32 %u7, %u7, %u9;
+ld.param.u32 %u10, [pframe];
+shl.b32 %u11, %u7, 13;
+add.u32 %u11, %u11, %u6;
+mul.lo.u32 %u12, %u10, 2654435769;
+xor.b32 %u11, %u11, %u12;
+xor.b32 %u12, %u11, 61;
+shr.u32 %u13, %u11, 16;
+xor.b32 %u11, %u12, %u13;
+mul.lo.u32 %u11, %u11, 9;
+shr.u32 %u13, %u11, 4;
+xor.b32 %u11, %u11, %u13;
+mul.lo.u32 %u11, %u11, 668265261;
+shr.u32 %u13, %u11, 15;
+xor.b32 %u11, %u11, %u13;
+mov.u64 %d0, lstate;
+cvta.local.u64 %d1, %d0;
+st.u32 [%d1], %u11;
+ld.param.u32 %u14, [pus];
+ld.param.u32 %u18, [pshut];
+cvt.rn.f32.u32 %f0, %u14;
+cvt.rn.f32.u32 %f10, %u18;
+shr.u32 %u19, %u11, 8;
+cvt.rn.f32.u32 %f11, %u19;
+mul.f32 %f11, %f11, 0f33800000;
+mul.f32 %f10, %f10, %f11;
+add.f32 %f0, %f0, %f10;
+mul.f32 %f0, %f0, 0f358637BD;
+st.f32 [%d1+4], %f0;
+ld.param.u32 %u15, [pw];
+ld.param.u32 %u16, [ph];
+cvt.rn.f32.u32 %f1, %u15;
+cvt.rn.f32.u32 %f2, %u16;
+st.f32 [%d1+8], %f1;
+st.f32 [%d1+12], %f2;
+st.u32 [%d1+16], %u10;
+cvt.rn.f32.u32 %f3, %u6;
+cvt.rn.f32.u32 %f4, %u7;
+{
+.param .u64 a0;
+st.param.u64 [a0], %d1;
+.param .f32 a1;
+st.param.f32 [a1], %f3;
+.param .f32 a2;
+st.param.f32 [a2], %f4;
+.param .align 4 .b8 r[12];
+call.uni (r), f_pixel_ff, (a0, a1, a2);
+ld.param.f32 %f5, [r];
+ld.param.f32 %f6, [r+4];
+ld.param.f32 %f7, [r+8];
+}
+add.f32 %f8, %f5, %f6;
+add.f32 %f8, %f8, %f7;
+testp.finite.f32 %p1, %f8;
+@!%p1 exit;
+mul.lo.u32 %u17, %u7, %u15;
+add.u32 %u17, %u17, %u6;
+mul.wide.u32 %d2, %u17, 12;
+ld.param.u64 %d3, [pfb];
+add.u64 %d2, %d2, %d3;
+ld.global.f32 %f9, [%d2];
+add.f32 %f9, %f9, %f5;
+st.global.f32 [%d2], %f9;
+ld.global.f32 %f9, [%d2+4];
+add.f32 %f9, %f9, %f6;
+st.global.f32 [%d2+4], %f9;
+ld.global.f32 %f9, [%d2+8];
+add.f32 %f9, %f9, %f7;
+st.global.f32 [%d2+8], %f9;
+exit;
+}
+"
+  let tone = ".entry pi_tone (.param .u64 pfb, .param .u64 pout, .param .u32 pn, .param .u32 pspp, .param .u32 pbs)
+{
+.reg .u32 %u<24>;
+.reg .u64 %d<8>;
+.reg .f32 %f<16>;
+.reg .pred %p<4>;
+.local .align 4 .b8 lstate[32];
+ld.param.u32 %u0, [pn];
+ld.param.u32 %u2, [pbs];
+mov.u32 %u3, %ctaid.x;
+mov.u32 %u4, %tid.x;
+mul.lo.u32 %u3, %u3, %u2;
+add.u32 %u3, %u3, %u4;
+setp.ge.u32 %p0, %u3, %u0;
+@%p0 exit;
+mul.wide.u32 %d2, %u3, 12;
+ld.param.u64 %d3, [pfb];
+add.u64 %d2, %d2, %d3;
+ld.param.u32 %u5, [pspp];
+cvt.rn.f32.u32 %f0, %u5;
+rcp.rn.f32 %f0, %f0;
+ld.global.f32 %f1, [%d2];
+ld.global.f32 %f2, [%d2+4];
+ld.global.f32 %f3, [%d2+8];
+mul.f32 %f1, %f1, %f0;
+mul.f32 %f2, %f2, %f0;
+mul.f32 %f3, %f3, %f0;
+mul.lo.u32 %u11, %u3, 2654435769;
+mov.u64 %d0, lstate;
+cvta.local.u64 %d1, %d0;
+st.u32 [%d1], %u11;
+{
+.param .u64 a0;
+st.param.u64 [a0], %d1;
+.param .f32 a1;
+st.param.f32 [a1], %f1;
+.param .f32 a2;
+st.param.f32 [a2], %f2;
+.param .f32 a3;
+st.param.f32 [a3], %f3;
+.param .align 4 .b8 r[12];
+call.uni (r), f_tonemap_v, (a0, a1, a2, a3);
+ld.param.f32 %f4, [r];
+ld.param.f32 %f5, [r+4];
+ld.param.f32 %f6, [r+8];
+}
+mul.lo.u32 %u11, %u11, 747796405;
+shr.u32 %u12, %u11, 8;
+cvt.rn.f32.u32 %f7, %u12;
+mul.f32 %f7, %f7, 0f33800000;
+mov.f32 %f8, 0f437F0000;
+mul.f32 %f4, %f4, %f8;
+mul.f32 %f5, %f5, %f8;
+mul.f32 %f6, %f6, %f8;
+add.f32 %f4, %f4, %f7;
+add.f32 %f5, %f5, %f7;
+add.f32 %f6, %f6, %f7;
+cvt.rzi.u32.f32 %u6, %f4;
+cvt.rzi.u32.f32 %u7, %f5;
+cvt.rzi.u32.f32 %u8, %f6;
+min.u32 %u6, %u6, 255;
+min.u32 %u7, %u7, 255;
+min.u32 %u8, %u8, 255;
+mul.wide.u32 %d4, %u3, 3;
+ld.param.u64 %d5, [pout];
+add.u64 %d4, %d4, %d5;
+st.global.u8 [%d4], %u6;
+st.global.u8 [%d4+1], %u7;
+st.global.u8 [%d4+2], %u8;
+exit;
+}
+"
+  return render ++ tone
+}
+
+# source (after the library) -> the whole module's PTX
+skill sh_compile(src) -> Any {
+  let lib = sh_parse(shade_library(), {}, {}, 1000000)
+  let all = sh_parse(src, lib[0], lib[1], 0)
+  let C = {"fns": rt_sh_box(all[0]), "consts": rt_sh_box(all[1]), "spec": rt_sh_box({}), "decls": rt_sh_box([]), "defs": rt_sh_box([]), "lib": rt_sh_box(lib[0])}
+  let r1 = sh_compile_fn(C, "pixel", ["f", "f"], 0)
+  if r1 != "v" { fail("shader: pixel(x, y) must return a colour, [r, g, b]; it returns " ++ sh_tname(r1)) }
+  let r2 = sh_compile_fn(C, "tonemap", ["v"], 0)
+  if r2 != "v" { fail("shader: tonemap(c) must return a colour, [r, g, b]; it returns " ++ sh_tname(r2)) }
+  return ".version 7.0\n.target sm_80\n.address_size 64\n" ++ join(rt_sh_get(C["decls"]), "") ++ join(rt_sh_get(C["defs"]), "") ++ sh_kernels()
+}
+
+# one thread per sample s (start, start + 1 ...): name(s) -> [left, right, _], as two floats per sample at pout + s * 8.
+skill sh_sound_kernel(entry, fname) -> Any {
+  return ".entry " ++ entry ++ " (.param .u64 pout, .param .u64 ptbl, .param .u32 pstart, .param .u32 pn, .param .u32 prate, .param .u32 pbs)
+{
+.reg .u32 %u<16>;
+.reg .u64 %d<8>;
+.reg .f32 %f<8>;
+.reg .pred %p<4>;
+.local .align 8 .b8 lstate[32];
+ld.param.u32 %u0, [pn];
+ld.param.u32 %u1, [pbs];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %tid.x;
+mul.lo.u32 %u2, %u2, %u1;
+add.u32 %u2, %u2, %u3;
+setp.ge.u32 %p0, %u2, %u0;
+@%p0 exit;
+ld.param.u32 %u4, [pstart];
+add.u32 %u4, %u4, %u2;
+mul.lo.u32 %u5, %u4, 2654435769;
+mov.u64 %d0, lstate;
+cvta.local.u64 %d1, %d0;
+st.u32 [%d1], %u5;
+ld.param.u32 %u6, [prate];
+cvt.rn.f32.u32 %f0, %u6;
+st.f32 [%d1+8], %f0;
+ld.param.u64 %d2, [ptbl];
+st.u64 [%d1+24], %d2;
+{
+.param .u64 a0;
+st.param.u64 [a0], %d1;
+.param .s32 a1;
+st.param.s32 [a1], %u4;
+.param .align 4 .b8 r[12];
+call.uni (r), " ++ fname ++ ", (a0, a1);
+ld.param.f32 %f1, [r];
+ld.param.f32 %f2, [r+4];
+}
+mul.wide.u32 %d3, %u4, 8;
+ld.param.u64 %d4, [pout];
+add.u64 %d3, %d3, %d4;
+st.global.f32 [%d3], %f1;
+st.global.f32 [%d3+4], %f2;
+exit;
+}
+"
+}
+
+# the same compiler, for sound: sound(s) and impulse(s) are compiled from the library and src
+skill sh_compile_sound(src) -> Any {
+  let lib = sh_parse(shade_library(), {}, {}, 1000000)
+  let lib2 = sh_parse(sound_library(), lib[0], lib[1], 1000000)
+  let all = sh_parse(src, lib2[0], lib2[1], 0)
+  let C = {"fns": rt_sh_box(all[0]), "consts": rt_sh_box(all[1]), "spec": rt_sh_box({}), "decls": rt_sh_box([]), "defs": rt_sh_box([]), "lib": rt_sh_box(lib2[0])}
+  for nm in ["sound", "impulse"] {
+    let r = sh_compile_fn(C, nm, ["i"], 0)
+    if r != "v" { fail("shader: " ++ nm ++ "(s) must return [left, right, 0]; it returns " ++ sh_tname(r)) }
+  }
+  return ".version 7.0\n.target sm_80\n.address_size 64\n" ++ join(rt_sh_get(C["decls"]), "") ++ join(rt_sh_get(C["defs"]), "") ++ sh_sound_kernel("pi_sound", "f_sound_i") ++ sh_sound_kernel("pi_impulse", "f_impulse_i")
+}
+
+# ---- GPU code in, with what the driver said when it refuses it ---------------------------------------------------------
+skill rt_sh_module(ptx, logpath) -> Any {
+  let n = 65536
+  let log = rt_zero(rt_alloc(n), n)
+  let opts = rt_zero(rt_alloc(16), 16)
+  do rt_poke32(opts, 5)
+  do rt_poke32(opts + 4, 6)
+  let vals = rt_alloc(16)
+  do poke(vals, log)
+  do poke(vals + 8, n)
+  let mod = rt_zero(rt_alloc(8), 8)
+  let r = rt_u32(wcallp(rt_cu("cuModuleLoadDataEx"), mod, rt_cstr(ptx), 2, opts, vals))
+  if r != 0 {
+    let k = 0
+    while k < n - 1 and peekb(log + k) != 0 { let k = k + 1 }
+    let t = rt_text_new(k)
+    for i in range(0, k) { do pokeb(t + 16 + i, peekb(log + i)) }
+    do rt_write_file(logpath, t)
+    return rt_tag(0 - 300 - r)
+  }
+  return rt_tag(peek(mod))
+}
+
+# ---- PNG ------------------------------------------------------------------------------------------------------------
+skill rt_png_crc_table() -> Any {
+  let t = rt_alloc(2048)
+  for i in range(0, 256) {
+    let c = i
+    for k in range(0, 8) {
+      if band(c, 1) == 1 { let c = bxor(shr(c, 1), 3988292384) } else { let c = shr(c, 1) }
+    }
+    do poke(t + 8 * i, c)
+  }
+  return t
+}
+
+skill rt_png_crc(t, c, p, n) -> Any {
+  for i in range(0, n) { let c = bxor(peek(t + 8 * band(bxor(c, peekb(p + i)), 255)), shr(c, 8)) }
+  return c
+}
+
+skill rt_png_be32(p, v) -> Any {
+  do pokeb(p, band(shr(v, 24), 255))
+  do pokeb(p + 1, band(shr(v, 16), 255))
+  do pokeb(p + 2, band(shr(v, 8), 255))
+  do pokeb(p + 3, band(v, 255))
+  return 0
+}
+
+# a chunk at q: length, 4-byte name, the n bytes already at q + 8, its check -> the byte after it
+skill rt_png_seal(t, q, n) -> Any {
+  do rt_png_be32(q, n)
+  let c = rt_png_crc(t, 4294967295, q + 4, n + 4)
+  do rt_png_be32(q + 8 + n, bxor(c, 4294967295))
+  return q + 12 + n
+}
+
+skill rt_png_name(q, a, b, c, d) -> Any {
+  do pokeb(q + 4, a)
+  do pokeb(q + 5, b)
+  do pokeb(q + 6, c)
+  do pokeb(q + 7, d)
+  return 0
+}
+
+# ---- deflate: the filtered bytes as Huffman codes made for this very picture ----
+# Pictures that are rendered, not drawn, have almost no long repeats, so what shrinks them is the filter (each byte as
+# the difference from what its neighbours predict) and then codes that are short for the small differences.
+skill rt_png_filter(src, dst, w, h) -> Any {
+  let stride = 3 * w
+  let zero = rt_zero(rt_alloc(stride), stride)
+  for y in range(0, h) {
+    let cur = src + y * stride
+    let up = zero
+    if y > 0 { let up = cur - stride }
+    let out = dst + y * (stride + 1)
+    do pokeb(out, 4)
+    for i in range(0, stride) {
+      let a = 0
+      let c = 0
+      if i >= 3 {
+        let a = peekb(cur + i - 3)
+        let c = peekb(up + i - 3)
+      }
+      let b = peekb(up + i)
+      let p = a + b - c
+      let pa = p - a
+      if pa < 0 { let pa = 0 - pa }
+      let pb = p - b
+      if pb < 0 { let pb = 0 - pb }
+      let pc = p - c
+      if pc < 0 { let pc = 0 - pc }
+      let pr = c
+      if pb <= pc { let pr = b }
+      if pa <= pb and pa <= pc { let pr = a }
+      do pokeb(out + 1 + i, band(peekb(cur + i) + 256 - pr, 255))
+    }
+  }
+  return 0
+}
+
+# code lengths for 256 symbols + end of block, none over 15: a Huffman tree over the counts (halved until it fits)
+skill rt_png_lengths(freq, lens) -> Any {
+  let m = 257
+  let cnt = rt_alloc(8 * 257)
+  for i in range(0, m) { do poke(cnt + 8 * i, peek(freq + 8 * i)) }
+  let w = rt_alloc(8 * 514)
+  let parent = rt_alloc(8 * 514)
+  let done = 0
+  while done == 0 {
+    let n = 0
+    for i in range(0, m) {
+      do poke(lens + 8 * i, 0)
+      if peek(cnt + 8 * i) > 0 {
+        do poke(w + 8 * i, peek(cnt + 8 * i))
+        let n = n + 1
+      } else {
+        do poke(w + 8 * i, 0)
+      }
+      do poke(parent + 8 * i, 0 - 1)
+    }
+    let next = m
+    let live = n
+    while live > 1 {
+      let a = 0 - 1
+      let b = 0 - 1
+      for i in range(0, next) {
+        let v = peek(w + 8 * i)
+        if v > 0 and peek(parent + 8 * i) == 0 - 1 {
+          if a < 0 or v < peek(w + 8 * a) {
+            let b = a
+            let a = i
+          } else {
+            if b < 0 or v < peek(w + 8 * b) { let b = i }
+          }
+        }
+      }
+      do poke(w + 8 * next, peek(w + 8 * a) + peek(w + 8 * b))
+      do poke(parent + 8 * next, 0 - 1)
+      do poke(parent + 8 * a, next)
+      do poke(parent + 8 * b, next)
+      let next = next + 1
+      let live = live - 1
+    }
+    let deepest = 0
+    for i in range(0, m) {
+      if peek(cnt + 8 * i) > 0 {
+        let d = 0
+        let k = i
+        while peek(parent + 8 * k) != 0 - 1 {
+          let k = peek(parent + 8 * k)
+          let d = d + 1
+        }
+        if d == 0 { let d = 1 }
+        do poke(lens + 8 * i, d)
+        if d > deepest { let deepest = d }
+      }
+    }
+    if deepest <= 15 {
+      let done = 1
+    } else {
+      for i in range(0, m) {
+        let v = peek(cnt + 8 * i)
+        if v > 0 { do poke(cnt + 8 * i, shr(v, 1) + 1) }
+      }
+    }
+  }
+  return 0
+}
+
+# canonical codes for lens, bit-reversed as deflate sends them
+skill rt_png_codes(lens, codes, m) -> Any {
+  let bl = rt_zero(rt_alloc(8 * 17), 8 * 17)
+  for i in range(0, m) {
+    let l = peek(lens + 8 * i)
+    if l > 0 { do poke(bl + 8 * l, peek(bl + 8 * l) + 1) }
+  }
+  let nx = rt_zero(rt_alloc(8 * 17), 8 * 17)
+  let code = 0
+  for b in range(1, 16) {
+    let code = shl(code + peek(bl + 8 * (b - 1)), 1)
+    do poke(nx + 8 * b, code)
+  }
+  for i in range(0, m) {
+    let l = peek(lens + 8 * i)
+    if l > 0 {
+      let c = peek(nx + 8 * l)
+      do poke(nx + 8 * l, c + 1)
+      let r = 0
+      for k in range(0, l) {
+        let r = bor(shl(r, 1), band(c, 1))
+        let c = shr(c, 1)
+      }
+      do poke(codes + 8 * i, r)
+    }
+  }
+  return 0
+}
+
+# the bit writer: its state in memory: [write pointer, bit buffer, bits in it]
+skill rt_png_bits(bw, v, n) -> Any {
+  let buf = bor(peek(bw + 8), shl(v, peek(bw + 16)))
+  let cnt = peek(bw + 16) + n
+  let q = peek(bw)
+  while cnt >= 8 {
+    do pokeb(q, band(buf, 255))
+    let q = q + 1
+    let buf = shr(buf, 8)
+    let cnt = cnt - 8
+  }
+  do poke(bw, q)
+  do poke(bw + 8, buf)
+  do poke(bw + 16, cnt)
+  return 0
+}
+
+# RFC 1951's order of the 19 code-length symbols
+skill rt_png_order() -> Any {
+  let p = rt_alloc(8 * 19)
+  do poke(p, 16)
+  do poke(p + 8, 17)
+  do poke(p + 16, 18)
+  do poke(p + 24, 0)
+  do poke(p + 32, 8)
+  do poke(p + 40, 7)
+  do poke(p + 48, 9)
+  do poke(p + 56, 6)
+  do poke(p + 64, 10)
+  do poke(p + 72, 5)
+  do poke(p + 80, 11)
+  do poke(p + 88, 4)
+  do poke(p + 96, 12)
+  do poke(p + 104, 3)
+  do poke(p + 112, 13)
+  do poke(p + 120, 2)
+  do poke(p + 128, 14)
+  do poke(p + 136, 1)
+  do poke(p + 144, 15)
+  return p
+}
+
+# bytes src .. src + n as dynamic-Huffman blocks (a new table each 4 MB: a picture's top is not its bottom). The code
+# lengths go as a flat 4-bit code over the 16 lengths: it costs 128 bytes a block and no search.
+skill rt_png_deflate(src, n, bw) -> Any {
+  let piece = 4194304
+  let at = 0
+  let freq = rt_alloc(8 * 257)
+  let lens = rt_alloc(8 * 257)
+  let codes = rt_alloc(8 * 257)
+  let cl = rt_alloc(8 * 19)
+  let clc = rt_alloc(8 * 19)
+  let order = rt_png_order()
+  for i in range(0, 19) {
+    do poke(cl + 8 * i, 0)
+    if i < 16 { do poke(cl + 8 * i, 4) }
+  }
+  do rt_png_codes(cl, clc, 19)
+  while at < n {
+    let m = n - at
+    if m > piece { let m = piece }
+    let last = 0
+    if at + m == n { let last = 1 }
+    for i in range(0, 257) { do poke(freq + 8 * i, 0) }
+    for i in range(0, m) {
+      let b = peekb(src + at + i)
+      do poke(freq + 8 * b, peek(freq + 8 * b) + 1)
+    }
+    do poke(freq + 8 * 256, 1)
+    do rt_png_lengths(freq, lens)
+    do rt_png_codes(lens, codes, 257)
+    do rt_png_bits(bw, last, 1)
+    do rt_png_bits(bw, 2, 2)
+    do rt_png_bits(bw, 0, 5)
+    do rt_png_bits(bw, 0, 5)
+    do rt_png_bits(bw, 15, 4)
+    for i in range(0, 19) { do rt_png_bits(bw, peek(cl + 8 * peek(order + 8 * i)), 3) }
+    for i in range(0, 257) { do rt_png_bits(bw, peek(clc + 8 * peek(lens + 8 * i)), 4) }
+    # the one distance code deflate requires, unused
+    do rt_png_bits(bw, peek(clc + 8), 4)
+    for i in range(0, m) {
+      let b = peekb(src + at + i)
+      do rt_png_bits(bw, peek(codes + 8 * b), peek(lens + 8 * b))
+    }
+    do rt_png_bits(bw, peek(codes + 8 * 256), peek(lens + 8 * 256))
+    let at = at + m
+  }
+  if peek(bw + 16) > 0 { do rt_png_bits(bw, 0, 8 - peek(bw + 16)) }
+  return 0
+}
+
+# w x h pixels of 3 bytes at host memory src -> path, a real compressed PNG -> its size in bytes, 0 on failure
+skill rt_png_write(patht, srct, wt, ht) -> Any {
+  let src = rt_untag(srct)
+  let w = rt_untag(wt)
+  let h = rt_untag(ht)
+  let raw = (3 * w + 1) * h
+  let fil = rt_alloc(raw)
+  do rt_png_filter(src, fil, w, h)
+  let cap = raw + raw // 8 + 65536
+  let out = rt_alloc(cap)
+  let t = rt_png_crc_table()
+  let q = out
+  do pokeb(q, 137)
+  do pokeb(q + 1, 80)
+  do pokeb(q + 2, 78)
+  do pokeb(q + 3, 71)
+  do pokeb(q + 4, 13)
+  do pokeb(q + 5, 10)
+  do pokeb(q + 6, 26)
+  do pokeb(q + 7, 10)
+  let q = q + 8
+  do rt_png_name(q, 73, 72, 68, 82)
+  do rt_png_be32(q + 8, w)
+  do rt_png_be32(q + 12, h)
+  do pokeb(q + 16, 8)
+  do pokeb(q + 17, 2)
+  do pokeb(q + 18, 0)
+  do pokeb(q + 19, 0)
+  do pokeb(q + 20, 0)
+  let q = rt_png_seal(t, q, 13)
+  do rt_png_name(q, 73, 68, 65, 84)
+  let d = q + 8
+  do pokeb(d, 120)
+  do pokeb(d + 1, 1)
+  let bw = rt_zero(rt_alloc(24), 24)
+  do poke(bw, d + 2)
+  do rt_png_deflate(fil, raw, bw)
+  let e = peek(bw)
+  let s1 = 1
+  let s2 = 0
+  for i in range(0, raw) {
+    let s1 = s1 + peekb(fil + i)
+    if s1 >= 65521 { let s1 = s1 - 65521 }
+    let s2 = s2 + s1
+    if s2 >= 65521 { let s2 = s2 - 65521 }
+  }
+  do rt_png_be32(e, s2 * 65536 + s1)
+  let e = e + 4
+  let q = rt_png_seal(t, q, e - d)
+  do rt_png_name(q, 73, 69, 78, 68)
+  let q = rt_png_seal(t, q, 0)
+  let hd = wcall("CreateFileA", rt_cstr(patht), 1073741824, 0, 0, 2, 128, 0)
+  if hd == 0 - 1 { return rt_tag(0) }
+  do wcall("WriteFile", hd, out, q - out, gaddr(2), 0)
+  do wcall("CloseHandle", hd)
+  return rt_tag(q - out)
+}
+
+# ---- rendering --------------------------------------------------------------------------------------------------------
+# the scene compiled and on the GPU, with its picture memory -> everything the steps below need
+skill sh_open(src, w, h) -> Any {
+  let t0 = ticks()
+  let ptx = sh_compile(src)
+  write_file("out\\shade_last.ptx", ptx)
+  let t1 = ticks()
+  let rc = rt_gpu_open()
+  if rc != 1 { fail("the GPU could not be opened: " ++ str(rc)) }
+  let mod = rt_sh_module(ptx, "out\\shade_log.txt")
+  if mod < 0 { fail("the driver refused the GPU code (" ++ str(mod) ++ "): " ++ read_file("out\\shade_log.txt")) }
+  let kr = rt_gpu_fn(mod, "pi_render")
+  let kt = rt_gpu_fn(mod, "pi_tone")
+  if kr < 0 or kt < 0 { fail("the kernels are missing from the module") }
+  print("compiled in " ++ str(t1 - t0) ++ " ms, loaded by the driver in " ++ str(ticks() - t1) ++ " ms")
+  let fb = rt_gpu_alloc(12 * w * h)
+  let bytes = rt_gpu_alloc(3 * w * h)
+  if fb < 0 or bytes < 0 { fail("not enough GPU memory for a " ++ str(w) ++ " x " ++ str(h) ++ " picture") }
+  // the tile size is kept between frames
+  let tile = arr(1)
+  aset(tile, 0, 64)
+  return {"kr": kr, "kt": kt, "fb": fb, "bytes": bytes, "w": w, "h": h, "tile": tile}
+}
+
+# spp samples of the moment us (microseconds), the shutter open for shut more; seed makes each frame's noise its own.
+# Each launch is kept short (the tile shrinks if it is not), so the desktop this same GPU draws stays responsive.
+skill sh_frame(S, us, shut, spp, seed, report) -> Any {
+  let w = S["w"]
+  let h = S["h"]
+  let kr = S["kr"]
+  let fb = S["fb"]
+  let tile = aget(S["tile"], 0)
+  let bs = 256
+  rt_gpu_zero(fb, 12 * w * h)
+  let u0 = rt_usec()
+  let last = ticks()
+  for s in range(0, spp) {
+    let y = 0
+    while y < h {
+      let th = min(tile, h - y)
+      let x = 0
+      while x < w {
+        let tw = min(tile, w - x)
+        let u = rt_usec()
+        let rr = rt_gpu_launch(kr, (tw * th + bs - 1) // bs, bs, [fb, w, h, x, y, tw, th, seed + s, us, shut, bs])
+        if rr != 0 { fail("a launch failed: " ++ str(rr)) }
+        let took = rt_usec() - u
+        // longer than 60 ms stutters the desktop; under 15 ms wastes launches
+        if took > 60000 and tile > 16 { tile = tile // 2 }
+        if took < 15000 and tile < 512 { tile = tile * 2 }
+        x += tw
+      }
+      y += th
+    }
+    if report and ticks() - last > 5000 {
+      last = ticks()
+      print("  sample " ++ str(s + 1) ++ " of " ++ str(spp) ++ ", " ++ str((rt_usec() - u0) // 1000000) ++ " s")
+    }
+  }
+  aset(S["tile"], 0, tile)
+  return rt_usec() - u0
+}
+
+# the accumulated light as displayable bytes
+skill sh_tone(S, spp) -> Any {
+  let n = S["w"] * S["h"]
+  let bs = 256
+  let tr = rt_gpu_launch(S["kt"], (n + bs - 1) // bs, bs, [S["fb"], S["bytes"], n, spp, bs])
+  if tr != 0 { fail("the tone pass failed: " ++ str(tr)) }
+  return 0
+}
+
+# [mean brightness, % near black, % near white] of n pixels of 3 bytes
+skill rt_img_stats(ht, nt) -> Any {
+  let p = rt_untag(ht)
+  let n = rt_untag(nt) * 3
+  let sum = 0
+  let black = 0
+  let white = 0
+  for i in range(0, n) {
+    let v = peekb(p + i)
+    let sum = sum + v
+    if v < 8 { let black = black + 1 }
+    if v > 247 { let white = white + 1 }
+  }
+  let r = rt_list_new(0)
+  let r = rt_append(r, rt_tag(sum * 100 // (255 * n)))
+  let r = rt_append(r, rt_tag(black * 100 // n))
+  return rt_append(r, rt_tag(white * 100 // n))
+}
+
+# scene (source text), w x h, samples a pixel -> a PNG
+skill sh_render(src, w, h, spp, path) -> Any {
+  let S = sh_open(src, w, h)
+  let us = sh_frame(S, 0, 0, spp, 0, true)
+  print("rendered " ++ str(w) ++ " x " ++ str(h) ++ " at " ++ str(spp) ++ " samples in " ++ str(us // 1000) ++ " ms (" ++ str(w * h * spp // max(1, us // 1000)) ++ " thousand samples/s)")
+  let u1 = rt_usec()
+  sh_tone(S, spp)
+  let n = w * h
+  let host = rt_host_alloc(3 * n)
+  if host < 0 { fail("not enough memory for the picture") }
+  rt_gpu_to_host(host, S["bytes"], 3 * n)
+  let size = rt_png_write(path, host, w, h)
+  print("wrote " ++ path ++ ", " ++ str(size) ++ " bytes, in " ++ str((rt_usec() - u1) // 1000) ++ " ms")
+  let st = rt_img_stats(host, n)
+  print("the picture: brightness " ++ str(st[0]) ++ "%, " ++ str(st[1]) ++ "% near black, " ++ str(st[2]) ++ "% near white")
+  rt_gpu_free(S["fb"])
+  rt_gpu_free(S["bytes"])
+  rt_host_free(host)
+  return size
+}

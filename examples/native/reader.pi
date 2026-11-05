@@ -1,0 +1,185 @@
+# Pi teaches itself to READ, at scale, from its own aligned data (data\pairs\wikipedia_pairs.jsonl: each Wikidata fact
+# with the Wikipedia sentence that states it). For every fact Pi opens the subject's WHOLE local article and learns,
+# by counting (no gradients, no web), per relation:
+#   1. which sentence states it -- the aligned sentence is the positive, every other sentence of the article a
+#      negative: word stems, paragraph and sentence position, whether the subject is named
+#   2. where the answer sits in that sentence -- grammar step 3's slots (out\slots.txt)
+# Test, end to end on held-out facts from other articles (offset 1 GB on): given only the subject's article and the
+# relation, pick the answer among all names and years of the article.
+#   out\reader.exe [train facts] [test facts]
+import "readerlib.pi"
+
+# raw counts of a table -> text ("totals" 4 lines, then "key pos neg" for every used slot)
+skill dump_counts(t, nrel) -> Any {
+  let head = []
+  for q in range(4, 8) {
+    let xs = []
+    for ri in range(0, nrel) { let xs = append(xs, str(aget(t[q], ri))) }
+    let head = append(head, join(xs, " "))
+  }
+  let blocks = [join(head, "\n")]
+  let i = 0
+  while i < t[3] {
+    let m = mark()
+    let lines = []
+    let e = i + 65536
+    while i < e {
+      if aget(t[0], i) != 0 { let lines = append(lines, str(aget(t[0], i)) ++ " " ++ str(aget(t[1], i)) ++ " " ++ str(aget(t[2], i))) }
+      let i = i + 1
+    }
+    let keep = release(m, join(lines, "\n"))
+    if len(keep) > 0 { let blocks = append(blocks, keep) }
+  }
+  return join(blocks, "\n")
+}
+
+skill add_counts(t, txt, nrel) -> Any {
+  let ls = split(txt, "\n")
+  for q in range(0, 4) {
+    let xs = split(ls[q], " ")
+    for ri in range(0, nrel) { do aset(t[4 + q], ri, aget(t[4 + q], ri) + rd_int(xs[ri])) }
+  }
+  let i = 4
+  while i < len(ls) {
+    let m = mark()
+    let p = split(ls[i], " ")
+    if len(p) == 3 {
+      let key = rd_int(p[0])
+      let s = key % t[3]
+      while aget(t[0], s) != 0 and aget(t[0], s) != key { let s = (s + 1) % t[3] }
+      do aset(t[0], s, key)
+      do aset(t[1], s, aget(t[1], s) + rd_int(p[1]))
+      do aset(t[2], s, aget(t[2], s) + rd_int(p[2]))
+    }
+    do release(m, 0)
+    let i = i + 1
+  }
+  return 0
+}
+
+skill main() -> Any {
+  # a worker: "learnpart ntr w W" -> out\rd_w<w>.txt
+  if arg(1) == "learnpart" {
+    let rl = rm_rels()
+    let w = rd_int(arg(3))
+    let nw = rd_int(arg(4))
+    let maxn = rd_int(arg(2))
+    let need = hset(4194304)
+    do stream_facts(rl, 1, 0, 0, w, nw, maxn, need, null, null)
+    let ix = article_index_h(need)
+    let tsz = 8388608
+    let t = [arr(tsz), arr(tsz), arr(tsz), tsz, arr(len(rl)), arr(len(rl)), arr(len(rl)), arr(len(rl))]
+    let used = stream_facts(rl, 2, 0, 0, w, nw, maxn, null, ix, t)
+    do write_file("out\\rd_w" ++ str(w) ++ ".txt", dump_counts(t, len(rl)))
+    return "worker " ++ str(w) ++ ": " ++ str(used) ++ " articles"
+  }
+  let ntr = 20000
+  if arg(1) != null { let ntr = rd_int(arg(1)) }
+  let nte = 2000
+  if arg(2) != null { let nte = rd_int(arg(2)) }
+  let t0 = ticks()
+  let rl = sl_rels()
+  let usefacts = arg(3) == "facts" or arg(4) == "facts" or arg(5) == "facts"
+  if usefacts { let rl = rm_rels() }
+  let train = []
+  let test = []
+  let tune = []
+  if usefacts {
+    let tune = stream_facts(rl, 0, 1, 12000, 0, 1, 0, null, null, null)
+    let test = stream_facts(rl, 0, 2, nte, 0, 1, 0, null, null, null)
+    let isw = arg(3) == "workers" or arg(4) == "workers" or arg(5) == "workers"
+    if isw == false { let train = stream_facts(rl, 0, 0, ntr, 0, 1, 0, null, null, null) }
+  } else {
+    let train = read_facts(0, 900, ntr, rl)
+    let test = read_facts(1000000000, 100, nte, rl)
+    let tune = read_facts(900000000, 100, 3000, rl)
+  }
+  let ix = null
+  if arg(3) == "workers" or arg(4) == "workers" or arg(5) == "workers" { let ix = article_index(test ++ tune) } else { let ix = article_index(train ++ test ++ tune) }
+  let t1 = ticks()
+  let tsz = 8388608
+  let t = [arr(tsz), arr(tsz), arr(tsz), tsz, arr(len(rl)), arr(len(rl)), arr(len(rl)), arr(len(rl))]
+  let used = 0
+  if arg(3) == "workers" or arg(4) == "workers" or arg(5) == "workers" {
+    let nw = 6
+    let hs = []
+    for w in range(0, nw) { let hs = append(hs, spawn(arg(0) ++ " learnpart " ++ str(ntr) ++ " " ++ str(w) ++ " " ++ str(nw))) }
+    for h in hs { do wait(h, 36000000) }
+    for w in range(0, nw) {
+      let m = mark()
+      let txt = read_file("out\\rd_w" ++ str(w) ++ ".txt")
+      if txt != null { do add_counts(t, txt, len(rl)) }
+      do release(m, 0)
+    }
+    let used = len(train)
+  } else { let used = learn(train, ix, t) }
+  let t2 = ticks()
+  let sm = sl_load()
+  let out = "facts " ++ str(len(train)) ++ " train / " ++ str(len(test)) ++ " held out; articles indexed in " ++ str((t1 - t0) // 1000) ++ " s; Pi learned which sentences state each relation from " ++ str(used) ++ " whole articles in " ++ str((t2 - t1) // 1000) ++ " s\n"
+  # per relation: n, reachable, Pi, most frequent, first (with "nopos": without the candidate-position evidence)
+  let pr = arr(5 * len(rl))
+  let cpos = arg(3) != "nopos"
+  let qs = []
+  for f in tune {
+    let m = mark()
+    let r = release(m, test_one(f, ix, t, sm, 1.0, cpos, null))
+    if r != null {
+      if len(r[4]) > 0 and len(r[4]) < 400 { let qs = append(qs, r[4]) }
+    }
+  }
+  let wts = combine(qs, 10)
+  let ws5 = []
+  for x in wts { let ws5 = append(ws5, str(x)) }
+  let out = out ++ "combiner learned on " ++ str(len(qs)) ++ " tuning facts: weights (sentence, slot, article position, sentence position, bias) " ++ join(ws5, " ") ++ "\n"
+  for f in test {
+    let m = mark()
+    let r = release(m, test_one(f, ix, t, sm, 1.0, cpos, wts))
+    if r != null {
+      let b = 5 * f[0]
+      do aset(pr, b, aget(pr, b) + 1)
+      for q in range(0, 4) { do aset(pr, b + 1 + q, aget(pr, b + 1 + q) + r[q]) }
+    }
+  }
+  for grp in [["all", 0], ["names (no dates)", 1]] {
+    let tot = [0, 0, 0, 0, 0]
+    for ri in range(0, len(rl)) {
+      let isdate = ri == 2 or ri == 3 or ri == 19
+      if grp[1] == 0 or isdate == false {
+        let tot = [tot[0] + aget(pr, 5 * ri), tot[1] + aget(pr, 5 * ri + 1), tot[2] + aget(pr, 5 * ri + 2), tot[3] + aget(pr, 5 * ri + 3), tot[4] + aget(pr, 5 * ri + 4)]
+      }
+    }
+    let out = out ++ grp[0] ++ ": held-out " ++ str(tot[0]) ++ " (answer in the article " ++ pc(tot[1], tot[0]) ++ "): PI'S LEARNED READING " ++ pc(tot[2], tot[0]) ++ " | most frequent name " ++ pc(tot[3], tot[0]) ++ " | first name " ++ pc(tot[4], tot[0]) ++ "  [of reachable: Pi " ++ pc(tot[2], tot[1]) ++ "]\n"
+  }
+  let out = out ++ "per relation (100+ held out), Pi vs first name:"
+  for ri in range(0, len(rl)) {
+    let n = aget(pr, 5 * ri)
+    if n >= 100 { let out = out ++ " " ++ rl[ri] ++ " " ++ pc(aget(pr, 5 * ri + 2), n) ++ "/" ++ pc(aget(pr, 5 * ri + 4), n) }
+  }
+  let out = out ++ "\n"
+  if arg(3) == "save" or arg(4) == "save" or arg(5) == "save" {
+    let head = []
+    for q in range(4, 8) {
+      let xs = []
+      for ri in range(0, len(rl)) { let xs = append(xs, str(aget(t[q], ri))) }
+      let head = append(head, join(xs, " "))
+    }
+    let blocks = [join(head, "\n"), join(ws5, " ")]
+    let kept = 0
+    let i = 0
+    while i < t[3] {
+      let m = mark()
+      let lines = []
+      let e = i + 65536
+      while i < e {
+        if aget(t[0], i) != 0 and aget(t[1], i) + aget(t[2], i) >= 3 { let lines = append(lines, str(aget(t[0], i)) ++ " " ++ str(aget(t[1], i)) ++ " " ++ str(aget(t[2], i))) }
+        let i = i + 1
+      }
+      let keep = release(m, [join(lines, "\n"), len(lines)])
+      if keep[1] > 0 { let blocks = append(blocks, keep[0]) }
+      let kept = kept + keep[1]
+    }
+    do write_file("out\\reader_model.txt", join(blocks, "\n"))
+    let out = out ++ "saved " ++ str(kept) ++ " learned evidence counts -> out\\reader_model.txt\n"
+  }
+  return out ++ "total " ++ str((ticks() - t0) // 1000) ++ " s"
+}

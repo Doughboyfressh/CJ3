@@ -1,0 +1,92 @@
+# Lists that grow in place, checked against value semantics. The compiler grows a list in place only while nothing
+# else can see it (own_body in pic.pi); every case here shares, stores, captures, iterates or releases a list and
+# then grows it again -- the other holder must never see the growth. Each line must read the same as with a
+# compiler that copies on every append.
+
+skill wrap(x) -> Any { return [x, len(x)] }
+
+skill build(n) -> Any {
+  let out = []
+  for i in range(0, n) { let out = append(out, i) }
+  return out
+}
+
+skill main() -> Any {
+  let lines = []
+  # 1. aliased by another name, then grown
+  let a = []
+  let a = append(a, 1)
+  let b = a
+  let a = append(a, 2)
+  let lines = append(lines, "alias " ++ str(b) ++ " " ++ str(a))
+  # 2. passed to a skill that keeps it, then grown
+  let c = []
+  for i in range(0, 5) { let c = append(c, i) }
+  let w = wrap(c)
+  let c = append(c, 99)
+  let lines = append(lines, "kept " ++ str(w) ++ " " ++ str(len(c)))
+  # 3. captured by a function, then grown
+  let d = []
+  let d = append(d, 7)
+  let f = fn(k) => len(d) + k
+  let d = append(d, 8)
+  let lines = append(lines, "captured " ++ str(f(0)) ++ " " ++ str(len(d)))
+  # 4. grown while a loop walks it: the loop sees the length it started with
+  let e = []
+  for i in range(0, 3) { let e = append(e, i) }
+  let seen = 0
+  for x in e {
+    let e = append(e, x + 10)
+    let seen = seen + 1
+  }
+  let lines = append(lines, "walked " ++ str(seen) ++ " " ++ str(e))
+  # 5. stored inside another list, then grown
+  let g = []
+  let g = append(g, "x")
+  let box = [g]
+  let g = append(g, "y")
+  let lines = append(lines, "stored " ++ str(box) ++ " " ++ str(g))
+  # 6. made inside a region that is released, then grown: h itself is gone (using it is undefined), but growing it
+  # must not write into the memory the region's release handed on to junk
+  let h = []
+  let m = mark()
+  let h = append(h, "in")
+  let kept = release(m, len(h))
+  let junk = build(50)
+  let h = append(h, "after")
+  let lines = append(lines, "region " ++ str(kept) ++ " " ++ str(sum(junk)) ++ " " ++ str(junk[49]))
+  # 7. joined to itself, and grown through many sizes
+  let p = []
+  let p = append(p, 1)
+  let p = p ++ p
+  let p = p ++ p
+  let p = p ++ [5]
+  let q = build(10000)
+  let lines = append(lines, "self " ++ str(p) ++ " " ++ str(sum(q)) ++ " " ++ str(q[9999]))
+  # 8. rebuilt fresh each pass and handed on (the y = y2 pattern)
+  let y = [0, 0, 0]
+  for k in range(0, 4) {
+    let y2 = []
+    for i in range(0, 3) { let y2 = append(y2, y[i] + k) }
+    let y = y2
+  }
+  let lines = append(lines, "rebuilt " ++ str(y))
+  # 9. a region per pass, the result appended after its release (the matrix-row pattern)
+  let rows = []
+  for r in range(0, 6) {
+    let mm = mark()
+    let t = build(r + 1)
+    let v = release(mm, sum(t))
+    let rows = append(rows, v)
+  }
+  let lines = append(lines, "rows " ++ str(rows))
+  # 10. two lists grown from the same one
+  let base = []
+  let base = append(base, 1)
+  let base = append(base, 2)
+  let x1 = append(base, 3)
+  let x2 = append(base, 4)
+  let base = append(base, 5)
+  let lines = append(lines, "forks " ++ str(x1) ++ " " ++ str(x2) ++ " " ++ str(base))
+  return join(lines, "\n")
+}

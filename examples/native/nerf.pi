@@ -1,0 +1,358 @@
+# nerf: a neural field with HIERARCHICAL importance sampling. A coarse pass finds where each ray meets a surface, then
+# the fine pass concentrates its samples in a tight window there -- so the surface is densely sampled and the field
+# commits to opaque geometry instead of fog. Trained from several posed photos, it renders camera angles it never saw.
+# Real photos + COLMAP poses drop into the same trainer.
+#   nerf DIR [steps] [hidden] [L]
+import "grad.pi"
+
+skill NF_NEAR() -> Any { return 0.9 }
+skill NF_FAR() -> Any { return 5.7 }
+skill NF_MC() -> Any { return 48 }
+skill NF_MF() -> Any { return 96 }
+skill NF_HW() -> Any { return 0.55 }
+
+skill nf_split(line) -> Any {
+  let f = []
+  for w in split(line, " ") {
+    if len(w) > 0 { f = append(f, w) }
+  }
+  return f
+}
+skill nf_ntrain(lines) -> Any {
+  let c = 0
+  for line in lines {
+    if len(trim(line)) > 0 and contains(line, "train") { c += 1 }
+  }
+  return c
+}
+skill nf_three(n) -> Any {
+  let s = str(n)
+  while len(s) < 3 { s = "0" ++ s }
+  return s
+}
+skill nf_tok(b, i) -> Any {
+  let n = len(b)
+  while i < n and (aget(b, i) == 32 or aget(b, i) == 9 or aget(b, i) == 10 or aget(b, i) == 13) { i += 1 }
+  let v = 0
+  while i < n and aget(b, i) >= 48 and aget(b, i) <= 57 {
+    v = v * 10 + aget(b, i) - 48
+    i += 1
+  }
+  return [v, i]
+}
+skill nf_ppm(path) -> Any {
+  let size = rt_file_size(path)
+  let b = read_bytes(path, 0, size)
+  let w = nf_tok(b, 2)
+  let h = nf_tok(b, w[1])
+  let mx = nf_tok(b, h[1])
+  return [w[0], h[0], b, mx[1] + 1]
+}
+skill nf_read(dir) -> Any {
+  let lines = split(read_file(dir ++ "\\poses.txt"), "\n")
+  let nt = nf_ntrain(lines)
+  let views = []
+  let idx = 0
+  for line in lines {
+    if len(trim(line)) > 0 {
+      let f = nf_split(line)
+      let test = f[7] == "test"
+      let vid = if test { 1000 + idx - nt } else { idx }
+      let img = nf_ppm(dir ++ "\\view_" ++ nf_three(vid) ++ ".ppm")
+      let pose = [float(f[0]), float(f[1]), float(f[2]), float(f[3]), float(f[4]), float(f[5]), float(f[6]), test]
+      views = append(views, pose ++ img)
+      idx += 1
+    }
+  }
+  return views
+}
+
+skill nf_norm3(x, y, z) -> Any {
+  let l = sqrt(x * x + y * y + z * z) + 0.0000001
+  return [x / l, y / l, z / l]
+}
+skill nf_basis(ex, ey, ez, tx, ty, tz, fov) -> Any {
+  let f = nf_norm3(tx - ex, ty - ey, tz - ez)
+  let r = nf_norm3(f[2], 0.0, 0.0 - f[0])
+  let ux = r[1] * f[2] - r[2] * f[1]
+  let uy = r[2] * f[0] - r[0] * f[2]
+  let uz = r[0] * f[1] - r[1] * f[0]
+  let tn = sin(fov * 0.5) / cos(fov * 0.5)
+  return [ex, ey, ez, f[0], f[1], f[2], r[0], r[1], r[2], ux, uy, uz, tn]
+}
+skill nf_ray(bz, px, py, w, h) -> Any {
+  let tn = bz[12]
+  let sx = (2.0 * (float(px) + 0.5) / float(w) - 1.0) * tn
+  let sy = (1.0 - 2.0 * (float(py) + 0.5) / float(h)) * tn
+  return nf_norm3(bz[3] + bz[6] * sx + bz[9] * sy, bz[4] + bz[7] * sx + bz[10] * sy, bz[5] + bz[8] * sx + bz[11] * sy)
+}
+
+skill nf_rng(st) -> Any {
+  aset(st, 0, (aget(st, 0) * 1103515245 + 12345) % 2147483648)
+  return aget(st, 0)
+}
+
+skill nf_net(G, st, F, hid) -> Any {
+  let sizes = [F, hid, hid, hid, 4]
+  let layers = []
+  for l in range(0, len(sizes) - 1) {
+    let wt = g_param(G, sizes[l], sizes[l + 1])
+    let bt = g_param(G, 1, sizes[l + 1])
+    let scale = if l == len(sizes) - 2 { 0.03 } else { sqrt(2.0 / float(sizes[l])) }
+    g_randn(wt, st, scale)
+    layers = append(layers, [wt, bt])
+  }
+  return layers
+}
+skill nf_fwd(G, layers, feat) -> Any {
+  let h = feat
+  let n = len(layers)
+  for l in range(0, n) {
+    let act = if l == n - 1 { "" } else { "relu" }
+    h = g_dense(G, h, layers[l][0], layers[l][1], act, 0.0)
+  }
+  return h
+}
+
+# ---- hierarchical forward: Nr rays (ray r uses basis bases[rv[r]], pixel rpx[r],rpy[r]) -> colours C[Nr x 3].
+# The coarse pass (forward only) proposes a surface depth per ray; the fine pass samples a tight window there. It
+# CLEARS the graph/tape internally (the coarse pass carries no gradient), so nothing else may be in the graph when it
+# is called. Returns [C, deltabuf_gpu]; the caller frees the fine graph (teardown) and deltabuf_gpu.
+skill nf_hier(G, layers, rv, rpx, rpy, bases, Nr, w, h, L, alpha, noise, seed) -> Any {
+  let near = NF_NEAR()
+  let far = NF_FAR()
+  let rng = far - near
+  let Mc = NF_MC()
+  let Mf = NF_MF()
+  let hw = NF_HW()
+  let ptsc = g_tensor(Nr * Mc, 3)
+  rt_sh_set(G["graph"], append(rt_sh_get(G["graph"]), ptsc))
+  let hpc = rt_host_alloc(4 * Nr * Mc * 3)
+  for r in range(0, Nr) {
+    let bz = bases[aget(rv, r)]
+    let d = nf_ray(bz, aget(rpx, r), aget(rpy, r), w, h)
+    for i in range(0, Mc) {
+      let tc = near + (float(i) + 0.5) / float(Mc) * rng
+      let b = (r * Mc + i) * 3
+      rt_g_putbits(hpc, b, g_f32bits(bz[0] + d[0] * tc))
+      rt_g_putbits(hpc, b + 1, g_f32bits(bz[1] + d[1] * tc))
+      rt_g_putbits(hpc, b + 2, g_f32bits(bz[2] + d[2] * tc))
+    }
+  }
+  rt_host_to_gpu(ptsc[0], hpc, 4 * Nr * Mc * 3)
+  rt_host_free(hpc)
+  let cdc = g_const_delta(Nr, rng / float(Mc))
+  let rawc = nf_fwd(G, layers, g_posenc(G, ptsc, L, alpha))
+  let wts = g_vweights(G, rawc, Mc, cdc)
+  rt_gpu_free(cdc)
+  for t in rt_sh_get(G["graph"]) {
+    rt_gpu_free(t[0])
+    rt_gpu_free(t[1])
+  }
+  rt_sh_set(G["graph"], [])
+  rt_sh_set(G["tape"], [])
+  # fine: a tight window around each ray's surface
+  let ptsf = g_tensor(Nr * Mf, 3)
+  rt_sh_set(G["graph"], append(rt_sh_get(G["graph"]), ptsf))
+  let hpf = rt_host_alloc(4 * Nr * Mf * 3)
+  let hdf = rt_host_alloc(4 * Nr)
+  for r in range(0, Nr) {
+    let bz = bases[aget(rv, r)]
+    let d = nf_ray(bz, aget(rpx, r), aget(rpy, r), w, h)
+    let sw = 0.0
+    let swt = 0.0
+    for i in range(0, Mc) {
+      let wi = g_bits_real(rt_g_getbits(wts, r * Mc + i))
+      let tc = near + (float(i) + 0.5) / float(Mc) * rng
+      sw = sw + wi
+      swt = swt + wi * tc
+    }
+    let lo = near
+    let hi = far
+    if sw > 0.02 {
+      let ts = swt / sw
+      lo = max(near, ts - hw)
+      hi = min(far, ts + hw)
+    }
+    rt_g_putbits(hdf, r, g_f32bits((hi - lo) / float(Mf)))
+    for j in range(0, Mf) {
+      let tf = lo + (float(j) + 0.5) / float(Mf) * (hi - lo)
+      let b = (r * Mf + j) * 3
+      rt_g_putbits(hpf, b, g_f32bits(bz[0] + d[0] * tf))
+      rt_g_putbits(hpf, b + 1, g_f32bits(bz[1] + d[1] * tf))
+      rt_g_putbits(hpf, b + 2, g_f32bits(bz[2] + d[2] * tf))
+    }
+  }
+  rt_host_free(wts)
+  rt_host_to_gpu(ptsf[0], hpf, 4 * Nr * Mf * 3)
+  rt_host_free(hpf)
+  let dbuf = rt_gpu_alloc(4 * Nr)
+  rt_host_to_gpu(dbuf, hdf, 4 * Nr)
+  rt_host_free(hdf)
+  let rawf = nf_fwd(G, layers, g_posenc(G, ptsf, L, alpha))
+  if noise { do g_addnoise(G, rawf, 1.0, seed) }
+  let C = g_volrender(G, rawf, Mf, dbuf, 1.0)
+  return [C, dbuf]
+}
+
+skill nf_render(G, layers, bz, w, h, L) -> Any {
+  let out = arr(3 * w * h + 1)
+  let bases = [bz]
+  let rowblk = 8
+  let E2 = []
+  let y0 = 0
+  while y0 < h {
+    let mm = mark()
+    let rows = min(rowblk, h - y0)
+    let Nr = rows * w
+    let rv = arr(Nr + 1)
+    let rpx = arr(Nr + 1)
+    let rpy = arr(Nr + 1)
+    for yy in range(0, rows) {
+      for xx in range(0, w) {
+        let r = yy * w + xx
+        aset(rv, r, 0)
+        aset(rpx, r, xx)
+        aset(rpy, r, y0 + yy)
+      }
+    }
+    let res = nf_hier(G, layers, rv, rpx, rpy, bases, Nr, w, h, L, float(L), false, 0)
+    let C = res[0]
+    let ch = rt_host_alloc(4 * Nr * 3)
+    rt_gpu_to_host(ch, C[0], 4 * Nr * 3)
+    for p in range(0, Nr * 3) {
+      let v = g_bits_real(rt_g_getbits(ch, p))
+      let q = int(v * 255.0 + 0.5)
+      if q < 0 { q = 0 }
+      if q > 255 { q = 255 }
+      aset(out, (y0 * w) * 3 + p, q)
+    }
+    rt_host_free(ch)
+    rt_gpu_free(res[1])
+    for t in rt_sh_get(G["graph"]) {
+      rt_gpu_free(t[0])
+      rt_gpu_free(t[1])
+    }
+    rt_sh_set(G["graph"], E2)
+    rt_sh_set(G["tape"], E2)
+    do release(mm, 0)
+    y0 = y0 + rows
+  }
+  return out
+}
+skill rt_nf_pack(bt) -> Any {
+  let b = bt
+  let n = peek(b + 8)
+  let p = rt_alloc(n)
+  for i in range(0, n) { do pokeb(p + i, rt_untag(peek(b + 16 + 8 * i)) % 256) }
+  return rt_tag(p)
+}
+skill nf_psnr(out, view, w, h) -> Any {
+  let bytes = view[10]
+  let pstart = view[11]
+  let se = 0.0
+  for i in range(0, 3 * w * h) {
+    let d = float(aget(out, i) - aget(bytes, pstart + i)) / 255.0
+    se = se + d * d
+  }
+  return 0.0 - 10.0 * log10(se / float(3 * w * h) + 0.0000000001)
+}
+
+skill main() -> Any {
+  if arg(1) == null { return "nerf DIR [steps] [hidden] [L]" }
+  let dir = arg(1)
+  let steps = if arg(2) != null { int(arg(2)) } else { 3000 }
+  let hid = if arg(3) != null { int(arg(3)) } else { 128 }
+  let L = if arg(4) != null { int(arg(4)) } else { 6 }
+  let F = 3 + 6 * L
+  let views = nf_read(dir)
+  let train = []
+  let trainbz = []
+  let test = []
+  let testbz = []
+  for v in views {
+    let bz = nf_basis(v[0], v[1], v[2], v[3], v[4], v[5], v[6])
+    if v[7] {
+      test = append(test, v)
+      testbz = append(testbz, bz)
+    } else {
+      train = append(train, v)
+      trainbz = append(trainbz, bz)
+    }
+  }
+  let w = train[0][8]
+  let h = train[0][9]
+  print(str(len(train)) ++ " train + " ++ str(len(test)) ++ " test, " ++ str(w) ++ "x" ++ str(h) ++ "; field " ++ str(F) ++ "->" ++ str(hid) ++ ", " ++ str(steps) ++ " steps, coarse " ++ str(NF_MC()) ++ " + fine " ++ str(NF_MF()))
+
+  let G = g_open()
+  let st = arr(1)
+  aset(st, 0, 2024)
+  let layers = nf_net(G, st, F, hid)
+  let opt = g_opt(G, 0.0012)
+
+  let Nr = 1024
+  let EMPTY = []
+  let tt = ticks()
+  for step in range(0, steps + 1) {
+    let mm = mark()
+    let alpha = 1.0 + (float(L) - 1.0) * min(1.0, float(step) / (0.6 * float(steps)))
+    let rv = arr(Nr + 1)
+    let rpx = arr(Nr + 1)
+    let rpy = arr(Nr + 1)
+    let ht = rt_host_alloc(4 * Nr * 3)
+    for r in range(0, Nr) {
+      let vi = nf_rng(st) % len(train)
+      let px = nf_rng(st) % w
+      let py = nf_rng(st) % h
+      aset(rv, r, vi)
+      aset(rpx, r, px)
+      aset(rpy, r, py)
+      let bytes = train[vi][10]
+      let ps = train[vi][11] + 3 * (py * w + px)
+      rt_g_putbits(ht, r * 3, g_f32bits(float(aget(bytes, ps)) / 255.0))
+      rt_g_putbits(ht, r * 3 + 1, g_f32bits(float(aget(bytes, ps + 1)) / 255.0))
+      rt_g_putbits(ht, r * 3 + 2, g_f32bits(float(aget(bytes, ps + 2)) / 255.0))
+    }
+    # nf_hier clears the graph, so make the target tensor AFTER it (and keep it out of the graph)
+    let res = nf_hier(G, layers, rv, rpx, rpy, trainbz, Nr, w, h, L, alpha, true, step + 1)
+    let C = res[0]
+    let tgt = g_tensor(Nr, 3)
+    rt_host_to_gpu(tgt[0], ht, 4 * Nr * 3)
+    rt_host_free(ht)
+    let Lo = g_mse(G, C, tgt)
+    g_backward(G)
+    g_step(G, opt)
+    if step % 200 == 0 {
+      print("step " ++ str(step) ++ "  loss " ++ format("{:.6f}", Lo) ++ "  PSNR " ++ format("{:.2f}", 0.0 - 10.0 * log10(Lo + 0.0000000001)) ++ " dB  (" ++ str((ticks() - tt) // 1000) ++ " s)")
+    }
+    rt_gpu_free(res[1])
+    rt_gpu_free(tgt[0])
+    rt_gpu_free(tgt[1])
+    for t in rt_sh_get(G["graph"]) {
+      rt_gpu_free(t[0])
+      rt_gpu_free(t[1])
+    }
+    rt_sh_set(G["graph"], EMPTY)
+    rt_sh_set(G["tape"], EMPTY)
+    do release(mm, 0)
+  }
+
+  let sum = 0.0
+  for j in range(0, len(test)) {
+    let out = nf_render(G, layers, testbz[j], w, h, L)
+    let ps = nf_psnr(out, test[j], w, h)
+    sum = sum + ps
+    rt_png_write(dir ++ "\\novel_" ++ nf_three(j) ++ ".png", rt_nf_pack(out), w, h)
+    print("  novel view " ++ str(j) ++ ": " ++ format("{:.2f}", ps) ++ " dB")
+  }
+  print("MEAN NOVEL-VIEW PSNR: " ++ format("{:.2f}", sum / float(len(test))) ++ " dB")
+  let frames = 48
+  for k in range(0, frames) {
+    let a = float(k) / float(frames) * 6.2831853
+    let bz = nf_basis(3.3 * cos(a), 1.35, 3.3 * sin(a), 0.0, 0.0 - 0.15, 0.0, 0.9)
+    let out = nf_render(G, layers, bz, w, h, L)
+    rt_png_write(dir ++ "\\orbit_" ++ nf_three(k) ++ ".png", rt_nf_pack(out), w, h)
+  }
+  print("wrote " ++ str(frames) ++ " orbit frames")
+  return 0
+}

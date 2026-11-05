@@ -1,0 +1,11 @@
+# Generated / large runtime data -- never pushed.
+# out/ holds the brain's weight-derived system snapshots (flash_sys*.snap), ~19 GB of Wikipedia data,
+# indexes, logs, and all compiled .exe binaries. None of it belongs in source control.
+out/
+
+# tooling caches
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# keep the bootstrap compiler (seed/pic.exe) -- it is required to build Pi and lives outside out/

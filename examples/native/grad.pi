@@ -1,0 +1,1156 @@
+# grad: Pi learns on its own GPU. Float32 tensors that stay resident in GPU memory, a tape of the operations that made
+# each one, and a backward pass that fills every tensor's gradient. With an Adam step, Pi can train a network it wrote
+# itself, from scratch, on real data -- no outside model, no framework. This is the half the forward engine was missing.
+#   G = g_open()                   load the kernels (once)
+#   t = g_tensor(rows, cols)       a tensor of zeros; g_param(G, r, c) is a trainable one
+#   g_matmul(G, x, w), g_dense(G, x, w, b, act, a), g_mse(G, pred, tgt)   forward, each recording how to go back
+#   g_backward(G)                 fill every .grad
+#   g_step(G, opt)                one Adam step; g_zero_grad(G) resets grads and the tape between steps
+# A forward pass must be a tree (each tensor produced once) -- true for a feedforward net; branching would need grads
+# to accumulate, which is a later addition.
+import "shade.pi"
+
+skill G_V() -> Any { return ".version 7.0\n.target sm_80\n.address_size 64\n" }
+
+# C[M,N] = A[M,K] . B[K,N], one thread per output element
+skill g_k_mm() -> Any {
+  return ".visible .entry mm (.param .u64 pa, .param .u64 pb, .param .u64 pc, .param .u32 pM, .param .u32 pK, .param .u32 pN)
+{
+.reg .u32 %u<12>;
+.reg .u64 %d<12>;
+.reg .f32 %f<6>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pM];
+ld.param.u32 %u1, [pK];
+ld.param.u32 %u2, [pN];
+mov.u32 %u3, %ctaid.x;
+mov.u32 %u4, %ntid.x;
+mov.u32 %u5, %tid.x;
+mad.lo.u32 %u3, %u3, %u4, %u5;
+mul.lo.u32 %u6, %u0, %u2;
+setp.ge.u32 %p0, %u3, %u6;
+@%p0 exit;
+div.u32 %u7, %u3, %u2;
+rem.u32 %u8, %u3, %u2;
+ld.param.u64 %d0, [pa];
+ld.param.u64 %d1, [pb];
+ld.param.u64 %d2, [pc];
+mul.lo.u32 %u9, %u7, %u1;
+mul.wide.u32 %d3, %u9, 4;
+add.u64 %d3, %d0, %d3;
+mul.wide.u32 %d4, %u8, 4;
+add.u64 %d4, %d1, %d4;
+mul.wide.u32 %d9, %u2, 4;
+mov.f32 %f0, 0f00000000;
+mov.u32 %u10, 0;
+L1:
+setp.ge.u32 %p1, %u10, %u1;
+@%p1 bra E1;
+ld.global.f32 %f1, [%d3];
+ld.global.f32 %f2, [%d4];
+fma.rn.f32 %f0, %f1, %f2, %f0;
+add.u64 %d3, %d3, 4;
+add.u64 %d4, %d4, %d9;
+add.u32 %u10, %u10, 1;
+bra L1;
+E1:
+mul.wide.u32 %d6, %u3, 4;
+add.u64 %d6, %d2, %d6;
+st.global.f32 [%d6], %f0;
+exit;
+}
+"
+}
+
+# C[K,N] = A[M,K]^T . B[M,N]  (a weight's gradient: X^T . dZ)
+skill g_k_atb() -> Any {
+  return ".visible .entry mm_atb (.param .u64 pa, .param .u64 pb, .param .u64 pc, .param .u32 pM, .param .u32 pK, .param .u32 pN)
+{
+.reg .u32 %u<12>;
+.reg .u64 %d<12>;
+.reg .f32 %f<6>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pM];
+ld.param.u32 %u1, [pK];
+ld.param.u32 %u2, [pN];
+mov.u32 %u3, %ctaid.x;
+mov.u32 %u4, %ntid.x;
+mov.u32 %u5, %tid.x;
+mad.lo.u32 %u3, %u3, %u4, %u5;
+mul.lo.u32 %u6, %u1, %u2;
+setp.ge.u32 %p0, %u3, %u6;
+@%p0 exit;
+div.u32 %u7, %u3, %u2;
+rem.u32 %u8, %u3, %u2;
+ld.param.u64 %d0, [pa];
+ld.param.u64 %d1, [pb];
+ld.param.u64 %d2, [pc];
+mul.wide.u32 %d3, %u7, 4;
+add.u64 %d3, %d0, %d3;
+mul.wide.u32 %d4, %u8, 4;
+add.u64 %d4, %d1, %d4;
+mul.wide.u32 %d7, %u1, 4;
+mul.wide.u32 %d8, %u2, 4;
+mov.f32 %f0, 0f00000000;
+mov.u32 %u10, 0;
+L2:
+setp.ge.u32 %p1, %u10, %u0;
+@%p1 bra E2;
+ld.global.f32 %f1, [%d3];
+ld.global.f32 %f2, [%d4];
+fma.rn.f32 %f0, %f1, %f2, %f0;
+add.u64 %d3, %d3, %d7;
+add.u64 %d4, %d4, %d8;
+add.u32 %u10, %u10, 1;
+bra L2;
+E2:
+mul.wide.u32 %d6, %u3, 4;
+add.u64 %d6, %d2, %d6;
+st.global.f32 [%d6], %f0;
+exit;
+}
+"
+}
+
+# C[M,K] = A[M,N] . B[K,N]^T  (an input's gradient: dZ . W^T)
+skill g_k_abt() -> Any {
+  return ".visible .entry mm_abt (.param .u64 pa, .param .u64 pb, .param .u64 pc, .param .u32 pM, .param .u32 pK, .param .u32 pN)
+{
+.reg .u32 %u<14>;
+.reg .u64 %d<12>;
+.reg .f32 %f<6>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pM];
+ld.param.u32 %u1, [pK];
+ld.param.u32 %u2, [pN];
+mov.u32 %u3, %ctaid.x;
+mov.u32 %u4, %ntid.x;
+mov.u32 %u5, %tid.x;
+mad.lo.u32 %u3, %u3, %u4, %u5;
+mul.lo.u32 %u6, %u0, %u1;
+setp.ge.u32 %p0, %u3, %u6;
+@%p0 exit;
+div.u32 %u7, %u3, %u1;
+rem.u32 %u8, %u3, %u1;
+ld.param.u64 %d0, [pa];
+ld.param.u64 %d1, [pb];
+ld.param.u64 %d2, [pc];
+mul.lo.u32 %u9, %u7, %u2;
+mul.wide.u32 %d3, %u9, 4;
+add.u64 %d3, %d0, %d3;
+mul.lo.u32 %u11, %u8, %u2;
+mul.wide.u32 %d4, %u11, 4;
+add.u64 %d4, %d1, %d4;
+mov.f32 %f0, 0f00000000;
+mov.u32 %u10, 0;
+L3:
+setp.ge.u32 %p1, %u10, %u2;
+@%p1 bra E3;
+ld.global.f32 %f1, [%d3];
+ld.global.f32 %f2, [%d4];
+fma.rn.f32 %f0, %f1, %f2, %f0;
+add.u64 %d3, %d3, 4;
+add.u64 %d4, %d4, 4;
+add.u32 %u10, %u10, 1;
+bra L3;
+E3:
+mul.wide.u32 %d6, %u3, 4;
+add.u64 %d6, %d2, %d6;
+st.global.f32 [%d6], %f0;
+exit;
+}
+"
+}
+
+# Z[M,N] += b[N], broadcast over rows
+skill g_k_addbias() -> Any {
+  return ".visible .entry addbias (.param .u64 pz, .param .u64 pb, .param .u32 pM, .param .u32 pN)
+{
+.reg .u32 %u<10>;
+.reg .u64 %d<8>;
+.reg .f32 %f<4>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pM];
+ld.param.u32 %u1, [pN];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %ntid.x;
+mov.u32 %u4, %tid.x;
+mad.lo.u32 %u2, %u2, %u3, %u4;
+mul.lo.u32 %u5, %u0, %u1;
+setp.ge.u32 %p0, %u2, %u5;
+@%p0 exit;
+rem.u32 %u6, %u2, %u1;
+ld.param.u64 %d0, [pz];
+ld.param.u64 %d1, [pb];
+mul.wide.u32 %d2, %u2, 4;
+add.u64 %d2, %d0, %d2;
+mul.wide.u32 %d3, %u6, 4;
+add.u64 %d3, %d1, %d3;
+ld.global.f32 %f0, [%d2];
+ld.global.f32 %f1, [%d3];
+add.f32 %f0, %f0, %f1;
+st.global.f32 [%d2], %f0;
+exit;
+}
+"
+}
+
+# db[j] = sum over rows of dZ[,j]
+skill g_k_biasgrad() -> Any {
+  return ".visible .entry biasgrad (.param .u64 pdz, .param .u64 pdb, .param .u32 pM, .param .u32 pN)
+{
+.reg .u32 %u<10>;
+.reg .u64 %d<8>;
+.reg .f32 %f<4>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pM];
+ld.param.u32 %u1, [pN];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %ntid.x;
+mov.u32 %u4, %tid.x;
+mad.lo.u32 %u2, %u2, %u3, %u4;
+setp.ge.u32 %p0, %u2, %u1;
+@%p0 exit;
+ld.param.u64 %d0, [pdz];
+ld.param.u64 %d1, [pdb];
+mul.wide.u32 %d2, %u2, 4;
+add.u64 %d2, %d0, %d2;
+mul.wide.u32 %d4, %u1, 4;
+mov.f32 %f0, 0f00000000;
+mov.u32 %u5, 0;
+LB:
+setp.ge.u32 %p1, %u5, %u0;
+@%p1 bra EB;
+ld.global.f32 %f1, [%d2];
+add.f32 %f0, %f0, %f1;
+add.u64 %d2, %d2, %d4;
+add.u32 %u5, %u5, 1;
+bra LB;
+EB:
+mul.wide.u32 %d3, %u2, 4;
+add.u64 %d3, %d1, %d3;
+st.global.f32 [%d3], %f0;
+exit;
+}
+"
+}
+
+# Y = act(a*X): mode 0 relu (a unused), mode 1 sin(a*X)
+skill g_k_act() -> Any {
+  return ".visible .entry act (.param .u64 px, .param .u64 py, .param .u32 pn, .param .u32 pmode, .param .f32 pa)
+{
+.reg .u32 %u<8>;
+.reg .u64 %d<6>;
+.reg .f32 %f<8>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+mov.u32 %u1, %ctaid.x;
+mov.u32 %u2, %ntid.x;
+mov.u32 %u3, %tid.x;
+mad.lo.u32 %u1, %u1, %u2, %u3;
+setp.ge.u32 %p0, %u1, %u0;
+@%p0 exit;
+ld.param.u32 %u4, [pmode];
+ld.param.f32 %f5, [pa];
+ld.param.u64 %d0, [px];
+ld.param.u64 %d1, [py];
+mul.wide.u32 %d2, %u1, 4;
+add.u64 %d3, %d0, %d2;
+add.u64 %d4, %d1, %d2;
+ld.global.f32 %f0, [%d3];
+setp.eq.u32 %p1, %u4, 0;
+@!%p1 bra SIN;
+max.f32 %f1, %f0, 0f00000000;
+st.global.f32 [%d4], %f1;
+exit;
+SIN:
+mul.f32 %f0, %f0, %f5;
+mul.f32 %f6, %f0, 0f3E22F983;
+cvt.rni.f32.f32 %f6, %f6;
+mul.f32 %f7, %f6, 0f40C90FDB;
+sub.f32 %f0, %f0, %f7;
+sin.approx.f32 %f1, %f0;
+st.global.f32 [%d4], %f1;
+exit;
+}
+"
+}
+
+# dX = dY * act'(a*X)
+skill g_k_actb() -> Any {
+  return ".visible .entry actb (.param .u64 px, .param .u64 pdy, .param .u64 pdx, .param .u32 pn, .param .u32 pmode, .param .f32 pa)
+{
+.reg .u32 %u<8>;
+.reg .u64 %d<8>;
+.reg .f32 %f<8>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+mov.u32 %u1, %ctaid.x;
+mov.u32 %u2, %ntid.x;
+mov.u32 %u3, %tid.x;
+mad.lo.u32 %u1, %u1, %u2, %u3;
+setp.ge.u32 %p0, %u1, %u0;
+@%p0 exit;
+ld.param.u32 %u4, [pmode];
+ld.param.f32 %f5, [pa];
+ld.param.u64 %d0, [px];
+ld.param.u64 %d1, [pdy];
+ld.param.u64 %d2, [pdx];
+mul.wide.u32 %d3, %u1, 4;
+add.u64 %d4, %d0, %d3;
+add.u64 %d5, %d1, %d3;
+add.u64 %d6, %d2, %d3;
+ld.global.f32 %f0, [%d4];
+ld.global.f32 %f1, [%d5];
+setp.eq.u32 %p1, %u4, 0;
+@!%p1 bra SINB;
+setp.gt.f32 %p2, %f0, 0f00000000;
+selp.f32 %f2, %f1, 0f00000000, %p2;
+st.global.f32 [%d6], %f2;
+exit;
+SINB:
+mul.f32 %f0, %f0, %f5;
+mul.f32 %f6, %f0, 0f3E22F983;
+cvt.rni.f32.f32 %f6, %f6;
+mul.f32 %f7, %f6, 0f40C90FDB;
+sub.f32 %f0, %f0, %f7;
+cos.approx.f32 %f2, %f0;
+mul.f32 %f2, %f2, %f5;
+mul.f32 %f2, %f2, %f1;
+st.global.f32 [%d6], %f2;
+exit;
+}
+"
+}
+
+# dpred = 2(pred - tgt)/P, and the sum of squared error atomically into loss[0]
+skill g_k_mse() -> Any {
+  return ".visible .entry mseg (.param .u64 pp, .param .u64 pt, .param .u64 pd, .param .u64 pl, .param .u32 pn)
+{
+.reg .u32 %u<8>;
+.reg .u64 %d<8>;
+.reg .f32 %f<8>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+mov.u32 %u1, %ctaid.x;
+mov.u32 %u2, %ntid.x;
+mov.u32 %u3, %tid.x;
+mad.lo.u32 %u1, %u1, %u2, %u3;
+setp.ge.u32 %p0, %u1, %u0;
+@%p0 exit;
+ld.param.u64 %d0, [pp];
+ld.param.u64 %d1, [pt];
+ld.param.u64 %d2, [pd];
+ld.param.u64 %d3, [pl];
+mul.wide.u32 %d4, %u1, 4;
+add.u64 %d5, %d0, %d4;
+add.u64 %d6, %d1, %d4;
+add.u64 %d7, %d2, %d4;
+ld.global.f32 %f0, [%d5];
+ld.global.f32 %f1, [%d6];
+sub.f32 %f2, %f0, %f1;
+cvt.rn.f32.u32 %f3, %u0;
+mul.f32 %f4, %f2, %f2;
+div.rn.f32 %f4, %f4, %f3;
+red.global.add.f32 [%d3], %f4;
+add.f32 %f5, %f2, %f2;
+div.rn.f32 %f5, %f5, %f3;
+st.global.f32 [%d7], %f5;
+exit;
+}
+"
+}
+
+# one Adam step over n parameters. mc = 1 - b1^t, vc = 1 - b2^t passed in.
+skill g_k_adam() -> Any {
+  return ".visible .entry adam (.param .u64 pp, .param .u64 pg, .param .u64 pm, .param .u64 pv, .param .u32 pn, .param .f32 plr, .param .f32 pb1, .param .f32 pb2, .param .f32 peps, .param .f32 pmc, .param .f32 pvc)
+{
+.reg .u32 %u<8>;
+.reg .u64 %d<10>;
+.reg .f32 %f<20>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+mov.u32 %u1, %ctaid.x;
+mov.u32 %u2, %ntid.x;
+mov.u32 %u3, %tid.x;
+mad.lo.u32 %u1, %u1, %u2, %u3;
+setp.ge.u32 %p0, %u1, %u0;
+@%p0 exit;
+ld.param.f32 %f10, [plr];
+ld.param.f32 %f11, [pb1];
+ld.param.f32 %f12, [pb2];
+ld.param.f32 %f13, [peps];
+ld.param.f32 %f14, [pmc];
+ld.param.f32 %f15, [pvc];
+ld.param.u64 %d0, [pp];
+ld.param.u64 %d1, [pg];
+ld.param.u64 %d2, [pm];
+ld.param.u64 %d3, [pv];
+mul.wide.u32 %d4, %u1, 4;
+add.u64 %d5, %d0, %d4;
+add.u64 %d6, %d1, %d4;
+add.u64 %d7, %d2, %d4;
+add.u64 %d8, %d3, %d4;
+ld.global.f32 %f0, [%d5];
+ld.global.f32 %f1, [%d6];
+ld.global.f32 %f2, [%d7];
+ld.global.f32 %f3, [%d8];
+mov.f32 %f4, 0f3F800000;
+sub.f32 %f5, %f4, %f11;
+mul.f32 %f2, %f2, %f11;
+fma.rn.f32 %f2, %f1, %f5, %f2;
+sub.f32 %f6, %f4, %f12;
+mul.f32 %f7, %f1, %f1;
+mul.f32 %f3, %f3, %f12;
+fma.rn.f32 %f3, %f7, %f6, %f3;
+st.global.f32 [%d7], %f2;
+st.global.f32 [%d8], %f3;
+div.rn.f32 %f8, %f2, %f14;
+div.rn.f32 %f9, %f3, %f15;
+sqrt.rn.f32 %f9, %f9;
+add.f32 %f9, %f9, %f13;
+div.rn.f32 %f8, %f8, %f9;
+mul.f32 %f8, %f8, %f10;
+sub.f32 %f0, %f0, %f8;
+st.global.f32 [%d5], %f0;
+exit;
+}
+"
+}
+
+
+# ---- volume rendering: per-ray samples (density+colour) composited into a pixel; the heart of a neural field --------
+# raw[(Nr*M) x 4]: for each sample, column 0 = density logit (density = relu), 1..3 = colour logits (sigmoid). The ray's
+# M samples are consecutive. delta = sample spacing; bg = background brightness (white = 1). -> C[Nr x 3]. T[Nr*M] keeps
+# each sample's transmittance for the backward pass.
+skill g_k_vrfwd() -> Any {
+  return ".visible .entry vrfwd (.param .u64 praw, .param .u64 pc, .param .u64 pt, .param .u32 pNr, .param .u32 pM, .param .u64 pdelta, .param .f32 pbg)
+{
+.reg .u32 %u<12>;
+.reg .u64 %d<12>;
+.reg .f32 %f<24>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pNr];
+ld.param.u32 %u1, [pM];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %ntid.x;
+mov.u32 %u4, %tid.x;
+mad.lo.u32 %u2, %u2, %u3, %u4;
+setp.ge.u32 %p0, %u2, %u0;
+@%p0 exit;
+ld.param.u64 %d6, [pdelta];
+mul.wide.u32 %d7, %u2, 4;
+add.u64 %d6, %d6, %d7;
+ld.global.f32 %f0, [%d6];
+ld.param.f32 %f1, [pbg];
+ld.param.u64 %d0, [praw];
+ld.param.u64 %d1, [pc];
+ld.param.u64 %d2, [pt];
+mul.lo.u32 %u5, %u2, %u1;
+mul.wide.u32 %d3, %u5, 16;
+add.u64 %d3, %d0, %d3;
+mul.wide.u32 %d4, %u5, 4;
+add.u64 %d4, %d2, %d4;
+mov.f32 %f2, 0f3F800000;
+mov.f32 %f3, 0f00000000;
+mov.f32 %f4, 0f00000000;
+mov.f32 %f5, 0f00000000;
+mov.u32 %u6, 0;
+LF:
+setp.ge.u32 %p1, %u6, %u1;
+@%p1 bra EF;
+ld.global.f32 %f6, [%d3];
+max.f32 %f7, %f6, 0f00000000;
+mul.f32 %f8, %f7, %f0;
+neg.f32 %f8, %f8;
+mul.f32 %f8, %f8, 0f3FB8AA3B;
+ex2.approx.f32 %f8, %f8;
+mov.f32 %f9, 0f3F800000;
+sub.f32 %f10, %f9, %f8;
+ld.global.f32 %f11, [%d3+4];
+neg.f32 %f14, %f11;
+mul.f32 %f14, %f14, 0f3FB8AA3B;
+ex2.approx.f32 %f14, %f14;
+add.f32 %f14, %f14, 0f3F800000;
+rcp.approx.f32 %f11, %f14;
+ld.global.f32 %f12, [%d3+8];
+neg.f32 %f14, %f12;
+mul.f32 %f14, %f14, 0f3FB8AA3B;
+ex2.approx.f32 %f14, %f14;
+add.f32 %f14, %f14, 0f3F800000;
+rcp.approx.f32 %f12, %f14;
+ld.global.f32 %f13, [%d3+12];
+neg.f32 %f14, %f13;
+mul.f32 %f14, %f14, 0f3FB8AA3B;
+ex2.approx.f32 %f14, %f14;
+add.f32 %f14, %f14, 0f3F800000;
+rcp.approx.f32 %f13, %f14;
+mul.f32 %f15, %f2, %f10;
+fma.rn.f32 %f3, %f15, %f11, %f3;
+fma.rn.f32 %f4, %f15, %f12, %f4;
+fma.rn.f32 %f5, %f15, %f13, %f5;
+st.global.f32 [%d4], %f2;
+sub.f32 %f2, %f2, %f15;
+add.u64 %d3, %d3, 16;
+add.u64 %d4, %d4, 4;
+add.u32 %u6, %u6, 1;
+bra LF;
+EF:
+fma.rn.f32 %f3, %f2, %f1, %f3;
+fma.rn.f32 %f4, %f2, %f1, %f4;
+fma.rn.f32 %f5, %f2, %f1, %f5;
+mul.wide.u32 %d5, %u2, 12;
+add.u64 %d5, %d1, %d5;
+st.global.f32 [%d5], %f3;
+st.global.f32 [%d5+4], %f4;
+st.global.f32 [%d5+8], %f5;
+exit;
+}
+"
+}
+
+skill g_k_vrbwd() -> Any {
+  return ".visible .entry vrbwd (.param .u64 praw, .param .u64 pt, .param .u64 pdc, .param .u64 pdraw, .param .u32 pNr, .param .u32 pM, .param .u64 pdelta, .param .f32 pbg)
+{
+.reg .u32 %u<14>;
+.reg .u64 %d<14>;
+.reg .f32 %f<40>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pNr];
+ld.param.u32 %u1, [pM];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %ntid.x;
+mov.u32 %u4, %tid.x;
+mad.lo.u32 %u2, %u2, %u3, %u4;
+setp.ge.u32 %p0, %u2, %u0;
+@%p0 exit;
+ld.param.u64 %d11, [pdelta];
+mul.wide.u32 %d12, %u2, 4;
+add.u64 %d11, %d11, %d12;
+ld.global.f32 %f0, [%d11];
+ld.param.f32 %f1, [pbg];
+ld.param.u64 %d0, [praw];
+ld.param.u64 %d1, [pt];
+ld.param.u64 %d2, [pdc];
+ld.param.u64 %d3, [pdraw];
+mul.wide.u32 %d4, %u2, 12;
+add.u64 %d4, %d2, %d4;
+ld.global.f32 %f2, [%d4];
+ld.global.f32 %f3, [%d4+4];
+ld.global.f32 %f4, [%d4+8];
+add.f32 %f5, %f2, %f3;
+add.f32 %f5, %f5, %f4;
+mul.lo.u32 %u5, %u2, %u1;
+mov.u32 %u6, %u1;
+sub.u32 %u6, %u6, 1;
+add.u32 %u7, %u5, %u6;
+mul.wide.u32 %d5, %u7, 16;
+add.u64 %d5, %d0, %d5;
+ld.global.f32 %f6, [%d5];
+max.f32 %f6, %f6, 0f00000000;
+mul.f32 %f7, %f6, %f0;
+neg.f32 %f7, %f7;
+mul.f32 %f7, %f7, 0f3FB8AA3B;
+ex2.approx.f32 %f7, %f7;
+mul.wide.u32 %d6, %u7, 4;
+add.u64 %d6, %d1, %d6;
+ld.global.f32 %f8, [%d6];
+mul.f32 %f9, %f8, %f7;
+mul.f32 %f10, %f0, %f9;
+mul.f32 %f10, %f10, %f1;
+mul.f32 %f10, %f10, %f5;
+mov.f32 %f11, 0f00000000;
+mov.f32 %f12, 0f00000000;
+mov.f32 %f13, 0f00000000;
+mov.u32 %u8, %u1;
+sub.u32 %u8, %u8, 1;
+LB:
+add.u32 %u9, %u5, %u8;
+mul.wide.u32 %d7, %u9, 16;
+add.u64 %d7, %d0, %d7;
+mul.wide.u32 %d8, %u9, 4;
+add.u64 %d8, %d1, %d8;
+mul.wide.u32 %d10, %u9, 16;
+add.u64 %d10, %d3, %d10;
+ld.global.f32 %f14, [%d7];
+setp.gt.f32 %p1, %f14, 0f00000000;
+max.f32 %f15, %f14, 0f00000000;
+selp.f32 %f16, 0f3F800000, 0f00000000, %p1;
+mul.f32 %f17, %f15, %f0;
+neg.f32 %f17, %f17;
+mul.f32 %f17, %f17, 0f3FB8AA3B;
+ex2.approx.f32 %f17, %f17;
+mov.f32 %f18, 0f3F800000;
+sub.f32 %f19, %f18, %f17;
+ld.global.f32 %f20, [%d8];
+mul.f32 %f21, %f20, %f19;
+sub.f32 %f22, %f20, %f21;
+ld.global.f32 %f23, [%d7+4];
+neg.f32 %f24, %f23;
+mul.f32 %f24, %f24, 0f3FB8AA3B;
+ex2.approx.f32 %f24, %f24;
+add.f32 %f24, %f24, 0f3F800000;
+rcp.approx.f32 %f23, %f24;
+ld.global.f32 %f25, [%d7+8];
+neg.f32 %f24, %f25;
+mul.f32 %f24, %f24, 0f3FB8AA3B;
+ex2.approx.f32 %f24, %f24;
+add.f32 %f24, %f24, 0f3F800000;
+rcp.approx.f32 %f25, %f24;
+ld.global.f32 %f26, [%d7+12];
+neg.f32 %f24, %f26;
+mul.f32 %f24, %f24, 0f3FB8AA3B;
+ex2.approx.f32 %f24, %f24;
+add.f32 %f24, %f24, 0f3F800000;
+rcp.approx.f32 %f26, %f24;
+mul.f32 %f27, %f2, %f23;
+fma.rn.f32 %f27, %f3, %f25, %f27;
+fma.rn.f32 %f27, %f4, %f26, %f27;
+mul.f32 %f28, %f2, %f11;
+fma.rn.f32 %f28, %f3, %f12, %f28;
+fma.rn.f32 %f28, %f4, %f13, %f28;
+mul.f32 %f29, %f22, %f27;
+sub.f32 %f29, %f29, %f28;
+mul.f32 %f29, %f29, %f0;
+sub.f32 %f29, %f29, %f10;
+mul.f32 %f29, %f29, %f16;
+st.global.f32 [%d10], %f29;
+sub.f32 %f30, %f18, %f23;
+mul.f32 %f30, %f23, %f30;
+mul.f32 %f31, %f21, %f2;
+mul.f32 %f31, %f31, %f30;
+st.global.f32 [%d10+4], %f31;
+sub.f32 %f30, %f18, %f25;
+mul.f32 %f30, %f25, %f30;
+mul.f32 %f31, %f21, %f3;
+mul.f32 %f31, %f31, %f30;
+st.global.f32 [%d10+8], %f31;
+sub.f32 %f30, %f18, %f26;
+mul.f32 %f30, %f26, %f30;
+mul.f32 %f31, %f21, %f4;
+mul.f32 %f31, %f31, %f30;
+st.global.f32 [%d10+12], %f31;
+fma.rn.f32 %f11, %f21, %f23, %f11;
+fma.rn.f32 %f12, %f21, %f25, %f12;
+fma.rn.f32 %f13, %f21, %f26, %f13;
+setp.eq.u32 %p2, %u8, 0;
+@%p2 bra EB;
+sub.u32 %u8, %u8, 1;
+bra LB;
+EB:
+exit;
+}
+"
+}
+
+skill g_k_posenc() -> Any {
+  return ".visible .entry posenc (.param .u64 pp, .param .u64 pf, .param .u32 pn, .param .u32 pL, .param .f32 palpha)
+{
+.reg .u32 %u<10>;
+.reg .u64 %d<8>;
+.reg .f32 %f<14>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+ld.param.u32 %u1, [pL];
+ld.param.f32 %f9, [palpha];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %ntid.x;
+mov.u32 %u4, %tid.x;
+mad.lo.u32 %u2, %u2, %u3, %u4;
+setp.ge.u32 %p0, %u2, %u0;
+@%p0 exit;
+ld.param.u64 %d0, [pp];
+ld.param.u64 %d1, [pf];
+mul.wide.u32 %d2, %u2, 12;
+add.u64 %d2, %d0, %d2;
+mul.lo.u32 %u5, %u1, 6;
+add.u32 %u5, %u5, 3;
+mul.lo.u32 %u6, %u2, %u5;
+mul.wide.u32 %d3, %u6, 4;
+add.u64 %d3, %d1, %d3;
+ld.global.f32 %f0, [%d2];
+ld.global.f32 %f1, [%d2+4];
+ld.global.f32 %f2, [%d2+8];
+st.global.f32 [%d3], %f0;
+st.global.f32 [%d3+4], %f1;
+st.global.f32 [%d3+8], %f2;
+add.u64 %d3, %d3, 12;
+mov.f32 %f3, 0f40490FDB;
+mov.u32 %u7, 0;
+LK:
+setp.ge.u32 %p1, %u7, %u1;
+@%p1 bra EK;
+cvt.rn.f32.u32 %f11, %u7;
+sub.f32 %f10, %f9, %f11;
+max.f32 %f10, %f10, 0f00000000;
+min.f32 %f10, %f10, 0f3F800000;
+mul.f32 %f4, %f3, %f0;
+mul.f32 %f5, %f4, 0f3E22F983;
+cvt.rni.f32.f32 %f5, %f5;
+mul.f32 %f6, %f5, 0f40C90FDB;
+sub.f32 %f4, %f4, %f6;
+sin.approx.f32 %f7, %f4;
+cos.approx.f32 %f8, %f4;
+mul.f32 %f7, %f7, %f10;
+mul.f32 %f8, %f8, %f10;
+st.global.f32 [%d3], %f7;
+st.global.f32 [%d3+4], %f8;
+add.u64 %d3, %d3, 8;
+mul.f32 %f4, %f3, %f1;
+mul.f32 %f5, %f4, 0f3E22F983;
+cvt.rni.f32.f32 %f5, %f5;
+mul.f32 %f6, %f5, 0f40C90FDB;
+sub.f32 %f4, %f4, %f6;
+sin.approx.f32 %f7, %f4;
+cos.approx.f32 %f8, %f4;
+mul.f32 %f7, %f7, %f10;
+mul.f32 %f8, %f8, %f10;
+st.global.f32 [%d3], %f7;
+st.global.f32 [%d3+4], %f8;
+add.u64 %d3, %d3, 8;
+mul.f32 %f4, %f3, %f2;
+mul.f32 %f5, %f4, 0f3E22F983;
+cvt.rni.f32.f32 %f5, %f5;
+mul.f32 %f6, %f5, 0f40C90FDB;
+sub.f32 %f4, %f4, %f6;
+sin.approx.f32 %f7, %f4;
+cos.approx.f32 %f8, %f4;
+mul.f32 %f7, %f7, %f10;
+mul.f32 %f8, %f8, %f10;
+st.global.f32 [%d3], %f7;
+st.global.f32 [%d3+4], %f8;
+add.u64 %d3, %d3, 8;
+mul.f32 %f3, %f3, 0f40000000;
+add.u32 %u7, %u7, 1;
+bra LK;
+EK:
+exit;
+}
+"
+}
+
+skill g_k_addnoise() -> Any {
+  return ".visible .entry addnoise (.param .u64 praw, .param .u32 pn, .param .f32 pscale, .param .u32 pseed)
+{
+.reg .u32 %u<12>;
+.reg .u64 %d<4>;
+.reg .f32 %f<10>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pn];
+mov.u32 %u1, %ctaid.x;
+mov.u32 %u2, %ntid.x;
+mov.u32 %u3, %tid.x;
+mad.lo.u32 %u1, %u1, %u2, %u3;
+setp.ge.u32 %p0, %u1, %u0;
+@%p0 exit;
+ld.param.f32 %f0, [pscale];
+ld.param.u32 %u4, [pseed];
+ld.param.u64 %d0, [praw];
+add.u32 %u5, %u1, %u4;
+mul.lo.u32 %u5, %u5, 747796405;
+add.u32 %u5, %u5, 2891336453;
+mul.lo.u32 %u6, %u5, %u5;
+xor.b32 %u6, %u6, %u5;
+shr.u32 %u7, %u6, 9;
+or.b32 %u7, %u7, 1065353216;
+mov.b32 %f1, %u7;
+sub.f32 %f1, %f1, 0f3F800000;
+max.f32 %f1, %f1, 0f34000000;
+mul.lo.u32 %u8, %u6, 747796405;
+add.u32 %u8, %u8, 2891336453;
+mul.lo.u32 %u9, %u8, %u8;
+xor.b32 %u9, %u9, %u8;
+shr.u32 %u7, %u9, 9;
+or.b32 %u7, %u7, 1065353216;
+mov.b32 %f2, %u7;
+sub.f32 %f2, %f2, 0f3F800000;
+lg2.approx.f32 %f3, %f1;
+mul.f32 %f3, %f3, 0fBFB17218;
+sqrt.approx.f32 %f3, %f3;
+mul.f32 %f4, %f2, 0f40C90FDB;
+cos.approx.f32 %f4, %f4;
+mul.f32 %f3, %f3, %f4;
+mul.f32 %f3, %f3, %f0;
+mul.wide.u32 %d1, %u1, 16;
+add.u64 %d1, %d0, %d1;
+ld.global.f32 %f5, [%d1];
+add.f32 %f5, %f5, %f3;
+st.global.f32 [%d1], %f5;
+exit;
+}
+"
+}
+
+skill g_k_vrw() -> Any {
+  return ".visible .entry vrw (.param .u64 praw, .param .u64 pw, .param .u64 pdelta, .param .u32 pNr, .param .u32 pM)
+{
+.reg .u32 %u<10>;
+.reg .u64 %d<8>;
+.reg .f32 %f<8>;
+.reg .pred %p<4>;
+ld.param.u32 %u0, [pNr];
+ld.param.u32 %u1, [pM];
+mov.u32 %u2, %ctaid.x;
+mov.u32 %u3, %ntid.x;
+mov.u32 %u4, %tid.x;
+mad.lo.u32 %u2, %u2, %u3, %u4;
+setp.ge.u32 %p0, %u2, %u0;
+@%p0 exit;
+ld.param.u64 %d5, [pdelta];
+mul.wide.u32 %d6, %u2, 4;
+add.u64 %d5, %d5, %d6;
+ld.global.f32 %f0, [%d5];
+ld.param.u64 %d0, [praw];
+ld.param.u64 %d1, [pw];
+mul.lo.u32 %u5, %u2, %u1;
+mul.wide.u32 %d2, %u5, 16;
+add.u64 %d2, %d0, %d2;
+mul.wide.u32 %d3, %u5, 4;
+add.u64 %d3, %d1, %d3;
+mov.f32 %f2, 0f3F800000;
+mov.u32 %u6, 0;
+LW:
+setp.ge.u32 %p1, %u6, %u1;
+@%p1 bra EW;
+ld.global.f32 %f3, [%d2];
+max.f32 %f3, %f3, 0f00000000;
+mul.f32 %f4, %f3, %f0;
+neg.f32 %f4, %f4;
+mul.f32 %f4, %f4, 0f3FB8AA3B;
+ex2.approx.f32 %f4, %f4;
+mov.f32 %f5, 0f3F800000;
+sub.f32 %f5, %f5, %f4;
+mul.f32 %f6, %f2, %f5;
+st.global.f32 [%d3], %f6;
+sub.f32 %f2, %f2, %f6;
+add.u64 %d2, %d2, 16;
+add.u64 %d3, %d3, 4;
+add.u32 %u6, %u6, 1;
+bra LW;
+EW:
+exit;
+}
+"
+}
+
+skill g_ptx() -> Any {
+  return G_V() ++ g_k_mm() ++ g_k_atb() ++ g_k_abt() ++ g_k_addbias() ++ g_k_biasgrad() ++ g_k_act() ++ g_k_actb() ++ g_k_mse() ++ g_k_adam() ++ g_k_vrfwd() ++ g_k_vrbwd() ++ g_k_posenc() ++ g_k_addnoise() ++ g_k_vrw()
+}
+
+# ---- float32 <-> Pi reals (Pi reals are doubles) --------------------------------------------------------------------
+skill g_pow2(k) -> Any {
+  let r = 1.0
+  let n = if k < 0 { 0 - k } else { k }
+  for i in range(0, n) { r = r * 2.0 }
+  if k < 0 { return 1.0 / r }
+  return r
+}
+skill g_f32bits(x) -> Any {
+  if x == 0.0 { return 0 }
+  let s = 0
+  if x < 0.0 {
+    s = 2147483648
+    x = 0.0 - x
+  }
+  let e = 0
+  while x >= 2.0 {
+    x = x / 2.0
+    e += 1
+  }
+  while x < 1.0 {
+    x = x * 2.0
+    e += 0 - 1
+  }
+  let m = int((x - 1.0) * 8388608.0 + 0.5)
+  if m >= 8388608 {
+    m = 0
+    e += 1
+  }
+  if e < 0 - 126 { return s }
+  if e > 127 { return s + 2139095040 }
+  return s + (e + 127) * 8388608 + m
+}
+skill g_bits_real(b) -> Any {
+  let s = if b >= 2147483648 { 0.0 - 1.0 } else { 1.0 }
+  let r = b % 2147483648
+  let e = r // 8388608
+  let m = r % 8388608
+  if e == 0 { return s * float(m) * g_pow2(0 - 149) }
+  if e == 255 { return s * 1.0e30 }
+  return s * (1.0 + float(m) / 8388608.0) * g_pow2(e - 127)
+}
+
+skill rt_g_putbits(host, it, bits) -> Any {
+  do rt_poke32(rt_untag(host) + 4 * rt_untag(it), rt_untag(bits))
+  return rt_tag(0)
+}
+skill rt_g_getbits(host, it) -> Any { return rt_tag(rt_peek32(rt_untag(host) + 4 * rt_untag(it))) }
+
+# ---- the engine ----
+skill g_open() -> Any {
+  if rt_gpu_open() != 1 { fail("the GPU could not be opened") }
+  let mod = rt_sh_module(g_ptx(), "out\\grad_log.txt")
+  if mod < 0 { fail("the driver refused the training kernels (" ++ str(mod) ++ "): " ++ read_file("out\\grad_log.txt")) }
+  let fns = {}
+  for nm in ["mm", "mm_atb", "mm_abt", "addbias", "biasgrad", "act", "actb", "mseg", "adam", "vrfwd", "vrbwd", "posenc", "addnoise", "vrw"] {
+    let f = rt_gpu_fn(mod, nm)
+    if f < 0 { fail("kernel " ++ nm ++ " missing") }
+    fns = put(fns, nm, f)
+  }
+  return {"fns": fns, "tape": rt_sh_box([]), "params": rt_sh_box([]), "graph": rt_sh_box([])}
+}
+
+skill g_bs() -> Any { return 256 }
+skill g_run(G, name, n, ps) -> Any {
+  let r = rt_gpu_launch(G["fns"][name], (n + g_bs() - 1) // g_bs(), g_bs(), ps)
+  if r != 0 { fail("kernel " ++ name ++ " failed: " ++ str(r)) }
+  return 0
+}
+
+# a tensor: [data on GPU, grad on GPU, rows, cols, wants-grad flag]
+skill g_tensor(rows, cols) -> Any {
+  let n = rows * cols
+  let data = rt_gpu_alloc(4 * n)
+  let grad = rt_gpu_alloc(4 * n)
+  rt_gpu_zero(data, 4 * n)
+  rt_gpu_zero(grad, 4 * n)
+  return [data, grad, rows, cols, arr(1)]
+}
+skill g_n(t) -> Any { return t[2] * t[3] }
+skill g_wants(t) -> Any { return aget(t[4], 0) == 1 }
+skill g_param(G, rows, cols) -> Any {
+  let t = g_tensor(rows, cols)
+  aset(t[4], 0, 1)
+  rt_sh_set(G["params"], append(rt_sh_get(G["params"]), t))
+  return t
+}
+
+skill g_set(t, xs) -> Any {
+  let n = g_n(t)
+  let host = rt_host_alloc(4 * n)
+  for i in range(0, n) { rt_g_putbits(host, i, g_f32bits(xs[i])) }
+  rt_host_to_gpu(t[0], host, 4 * n)
+  rt_host_free(host)
+  return t
+}
+skill g_get(t, which) -> Any {
+  let n = g_n(t)
+  let host = rt_host_alloc(4 * n)
+  rt_gpu_to_host(host, if which == 1 { t[1] } else { t[0] }, 4 * n)
+  let out = []
+  for i in range(0, n) { out = append(out, g_bits_real(rt_g_getbits(host, i))) }
+  rt_host_free(host)
+  return out
+}
+
+skill g_randn_list(st, n, scale) -> Any {
+  let out = []
+  for i in range(0, n // 2 + 1) {
+    aset(st, 0, (aget(st, 0) * 1103515245 + 12345) % 2147483648)
+    let u1 = (float(aget(st, 0)) + 1.0) / 2147483649.0
+    aset(st, 0, (aget(st, 0) * 1103515245 + 12345) % 2147483648)
+    let u2 = float(aget(st, 0)) / 2147483648.0
+    let r = sqrt(0.0 - 2.0 * log(u1)) * scale
+    out = append(out, r * cos(6.2831853 * u2))
+    out = append(out, r * sin(6.2831853 * u2))
+  }
+  return slice(out, 0, n)
+}
+skill g_randn(t, st, scale) -> Any { return g_set(t, g_randn_list(st, g_n(t), scale)) }
+
+# uniform in [-scale, scale], straight into the tensor's host buffer (SIREN wants uniform init)
+skill g_uniform(t, st, scale) -> Any {
+  let n = g_n(t)
+  let host = rt_host_alloc(4 * n)
+  for i in range(0, n) {
+    aset(st, 0, (aget(st, 0) * 1103515245 + 12345) % 2147483648)
+    let u = float(aget(st, 0)) / 2147483648.0 * 2.0 - 1.0
+    rt_g_putbits(host, i, g_f32bits(u * scale))
+  }
+  rt_host_to_gpu(t[0], host, 4 * n)
+  rt_host_free(host)
+  return t
+}
+
+# ---- forward ops; each records on the tape how to push gradient back ----
+skill g_push(G, entry) -> Any { return rt_sh_set(G["tape"], append(rt_sh_get(G["tape"]), entry)) }
+
+skill g_matmul(G, x, w) -> Any {
+  let M = x[2]
+  let K = x[3]
+  let N = w[3]
+  let out = g_tensor(M, N)
+  aset(out[4], 0, 1)
+  rt_sh_set(G["graph"], append(rt_sh_get(G["graph"]), out))
+  g_run(G, "mm", M * N, [x[0], w[0], out[0], M, K, N])
+  g_push(G, ["matmul", x, w, out, M, K, N])
+  return out
+}
+
+# out = x . w + b, then activation ("" none, "relu", "sin"); a = sin frequency
+skill g_dense(G, x, w, b, act, a) -> Any {
+  let z = g_matmul(G, x, w)
+  g_run(G, "addbias", g_n(z), [z[0], b[0], z[2], z[3]])
+  g_push(G, ["addbias", z, b])
+  if act == "" { return z }
+  let mode = if act == "relu" { 0 } else { 1 }
+  let y = g_tensor(z[2], z[3])
+  aset(y[4], 0, 1)
+  rt_sh_set(G["graph"], append(rt_sh_get(G["graph"]), y))
+  g_run(G, "act", g_n(z), [z[0], y[0], g_n(z), mode, g_f32bits(a)])
+  g_push(G, ["act", z, y, mode, a])
+  return y
+}
+
+skill g_mse(G, pred, tgt) -> Any {
+  let n = g_n(pred)
+  let lossdev = rt_gpu_alloc(4)
+  rt_gpu_zero(lossdev, 4)
+  g_run(G, "mseg", n, [pred[0], tgt[0], pred[1], lossdev, n])
+  let host = rt_host_alloc(4)
+  rt_gpu_to_host(host, lossdev, 4)
+  let loss = g_bits_real(rt_g_getbits(host, 0))
+  rt_host_free(host)
+  rt_gpu_free(lossdev)
+  return loss
+}
+
+# raw[(Nr*M) x 4] (density logit + 3 colour logits per sample) -> pixel colours C[Nr x 3] by volume rendering
+skill g_volrender(G, raw, M, deltabuf, bg) -> Any {
+  let Nr = raw[2] // M
+  let out = g_tensor(Nr, 3)
+  aset(out[4], 0, 1)
+  rt_sh_set(G["graph"], append(rt_sh_get(G["graph"]), out))
+  let tscr = rt_gpu_alloc(4 * Nr * M)
+  let bs = 256
+  let r = rt_gpu_launch(G["fns"]["vrfwd"], (Nr + bs - 1) // bs, bs, [raw[0], out[0], tscr, Nr, M, deltabuf, g_f32bits(bg)])
+  if r != 0 { fail("vrfwd failed: " ++ str(r)) }
+  g_push(G, ["volrender", raw, out, M, deltabuf, bg, tscr, Nr])
+  return out
+}
+
+# a GPU buffer of n copies of delta (for uniform sampling)
+skill g_const_delta(n, delta) -> Any {
+  let buf = rt_gpu_alloc(4 * n)
+  let host = rt_host_alloc(4 * n)
+  for i in range(0, n) { rt_g_putbits(host, i, g_f32bits(delta)) }
+  rt_host_to_gpu(buf, host, 4 * n)
+  rt_host_free(host)
+  return buf
+}
+
+# per-sample volume-rendering weights of raw[(Nr*M) x 4] -> a host buffer of Nr*M floats (caller frees). For
+# importance sampling: where the weight is high, a surface is.
+skill g_vweights(G, raw, M, deltabuf) -> Any {
+  let Nr = raw[2] // M
+  let wdev = rt_gpu_alloc(4 * Nr * M)
+  let bs = 256
+  let r = rt_gpu_launch(G["fns"]["vrw"], (Nr + bs - 1) // bs, bs, [raw[0], wdev, deltabuf, Nr, M])
+  if r != 0 { fail("vrw failed: " ++ str(r)) }
+  let host = rt_host_alloc(4 * Nr * M)
+  rt_gpu_to_host(host, wdev, 4 * Nr * M)
+  rt_gpu_free(wdev)
+  return host
+}
+
+# 3D points[n x 3] -> Fourier features[n x (3 + 6L)] = [p, sin(pi 2^k p), cos(pi 2^k p)]. An input (no gradient).
+skill g_posenc(G, pts, L, alpha) -> Any {
+  let n = pts[2]
+  let F = 3 + 6 * L
+  let feat = g_tensor(n, F)
+  rt_sh_set(G["graph"], append(rt_sh_get(G["graph"]), feat))
+  let bs = 256
+  let r = rt_gpu_launch(G["fns"]["posenc"], (n + bs - 1) // bs, bs, [pts[0], feat[0], n, L, g_f32bits(alpha)])
+  if r != 0 { fail("posenc failed: " ++ str(r)) }
+  return feat
+}
+
+# add Gaussian noise to the density channel (column 0 of a (Nr*M) x 4 raw tensor), in place. Training only --
+# it makes thin persistent fog unreliable so the field commits to opaque surfaces or empty space.
+skill g_addnoise(G, raw, scale, seed) -> Any {
+  let n = raw[2]
+  let bs = 256
+  let r = rt_gpu_launch(G["fns"]["addnoise"], (n + bs - 1) // bs, bs, [raw[0], n, g_f32bits(scale), seed])
+  if r != 0 { fail("addnoise failed: " ++ str(r)) }
+  return raw
+}
+
+# walk the tape in reverse. A feedforward net is a tree, so each tensor's grad is written once (no accumulation).
+skill g_backward(G) -> Any {
+  let tape = rt_sh_get(G["tape"])
+  let i = len(tape) - 1
+  while i >= 0 {
+    let e = tape[i]
+    let k = e[0]
+    if k == "act" {
+      let z = e[1]
+      let y = e[2]
+      g_run(G, "actb", g_n(z), [z[0], y[1], z[1], g_n(z), e[3], g_f32bits(e[4])])
+    } else if k == "addbias" {
+      let z = e[1]
+      let b = e[2]
+      if g_wants(b) { g_run(G, "biasgrad", b[3], [z[1], b[1], z[2], z[3]]) }
+    } else if k == "volrender" {
+      let raw = e[1]
+      let out = e[2]
+      let bs = 256
+      let Nr = e[7]
+      let r = rt_gpu_launch(G["fns"]["vrbwd"], (Nr + bs - 1) // bs, bs, [raw[0], e[6], out[1], raw[1], Nr, e[3], e[4], g_f32bits(e[5])])
+      if r != 0 { fail("vrbwd failed: " ++ str(r)) }
+      rt_gpu_free(e[6])
+    } else if k == "matmul" {
+      let x = e[1]
+      let w = e[2]
+      let out = e[3]
+      if g_wants(w) { g_run(G, "mm_atb", e[5] * e[6], [x[0], out[1], w[1], e[4], e[5], e[6]]) }
+      if g_wants(x) { g_run(G, "mm_abt", e[4] * e[5], [out[1], w[0], x[1], e[4], e[5], e[6]]) }
+    }
+    i = i - 1
+  }
+  return 0
+}
+
+# ---- Adam ----
+skill g_opt(G, lr) -> Any {
+  let st = []
+  for p in rt_sh_get(G["params"]) {
+    let n = g_n(p)
+    let m = rt_gpu_alloc(4 * n)
+    let v = rt_gpu_alloc(4 * n)
+    rt_gpu_zero(m, 4 * n)
+    rt_gpu_zero(v, 4 * n)
+    st = append(st, [m, v])
+  }
+  return {"st": st, "t": arr(1), "lr": lr}
+}
+skill g_zero_grad(G) -> Any {
+  for p in rt_sh_get(G["params"]) { rt_gpu_zero(p[1], 4 * g_n(p)) }
+  # free the previous forward pass's intermediate tensors (never a param, x, or target)
+  for t in rt_sh_get(G["graph"]) {
+    rt_gpu_free(t[0])
+    rt_gpu_free(t[1])
+  }
+  rt_sh_set(G["graph"], [])
+  rt_sh_set(G["tape"], [])
+  return 0
+}
+skill g_powf(base, k) -> Any {
+  let r = 1.0
+  for i in range(0, k) { r = r * base }
+  return r
+}
+skill g_step(G, opt) -> Any {
+  aset(opt["t"], 0, aget(opt["t"], 0) + 1)
+  let t = aget(opt["t"], 0)
+  let mc = 1.0 - g_powf(0.9, t)
+  let vc = 1.0 - g_powf(0.999, t)
+  let ps = rt_sh_get(G["params"])
+  let i = 0
+  for p in ps {
+    let s = opt["st"][i]
+    let n = g_n(p)
+    g_run(G, "adam", n, [p[0], p[1], s[0], s[1], n, g_f32bits(opt["lr"]), g_f32bits(0.9), g_f32bits(0.999), g_f32bits(0.00000001), g_f32bits(mc), g_f32bits(vc)])
+    i += 1
+  }
+  return 0
+}

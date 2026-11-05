@@ -1,0 +1,41 @@
+# a still life: marble, gold, glass and glazed clay in afternoon sun
+
+skill scene(p) {
+  let d = [p.y, 1.0, 0.0]
+  d = near(d, [sd_sphere(p - [-1.6, 0.8, 0.2], 0.8), 2.0, 0.0])
+  d = near(d, [sd_sphere(p - [0.2, 0.75, -0.6], 0.75), 3.0, 0.0])
+  d = near(d, [sd_torus(rot_x(p - [1.8, 0.5, 0.6], 0.6), 0.55, 0.18), 4.0, 0.0])
+  return d
+}
+
+skill cam_from() { return [0.0, 1.7, 5.6] }
+skill cam_at() { return [0.0, 0.55, 0.0] }
+skill cam_fov() { return 0.62 }
+skill cam_aperture() { return 0.015 }
+skill sun_dir() { return normalize([0.8, 0.2, 0.5]) }
+skill sun_power() { return 30.0 }
+skill cloud_cover() { return 0.3 }
+skill exposure() { return 0.3 }
+let MAX_RADIANCE = 30.0
+
+skill marble(p) {
+  let v = sin(p.x * 3.0 + fbm(p * 2.0, 5) * 6.0)
+  let w = pow(abs(v), 0.35)
+  return mix([0.07, 0.065, 0.07], [0.62, 0.60, 0.57], w)
+}
+
+skill albedo(p, n, id) {
+  if id < 1.5 { return marble(p) }
+  if id < 2.5 { return [1.0, 0.76, 0.33] }
+  if id < 3.5 { return [1.0, 1.0, 1.0] }
+  return [0.55, 0.09, 0.07]
+}
+skill roughness(p, n, id) {
+  if id < 1.5 { return 0.16 }
+  if id < 2.5 { return 0.22 }
+  if id < 3.5 { return 0.0 }
+  return 0.35
+}
+skill metallic(p, n, id) { return if id > 1.5 and id < 2.5 { 1.0 } else { 0.0 } }
+skill glass(p, n, id) { return if id > 2.5 and id < 3.5 { 1.0 } else { 0.0 } }
+skill glass_tint(id) { return [0.93, 0.97, 0.95] }

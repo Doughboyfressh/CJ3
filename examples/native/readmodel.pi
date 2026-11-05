@@ -1,0 +1,130 @@
+# Pi's self-taught reading model (reader.exe ... save -> out\reader_model.txt), used by the research agent:
+# per relation, which sentences state a fact (word stems, paragraph / sentence position, subject named) and where
+# its answer sits among the article's names, with the combiner's weights. Keys are sl_key("relation|feature").
+
+# the reader's relations: the 24 with grammar slots first (same indices as sl_rels), then the rest of the 28
+# question kinds
+skill rm_rels() -> Any { return sl_rels() ++ ["discoverer_or_inventor", "architect", "named_after", "mountain_range", "owned_by", "constellation"] }
+
+skill rm_rel_ix(r) -> Any {
+  if r == null { return 0 - 1 }
+  let rl = rm_rels()
+  for i in range(0, len(rl)) {
+    if rl[i] == r { return i }
+  }
+  return 0 - 1
+}
+
+skill rm_int(s) -> Any {
+  let v = 0
+  let neg = false
+  for i in range(0, len(s)) {
+    let c = ord(slice(s, i, i + 1))
+    if c == 45 { let neg = true }
+    if c >= 48 and c <= 57 { let v = v * 10 + (c - 48) }
+  }
+  if neg { return 0 - v }
+  return v
+}
+
+# "322415.837964" -> a real (integer part + fraction)
+skill rm_real(s) -> Any {
+  let p = split(s, ".")
+  let v = rm_int(p[0]) * 1.0
+  if len(p) > 1 {
+    let f = 0.0
+    let sc = 1.0
+    for i in range(0, len(p[1])) {
+      let c = ord(slice(p[1], i, i + 1))
+      if c >= 48 and c <= 57 {
+        let sc = sc / 10.0
+        let f = f + (c - 48) * sc
+      }
+    }
+    if slice(s, 0, 1) == "-" { let v = v - f } else { let v = v + f }
+  }
+  return v
+}
+
+# -> [keys, for, against, size, sentence totals for/against, candidate totals for/against, combiner weights] or null
+skill rm_load() -> Any {
+  let t = read_file("out\\reader_model.txt")
+  if t == null { return null }
+  let ls = split(t, "\n")
+  let tots = []
+  for q in range(0, 4) {
+    let a = []
+    for x in split(ls[q], " ") { let a = append(a, rm_int(x)) }
+    let tots = append(tots, a)
+  }
+  let w = []
+  # num() gives null on long decimals ("322415.837964"): parsed by hand
+  for x in split(ls[4], " ") { let w = append(w, rm_real(x)) }
+  let hsz = 8388608
+  let hk = arr(hsz)
+  let hp = arr(hsz)
+  let hn = arr(hsz)
+  let i = 5
+  while i < len(ls) {
+    let m = mark()
+    let p = split(ls[i], " ")
+    if len(p) == 3 {
+      let k = rm_int(p[0])
+      let s = k % hsz
+      while aget(hk, s) != 0 and aget(hk, s) != k { let s = (s + 1) % hsz }
+      do aset(hk, s, k)
+      do aset(hp, s, rm_int(p[1]))
+      do aset(hn, s, rm_int(p[2]))
+    }
+    do release(m, 0)
+    let i = i + 1
+  }
+  return [hk, hp, hn, hsz, tots[0], tots[1], tots[2], tots[3], w]
+}
+
+skill rm_bucket(n) -> Any {
+  if n <= 1 { return "1" }
+  if n <= 2 { return "2" }
+  if n <= 5 { return "5" }
+  if n <= 15 { return "15" }
+  return "far"
+}
+
+skill aget_l(xs, i) -> Any {
+  if i < len(xs) { return xs[i] }
+  return 0
+}
+
+skill rm_lr(m, ri, f, tp, tn) -> Any {
+  let key = sl_key(str(ri) ++ "|" ++ f)
+  let s = key % m[3]
+  while aget(m[0], s) != 0 and aget(m[0], s) != key { let s = (s + 1) % m[3] }
+  let a = 0
+  let b = 0
+  if aget(m[0], s) == key {
+    let a = aget(m[1], s)
+    let b = aget(m[2], s)
+  }
+  return log2((a + 1) * 1.0 / (aget_l(tp, ri) + 100)) - log2((b + 1) * 1.0 / (aget_l(tn, ri) + 100))
+}
+
+# how strongly a sentence states relation ri (words, paragraph, sentence number, subject named)
+skill rm_sent(m, ri, ws, para, si, subj1) -> Any {
+  let sc = rm_lr(m, ri, "P" ++ rm_bucket(para), m[4], m[5]) + rm_lr(m, ri, "I" ++ rm_bucket(si + 1), m[4], m[5])
+  let named = false
+  for w in ws {
+    let lw = lower(w)
+    let sc = sc + rm_lr(m, ri, slice(lw, 0, 6), m[4], m[5])
+    if lw == subj1 { let named = true }
+  }
+  if named { let sc = sc + rm_lr(m, ri, "SUBJ", m[4], m[5]) }
+  return sc
+}
+
+# a candidate's reading score: the combiner over sentence, slot, k-th name of the article, j-th of the sentence
+skill rm_cand(m, ri, sent, slot, ak, j) -> Any {
+  let w = m[8]
+  let vk = rm_lr(m, ri, "CK" ++ rm_bucket(ak), m[6], m[7])
+  let vj = rm_lr(m, ri, "CJ" ++ rm_bucket(j), m[6], m[7])
+  return w[0] * sent + w[1] * slot + w[2] * vk + w[3] * vj
+}

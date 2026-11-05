@@ -1,0 +1,180 @@
+# flashchat QUESTION [maxtokens]: Qwen3.8 Flash Next on Pi's engine answers (greedy, thinking closed). The tokenizer is
+# Ornith's: the two models share their whole vocabulary (248,320 tokens, checked identical).
+import "flash.pi"
+import "forwardlib.pi"
+import "braintok.pi"
+import "pidraft.pi"
+
+skill main() -> Any {
+  let q = arg(1)
+  if q == null { return "flashchat QUESTION|@FILE [maxtokens]" }
+  if slice(q, 0, 1) == "@" { q = read_file(slice(q, 1, len(q))) }
+  let maxt = if arg(2) != null { int(arg(2)) } else { 200 }
+  let tk = tk_load(MODEL())
+  let om = open_model(MODEL())
+  let fl = fl_open()
+  if typeof(fl) == "text" { return fl }
+  // the per-layer profile only for bench (in the brain its clock reads would cost time)
+  if arg(3) == "bench" { aset(fl["bk"][13], 0, 1) }
+  let mi = rt_gpu_meminfo()
+  print("(GPU memory free after open: " ++ str(mi[0] // 1048576) ++ " MiB of " ++ str(mi[1] // 1048576) ++ ")")
+  print("(decode graphs: " ++ (if fl["g"] != null { "recorded in " ++ str(fl["gus"] // 1000) ++ " ms" } else { "off" }) ++ ")")
+  let ids = [248045] ++ tk_encode(tk, "user\n" ++ q) ++ [248046] ++ tk_encode(tk, "\n") ++ [248045] ++ tk_encode(tk, "assistant\n") ++ [248068] ++ tk_encode(tk, "\n\n") ++ [248069] ++ tk_encode(tk, "\n\n")
+  let t0 = ticks()
+  let top = null
+  let p = 0
+  while p < len(ids) {
+    let n = min(FL_TMAX(), len(ids) - p)
+    top = fl_forward_k(fl, ids, p, p, n, false, 1)
+    p += n
+  }
+  let tp = ticks() - t0
+  let out = ""
+  let trace = ""
+  let t1 = ticks()
+  let k = 0
+  while k < maxt {
+    let nx = top[0][1]
+    if nx == 248046 or nx == 248044 { break }
+    ids ++= [nx]
+    trace = trace ++ str(k) ++ " " ++ str(nx) ++ " " ++ format("{:.6f}", top[0][0]) ++ "\n"
+    let piece = show(token(om, nx))
+    out = out ++ piece
+    rt_out(piece)
+    top = fl_forward_k(fl, ids, len(ids) - 1, len(ids) - 1, 1, arg(4) != null and k == int(arg(4)), 1)
+    k += 1
+  }
+  let td = ticks() - t1
+  let ctr = fl["ctr"]
+  print("")
+  print("(prompt " ++ str(len(ids) - k) ++ " tokens in " ++ str(tp) ++ " ms; " ++ str(k) ++ " tokens in " ++ str(td) ++ " ms = " ++ format("{:.1f}", k * 1000.0 / max(td, 1)) ++ " tokens/s; experts loaded " ++ str(aget(ctr, 1)) ++ ", reused " ++ str(aget(ctr, 2)) ++ ")")
+  if arg(3) == "trace" { write_file("out\\flash_trace.txt", trace) }
+  // bench: the same answer again with the cache warm (every expert it needs already on the GPU)
+  if arg(3) == "bench" {
+    fl_reset(fl)
+    let gen = slice(ids, len(ids) - k, len(ids))
+    let ids2 = slice(ids, 0, len(ids) - k)
+    let p2 = 0
+    let tb = ticks()
+    while p2 < len(ids2) {
+      let n2 = min(FL_TMAX(), len(ids2) - p2)
+      fl_forward_k(fl, ids2, p2, p2, n2, false, 1)
+      p2 += n2
+    }
+    let tpre = ticks() - tb
+    let l0 = aget(ctr, 1)
+    let tc = ticks()
+    let pr = fl["prof"]
+    for i in range(0, 12) { aset(pr, i, 0) }
+    fl_kp_zero(fl)
+    for g in gen {
+      ids2 ++= [g]
+      fl_forward_k(fl, ids2, len(ids2) - 1, len(ids2) - 1, 1, false, 1)
+    }
+    let tg = ticks() - tc
+    print("warm: prompt " ++ str(len(ids2) - k) ++ " tokens in " ++ str(tpre) ++ " ms; " ++ str(k) ++ " tokens in " ++ str(tg) ++ " ms = " ++ format("{:.1f}", k * 1000.0 / max(tg, 1)) ++ " tokens/s (" ++ str(aget(ctr, 1) - l0) ++ " experts loaded)")
+    let np = max(aget(pr, 4), 1)
+    print("per decode pass (us): total " ++ str(aget(pr, 3) // np) ++ " = GPU wait at the 48 router syncs " ++ str(aget(pr, 0) // np) ++ " + expert bookkeeping " ++ str((aget(pr, 1) - aget(pr, 2)) // np) ++ " + disk loads " ++ str(aget(pr, 2) // np) ++ " + the rest (launches, host) " ++ str((aget(pr, 3) - aget(pr, 0) - aget(pr, 1)) // np))
+    if fl["pg"] != null {
+      let st = fl["pg"][4]
+      print("  next layer guessed a layer early: " ++ format("{:.1f}", aget(st, 1) * 100.0 / max(aget(st, 0) * 10, 1)) ++ "% of its experts; of " ++ str(aget(st, 2)) ++ " misses, " ++ str(aget(st, 3)) ++ " guessed")
+    }
+    print("  bookkeeping: reading E " ++ str(aget(pr, 8) // np) ++ ", the Pi loop " ++ str((aget(pr, 9) - aget(pr, 2)) // np) ++ ", writing TAB " ++ str(aget(pr, 10) // np))
+    print("  of the rest: embedding + n-gram rows on the host " ++ str(aget(pr, 6) // np) ++ ", issuing the 12 live attention halves " ++ str(aget(pr, 7) // np))
+    if fl["kp"] != null {
+      for ln in fl_kp_report(fl, max(k, 1)) { print(ln) }
+    }
+  }
+  // spec: the same answer, warm, once token by token and once with Pi's drafts checked in one pass each
+  // (pidraft.pi); the drafted run must give exactly the same tokens
+  if arg(3) == "spec" {
+    let gen = slice(ids, len(ids) - k, len(ids))
+    let base = slice(ids, 0, len(ids) - k)
+    fl_reset(fl)
+    let w = base
+    let p3 = 0
+    while p3 < len(w) {
+      let n3 = min(FL_TMAX(), len(w) - p3)
+      fl_forward_k(fl, w, p3, p3, n3, false, 1)
+      p3 += n3
+    }
+    let tw = ticks()
+    for g in gen {
+      w ++= [g]
+      fl_forward_k(fl, w, len(w) - 1, len(w) - 1, 1, false, 1)
+    }
+    let tplain = ticks() - tw
+    fl_reset(fl)
+    let s2 = base
+    let top2 = null
+    let p2 = 0
+    while p2 < len(s2) {
+      let n2 = min(FL_TMAX(), len(s2) - p2)
+      top2 = fl_forward_k(fl, s2, p2, p2, n2, false, 1)
+      p2 += n2
+    }
+    let pd = pd_new()
+    for j in range(2, len(s2) + 1) { pd_push_at(pd, s2, j) }
+    let out2 = []
+    let passes = 0
+    let drafted = 0
+    let accepted = 0
+    let done = false
+    let ts0 = ticks()
+    let prs = fl["prof"]
+    for i in range(0, 8) { aset(prs, i, 0) }
+    let tv = 0
+    let tsg = 0
+    let ctr0 = aget(fl["ctr"], 1)
+    while len(out2) < k and not done {
+      let nx = top2[0][1]
+      if nx == 248046 or nx == 248044 { break }
+      s2 ++= [nx]
+      out2 ++= [nx]
+      pd_push(pd, s2)
+      let d = pd_draft(pd, s2, min(FL_TS() - 1, k - len(out2)))
+      passes += 1
+      if len(d) == 0 {
+        let u1 = rt_usec()
+        top2 = fl_forward_k(fl, s2, len(s2) - 1, len(s2) - 1, 1, false, 1)
+        tsg += rt_usec() - u1
+      } else {
+        drafted += 1
+        let u1 = rt_usec()
+        let ys = fl_forward_k(fl, s2 ++ d, len(s2) - 1, len(s2) - 1, 1 + len(d), false, 0)
+        tv += rt_usec() - u1
+        let m = 0
+        while m < len(d) and d[m] == ys[m] { m += 1 }
+        if m < len(d) { fl_rollback(fl, m) }
+        accepted += m
+        for j in range(0, m) {
+          if d[j] == 248046 or d[j] == 248044 { done = true }
+          if not done {
+            s2 ++= [d[j]]
+            out2 ++= [d[j]]
+            pd_push(pd, s2)
+          }
+        }
+        top2 = [[0.0, ys[m]]]
+      }
+    }
+    let tspec = ticks() - ts0
+    let same = 0
+    while same < min(len(out2), len(gen)) and out2[same] == gen[same] { same += 1 }
+    print("plain: " ++ str(k) ++ " tokens in " ++ str(tplain) ++ " ms = " ++ format("{:.1f}", k * 1000.0 / max(tplain, 1)) ++ " tokens/s")
+    print("drafted: " ++ str(len(out2)) ++ " tokens in " ++ str(tspec) ++ " ms = " ++ format("{:.1f}", len(out2) * 1000.0 / max(tspec, 1)) ++ " tokens/s; " ++ str(passes) ++ " passes (" ++ format("{:.2f}", len(out2) * 1.0 / max(passes, 1)) ++ " tokens a pass), a draft in " ++ str(drafted) ++ ", " ++ str(accepted) ++ " draft tokens kept")
+    print("  verify passes " ++ str(drafted) ++ ": " ++ str(tv // max(drafted, 1) // 1000) ++ " ms each; one-token passes " ++ str(passes - drafted) ++ ": " ++ str(tsg // max(passes - drafted, 1) // 1000) ++ " ms each; experts loaded " ++ str(aget(fl["ctr"], 1) - ctr0))
+    print("  all passes: GPU wait " ++ str(aget(prs, 0) // 1000) ++ " ms, bookkeeping " ++ str((aget(prs, 1) - aget(prs, 2)) // 1000) ++ " ms, disk " ++ str(aget(prs, 2) // 1000) ++ " ms, the rest " ++ str((aget(prs, 3) - aget(prs, 0) - aget(prs, 1)) // 1000) ++ " ms")
+    print("the same tokens as plain greedy: " ++ str(same) ++ " of " ++ str(len(gen)) ++ (if same == len(gen) and len(out2) == len(gen) { " -- IDENTICAL" } else { " -- DIFFERENT" }))
+  }
+  if fl["elog"] != null {
+    let el = fl["elog"]
+    let parts = []
+    for i in range(1, aget(el, 0) + 1) { parts ++= [str(aget(el, i))] }
+    write_file("out\\flash_elog.txt", join(parts, "\n"))
+    print("expert lookups logged: " ++ str(aget(el, 0)))
+  }
+  if arg(3) == "ids" { print("ids: " ++ join(map(ids, fn(v) => str(v)), " ")) }
+  if arg(3) == "check" { print("cache check [slots checked, bad]: " ++ str(fl_check(fl, 7))) }
+  return out
+}

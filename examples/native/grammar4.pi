@@ -1,0 +1,891 @@
+# Grammar, step 4: structure ACROSS phrases, and WRITING. Both learned from data, no rules.
+#   out\grammar4.exe agree [files]   which earlier words decide a verb's number (is/are, was/were, has/have), at what
+#                                    distance and across which phrases -- learned from raw text (out\wiki\00_*), tested
+#                                    on held-out text (out\wiki\40_09.txt) against the word just before the verb
+#   out\grammar4.exe write [MB]      how each kind of fact is phrased ("[S] was directed by [V]"), learned from aligned
+#                                    facts; tested on held-out facts: does Pi phrase them as the real sentence does?
+#                                    -> out\frames.txt (relation ||| frame ||| count)
+#   out\grammar4.exe say "Subject"   Pi writes what it knows about a subject (out\facts.txt), in its learned phrasing
+
+skill SRC() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\pairs\\wikipedia_pairs.jsonl" }
+
+skill wkey2(w) -> Any {
+  let h = 0
+  for i in range(0, len(w)) { let h = (h * 31 + ord(slice(w, i, i + 1))) % 1000000007 }
+  return h * 64 + len(w) + 1
+}
+
+skill is_alnum(c) -> Any { return (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) }
+
+skill words_of(s) -> Any {
+  let out = []
+  let n = len(s)
+  let i = 0
+  while i < n {
+    while i < n and is_alnum(ord(slice(s, i, i + 1))) == false { let i = i + 1 }
+    let a = i
+    while i < n and is_alnum(ord(slice(s, i, i + 1))) { let i = i + 1 }
+    if i > a { let out = append(out, slice(s, a, i)) }
+  }
+  return out
+}
+
+skill field(t, key) -> Any {
+  let parts = split(t, "\"" ++ key ++ "\": ")
+  if len(parts) < 2 { return null }
+  let r = parts[1]
+  if slice(r, 0, 1) == "\"" {
+    let e = 1
+    while e < len(r) {
+      if slice(r, e, e + 1) == "\"" and slice(r, e - 1, e) != "\\" { return slice(r, 1, e) }
+      let e = e + 1
+    }
+  }
+  return null
+}
+
+skill find_seq(a, b, from) -> Any {
+  if len(b) == 0 { return 0 - 1 }
+  let i = from
+  while i + len(b) <= len(a) {
+    let ok = true
+    let k = 0
+    while ok and k < len(b) {
+      if lower(a[i + k]) != lower(b[k]) { let ok = false }
+      let k = k + 1
+    }
+    if ok { return i }
+    let i = i + 1
+  }
+  return 0 - 1
+}
+
+skill slot(hk, hsz, key) -> Any {
+  let s = key % hsz
+  while aget(hk, s) != 0 and aget(hk, s) != key { let s = (s + 1) % hsz }
+  return s
+}
+
+skill imax(a, b) -> Any {
+  if a > b { return a }
+  return b
+}
+
+skill pct(a, n) -> Any { return str(100 * a // imax(1, n)) ++ "%" }
+
+# ---- 1. agreement across phrases ------------------------------------------------------------------------------------
+# 1 singular, 2 plural, 0 not one of the verbs
+skill num_of(w) -> Any {
+  if w == "is" or w == "was" or w == "has" { return 1 }
+  if w == "are" or w == "were" or w == "have" { return 2 }
+  return 0
+}
+
+skill is_prep(w) -> Any { return w == "of" or w == "in" or w == "with" or w == "for" or w == "on" or w == "at" or w == "from" or w == "by" or w == "to" or w == "about" or w == "near" or w == "under" or w == "between" or w == "among" or w == "behind" or w == "without" or w == "within" or w == "during" }
+
+# every earlier word (up to 10 back) as evidence: distance, whether a preposition lies between it and the verb, the word
+skill agree_feats(lw, j) -> Any {
+  let out = []
+  let crossed = "n"
+  let k = j - 1
+  while k >= 0 and j - k <= 10 {
+    let out = append(out, str(j - k) ++ crossed ++ " " ++ lw[k])
+    # its ending too (learned like a word: nothing here says what an ending means)
+    let n = len(lw[k])
+    if n >= 4 {
+      let out = append(out, str(j - k) ++ crossed ++ " ~" ++ slice(lw[k], n - 1, n))
+      let out = append(out, str(j - k) ++ crossed ++ " ~" ++ slice(lw[k], n - 2, n))
+    }
+    if is_prep(lw[k]) { let crossed = "p" }
+    let k = k - 1
+  }
+  let hs = heads(lw, j)
+  for h in range(0, len(hs)) {
+    let hw = lw[hs[h]]
+    let out = append(out, "H" ++ str(h + 1) ++ " " ++ hw)
+    let n = len(hw)
+    if n >= 4 {
+      let out = append(out, "H" ++ str(h + 1) ++ " ~" ++ slice(hw, n - 1, n))
+      let out = append(out, "H" ++ str(h + 1) ++ " ~" ++ slice(hw, n - 2, n))
+    }
+  }
+  return out
+}
+
+# the positions just before the first two prepositions going back from the verb (within 10 words)
+skill heads(lw, j) -> Any {
+  let out = []
+  let k = j - 1
+  while k >= 1 and j - k <= 10 and len(out) < 2 {
+    if is_prep(lw[k]) {
+      if is_prep(lw[k - 1]) == false { let out = append(out, k - 1) }
+    }
+    let k = k - 1
+  }
+  return out
+}
+
+# the evidence of one verb as 61 numbers: per group (distance 1-10 x across a phrase or not x word / last letter /
+# last two letters) the log ratio of the earlier word there, and 1 for the base
+skill agree_vec(t, lw, j) -> Any {
+  let v = []
+  for g in range(0, 66) { let v = append(v, 0.0) }
+  let crossed = 0
+  let k = j - 1
+  while k >= 0 and j - k <= 10 {
+    let d = j - k
+    let cs = "n"
+    if crossed == 1 { let cs = "p" }
+    let g0 = ((d - 1) * 2 + crossed) * 3
+    let x = lr(t, str(d) ++ cs ++ " " ++ lw[k])
+    if x[1] >= 5 { let v = slice(v, 0, g0) ++ [x[0]] ++ slice(v, g0 + 1, len(v)) }
+    let n = len(lw[k])
+    if n >= 4 {
+      let x1 = lr(t, str(d) ++ cs ++ " ~" ++ slice(lw[k], n - 1, n))
+      let v = slice(v, 0, g0 + 1) ++ [x1[0]] ++ slice(v, g0 + 2, len(v))
+      let x2 = lr(t, str(d) ++ cs ++ " ~" ++ slice(lw[k], n - 2, n))
+      let v = slice(v, 0, g0 + 2) ++ [x2[0]] ++ slice(v, g0 + 3, len(v))
+    }
+    if is_prep(lw[k]) { let crossed = 1 }
+    let k = k - 1
+  }
+  let hs = heads(lw, j)
+  for h in range(0, len(hs)) {
+    let hw = lw[hs[h]]
+    let g0 = 60 + 3 * h
+    let x = lr(t, "H" ++ str(h + 1) ++ " " ++ hw)
+    if x[1] >= 5 { let v = slice(v, 0, g0) ++ [x[0]] ++ slice(v, g0 + 1, len(v)) }
+    let n = len(hw)
+    if n >= 4 {
+      let x1 = lr(t, "H" ++ str(h + 1) ++ " ~" ++ slice(hw, n - 1, n))
+      let v = slice(v, 0, g0 + 1) ++ [x1[0]] ++ slice(v, g0 + 2, len(v))
+      let x2 = lr(t, "H" ++ str(h + 1) ++ " ~" ++ slice(hw, n - 2, n))
+      let v = slice(v, 0, g0 + 2) ++ [x2[0]] ++ slice(v, g0 + 3, len(v))
+    }
+  }
+  return append(v, 1.0)
+}
+
+skill dot(a, b) -> Any {
+  let s = 0.0
+  for i in range(0, len(a)) { let s = s + a[i] * b[i] }
+  return s
+}
+
+# -> [log ratio singular vs plural, times seen]
+skill lr(t, f) -> Any {
+  let key = wkey2(f)
+  let s = slot(t[0], t[3], key)
+  let a = 0
+  let b = 0
+  if aget(t[0], s) == key {
+    let a = aget(t[1], s)
+    let b = aget(t[2], s)
+  }
+  return [log2((a + 1) * 1.0 / (aget(t[4], 0) + 1000)) - log2((b + 1) * 1.0 / (aget(t[4], 1) + 1000)), a + b]
+}
+
+# one text: learn (count) or test (res: n, word-before right, all right, trusted-one right, majority right; then the
+# same at +5 for items with a preposition among the 4 words before the verb)
+skill agree_text(text, t, learn, res, featlog, st) -> Any {
+  for para in split(text, "\n") {
+    let m = mark()
+    let fresh = []
+    let w = []
+    let acc = []
+    let steps = 0
+    if st != null {
+      let w = st[0]
+      let acc = st[1]
+      let steps = st[2]
+    }
+    for sn in split(para, ". ") {
+      let ws = words_of(sn)
+      let lw = []
+      for w in ws { let lw = append(lw, lower(w)) }
+      let j = 1
+      while j < len(lw) {
+        let nb = num_of(lw[j])
+        if nb > 0 {
+          let fs = agree_feats(lw, j)
+          if learn == false and res == null {
+            # learn how much to trust each position: a perceptron over the 61 numbers (averaged)
+            let x = agree_vec(t, lw, j)
+            let y = 1.0
+            if nb == 2 { let y = 0.0 - 1.0 }
+            if y * dot(w, x) <= 0.0 {
+              let w2 = []
+              for i in range(0, 67) { let w2 = append(w2, w[i] + y * x[i]) }
+              let w = w2
+            }
+            let a2 = []
+            for i in range(0, 67) { let a2 = append(a2, acc[i] + w[i]) }
+            let acc = a2
+            let steps = steps + 1
+          }
+          if learn {
+            for f in fs {
+              let key = wkey2(f)
+              let s = slot(t[0], t[3], key)
+              if aget(t[0], s) == 0 and len(fresh) < 100000 { let fresh = append(fresh, f) }
+              do aset(t[0], s, key)
+              do aset(t[nb], s, aget(t[nb], s) + 1)
+            }
+            do aset(t[4], nb - 1, aget(t[4], nb - 1) + 1)
+          }
+          if learn == false and res != null {
+            # the base rate: how much likelier a singular verb is, before any evidence
+            let base = log2((aget(t[4], 0) + 1) * 1.0 / (aget(t[4], 1) + 1))
+            let loc = lr(t, fs[0])[0] + base
+            let all = base
+            let best = 0.0
+            let bm = 0.0
+            for f in fs {
+              let x = lr(t, f)
+              if x[1] >= 20 {
+                let all = all + x[0]
+                let ax = x[0]
+                if ax < 0 { let ax = 0.0 - ax }
+                if ax > bm {
+                  let bm = ax
+                  let best = x[0]
+                }
+              }
+            }
+            let att = false
+            let k = imax(0, j - 4)
+            while k < j {
+              if is_prep(lw[k]) { let att = true }
+              let k = k + 1
+            }
+            let o = 0
+            if att { let o = 7 }
+            let ok1 = 0
+            if (loc > 0 and nb == 1) or (loc <= 0 and nb == 2) { let ok1 = 1 }
+            let ok2 = 0
+            if (all > 0 and nb == 1) or (all <= 0 and nb == 2) { let ok2 = 1 }
+            let ok3 = 0
+            let best = best + base
+            if (best > 0 and nb == 1) or (best <= 0 and nb == 2) { let ok3 = 1 }
+            let ok4 = 0
+            if nb == 1 { let ok4 = 1 }
+            # jump over the phrase: when a preposition is among the 4 words before the verb, the evidence of the word
+            # before that phrase (its head) and its endings instead of the word next to the verb
+            let jump = loc
+            let hs = heads(lw, j)
+            if len(hs) > 0 {
+              if j - hs[0] <= 6 {
+                let hw = lw[hs[0]]
+                let jump = base + lr(t, "H1 " ++ hw)[0]
+                let n2 = len(hw)
+                if n2 >= 4 { let jump = jump + lr(t, "H1 ~" ++ slice(hw, n2 - 2, n2))[0] }
+              }
+            }
+            let ok6 = 0
+            if (jump > 0 and nb == 1) or (jump <= 0 and nb == 2) { let ok6 = 1 }
+            let ok5 = 0
+            if st != null {
+              let sc = dot(st[1], agree_vec(t, lw, j))
+              if (sc > 0.0 and nb == 1) or (sc <= 0.0 and nb == 2) { let ok5 = 1 }
+            }
+            for q in [0, o] {
+              if q == 0 or o == 7 {
+                do aset(res, q, aget(res, q) + 1)
+                do aset(res, q + 1, aget(res, q + 1) + ok1)
+                do aset(res, q + 2, aget(res, q + 2) + ok2)
+                do aset(res, q + 3, aget(res, q + 3) + ok3)
+                do aset(res, q + 4, aget(res, q + 4) + ok4)
+                do aset(res, q + 5, aget(res, q + 5) + ok5)
+                do aset(res, q + 6, aget(res, q + 6) + ok6)
+              }
+            }
+          }
+        }
+        let j = j + 1
+      }
+    }
+    let kept = release(m, [fresh, w, acc, steps])
+    let fresh = kept[0]
+    if st != null and res == null { let st = [kept[1], kept[2], kept[3]] }
+    if learn and len(fresh) > 0 and len(featlog) < 20000 { let featlog = append(featlog, fresh) }
+  }
+  if st != null and res == null { return st }
+  return featlog
+}
+
+skill agree(nfiles) -> Any {
+  let t0 = ticks()
+  let hsz = 8388608
+  let t = [arr(hsz), arr(hsz), arr(hsz), hsz, arr(2)]
+  let featlog = []
+  let names = listdir("out\\wiki")
+  let used = 0
+  for i in range(0, nfiles) {
+    let m = mark()
+    let text = read_file("out\\wiki\\" ++ names[i])
+    let r = release(m, [len(text), agree_text(text, t, true, null, [], null)])
+    let used = used + r[0]
+    if len(featlog) < 20000 { let featlog = featlog ++ r[1] }
+  }
+  # how much to trust each position: learned on 20 MB of the NEXT file (counted text is not reused for this)
+  let z = []
+  for i in range(0, 67) { let z = append(z, 0.0) }
+  let tn = read_file("out\\wiki\\" ++ names[nfiles])
+  let st = agree_text(slice(tn, 0, 20000000), t, false, null, [], [z, z, 0])
+  let t1 = ticks()
+  let res = arr(14)
+  let tx = read_file("out\\wiki\\40_09.txt")
+  do agree_text(slice(tx, 0, 30000000), t, false, res, [], st)
+  let t2 = ticks()
+  let out = "learned from " ++ str(used // 1000000) ++ " MB of text (" ++ str(aget(t[4], 0) + aget(t[4], 1)) ++ " verbs) in " ++ str((t1 - t0) // 1000) ++ " s; tested on 30 MB held out in " ++ str((t2 - t1) // 1000) ++ " s\n"
+  for h in [[0, "all verbs"], [7, "a phrase before the verb (a preposition among the 4 words before it)"]] {
+    let o = h[0]
+    let n = aget(res, o)
+    let out = out ++ h[1] ++ ": " ++ str(n) ++ " items\n  always singular " ++ pct(aget(res, o + 4), n) ++ ", the word before the verb " ++ pct(aget(res, o + 1), n) ++ ", PI all earlier words " ++ pct(aget(res, o + 2), n) ++ ", PI the one word it trusts most " ++ pct(aget(res, o + 3), n) ++ ", PI LEARNED WHICH POSITIONS TO TRUST " ++ pct(aget(res, o + 5), n) ++ ", PI JUMPS THE PHRASE " ++ pct(aget(res, o + 6), n) ++ "\n"
+  }
+  # what Pi learned to look at: words 3+ back, across a phrase (a preposition between), that decide the number
+  let sg = []
+  let pl = []
+  for blk in featlog {
+    for f in blk {
+      let ps = split(f, " ")
+      if len(ps) == 2 {
+        if slice(ps[0], len(ps[0]) - 1, len(ps[0])) == "p" and num(slice(ps[0], 0, len(ps[0]) - 1)) >= 3 {
+          let x = lr(t, f)
+          if x[1] >= 300 {
+            if x[0] > 2.5 and len(sg) < 8 { let sg = append(sg, f) }
+            if x[0] < 0.0 - 2.5 and len(pl) < 8 { let pl = append(pl, f) }
+          }
+        }
+      }
+    }
+  }
+  let out = out ++ "across a phrase -> singular (distance+p = a preposition between, the word): " ++ join(sg, " | ") ++ "\n"
+  return out ++ "across a phrase -> plural: " ++ join(pl, " | ")
+}
+
+# ---- Pi's word groups (step 1): word -> class; which classes are verbs (most members end in -ed, or the class of
+# "was" / "is") -- found from the groups themselves
+skill load_classes() -> Any {
+  let hsz = 131072
+  let hk = arr(hsz)
+  let hv = arr(hsz)
+  let nm = arr(300)
+  let ned = arr(300)
+  let t = read_file("out\\classes.txt")
+  for l in split(t, "\n") {
+    let p = split(l, " ")
+    if len(p) == 2 {
+      let c = int_of(p[1])
+      let k = wkey2(p[0])
+      let s = slot(hk, hsz, k)
+      do aset(hk, s, k)
+      do aset(hv, s, c + 1)
+      do aset(nm, c, aget(nm, c) + 1)
+      if len(p[0]) >= 4 and slice(p[0], len(p[0]) - 2, len(p[0])) == "ed" { do aset(ned, c, aget(ned, c) + 1) }
+    }
+  }
+  let verb = arr(300)
+  for c in range(0, 300) {
+    if aget(nm, c) >= 5 and 2 * aget(ned, c) >= aget(nm, c) { do aset(verb, c, 1) }
+  }
+  let cw = [hk, hv, hsz, verb]
+  for w in ["was", "is"] {
+    let c = cls_of(cw, w)
+    if c >= 0 { do aset(verb, c, 1) }
+  }
+  return cw
+}
+
+skill cls_of(cw, w) -> Any {
+  let k = wkey2(w)
+  let s = slot(cw[0], cw[2], k)
+  if aget(cw[0], s) == k { return aget(cw[1], s) - 1 }
+  return 0 - 1
+}
+
+# a phrasing Pi can write: it has a verb (by Pi's classes) and no capitalised word (names, nationalities)
+skill writable(cw, gap) -> Any {
+  let hasv = false
+  for w in gap {
+    if is_cap(w) { return false }
+    let c = cls_of(cw, lower(w))
+    if c >= 0 {
+      if aget(cw[3], c) == 1 { let hasv = true }
+    }
+  }
+  return hasv
+}
+
+skill is_cap(w) -> Any {
+  let c = ord(slice(w, 0, 1))
+  return c >= 65 and c <= 90
+}
+
+skill months() -> Any { return ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"] }
+
+skill is_month(w) -> Any {
+  for m in months() {
+    if lower(w) == m { return true }
+  }
+  return false
+}
+
+# 1912-06-23 -> "23 June 1912"; 1912 -> "1912"
+skill date_words(v) -> Any {
+  let p = split(v, "-")
+  if len(p) >= 3 and len(p[0]) == 4 {
+    let mi = num(p[1])
+    let d = num(slice(p[2], 0, 2))
+    if mi >= 1 and mi <= 12 and d >= 1 {
+      let m = months()[mi - 1]
+      return str(d) ++ " " ++ upper(slice(m, 0, 1)) ++ slice(m, 1, len(m)) ++ " " ++ p[0]
+    }
+  }
+  return slice(v, 0, 4)
+}
+
+# ---- the subject finder (EM, no labels): every earlier word may be the verb's subject; WHERE subjects sit (distance,
+# Pi's class of the word after the candidate, prepositions crossed) is learned as the place whose word's own number
+# best explains the verb's form. A word's own number: how it behaves right before a verb (word, else its ending).
+skill sigm(x) -> Any { return 1.0 / (1.0 + exp(0.0 - 0.6931 * x)) }
+
+skill real_int(x) -> Any {
+  if x < 1.0 { return 0 }
+  return int_of(split(str(x), ".")[0])
+}
+
+skill own_sing(t, w) -> Any {
+  let x = lr(t, "1n " ++ w)
+  if x[1] >= 5 { return sigm(x[0]) }
+  let n = len(w)
+  if n >= 4 { return sigm(lr(t, "1n ~" ++ slice(w, n - 2, n))[0]) }
+  return 0.5
+}
+
+skill path_sig(cw, lw, k, j, np) -> Any {
+  let c = "v"
+  if k + 1 < j { let c = str(cls_of(cw, lw[k + 1])) }
+  let pp = np
+  if pp > 2 { let pp = 2 }
+  return str(j - k) ++ "|" ++ c ++ "|" ++ str(pp)
+}
+
+# the candidates of one verb: [[place signature, P(singular) of its word]]
+skill subj_cands(t, cw, lw, j) -> Any {
+  let out = []
+  let np = 0
+  let k = j - 1
+  while k >= 0 and j - k <= 10 {
+    let out = append(out, [path_sig(cw, lw, k, j, np), own_sing(t, lw[k])])
+    if is_prep(lw[k]) { let np = np + 1 }
+    let k = k - 1
+  }
+  return out
+}
+
+# pi(sig) as an integer x 1,000,000 in a table [keys, expected subject count x1000, times available, size]
+skill pi_of(pm, sig) -> Any {
+  let k = wkey2(sig)
+  let s = slot(pm[0], pm[3], k)
+  if aget(pm[0], s) != k { return 0.1 }
+  return (aget(pm[1], s) * 0.001 + 0.1) / (aget(pm[2], s) + 1.0)
+}
+
+# one pass over a text: E (posteriors from the current pi) accumulated into pm2; or test (res)
+skill em_text(text, t, cw, pm, pm2, res) -> Any {
+  for para in split(text, "\n") {
+    let m = mark()
+    let ups = []
+    for sn in split(para, ". ") {
+      let lw = []
+      for w in words_of(sn) { let lw = append(lw, lower(w)) }
+      let j = 1
+      while j < len(lw) {
+        let nb = num_of(lw[j])
+        if nb > 0 {
+          let cs = subj_cands(t, cw, lw, j)
+          let tot = 0.0
+          let num_s = 0.0
+          let ws = []
+          for c in cs {
+            let pr = pi_of(pm, c[0])
+            let py = c[1]
+            if nb == 2 { let py = 1.0 - c[1] }
+            let ws = append(ws, pr * py)
+            let tot = tot + pr * py
+            let num_s = num_s + pr * c[1]
+          }
+          if res == null {
+            for i in range(0, len(cs)) { let ups = append(ups, [cs[i][0], real_int(1000.0 * ws[i] / tot)]) }
+          } else {
+            let den = 0.0
+            for c in cs { let den = den + pi_of(pm, c[0]) }
+            let ps = num_s / den
+            let ok = 0
+            if (ps > 0.5 and nb == 1) or (ps <= 0.5 and nb == 2) { let ok = 1 }
+            let att = false
+            let k = imax(0, j - 4)
+            while k < j {
+              if is_prep(lw[k]) { let att = true }
+              let k = k + 1
+            }
+            do aset(res, 0, aget(res, 0) + 1)
+            do aset(res, 1, aget(res, 1) + ok)
+            if att {
+              do aset(res, 2, aget(res, 2) + 1)
+              do aset(res, 3, aget(res, 3) + ok)
+            }
+          }
+        }
+        let j = j + 1
+      }
+    }
+    let ups = release(m, ups)
+    for u in ups {
+      let k = wkey2(u[0])
+      let s = slot(pm2[0], pm2[3], k)
+      do aset(pm2[0], s, k)
+      do aset(pm2[1], s, aget(pm2[1], s) + u[1])
+      do aset(pm2[2], s, aget(pm2[2], s) + 1)
+    }
+  }
+  return 0
+}
+
+skill subject_mode(nfiles) -> Any {
+  let t0 = ticks()
+  let hsz = 8388608
+  let t = [arr(hsz), arr(hsz), arr(hsz), hsz, arr(2)]
+  let names = listdir("out\\wiki")
+  for i in range(0, nfiles) {
+    let m = mark()
+    let text = read_file("out\\wiki\\" ++ names[i])
+    do release(m, agree_text(text, t, true, null, [], null))
+  }
+  let cw = load_classes()
+  let t1 = ticks()
+  # EM on 15 MB of the next file (not the counted text): 4 rounds
+  let tn = slice(read_file("out\\wiki\\" ++ names[nfiles]), 0, 15000000)
+  let psz = 262144
+  let pm = [arr(psz), arr(psz), arr(psz), psz]
+  for r in range(0, 4) {
+    let pm2 = [arr(psz), arr(psz), arr(psz), psz]
+    do em_text(tn, t, cw, pm, pm2, null)
+    let pm = pm2
+  }
+  let t2 = ticks()
+  let res = arr(4)
+  let tx = read_file("out\\wiki\\40_09.txt")
+  do em_text(slice(tx, 0, 30000000), t, cw, pm, null, res)
+  let out = "counted " ++ str(nfiles) ++ " files in " ++ str((t1 - t0) // 1000) ++ " s; EM (4 rounds, 15 MB) in " ++ str((t2 - t1) // 1000) ++ " s\n"
+  let out = out ++ "PI'S SUBJECT FINDER, held out: all verbs " ++ pct(aget(res, 1), aget(res, 0)) ++ " of " ++ str(aget(res, 0)) ++ "; with a phrase before the verb " ++ pct(aget(res, 3), aget(res, 2)) ++ " of " ++ str(aget(res, 2)) ++ "\n"
+  # where Pi learned subjects sit: the most trusted places (seen 200+ times)
+  let best = []
+  for d in range(1, 11) {
+    for pp in range(0, 3) {
+      let bsig = ""
+      let bp = 0.0
+      for c in range(0, 256) {
+        let sig = str(d) ++ "|" ++ str(c) ++ "|" ++ str(pp)
+        let k = wkey2(sig)
+        let s = slot(pm[0], pm[3], k)
+        if aget(pm[0], s) == k and aget(pm[2], s) >= 200 {
+          let v = pi_of(pm, sig)
+          if v > bp {
+            let bp = v
+            let bsig = sig
+          }
+        }
+      }
+      if bsig != "" and bp > 0.3 { let best = append(best, bsig ++ "=" ++ str(real_int(100.0 * bp)) ++ "%") }
+    }
+  }
+  return out ++ "where subjects sit (distance | Pi's class of the next word | prepositions crossed = how often the subject): " ++ join(best, "  ")
+}
+
+# ---- 2. writing: how each kind of fact is phrased --------------------------------------------------------------------
+# a fact's frame in its sentence: "[S] words [V]" or "[V] words [S]" (1-6 words between) -> [relation, frame] or null
+skill frame_of(t, cw) -> Any {
+  let r = field(t, "relation")
+  let s = field(t, "subject_label")
+  let v = field(t, "value")
+  let sent = field(t, "sentence")
+  if r == null or s == null or v == null or sent == null { return null }
+  let ws = words_of(sent)
+  let sw = words_of(s)
+  let vw = words_of(v)
+  if len(vw) == 0 or len(sw) == 0 { return null }
+  if r == "date_of_birth" or r == "date_of_death" or r == "inception" or r == "publication_date" { let vw = [slice(vw[0], 0, 4)] }
+  let a = find_seq(ws, sw, 0)
+  if a < 0 { return null }
+  let b = find_seq(ws, vw, a + len(sw))
+  if b >= 0 {
+    # a date: the day and month before the year belong to it
+    if len(vw) == 1 and b >= 2 {
+      if is_month(ws[b - 1]) and len(ws[b - 2]) <= 2 { let b = b - 2 } else {
+        if is_month(ws[b - 2]) and len(ws[b - 1]) <= 2 { let b = b - 2 }
+      }
+    }
+    let gap = slice(ws, a + len(sw), b)
+    if len(gap) >= 1 and len(gap) <= 6 and writable(cw, gap) { return [r, "[S] " ++ lower(join(gap, " ")) ++ " [V]"] }
+    return null
+  }
+  let b = find_seq(ws, vw, 0)
+  if b >= 0 and b + len(vw) <= a {
+    let gap = slice(ws, b + len(vw), a)
+    if len(gap) >= 1 and len(gap) <= 6 and writable(cw, gap) { return [r, "[V] " ++ lower(join(gap, " ")) ++ " [S]"] }
+  }
+  return null
+}
+
+skill rel_ix(rl, r) -> Any {
+  for i in range(0, len(rl)) {
+    if rl[i] == r { return i }
+  }
+  return 0 - 1
+}
+
+# best: [counts per relation, frames, relations, the most frequent frame overall, its count]
+skill frames_range(off, mb, ft, best, learn, res, cw) -> Any {
+  let chunk = 8000000
+  let pos = off
+  let carry = ""
+  while pos < off + mb * 1000000 {
+    let m = mark()
+    let b = read_bytes(SRC(), pos, chunk)
+    let n = 0
+    if b != null { let n = len(b) }
+    let ls = split(carry ++ arr_text(b, 0, n), "\n")
+    let ups = []
+    let got = [0, 0, 0]
+    for i in range(0, len(ls) - 1) {
+      let fr = frame_of(ls[i], cw)
+      if fr != null {
+        let key = wkey2(fr[0] ++ "|" ++ fr[1])
+        if learn {
+          let s = slot(ft[0], ft[2], key)
+          do aset(ft[0], s, key)
+          do aset(ft[1], s, aget(ft[1], s) + 1)
+          let fk = wkey2("*|" ++ fr[1])
+          let s2 = slot(ft[0], ft[2], fk)
+          do aset(ft[0], s2, fk)
+          do aset(ft[1], s2, aget(ft[1], s2) + 1)
+          let c = aget(ft[1], s)
+          if slice(fr[1], 0, 3) == "[S]" { let ups = append(ups, [fr[0], fr[1], c * c * 100 // aget(ft[1], s2)]) }
+        } else {
+          let ri = rel_ix(best[2], fr[0])
+          if ri >= 0 {
+            let ok = 0
+            if best[1][ri] == fr[1] { let ok = 1 }
+            let og = 0
+            if fr[1] == best[3] { let og = 1 }
+            let got = [got[0] + 1, got[1] + ok, got[2] + og]
+          }
+        }
+      }
+    }
+    let keep = release(m, [ls[len(ls) - 1], ups, got])
+    let carry = keep[0]
+    for u in keep[1] {
+      let ri = rel_ix(best[2], u[0])
+      if ri < 0 {
+        do aset(best[0], len(best[2]), u[2])
+        let best = [best[0], append(best[1], u[1]), append(best[2], u[0]), best[3], best[4]]
+      } else {
+        if u[2] > aget(best[0], ri) {
+          do aset(best[0], ri, u[2])
+          let best = [best[0], slice(best[1], 0, ri) ++ [u[1]] ++ slice(best[1], ri + 1, len(best[1])), best[2], best[3], best[4]]
+        }
+      }
+      if u[2] > aget(best[4], 0) {
+        do aset(best[4], 0, u[2])
+        let best = [best[0], best[1], best[2], u[1], best[4]]
+      }
+    }
+    if learn == false {
+      for q in range(0, 3) { do aset(res, q, aget(res, q) + keep[2][q]) }
+    }
+    if n < chunk { let pos = off + mb * 1000000 } else { let pos = pos + n }
+  }
+  return best
+}
+
+skill write_mode(mb) -> Any {
+  let t0 = ticks()
+  let hsz = 8388608
+  let ft = [arr(hsz), arr(hsz), hsz]
+  let cw = load_classes()
+
+  let best = frames_range(0, mb, ft, [arr(4096), [], [], "", arr(1)], true, null, cw)
+  let t1 = ticks()
+  let res = arr(3)
+  do frames_range(1000000000, 40, null, best, false, res, cw)
+  let lines = []
+  for i in range(0, len(best[2])) { let lines = append(lines, best[2][i] ++ " ||| " ++ best[1][i] ++ " ||| " ++ str(aget(best[0], i))) }
+  do write_file("out\\frames.txt", join(lines, "\n"))
+  let n = aget(res, 0)
+  let out = "learned the phrasing of " ++ str(len(best[2])) ++ " kinds of fact from " ++ str(mb) ++ " MB of aligned facts in " ++ str((t1 - t0) // 1000) ++ " s -> out\\frames.txt\n"
+  let out = out ++ "held-out facts (other articles), " ++ str(n) ++ " with a short phrasing: Pi's phrasing is EXACTLY the real sentence's for " ++ pct(aget(res, 1), n) ++ " (one phrasing for every kind of fact: " ++ pct(aget(res, 2), n) ++ ")\n"
+  let out = out ++ "examples of what Pi learned:\n"
+  for r in ["director", "author", "place_of_birth", "spouse", "founder", "record_label", "educated_at", "member_of_political_party", "capital", "composer"] {
+    let ri = rel_ix(best[2], r)
+    if ri >= 0 { let out = out ++ "  " ++ r ++ ": " ++ best[1][ri] ++ "\n" }
+  }
+  return out
+}
+
+# ---- pronouns: which one Wikipedia uses for a thing, read from the opening of its own local article -------------
+skill wl_find(title) -> Any {
+  let lt = lower(title)
+  let t = read_file("out\\wikiidx\\s" ++ str(wkey2(lt) % 256) ++ ".txt")
+  if t == null { return null }
+  let want = lt ++ " ||| "
+  let parts = split(t, "\n" ++ want)
+  if len(parts) < 2 {
+    if slice(t, 0, len(want)) != want { return null }
+    let p = split(split(t, "\n")[0], " ||| ")
+    return [p[1], int_of(p[2]), int_of(p[3])]
+  }
+  let p = split(split(parts[1], "\n")[0], " ||| ")
+  return [p[0], int_of(p[1]), int_of(p[2])]
+}
+
+# -> "He", "She", "They", "It" (the most used in the article's first 4,000 bytes; it/they count half: every article
+# has some) or null when Pi has no article
+skill pronoun(subject) -> Any {
+  let at = wl_find(subject)
+  if at == null { return null }
+  let n = at[2]
+  if n > 4000 { let n = 4000 }
+  let b = read_bytes("out\\wiki\\" ++ at[0] ++ ".txt", at[1], n)
+  if b == null { return null }
+  let he = 0
+  let she = 0
+  let it = 0
+  let they = 0
+  for w in words_of(lower(arr_text(b, 0, len(b)))) {
+    if w == "he" or w == "his" or w == "him" { let he = he + 2 }
+    if w == "she" or w == "her" or w == "hers" { let she = she + 2 }
+    if w == "it" or w == "its" { let it = it + 1 }
+    if w == "they" or w == "their" or w == "them" { let they = they + 1 }
+  }
+  if he >= she and he >= it and he >= they and he > 0 { return "He" }
+  if she >= it and she >= they and she > 0 { return "She" }
+  if they > it { return "They" }
+  return "It"
+}
+
+# "[S] was born on [V]" -> ["[S] was born", "on [V]"]: the part before the value's last linking word
+skill frame_split(f) -> Any {
+  let ws = split(f, " ")
+  if len(ws) >= 4 and ws[len(ws) - 1] == "[V]" {
+    return [join(slice(ws, 0, len(ws) - 2), " "), join(slice(ws, len(ws) - 2, len(ws)), " ")]
+  }
+  return [f, ""]
+}
+
+# Pi writes what it knows about a subject: each fact in its relation's learned phrasing
+skill say(subject) -> Any {
+  let ft = read_file("out\\frames.txt")
+  if ft == null { return "no out\\frames.txt (grammar4.exe write)" }
+  let rels = []
+  let frs = []
+  for l in split(ft, "\n") {
+    let p = split(l, " ||| ")
+    if len(p) == 3 {
+      let rels = append(rels, p[0])
+      let frs = append(frs, p[1])
+    }
+  }
+  let facts = read_file("out\\facts.txt")
+  let out = []
+  let ls = lower(subject)
+  # one thing per name: facts.txt keeps each thing's facts together and the best-known first (Abraham Lincoln the
+  # man, line 17; ships, books and towns of the same name come later) -> only the first block is written
+  let state = 0
+  for line in split(facts, "\n") {
+    let mine = false
+    if lower(slice(line, 0, len(subject) + 5)) == ls ++ " ||| " { let mine = true }
+    if mine and state == 0 { let state = 1 }
+    if mine == false and state == 1 { let state = 2 }
+    if mine and state == 1 {
+      let p = split(line, " ||| ")
+      if len(p) == 3 and lower(p[0]) == ls {
+        let ri = rel_ix(rels, p[1])
+        if ri >= 0 and lower(p[2]) != ls {
+          let v = p[2]
+          if p[1] == "date_of_birth" or p[1] == "date_of_death" or p[1] == "inception" or p[1] == "publication_date" {
+            let v = date_words(v)
+          }
+          let fs = frame_split(frs[ri])
+          let tail = join(split(fs[1], "[V]"), v)
+          let found = 0 - 1
+          for i in range(0, len(out)) {
+            if out[i][0] == fs[0] and fs[1] != "" { let found = i }
+          }
+          if found < 0 { let out = append(out, [fs[0], [tail], frs[ri], v]) } else {
+            let have = false
+            for x in out[found][1] {
+              if x == tail { let have = true }
+            }
+            if have == false { let out = slice(out, 0, found) ++ [[out[found][0], append(out[found][1], tail), out[found][2], out[found][3]]] ++ slice(out, found + 1, len(out)) }
+          }
+        }
+      }
+    }
+  }
+  if len(out) == 0 { return "Pi has no facts about " ++ subject }
+  let pr = pronoun(subject)
+  let sents = []
+  for i in range(0, len(out)) {
+    let it = out[i]
+    let who = subject
+    if i > 0 and pr != null and slice(it[0], 0, 3) == "[S]" { let who = pr }
+    let s = ""
+    if len(it[1]) == 1 and it[1][0] == "" { let s = join(split(join(split(it[2], "[S]"), who), "[V]"), it[3]) } else {
+      let s = join(split(it[0], "[S]"), who) ++ " " ++ join(it[1], " ")
+    }
+    # "they" takes were / are
+    if who == "They" {
+      let s = join(split(join(split(s, "They was "), "They were "), "They is "), "They are ")
+    }
+    let s = upper(slice(s, 0, 1)) ++ slice(s, 1, len(s)) ++ "."
+    let dup = false
+    for o in sents {
+      if o == s { let dup = true }
+    }
+    if dup == false { let sents = append(sents, s) }
+  }
+  return join(sents, " ")
+}
+
+skill main() -> Any {
+  if arg(1) == "agree" {
+    let nf = 2
+    if arg(2) != null { let nf = num(arg(2)) }
+    return agree(nf)
+  }
+  if arg(1) == "write" {
+    let mb = 900
+    if arg(2) != null { let mb = num(arg(2)) }
+    return write_mode(mb)
+  }
+  if arg(1) == "say" { return say(arg(2)) }
+  if arg(1) == "subject" {
+    let nf = 2
+    if arg(2) != null { let nf = num(arg(2)) }
+    return subject_mode(nf)
+  }
+  return "usage: grammar4.exe agree [files] | write [MB] | say \"Subject\""
+}
+
+# digits -> an integer (num gives a real, which cannot index an array)
+skill int_of(s) -> Any {
+  let v = 0
+  for i in range(0, len(s)) {
+    let c = ord(slice(s, i, i + 1))
+    if c >= 48 and c <= 57 { let v = v * 10 + (c - 48) }
+  }
+  return v
+}

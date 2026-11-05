@@ -1,0 +1,67 @@
+# The in-process evaluator, checked. Expressions (arithmetic, conditionals, let, lambdas and closures, recursion,
+# lists, higher-order functions) must give the right values; runaway or broken programs (an infinite loop, an
+# unbound name, division by zero) must FAIL cleanly instead of crashing or hanging; and interpreted results must
+# equal the same functions compiled natively. Self-checking: prints 1s.
+import "interp.pi"
+
+skill q(v) -> Any { return ["q", v] }
+skill V(n) -> Any { return ["v", n] }
+skill op(n, args) -> Any { return ["op", n, args] }
+skill call(n, args) -> Any { return ["call", n, args] }
+
+# definitions run by the interpreter
+skill defs() -> Any {
+  return {
+    "fact": ["lam", ["n"], ["if", op("<=", [V("n"), q(1)]), q(1), op("*", [V("n"), call("fact", [op("-", [V("n"), q(1)])])])]],
+    "fib": ["lam", ["n"], ["if", op("<", [V("n"), q(2)]), V("n"), op("+", [call("fib", [op("-", [V("n"), q(1)])]), call("fib", [op("-", [V("n"), q(2)])])])]],
+    "double_all": ["lam", ["xs"], ["if", op("empty", [V("xs")]), op("nil", []), op("cons", [op("*", [op("head", [V("xs")]), q(2)]), call("double_all", [op("tail", [V("xs")])])])]],
+    "sum": ["lam", ["xs"], ["if", op("empty", [V("xs")]), q(0), op("+", [op("head", [V("xs")]), call("sum", [op("tail", [V("xs")])])])]],
+    "twice": ["lam", ["f", "x"], ["app", V("f"), [["app", V("f"), [V("x")]]]]],
+    "loop": ["lam", ["n"], call("loop", [op("+", [V("n"), q(1)])])]
+  }
+}
+
+# the same functions, compiled natively
+skill fact_n(n) -> Any {
+  if n <= 1 { return 1 }
+  return n * fact_n(n - 1)
+}
+skill fib_n(n) -> Any {
+  if n < 2 { return n }
+  return fib_n(n - 1) + fib_n(n - 2)
+}
+
+skill B(b) -> Any {
+  if b { return "1" }
+  return "0"
+}
+
+skill ok_is(r, v) -> Any { return r[0] == 1 and r[1] == v }
+
+skill main() -> Any {
+  let d = defs()
+  let F = 100000
+  let out = B(ok_is(ev_closed(op("*", [op("+", [q(2), q(3)]), q(4)]), d, F), 20))
+  let out = out ++ B(ok_is(ev_closed(["if", op("<", [q(3), q(5)]), q(1), q(2)], d, F), 1))
+  let out = out ++ B(ok_is(ev_closed(["let", "x", q(7), op("*", [V("x"), V("x")])], d, F), 49))
+  let out = out ++ B(ok_is(ev_closed(["app", ["lam", ["x"], op("+", [V("x"), q(1)])], [q(41)]], d, F), 42))
+  let out = out ++ B(ok_is(ev_closed(["let", "k", q(10), ["app", ["lam", ["x"], op("+", [V("x"), V("k")])], [q(5)]]], d, F), 15))
+  let out = out ++ B(ok_is(run_def(d, "fact", [10], F), 3628800))
+  let out = out ++ B(ok_is(run_def(d, "fib", [15], F), 610))
+  let out = out ++ B(ok_is(run_def(d, "double_all", [[1, 2, 3]], F), [2, 4, 6]))
+  let out = out ++ B(ok_is(run_def(d, "sum", [[5, 6, 7, 8]], F), 26))
+  let out = out ++ B(ok_is(run_def(d, "twice", [["fn", ["y"], op("*", [V("y"), q(3)]), {}], 2], F), 18))
+  # runaway and broken programs fail cleanly
+  let out = out ++ B(run_def(d, "loop", [0], 1000)[0] == 0)
+  let out = out ++ B(ev_closed(V("nowhere"), d, F)[0] == 0)
+  let out = out ++ B(ev_closed(op("//", [q(1), q(0)]), d, F)[0] == 0)
+  let out = out ++ B(ev_closed(op("head", [op("nil", [])]), d, F)[0] == 0)
+  # interpreted == compiled
+  let same = true
+  for n in range(0, 13) {
+    if run_def(d, "fact", [n], F)[1] != fact_n(n) { let same = false }
+    if run_def(d, "fib", [n], F)[1] != fib_n(n) { let same = false }
+  }
+  let out = out ++ B(same)
+  return out
+}

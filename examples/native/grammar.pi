@@ -1,0 +1,477 @@
+# Pi learns English grammar from Wikipedia, checked against Wikidata.
+#
+# Each line of data/pairs/wikipedia_pairs.jsonl is a Wikipedia sentence beside a Wikidata fact about the article's
+# subject (subject, relation, value). Pi finds the subject and the value in the sentence; the words between them are a
+# PATTERN ("'s capital is", "was born in"). Over many sentences it counts which relation each pattern goes with; the
+# patterns that are frequent and point to one relation become Pi's grammar -- English mapped into Pi's own facts.
+#
+# The test: sentences from parts of the file Pi never read. Knowing only the subject, Pi reads the sentence with its
+# grammar, extracts (relation, value), and is scored against the Wikidata fact. Then Pi writes English back from facts.
+#
+#   out\grammar.exe [MB to learn from] [MB to test on]
+import "json.pi"
+
+skill DATA() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\pairs\\wikipedia_pairs.jsonl" }
+
+# ---- words ----------------------------------------------------------------------------------------------------------
+# letters, digits, hyphens -- and any byte of a non-English letter (UTF-8 bytes are >= 128), so names like Joza stay whole
+skill is_word_char(c) -> Any { return contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", c) or ord(c) >= 128 }
+
+# "Alabama's capital is Montgomery." -> ["Alabama", "'s", "capital", "is", "Montgomery", "."]
+skill tokens(s) -> Any {
+  let out = []
+  let cur = []
+  let cs = chars(s)
+  let n = len(cs)
+  let i = 0
+  while i < n {
+    let c = cs[i]
+    if is_word_char(c) {
+      let cur = append(cur, c)
+    } else {
+      if len(cur) > 0 {
+        let out = append(out, join(cur, ""))
+        let cur = []
+      }
+      if c == "'" and i + 1 < n {
+        if cs[i + 1] == "s" {
+          let out = append(out, "'s")
+          let i = i + 1
+        }
+      } else {
+        if c != " " { let out = append(out, c) }
+      }
+    }
+    let i = i + 1
+  }
+  if len(cur) > 0 { let out = append(out, join(cur, "")) }
+  return out
+}
+
+skill lower_all(ts) -> Any {
+  let out = []
+  for t in ts { let out = append(out, lower(t)) }
+  return out
+}
+
+# where the sequence sub starts in ts (case-insensitive), at or after from; -1 if nowhere
+skill find_seq(ts, sub, from) -> Any {
+  let n = len(ts)
+  let m = len(sub)
+  if m == 0 { return 0 - 1 }
+  for i in range(from, n - m + 1) {
+    let ok = true
+    for j in range(0, m) {
+      if ok {
+        if lower(ts[i + j]) != lower(sub[j]) { let ok = false }
+      }
+    }
+    if ok { return i }
+  }
+  return 0 - 1
+}
+
+# the subject as it is named in text: the title without a "(disambiguation)" part
+skill subject_tokens(title) -> Any {
+  let t = title
+  if contains(t, " (") { let t = split(t, " (")[0] }
+  return tokens(t)
+}
+
+# ---- counting tables (hash tables on Pi's in-place arrays: no copying as they grow) ----------------------------------
+skill TBL() -> Any { return 1048576 }
+
+skill strhash(s) -> Any {
+  let h1 = 7
+  let h2 = 13
+  for c in chars(s) {
+    let h1 = (h1 * 1000003 + ord(c) + 1) % 1073741789
+    let h2 = (h2 * 999983 + ord(c) + 7) % 1073741783
+  }
+  return h1 * 1073741783 + h2 + 1
+}
+
+skill new_table() -> Any { return {"keys": arr(TBL()), "vals": arr(TBL())} }
+
+# add by to the count of key; -> the new count
+skill bump(tab, key, by) -> Any {
+  let ks = tab["keys"]
+  let vs = tab["vals"]
+  let i = key % TBL()
+  let probes = 0
+  while probes < TBL() {
+    let probes = probes + 1
+    let k = aget(ks, i)
+    if k == 0 {
+      do aset(ks, i, key)
+      do aset(vs, i, by)
+      return by
+    }
+    if k == key {
+      do aset(vs, i, aget(vs, i) + by)
+      return aget(vs, i)
+    }
+    let i = (i + 1) % TBL()
+  }
+  return 0
+}
+
+skill count_of(tab, key) -> Any {
+  let ks = tab["keys"]
+  let i = key % TBL()
+  let probes = 0
+  while probes < TBL() {
+    let probes = probes + 1
+    let k = aget(ks, i)
+    if k == 0 { return 0 }
+    if k == key { return aget(tab["vals"], i) }
+    let i = (i + 1) % TBL()
+  }
+  return 0
+}
+
+skill gl_push(g, x) -> Any {
+  let cur = append(g[1], x)
+  if len(cur) >= 256 { return [append(g[0], cur), []] }
+  return [g[0], cur]
+}
+skill gl_items(g) -> Any {
+  let out = []
+  for c in g[0] { let out = out ++ c }
+  return out ++ g[1]
+}
+
+# ---- reading the data in pieces ------------------------------------------------------------------------------------
+# the complete lines of n bytes read from offset (the first, partial line is skipped unless offset is 0)
+skill lines_at(off, n) -> Any {
+  let t = read_at(DATA(), off, n)
+  if t == null { return [] }
+  let ls = split(t, "\n")
+  if off > 0 { let ls = slice(ls, 1, len(ls)) }
+  return slice(ls, 0, len(ls) - 1)
+}
+
+# one pair -> [tokens, subject tokens, relation, value tokens] or null
+skill read_pair(line) -> Any {
+  if contains(line, "\"kind\": \"pair\"") == false { return null }
+  let d = json_parse(line)
+  if d["approximate"] == true { return null }
+  let v = d["value"]
+  if typeof(v) != "text" { return null }
+  return [tokens(d["sentence"]), subject_tokens(d["title"]), d["relation"], tokens(v)]
+}
+
+# a pattern's words, with the specifics abstracted: numbers -> "#", capitalised words (nationalities, names) -> "^"
+skill pat_text(ws) -> Any {
+  let out = []
+  for w in ws {
+    # by character code (contains() matches letters without regard to case)
+    let o = ord(slice(w, 0, 1))
+    if o >= 48 and o <= 57 {
+      let out = append(out, "#")
+    } else {
+      if o >= 65 and o <= 90 { let out = append(out, "^") } else { let out = append(out, lower(w)) }
+    }
+  }
+  return join(out, " ")
+}
+
+# the pattern between the subject and the value, if both are there in that order with 1..6 words between; -> text or null
+skill pattern_of(p) -> Any {
+  let ts = p[0]
+  let si = find_seq(ts, p[1], 0)
+  if si < 0 { return null }
+  let se = si + len(p[1])
+  let vi = find_seq(ts, p[3], se)
+  if vi < 0 { return null }
+  let k = vi - se
+  if k < 1 or k > 6 { return null }
+  return pat_text(slice(ts, se, vi))
+}
+
+# ---- reading with the grammar --------------------------------------------------------------------------------------
+skill stop_word(t) -> Any {
+  return contains(".,;:()[]\"!?", t) or t == "and" or t == "which" or t == "who" or t == "where" or t == "with" or t == "in" or t == "on" or t == "of" or t == "the" or t == "a" or t == "an" or t == "is" or t == "was" or t == "from" or t == "for" or t == "to" or t == "by" or t == "at"
+}
+
+# the value after a pattern: the words up to the first stop (punctuation or a joining word), at most 5
+skill value_after(ts, i) -> Any {
+  let out = []
+  let j = i
+  let going = true
+  while going and j < len(ts) and len(out) < 5 {
+    if len(out) > 0 and stop_word(lower(ts[j])) {
+      let going = false
+    } else {
+      if contains(".,;:()[]\"!?", ts[j]) { let going = false } else { let out = append(out, ts[j]) }
+    }
+    let j = j + 1
+  }
+  return out
+}
+
+# knowing only the subject, read the sentence: -> [relation, value text] or null
+skill read_fact(ts, subj, gram) -> Any {
+  let si = find_seq(ts, subj, 0)
+  if si < 0 { return null }
+  let se = si + len(subj)
+  # the longest known pattern right after the subject
+  for back in range(0, 6) {
+    let k = 6 - back
+    if se + k < len(ts) {
+      let pat = pat_text(slice(ts, se, se + k))
+      let gi = count_of(gram, strhash(pat))
+      if gi > 0 {
+        let v = value_after(ts, se + k)
+        if len(v) > 0 { return [gi, join(v, " ")] }
+      }
+    }
+  }
+  return null
+}
+
+skill say(subject, pat, value) -> Any {
+  let s = join(subject, " ")
+  if slice(pat, 0, 2) == "'s" { return s ++ pat ++ " " ++ value ++ "." }
+  return s ++ " " ++ pat ++ " " ++ value ++ "."
+}
+
+# ---- kinds: what a thing IS, read from its own definitional sentence ("X is a Japanese car manufacturer") -----------
+skill is_alpha_word(t) -> Any {
+  if len(t) < 3 { return false }
+  for c in chars(t) {
+    if contains("abcdefghijklmnopqrstuvwxyz", c) == false { return false }
+  }
+  return true
+}
+
+# the head noun after "is a / was an / is the": the last word before a joining word or punctuation; null if none
+skill kind_in(ts, subj) -> Any {
+  let si = find_seq(ts, subj, 0)
+  if si < 0 { return null }
+  let i = si + len(subj)
+  if i + 2 >= len(ts) { return null }
+  let v = lower(ts[i])
+  if v != "is" and v != "was" and v != "are" and v != "were" { return null }
+  let d = lower(ts[i + 1])
+  if d != "a" and d != "an" and d != "the" { return null }
+  let head = null
+  let j = i + 2
+  let going = true
+  while going and j < len(ts) and j < i + 9 {
+    let t = lower(ts[j])
+    if contains(".,;:()[]\"", t) or t == "in" or t == "of" or t == "that" or t == "who" or t == "which" or t == "from" or t == "for" or t == "and" or t == "based" or t == "located" or t == "by" or t == "with" or t == "on" or t == "at" or t == "to" {
+      let going = false
+    } else {
+      # a participle ends the noun phrase: "a 2008 film directed by" -> film, not "directed"
+      if head != null and len(t) > 3 and slice(t, len(t) - 2, len(t)) == "ed" { let going = false } else { let head = t }
+    }
+    let j = j + 1
+  }
+  if head == null { return null }
+  if is_alpha_word(head) == false { return null }
+  return head
+}
+
+# subject -> kind, for every subject whose definitional sentence is in these pairs
+skill piece_kinds(ps) -> Any {
+  let kinds = {}
+  for p in ps {
+    let sj = join(p[1], " ")
+    if kinds[sj] == null {
+      let k = kind_in(p[0], p[1])
+      if k != null { let kinds = put(kinds, sj, k) }
+    }
+  }
+  return kinds
+}
+
+skill best_for(grammar, rel, kind) -> Any {
+  let best = null
+  for gr in grammar {
+    # writing needs words it can say: patterns with abstracted specifics (# ^) are for reading only
+    if gr[1] == rel and gr[4] == kind and contains(gr[0], "#") == false and contains(gr[0], "^") == false {
+      if best == null { let best = gr } else {
+        if gr[2] > best[2] { let best = gr }
+      }
+    }
+  }
+  return best
+}
+
+# reading with the grammar of the subject's kind first, then the general one; -> [grammar index, value] or null
+skill read_fact_k(ts, subj, gram, kgram, kind) -> Any {
+  let si = find_seq(ts, subj, 0)
+  if si < 0 { return null }
+  let se = si + len(subj)
+  for back in range(0, 6) {
+    let k = 6 - back
+    if se + k < len(ts) {
+      let pat = pat_text(slice(ts, se, se + k))
+      let gi = 0
+      if kind != null { let gi = count_of(kgram, strhash(kind ++ "|" ++ pat)) }
+      if gi == 0 { let gi = count_of(gram, strhash(pat)) }
+      if gi > 0 {
+        let v = value_after(ts, se + k)
+        if len(v) > 0 { return [gi, join(v, " ")] }
+      }
+    }
+  }
+  return null
+}
+
+skill main() -> Any {
+  let learn_mb = 40
+  if arg(1) != null { let learn_mb = num(arg(1)) }
+  let test_mb = 8
+  if arg(2) != null { let test_mb = num(arg(2)) }
+  let size = 1330000000
+  let piece = 4000000
+  # learn from pieces spread over the whole file; test on pieces from between them
+  let pieces = learn_mb * 1000000 // piece
+  let step = size // (pieces + 1)
+  let pat_rel = new_table()
+  let pat_all = new_table()
+  let kpat_rel = new_table()
+  let kpat_all = new_table()
+  let entries = [[], []]
+  let kentries = [[], []]
+  let pairs = 0
+  let found = 0
+  let typed = 0
+  for k in range(0, pieces) {
+    let m = mark()
+    let ps = []
+    for line in lines_at(k * step, piece) {
+      let p = read_pair(line)
+      if p != null { let ps = append(ps, p) }
+    }
+    let kinds = piece_kinds(ps)
+    let got = []
+    for p in ps {
+      let pat = pattern_of(p)
+      if pat != null { let got = append(got, [pat, p[2], kinds[join(p[1], " ")]]) }
+    }
+    let got = release(m, [got, len(ps)])
+    let pairs = pairs + got[1]
+    for pr in got[0] {
+      let found = found + 1
+      do bump(pat_all, strhash(pr[0]), 1)
+      if bump(pat_rel, strhash(pr[0] ++ "|" ++ pr[1]), 1) == 1 { let entries = gl_push(entries, [pr[0], pr[1]]) }
+      if pr[2] != null {
+        let typed = typed + 1
+        do bump(kpat_all, strhash(pr[2] ++ "|" ++ pr[0]), 1)
+        if bump(kpat_rel, strhash(pr[2] ++ "|" ++ pr[0] ++ "|" ++ pr[1]), 1) == 1 { let kentries = gl_push(kentries, pr) }
+      }
+    }
+    do print("read piece " ++ str(k + 1) ++ " of " ++ str(pieces) ++ ": " ++ str(pairs) ++ " pairs, " ++ str(found) ++ " patterns seen (" ++ str(typed) ++ " with the subject's kind)")
+  }
+  # general grammar: >= 5 times, >= 70% one relation; kind grammar: >= 3 times for that kind, >= 70%
+  let grammar = [[], []]
+  for e in gl_items(entries) {
+    let c = count_of(pat_rel, strhash(e[0] ++ "|" ++ e[1]))
+    let all = count_of(pat_all, strhash(e[0]))
+    if c >= 5 and c * 10 >= all * 7 { let grammar = gl_push(grammar, [e[0], e[1], c, c * 100 // all, null]) }
+  }
+  let grammar = gl_items(grammar)
+  let kgrammar = [[], []]
+  for e in gl_items(kentries) {
+    let c = count_of(kpat_rel, strhash(e[2] ++ "|" ++ e[0] ++ "|" ++ e[1]))
+    let all = count_of(kpat_all, strhash(e[2] ++ "|" ++ e[0]))
+    if c >= 3 and c * 10 >= all * 7 { let kgrammar = gl_push(kgrammar, [e[0], e[1], c, c * 100 // all, e[2]]) }
+  }
+  let kgrammar = gl_items(kgrammar)
+  let gram = new_table()
+  for i in range(0, len(grammar)) { do bump(gram, strhash(grammar[i][0]), i + 1) }
+  # kind patterns index into one combined list after the general ones
+  let allg = grammar ++ kgrammar
+  let kgram = new_table()
+  for i in range(0, len(kgrammar)) { do bump(kgram, strhash(kgrammar[i][4] ++ "|" ++ kgrammar[i][0]), len(grammar) + i + 1) }
+  let out = "Pi read " ++ str(pairs) ++ " sentence-fact pairs (" ++ str(learn_mb) ++ " MB, spread over the file); " ++ str(found) ++ " had a pattern, " ++ str(typed) ++ " of them with the subject's kind known.\n"
+  let out = out ++ "Its grammar: " ++ str(len(grammar)) ++ " general patterns + " ++ str(len(kgrammar)) ++ " patterns that depend on what the subject is.\n"
+  let out = out ++ "\nthe same fact, said differently for different kinds of thing:\n"
+  for want in [["country", ["road", "company", "village", "film", "river", "album"]], ["place_of_birth", ["politician", "footballer", "actor", "singer"]], ["located_in_the_administrative_territorial_entity", ["village", "town", "river", "station"]]] {
+    for kd in want[1] {
+      let b = best_for(kgrammar, want[0], kd)
+      if b != null { let out = out ++ "  " ++ want[0] ++ " of a " ++ kd ++ ":  \"" ++ b[0] ++ "\"  (" ++ str(b[2]) ++ "x, " ++ str(b[3]) ++ "%)\n" }
+    }
+  }
+  # the test: other parts of the file -- reading blind to kinds vs reading with them, on the same sentences
+  let tests = 0
+  let read0 = 0
+  let ok0 = 0
+  let both0 = 0
+  let read1 = 0
+  let ok1 = 0
+  let both1 = 0
+  let samples = []
+  let writes = []
+  let tpieces = test_mb * 1000000 // piece
+  for k in range(0, tpieces) {
+    let m = mark()
+    let ps = []
+    for line in lines_at(k * step + step // 2, piece) {
+      let p = read_pair(line)
+      if p != null { let ps = append(ps, p) }
+    }
+    let kinds = piece_kinds(ps)
+    let res = [0, 0, 0, 0, 0, 0, 0, [], []]
+    for p in ps {
+      let kind = kinds[join(p[1], " ")]
+      let gold_v = lower(join(p[3], " "))
+      let r0 = read_fact(p[0], p[1], gram)
+      let r1 = read_fact_k(p[0], p[1], gram, kgram, kind)
+      let a = res[1]
+      let b = res[2]
+      let c = res[3]
+      let d = res[4]
+      let e = res[5]
+      let f = res[6]
+      if r0 != null {
+        let a = a + 1
+        if grammar[r0[0] - 1][1] == p[2] {
+          let b = b + 1
+          if lower(r0[1]) == gold_v { let c = c + 1 }
+        }
+      }
+      let smp = res[7]
+      if r1 != null {
+        let d = d + 1
+        let gr = allg[r1[0] - 1]
+        if gr[1] == p[2] {
+          let e = e + 1
+          if lower(r1[1]) == gold_v {
+            let f = f + 1
+            if gr[4] != null and len(smp) < 6 { let smp = append(smp, join(p[1], " ") ++ " (a " ++ kind ++ ") --[" ++ gr[1] ++ "]--> " ++ r1[1] ++ "     via \"" ++ gr[0] ++ "\"") }
+          }
+        }
+      }
+      # writing: a true fact about a thing of known kind, in the grammar of that kind
+      let wr = res[8]
+      if kind != null and len(wr) < 6 {
+        let b2 = best_for(kgrammar, p[2], kind)
+        if b2 != null and len(p[3]) > 0 { let wr = append(wr, p[2] ++ "(" ++ join(p[1], " ") ++ ", " ++ join(p[3], " ") ++ ") [a " ++ kind ++ "]  ->  " ++ say(p[1], b2[0], join(p[3], " "))) }
+      }
+      let res = [res[0] + 1, a, b, c, d, e, f, smp, wr]
+    }
+    let res = release(m, res)
+    let tests = tests + res[0]
+    let read0 = read0 + res[1]
+    let ok0 = ok0 + res[2]
+    let both0 = both0 + res[3]
+    let read1 = read1 + res[4]
+    let ok1 = ok1 + res[5]
+    let both1 = both1 + res[6]
+    let samples = samples ++ res[7]
+    let writes = writes ++ res[8]
+  }
+  let out = out ++ "\nTEST on " ++ str(tests) ++ " pairs from parts of the file Pi never read (knowing only the subject):\n"
+  let out = out ++ "  blind to kinds: read " ++ str(read0) ++ ", kind of fact right " ++ str(ok0 * 100 // max(1, read0)) ++ "%, kind and value right " ++ str(both0) ++ " (" ++ str(both0 * 100 // max(1, read0)) ++ "%)\n"
+  let out = out ++ "  knowing kinds:  read " ++ str(read1) ++ ", kind of fact right " ++ str(ok1 * 100 // max(1, read1)) ++ "%, kind and value right " ++ str(both1) ++ " (" ++ str(both1 * 100 // max(1, read1)) ++ "%)\n"
+  let out = out ++ "  (a sentence can state a true fact other than the one paired with it; those count as misses here)\n"
+  let out = out ++ "\nfacts read through a kind's own grammar:\n"
+  for x in slice(samples, 0, 6) { let out = out ++ "  " ++ x ++ "\n" }
+  let out = out ++ "\nPi writes English from facts, in the grammar of the thing's kind:\n"
+  for x in slice(writes, 0, 6) { let out = out ++ "  " ++ x ++ "\n" }
+  return out
+}

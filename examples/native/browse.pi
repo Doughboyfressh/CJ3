@@ -1,0 +1,42 @@
+# Pi browses the web: fetch a page (https), understand it (title, headings, paragraphs, list items, links), follow
+# links by their text. No outside parser: HTML is read here, byte by byte.
+#   out\browse.exe <url>                      what the page says, and its links
+#   out\browse.exe <url> follow "<link text>" go where that link leads, and read it
+# Requests carry no personal data (user agent "Pi/1").
+import "browselib.pi"
+
+skill main() -> Any {
+  let url = arg(1)
+  if url == null { return "usage: browse.exe <url> [follow \"link text\"]" }
+  let page = fetch(url)
+  if page == null { return "no answer from " ++ url }
+  let pg = parse_html(page)
+  let out = show_page(url, pg, 6)
+  if arg(2) == "follow" {
+    let want = lower(arg(3))
+    let best = null
+    for l in pg[2] {
+      if best == null and lower(l[0]) == want { let best = l }
+    }
+    if best == null {
+      for l in pg[2] {
+        if best == null and find_from(lower(l[0]), 0, want) < len(l[0]) { let best = l }
+      }
+    }
+    if best == null { return out ++ "no link reading \"" ++ arg(3) ++ "\"" }
+    let to = resolve(url, best[1])
+    let out = out ++ "\nfollowing \"" ++ best[0] ++ "\" -> " ++ to ++ "\n"
+    let p2 = fetch(to)
+    if p2 == null { return out ++ "no answer" }
+    return out ++ show_page(to, parse_html(p2), 6)
+  }
+  let out = out ++ "links:\n"
+  let k = 0
+  for l in pg[2] {
+    if k < 15 {
+      let out = out ++ "  " ++ l[0] ++ " -> " ++ resolve(url, l[1]) ++ "\n"
+      let k = k + 1
+    }
+  }
+  return out
+}

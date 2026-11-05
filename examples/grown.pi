@@ -1,0 +1,13 @@
+# grown.pi: the rules Pi's language grew from its writers' compile failures. grow.pi (examples/native) proposes a
+# rule for the most common failure it has not decided yet, and adopts it only when the compiler still reproduces
+# itself, every golden program still passes, the rule's own golden program passes, and logged failures compile.
+# A rule is [name, pattern, replacement]: lists of tokens, rewritten right after lexing, before the parser sees them.
+# In a pattern "$id..." matches any name, "$num..." a number, "$str..." a quoted text, "$any..." any token; the
+# replacement uses the same variables, and "\"$id...\"" is the matched name as quoted text. Decided rules (adopted
+# and rejected) are listed with their reasons in examples/grown_ledger.txt.
+skill grown_rules() -> Any {
+  return [
+    ["grown 1: a map key must be quoted text, got X", ["{", "$id1", ":"], ["{", "\"$id1\"", ":"]],
+    ["grown 2: a map key must be quoted text, got X", [",", "$id1", ":"], [",", "\"$id1\"", ":"]]
+  ]
+}

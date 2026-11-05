@@ -1,0 +1,6 @@
+# grown_1: golden test of a rule langgrow.pi learned from the brain's own fixes (a map key must be quoted text, got X).
+# The form {counts: counts} must mean exactly { "counts" : counts} (the old compiler's output for it below).
+skill main() -> Any {
+  let counts = 1
+  return {counts: counts}
+}

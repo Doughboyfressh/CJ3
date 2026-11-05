@@ -1,0 +1,53 @@
+# Golden test for "gpu for" (values only, no timings): each GPU result is compared with the same body on the CPU.
+
+skill collatz(x, cap) -> Any {
+  let m = x
+  let s = 0
+  while m != 1 and s < cap {
+    if m % 2 == 0 { let m = m // 2 } else { let m = 3 * m + 1 }
+    let s = s + 1
+  }
+  return s
+}
+
+skill main() -> Any {
+  let out = []
+  # a range, an expression
+  gpu for x in range(0, 100000) -> v {
+    let v = (x * x + 3 * x) % 1000003
+  }
+  let sum = 0
+  let ok = true
+  for i in range(0, 100000) {
+    let sum = sum + aget(v, i)
+    if aget(v, i) != (i * i + 3 * i) % 1000003 { let ok = false }
+  }
+  let out = append(out, "range: sum " ++ str(sum) ++ " equal " ++ str(ok))
+  # a loop in every thread, an outer integer read inside
+  let cap = 1000
+  gpu for x in range(1, 10001) -> steps {
+    let m = x
+    let steps = 0
+    while m != 1 and steps < cap {
+      if m % 2 == 0 { let m = m // 2 } else { let m = 3 * m + 1 }
+      let steps = steps + 1
+    }
+  }
+  let ok2 = true
+  let best = 0
+  for x in range(1, 10001) {
+    if aget(steps, x - 1) != collatz(x, cap) { let ok2 = false }
+    let best = max(best, aget(steps, x - 1))
+  }
+  let out = append(out, "collatz 1..10000: longest " ++ str(best) ++ " equal " ++ str(ok2))
+  # a list: negatives, floor // and %, min max abs, if/else, and/or/not
+  let xs = [0 - 7, 0 - 1, 0, 3, 10, 0 - 22, 5]
+  gpu for x in xs -> rg {
+    let rg = x // 3 * 100 + x % 3
+    if x < 0 and not (x == 0 - 1) { let rg = rg + min(x, 0 - 5) } else { let rg = rg + max(abs(x), 4) }
+  }
+  let gl = []
+  for k in range(0, len(xs)) { let gl = append(gl, aget(rg, k)) }
+  let out = append(out, "list: " ++ str(gl))
+  return join(out, "\n")
+}

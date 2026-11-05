@@ -1,0 +1,33 @@
+# Tensors are values of the language: computed by Pi's own CPU loops or Pi's own GPU kernels.
+
+skill where() -> Any {
+  return device()
+}
+
+# a two-layer network's forward pass: 4 inputs -> 8 hidden -> 3 classes
+skill forward(x, on) -> Any {
+  let w1 = randn([4, 8], 1)
+  let b1 = zeros([8])
+  let w2 = randn([8, 3], 2)
+  if on == "gpu" {
+    let x = gpu(tensor(x))
+    let w1 = gpu(w1)
+    let w2 = gpu(w2)
+  }
+  let h = relu(matmul(x, w1) + b1)
+  return softmax(matmul(h, w2))
+}
+
+skill basics() -> Any {
+  let a = tensor([[1, 2], [3, 4]])
+  let b = tensor([[5, 6], [7, 8]])
+  return [matmul(a, b), a * 10 - 1, 1 / a, sum(a), mean(a, -1), transpose(a), shape(reshape(a, [4])), exp(tensor([0, 1]))]
+}
+
+# the same numbers in RAM, on the GPU and on the SSD; rows() reads only part of an SSD tensor
+skill places() -> Any {
+  let t = randn([1000, 64], 3)
+  let s = ssd(t)
+  let g = gpu(t)
+  return [place(t), place(g), place(s), tolist(rows(s, 10, 2)) == tolist(rows(t, 10, 2)), sum(s) == sum(t), shape(matmul(s, transpose(rows(t, 0, 4)))), place(ram(s))]
+}

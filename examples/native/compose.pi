@@ -1,0 +1,106 @@
+# compose OUT.score [seed] [bars]: a piece written by rules a composer would recognise: a chord progression in D minor, the
+# piano's left hand arpeggiating it, a melody that moves mostly by step over chord tones, strings rising in the second
+# half. Each performance is slightly human: timing and touch vary.
+
+skill rnd_next(st) -> Any {
+  let x = (aget(st, 0) * 1103515245 + 12345) % 2147483648
+  aset(st, 0, x)
+  return x
+}
+skill rnd_to(st, n) -> Any { return (rnd_next(st) // 65536) % n }
+
+skill sec(x) -> Any {
+  let m = int(x * 1000.0 + 0.5)
+  let frac = str(m % 1000)
+  while len(frac) < 3 { frac = "0" ++ frac }
+  return str(m // 1000) ++ "." ++ frac
+}
+
+skill line(t, dur, note, vel, inst, pan) -> Any {
+  return sec(t) ++ " " ++ sec(dur) ++ " " ++ str(note) ++ " " ++ sec(vel) ++ " " ++ inst ++ " " ++ (if pan < 0.0 { "-" ++ sec(0.0 - pan) } else { sec(pan) }) ++ "\n"
+}
+
+skill main() -> Any {
+  if arg(1) == null { return "compose OUT.score [seed] [bars]" }
+  let st = arr(1)
+  aset(st, 0, if arg(2) != null { int(arg(2)) } else { 31337 })
+  let beat = 60.0 / 66.0
+  // i, VI, III, VII, iv, VI, i (over its fifth), V: each as a root and the notes above it
+  let prog = [[38, [62, 65, 69, 74]], [34, [58, 62, 65, 70]], [41, [60, 65, 69, 72]], [36, [60, 64, 67, 72]], [31, [58, 62, 67, 70]], [34, [58, 62, 65, 70]], [33, [57, 62, 65, 69]], [33, [57, 61, 64, 69]]]
+  // D natural minor, for the melody's steps
+  let scale = [62, 64, 65, 67, 69, 70, 72, 74, 76, 77, 79, 81]
+  let out = "# written by compose.pi\n"
+  let t = 0.0
+  let pos = 4
+  let bars = if arg(3) != null { int(arg(3)) } else { 24 }
+  // the entrances, in proportion to the length
+  let melody_from = bars // 6
+  let strings_from = bars // 3
+  let top_from = bars * 2 // 3
+  for bar in range(0, bars) {
+    let ch = prog[bar % 8]
+    let root = ch[0]
+    let tones = ch[1]
+    let section = bar * 3 // bars
+    // the left hand: root, then the chord rising and falling, in eighths
+    let pattern = [0, 2, 3, 1, 2, 3, 1, 2]
+    for i in range(0, 8) {
+      let tt = t + float(i) * beat * 0.5 + float(rnd_to(st, 16)) * 0.0007
+      let note = if i == 0 { root + 12 } else { tones[pattern[i]] - 12 }
+      let vel = (if i == 0 { 0.52 } else { 0.30 + float(rnd_to(st, 10)) * 0.008 }) + float(section) * 0.04
+      out = out ++ line(tt, beat * 0.9, note, vel, "piano", 0.0 - 0.18)
+    }
+    if bar % 2 == 0 or section > 0 { out = out ++ line(t, beat * 3.6, root, 0.55 + float(section) * 0.05, "bass", 0.0) }
+    // the melody, from the fifth bar
+    if bar >= melody_from {
+      let rhythm = if bar % 4 == 3 { [0.0, 2.0] } else if bar % 2 == 0 { [0.0, 1.0, 1.5, 2.5, 3.0] } else { [0.0, 1.5, 2.0, 3.0] }
+      let k = 0
+      for r in rhythm {
+        // mostly a step; on a strong beat, lean toward a chord tone
+        let step = rnd_to(st, 5) - 2
+        pos = max(1, min(len(scale) - 2, pos + step))
+        let note = scale[pos]
+        if r == 0.0 or r == 2.0 {
+          let best = note
+          let bd = 99
+          for c in tones {
+            for o in [c, c + 12] {
+              if abs(o - note) < bd {
+                bd = abs(o - note)
+                best = o
+              }
+            }
+          }
+          note = best
+        }
+        let nx = if k + 1 < len(rhythm) { rhythm[k + 1] } else { 4.0 }
+        let dur = (nx - r) * beat * 0.97
+        let tt = t + r * beat + float(rnd_to(st, 20)) * 0.0009
+        let vel = 0.50 + float(rnd_to(st, 12)) * 0.012 + float(section) * 0.05 + (if r == 0.0 { 0.06 } else { 0.0 })
+        out = out ++ line(tt, dur, note + 12, vel, "piano", 0.14)
+        k += 1
+      }
+    }
+    // the strings enter under the second section and open out in the third
+    if bar >= strings_from {
+      let vs = if bar >= top_from { 0.56 } else { 0.34 + float(bar - strings_from) * 0.02 }
+      for c in tones {
+        out = out ++ line(t, beat * 4.05, c, vs, "strings", (float(c % 5) - 2.0) * 0.14)
+      }
+      if bar >= top_from { out = out ++ line(t, beat * 4.05, root + 12, vs, "strings", 0.0) }
+    }
+    // a little light at the top of the last section
+    if bar >= top_from and bar % 2 == 0 {
+      out = out ++ line(t + beat * 1.5, 1.0, tones[3] + 24, 0.25, "bell", 0.3)
+      out = out ++ line(t + beat * 3.0, 1.0, tones[1] + 24, 0.2, "bell", 0.0 - 0.3)
+    }
+    t = t + beat * 4.0
+  }
+  // the end: the tonic, held
+  for c in [38, 50, 57, 62, 65, 69, 74] {
+    out = out ++ line(t, beat * 6.0, c, 0.5, "piano", 0.0)
+  }
+  out = out ++ line(t, beat * 6.0, 62, 0.5, "strings", 0.0) ++ line(t, beat * 6.0, 69, 0.45, "strings", 0.2) ++ line(t, beat * 6.0, 74, 0.45, "strings", 0.0 - 0.2)
+  write_file(arg(1), out)
+  return "wrote " ++ arg(1)
+}

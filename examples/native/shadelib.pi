@@ -1,0 +1,790 @@
+# shadelib: the library of Pi's GPU dialect, written in that dialect. A program's own skills replace these by name.
+skill shade_library() -> Any {
+  return "
+let PI = 3.14159265358979
+let TAU = 6.28318530717959
+
+skill sqr(x) { return x * x }
+skill length(v) { return sqrt(dot(v, v)) }
+skill normalize(v) { return v / length(v) }
+skill distance(a, b) { return length(a - b) }
+skill mix(a, b, t) { return a + (b - a) * t }
+skill clamp(x, a, b) { return min(max(x, a), b) }
+skill saturate(x) { return min(max(x, 0.0), 1.0) }
+skill step(e, x) { return if x < e { 0.0 } else { 1.0 } }
+skill smoothstep(a, b, x) {
+  let t = saturate((x - a) / (b - a))
+  return t * t * (3.0 - 2.0 * t)
+}
+skill sign(x) { return if x < 0.0 { 0.0 - 1.0 } else { 1.0 } }
+skill pow(a, b) { return exp(log(max(a, 0.0000000001)) * b) }
+skill tan(x) { return sin(x) / cos(x) }
+skill luminance(c) { return dot(c, [0.2126, 0.7152, 0.0722]) }
+skill reflect(i, n) { return i - n * (2.0 * dot(i, n)) }
+
+# angles, by polynomial
+skill atan(x) {
+  let a = abs(x)
+  let inv = a > 1.0
+  let t = if inv { 1.0 / a } else { a }
+  let s = t * t
+  let r = t * (0.99997726 + s * (0.0 - 0.33262347 + s * (0.19354346 + s * (0.0 - 0.11643287 + s * (0.05265332 + s * (0.0 - 0.01172120))))))
+  if inv { r = 1.57079633 - r }
+  return r * sign(x)
+}
+skill atan2(y, x) {
+  if abs(x) < 0.0000001 { return 1.57079633 * sign(y) }
+  let r = atan(y / x)
+  if x < 0.0 { r = r + 3.14159265 * sign(y) }
+  return r
+}
+skill asin(x) { return atan2(x, sqrt(max(1.0 - x * x, 0.0))) }
+skill acos(x) { return 1.57079633 - asin(x) }
+
+# turning a point about an axis
+skill rot_x(p, a) {
+  let c = cos(a)
+  let s = sin(a)
+  return [p.x, c * p.y - s * p.z, s * p.y + c * p.z]
+}
+skill rot_y(p, a) {
+  let c = cos(a)
+  let s = sin(a)
+  return [c * p.x + s * p.z, p.y, c * p.z - s * p.x]
+}
+skill rot_z(p, a) {
+  let c = cos(a)
+  let s = sin(a)
+  return [c * p.x - s * p.y, s * p.x + c * p.y, p.z]
+}
+
+# ---- noise ----
+skill ihash(i, j, k) {
+  let h = i * 1619 + j * 31337 + k * 6971 + 1013
+  h = xor(h, shr(h, 13))
+  h = h * 1274126177
+  h = xor(h, shr(h, 16))
+  h = h * 668265261
+  return xor(h, shr(h, 15))
+}
+skill hash3(i, j, k) { return float(shr(ihash(i, j, k), 8)) * 0.00000005960464 }
+skill grad3(i, j, k, x, y, z) {
+  let h = band(ihash(i, j, k), 15)
+  let u = if h < 8 { x } else { y }
+  let v = if h < 4 { y } else { if h == 12 or h == 14 { x } else { z } }
+  let su = if band(h, 1) == 0 { u } else { 0.0 - u }
+  let sv = if band(h, 2) == 0 { v } else { 0.0 - v }
+  return su + sv
+}
+# smooth noise, about -1 .. 1
+skill noise(p) {
+  let fl = floor(p)
+  let i = int(fl.x)
+  let j = int(fl.y)
+  let k = int(fl.z)
+  let f = p - fl
+  let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0)
+  let a = mix(grad3(i, j, k, f.x, f.y, f.z), grad3(i + 1, j, k, f.x - 1.0, f.y, f.z), u.x)
+  let b = mix(grad3(i, j + 1, k, f.x, f.y - 1.0, f.z), grad3(i + 1, j + 1, k, f.x - 1.0, f.y - 1.0, f.z), u.x)
+  let c = mix(grad3(i, j, k + 1, f.x, f.y, f.z - 1.0), grad3(i + 1, j, k + 1, f.x - 1.0, f.y, f.z - 1.0), u.x)
+  let d = mix(grad3(i, j + 1, k + 1, f.x, f.y - 1.0, f.z - 1.0), grad3(i + 1, j + 1, k + 1, f.x - 1.0, f.y - 1.0, f.z - 1.0), u.x)
+  return mix(mix(a, b, u.y), mix(c, d, u.y), u.z)
+}
+skill fbm(p, octaves) {
+  let s = 0.0
+  let a = 0.5
+  let q = p
+  for i in range(0, octaves) {
+    s = s + a * noise(q)
+    q = rot_x(q, 0.7) * 2.03 + [1.7, 9.2, 3.1]
+    a = a * 0.5
+  }
+  return s
+}
+
+# ---- shapes: distance to the surface, for a point relative to the shape's centre ----
+skill sd_sphere(p, r) { return length(p) - r }
+skill sd_box(p, b) {
+  let q = abs(p) - b
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0)
+}
+skill sd_round_box(p, b, r) { return sd_box(p, b - r) - r }
+skill sd_torus(p, big, small) {
+  let q = sqrt(p.x * p.x + p.z * p.z) - big
+  return sqrt(q * q + p.y * p.y) - small
+}
+skill sd_cylinder(p, r, h) {
+  let dx = sqrt(p.x * p.x + p.z * p.z) - r
+  let dy = abs(p.y) - h
+  return min(max(dx, dy), 0.0) + sqrt(sqr(max(dx, 0.0)) + sqr(max(dy, 0.0)))
+}
+skill sd_plane(p, h) { return p.y - h }
+skill sd_capsule(p, a, b, r) {
+  let pa = p - a
+  let ba = b - a
+  let h = saturate(dot(pa, ba) / dot(ba, ba))
+  return length(pa - ba * h) - r
+}
+skill smin(a, b, k) {
+  let h = saturate(0.5 + 0.5 * (b - a) / k)
+  return mix(b, a, h) - k * h * (1.0 - h)
+}
+# the nearer of two [distance, material] pairs
+skill near(a, b) { return if a.x < b.x { a } else { b } }
+
+# ---- a scene replaces these ----
+let MAX_BOUNCES = 8
+let MAX_STEPS = 256
+let MAX_DIST = 200.0
+let HIT_EPS = 0.0004
+let MAX_RADIANCE = 40.0
+let CAUSTIC_MAX = 6.0
+let CLOUD_STEPS = 110
+skill scene(p) { return length(p) - 1.0 }
+skill cam_from() { return [0.0, 1.0, 5.0] }
+skill cam_at() { return [0.0, 0.0, 0.0] }
+skill cam_fov() { return 0.6 }
+skill cam_aperture() { return 0.0 }
+skill cam_focus() { return length(cam_at() - cam_from()) }
+skill exposure() { return 0.22 }
+skill sun_dir() { return normalize([0.5, 0.7, 0.4]) }
+skill sun_power() { return 22.0 }
+skill sun_size() { return 0.012 }
+skill albedo(p, n, id) { return [0.8, 0.8, 0.8] }
+skill roughness(p, n, id) { return 0.5 }
+skill metallic(p, n, id) { return 0.0 }
+skill emission(p, n, id) { return [0.0, 0.0, 0.0] }
+skill glass(p, n, id) { return 0.0 }
+skill ior(id) { return 1.5 }
+skill glass_tint(id) { return [1.0, 1.0, 1.0] }
+# how much a surface mirrors head-on, when it is not metal (0.04 most things, 0.02 water)
+skill spec_f0(p, n, id) { return 0.04 }
+# small detail that bends the light but is not worth marching: ripples, scratches
+skill bump(p, n, id, t) { return n }
+# distant things fade into the air; per unit of distance
+skill haze() { return 0.0 }
+# clouds: 0 means none, 0.2 scattered, 0.5 mostly covered
+skill cloud_cover() { return 0.0 }
+skill cloud_base() { return 1500.0 }
+skill cloud_top() { return 4200.0 }
+skill cloud_scale() { return 0.00035 }
+
+# ---- the sky: sunlight scattered through a real atmosphere (Rayleigh and Mie, thickness measured along the ray) ----
+skill atmo_depth(o, d, hr, hm) {
+  # optical depth from o to the top of the atmosphere along d, in [Rayleigh, Mie]
+  let R = 6371000.0
+  let top = 6471000.0
+  let b = dot(o, d)
+  let c = dot(o, o) - top * top
+  let dist = 0.0 - b + sqrt(max(b * b - c, 0.0))
+  let od = [0.0, 0.0, 0.0]
+  let prev = 0.0
+  for i in range(0, 8) {
+    # steps grow with distance: the air thins away from the ground
+    let u = (float(i) + 1.0) / 8.0
+    let te = dist * u * u
+    let st = te - prev
+    let h = length(o + d * (prev + st * 0.5)) - R
+    if h < 0.0 { h = 0.0 }
+    od = od + [exp(0.0 - h / hr) * st, exp(0.0 - h / hm) * st, 0.0]
+    prev = te
+  }
+  return od
+}
+skill atmosphere(rd, sun) {
+  let R = 6371000.0
+  let top = 6471000.0
+  let hr = 7994.0
+  let hm = 1200.0
+  let br = [0.0000058, 0.0000135, 0.0000331]
+  let bm = 0.000021
+  let o = [0.0, R + 2.0, 0.0]
+  let d = normalize([rd.x, max(rd.y, 0.002), rd.z])
+  let b = dot(o, d)
+  let c = dot(o, o) - top * top
+  let dist = 0.0 - b + sqrt(max(b * b - c, 0.0))
+  let mu = dot(d, sun)
+  let pr = 0.05968310 * (1.0 + mu * mu)
+  let g = 0.76
+  let pm = 0.11936621 * (1.0 - g * g) * (1.0 + mu * mu) / ((2.0 + g * g) * exp(1.5 * log(max(1.0 + g * g - 2.0 * g * mu, 0.0001))))
+  let sr = [0.0, 0.0, 0.0]
+  let sm = [0.0, 0.0, 0.0]
+  let odr = 0.0
+  let odm = 0.0
+  let prev = 0.0
+  for i in range(0, 20) {
+    let u = (float(i) + 1.0) / 20.0
+    let te = dist * u * u
+    let st = te - prev
+    let q = o + d * (prev + st * 0.5)
+    let h = length(q) - R
+    let hrs = exp(0.0 - h / hr) * st
+    let hms = exp(0.0 - h / hm) * st
+    let l = atmo_depth(q, sun, hr, hm)
+    # half this step's own air counts: the light arrives from the middle of it
+    # ozone takes out some of the green and red high up: it is why a low sun leaves the sky blue, not green
+    let tau = (br + [0.0000012, 0.0000036, 0.00000016]) * (odr + hrs * 0.5 + l.x) + (odm + hms * 0.5 + l.y) * bm * 1.1
+    let att = exp(tau * (0.0 - 1.0))
+    sr = sr + att * hrs
+    sm = sm + att * hms
+    odr = odr + hrs
+    odm = odm + hms
+    prev = te
+  }
+  return (sr * br * pr + sm * (bm * pm)) * 22.0
+}
+# ---- clouds: real volumes, lit by marching toward the sun from each point ----
+skill cloud_d(p, oct) {
+  let h = (p.y - cloud_base()) / (cloud_top() - cloud_base())
+  if h <= 0.0 or h >= 1.0 { return 0.0 }
+  let sh = smoothstep(0.0, 0.14, h) * smoothstep(1.0, 0.35, h)
+  let q = p * cloud_scale() + [time * 0.004, 0.0, time * 0.002]
+  let n = fbm(q, 4) * 2.4 + cloud_cover() * 2.0 - 0.9 + (1.0 - sh) * (0.0 - 0.6)
+  if n <= 0.0 { return 0.0 }
+  # small billows bite into the edges and leave the middle alone
+  if oct > 3 {
+    let e = 0.0
+    let a = 0.5
+    let f = q * 9.0
+    for i in range(0, oct) {
+      e = e + a * abs(noise(f))
+      f = rot_y(f, 1.1) * 2.31 + [2.3, 1.1, 5.7]
+      a = a * 0.5
+    }
+    n = n - e * 0.75 * (1.0 - saturate(n * 2.5))
+  }
+  return max(n, 0.0) * sh * 0.045
+}
+skill hg(mu, g) {
+  let t = 1.0 + g * g - 2.0 * g * mu
+  return 0.07957747 * (1.0 - g * g) / (t * sqrt(t))
+}
+# what is behind the clouds -> what the eye gets through them
+skill cloud_over(rd, bg, steps) {
+  if cloud_cover() <= 0.0 or rd.y < 0.008 { return bg }
+  let t0 = cloud_base() / rd.y
+  let t1 = min(cloud_top() / rd.y, 45000.0)
+  if t0 > 45000.0 { return bg }
+  let dt = (t1 - t0) / float(steps)
+  let t = t0 + dt * rnd()
+  let sd = sun_dir()
+  let sl = sun_light()
+  let mu = dot(rd, sd)
+  let ph = hg(mu, 0.8) * 0.6 + hg(mu, 0.0 - 0.25) * 0.4
+  let amb = atmosphere(normalize([0.2, 1.0, 0.1]), sd) * 1.6
+  let tr = 1.0
+  let c = [0.0, 0.0, 0.0]
+  for i in range(0, steps) {
+    let p = rd * t
+    let d = cloud_d(p, 5)
+    if d > 0.0 {
+      let od = 0.0
+      let lt = 90.0
+      for j in range(0, 6) {
+        od = od + cloud_d(p + sd * lt, 3) * lt * 0.6
+        lt = lt * 1.7
+      }
+      let be = exp(0.0 - od)
+      let pw = 1.0 - exp(0.0 - od * 2.0 - d * 40.0)
+      # light that has been scattered many times is not fully lost: a second, softer path through the cloud
+      let lit = sl * (ph * (be + 0.35 * exp(0.0 - od * 0.25)) * (0.4 + 0.6 * pw)) + amb * (0.35 + 0.65 * smoothstep(cloud_base(), cloud_top(), p.y))
+      let st = exp(0.0 - d * dt)
+      c = c + lit * (tr * (1.0 - st))
+      tr = tr * st
+      if tr < 0.01 { break }
+    }
+    t = t + dt
+  }
+  # far clouds melt into the air
+  let f = exp(0.0 - t0 * 0.00003)
+  return bg * (tr * f + 1.0 - f) + c * f
+}
+# the share of the sun a point gets past the clouds overhead
+skill cloud_shade(p) {
+  let sd = sun_dir()
+  if cloud_cover() <= 0.0 or sd.y < 0.01 { return 1.0 }
+  let t0 = (cloud_base() - p.y) / sd.y
+  let dt = (cloud_top() - cloud_base()) / sd.y / 6.0
+  let od = 0.0
+  for i in range(0, 6) {
+    od = od + cloud_d(p + sd * (t0 + (float(i) + 0.5) * dt), 3) * dt
+  }
+  return exp(0.0 - od * 0.7)
+}
+# the sky a ray sees; with_sun: the sun's own disc and the clouds' detail, for rays the eye sees directly or in a mirror
+skill sky(rd, with_sun) {
+  let c = atmosphere(rd, sun_dir())
+  if with_sun {
+    if dot(rd, sun_dir()) > 1.0 - sun_size() * sun_size() * 0.5 {
+      let o = [0.0, 6371002.0, 0.0]
+      let t = atmo_depth(o, sun_dir(), 7994.0, 1200.0)
+      c = c + exp(([0.0000058, 0.0000135, 0.0000331] * t.x + t.y * 0.0000231) * (0.0 - 1.0)) * (sun_power() / (PI * sun_size() * sun_size()))
+    }
+    return cloud_over(rd, c, CLOUD_STEPS)
+  }
+  return cloud_over(rd, c, 12)
+}
+# the sun as it reaches the ground: redder when low
+skill sun_light() {
+  let o = [0.0, 6371002.0, 0.0]
+  let t = atmo_depth(o, sun_dir(), 7994.0, 1200.0)
+  return exp(([0.0000058, 0.0000135, 0.0000331] * t.x + t.y * 0.0000231) * (0.0 - 1.0)) * sun_power()
+}
+
+# ---- marching ----
+skill dist(p) {
+  let r = scene(p)
+  return r.x
+}
+skill mat_id(p) {
+  let r = scene(p)
+  return r.y
+}
+skill normal(p, e) {
+  let a = dist(p + [e, 0.0 - e, 0.0 - e])
+  let b = dist(p + [0.0 - e, 0.0 - e, e])
+  let c = dist(p + [0.0 - e, e, 0.0 - e])
+  let d = dist(p + [e, e, e])
+  return normalize([e, 0.0 - e, 0.0 - e] * a + [0.0 - e, 0.0 - e, e] * b + [0.0 - e, e, 0.0 - e] * c + [e, e, e] * d)
+}
+# along rd from ro: the distance to the surface, or a negative number. side: 1 outside, -1 inside a solid
+skill march(ro, rd, tmax, side) {
+  let t = 0.001
+  for i in range(0, MAX_STEPS) {
+    let d = dist(ro + rd * t) * side
+    if d < HIT_EPS * (1.0 + t * 0.15) { return t }
+    t = t + d
+    if t > tmax { return 0.0 - 1.0 }
+  }
+  return 0.0 - 1.0
+}
+skill visible(ro, rd, tmax) {
+  let t = 0.002
+  for i in range(0, MAX_STEPS) {
+    let d = dist(ro + rd * t)
+    if d < HIT_EPS * (1.0 + t * 0.15) { return false }
+    t = t + d
+    if t > tmax { return true }
+  }
+  return true
+}
+
+# ---- sampling ----
+# a frame around n: its two sides
+skill side_a(n) {
+  let s = if n.z >= 0.0 { 1.0 } else { 0.0 - 1.0 }
+  let a = 0.0 - 1.0 / (s + n.z)
+  return [1.0 + s * n.x * n.x * a, s * n.x * n.y * a, 0.0 - s * n.x]
+}
+skill side_b(n) {
+  let s = if n.z >= 0.0 { 1.0 } else { 0.0 - 1.0 }
+  let a = 0.0 - 1.0 / (s + n.z)
+  return [n.x * n.y * a, s + n.y * n.y * a, 0.0 - n.y]
+}
+skill cos_dir(n) {
+  let r = sqrt(rnd())
+  let ph = TAU * rnd()
+  let x = r * cos(ph)
+  let y = r * sin(ph)
+  return normalize(side_a(n) * x + side_b(n) * y + n * sqrt(max(1.0 - r * r, 0.0)))
+}
+# a half vector seen by v (in n's frame), Heitz's visible-normal sampling for GGX
+skill ggx_half(n, v, a) {
+  let t1 = side_a(n)
+  let t2 = side_b(n)
+  let vl = [dot(v, t1), dot(v, t2), dot(v, n)]
+  let vh = normalize([a * vl.x, a * vl.y, vl.z])
+  let l2 = vh.x * vh.x + vh.y * vh.y
+  let tt1 = if l2 > 0.0000001 { [0.0 - vh.y, vh.x, 0.0] / sqrt(l2) } else { [1.0, 0.0, 0.0] }
+  let tt2 = cross(vh, tt1)
+  let r = sqrt(rnd())
+  let ph = TAU * rnd()
+  let p1 = r * cos(ph)
+  let s = 0.5 * (1.0 + vh.z)
+  let p2 = (1.0 - s) * sqrt(max(1.0 - p1 * p1, 0.0)) + s * r * sin(ph)
+  let nh = tt1 * p1 + tt2 * p2 + vh * sqrt(max(1.0 - p1 * p1 - p2 * p2, 0.0))
+  let hl = normalize([a * nh.x, a * nh.y, max(nh.z, 0.0)])
+  return normalize(t1 * hl.x + t2 * hl.y + n * hl.z)
+}
+skill smith_g1(nv, a) {
+  let t = a * a
+  return 2.0 * nv / (nv + sqrt(t + (1.0 - t) * nv * nv))
+}
+skill ggx_d(nh, a) {
+  let t = a * a
+  let k = nh * nh * (t - 1.0) + 1.0
+  return t / (PI * k * k)
+}
+skill schlick(f0, c) {
+  let m = 1.0 - c
+  let m2 = m * m
+  return f0 + (1.0 - f0) * (m2 * m2 * m)
+}
+skill fresnel_glass(c, eta) {
+  # exact, for unpolarised light; eta = outside / inside
+  let s2 = eta * eta * (1.0 - c * c)
+  if s2 >= 1.0 { return 1.0 }
+  let ct = sqrt(1.0 - s2)
+  let rs = (eta * c - ct) / (eta * c + ct)
+  let rp = (c - eta * ct) / (c + eta * ct)
+  return 0.5 * (rs * rs + rp * rp)
+}
+
+# ---- one path of light, traced backwards from the eye ----
+skill radiance(ro0, rd0) {
+  let L = [0.0, 0.0, 0.0]
+  let T = [1.0, 1.0, 1.0]
+  let ro = ro0
+  let rd = rd0
+  let inside = false
+  let inside_id = 0.0
+  let sharp = true
+  let matte = false
+  let first_t = 0.0 - 1.0
+  for bounce in range(0, MAX_BOUNCES) {
+    let t = march(ro, rd, MAX_DIST, if inside { 0.0 - 1.0 } else { 1.0 })
+    if t < 0.0 {
+      let s = sky(rd, sharp)
+      # the sun seen through glass after a matte bounce: a caustic, kept to what a few samples can carry
+      L = L + T * (if matte { min(s, CAUSTIC_MAX) } else { s })
+      break
+    }
+    if bounce == 0 { first_t = t }
+    let p = ro + rd * t
+    let eps = max(0.0005, 0.0004 * t)
+    let n = normal(p, eps)
+    if inside { n = n * (0.0 - 1.0) }
+    let id = mat_id(p)
+    n = bump(p, n, id, t)
+    if inside {
+      # coloured glass darkens with the distance travelled through it
+      L = L + [0.0, 0.0, 0.0]
+      T = T * pow(glass_tint(inside_id), t)
+    }
+    L = L + T * emission(p, n, id)
+    let base = albedo(p, n, id)
+    let rg = max(roughness(p, n, id), 0.02)
+    let mt = metallic(p, n, id)
+    let gl = glass(p, n, id)
+    let v = rd * (0.0 - 1.0)
+    let nv = max(dot(n, v), 0.001)
+    let a = rg * rg
+    if rnd() < gl {
+      # glass: reflect or bend, by Fresnel
+      let hn = if rg > 0.03 { ggx_half(n, v, a) } else { n }
+      let c = max(dot(hn, v), 0.0)
+      let eta = if inside { ior(inside_id) } else { 1.0 / ior(id) }
+      let fr = fresnel_glass(c, eta)
+      if rnd() < fr {
+        rd = reflect(rd, hn)
+        ro = p + n * (eps * 2.0)
+      } else {
+        let k = 1.0 - eta * eta * (1.0 - c * c)
+        rd = normalize(rd * eta + hn * (eta * c - sqrt(max(k, 0.0))))
+        ro = p - n * (eps * 2.0)
+        inside = not inside
+        if inside { inside_id = id }
+      }
+      sharp = true
+    } else {
+      let f0 = mix(vec3(spec_f0(p, n, id)), base, mt)
+      let diff = base * (1.0 - mt)
+      let ro2 = p + n * (eps * 2.0)
+      # the sun, directly, if it can see this point
+      let sd = sun_dir()
+      let tl = normalize(sd + side_a(sd) * ((rnd() - 0.5) * sun_size() * 2.0) + side_b(sd) * ((rnd() - 0.5) * sun_size() * 2.0))
+      let nl = dot(n, tl)
+      if nl > 0.0 and rg > 0.04 {
+        if visible(ro2, tl, MAX_DIST) {
+          let h = normalize(tl + v)
+          let nh = max(dot(n, h), 0.0)
+          let vh = max(dot(v, h), 0.0)
+          let f = schlick(f0, vh)
+          let spec = f * (ggx_d(nh, a) * smith_g1(nl, a) * smith_g1(nv, a) / max(4.0 * nl * nv, 0.0001))
+          let contrib = T * (diff * (1.0 / PI) * (1.0 - luminance(f)) + spec) * sun_light() * (nl * cloud_shade(p))
+          L = L + min(contrib, MAX_RADIANCE)
+        }
+      }
+      # and the next bounce: a mirror-like lobe or a matte one
+      let ff = schlick(f0, nv)
+      let ps = clamp(luminance(ff) / (luminance(ff) + luminance(diff) * (1.0 - luminance(ff)) + 0.0001), 0.05, 0.95)
+      if mt > 0.99 { ps = 1.0 }
+      if rnd() < ps {
+        let h = if rg > 0.03 { ggx_half(n, v, a) } else { n }
+        let nd = reflect(rd, h)
+        let nl2 = dot(n, nd)
+        if nl2 <= 0.0 { break }
+        let vh = max(dot(v, h), 0.0)
+        T = T * schlick(f0, vh) * (smith_g1(nl2, a) / ps)
+        rd = nd
+        sharp = rg <= 0.04
+      } else {
+        rd = cos_dir(n)
+        T = T * diff * ((1.0 - luminance(ff)) / (1.0 - ps))
+        sharp = false
+        matte = true
+      }
+      ro = ro2
+    }
+    # paths that carry little light end early, unbiased
+    if bounce > 2 {
+      let q = clamp(max(T.x, max(T.y, T.z)), 0.05, 1.0)
+      if rnd() > q { break }
+      T = T * (1.0 / q)
+    }
+  }
+  if first_t > 0.0 and haze() > 0.0 {
+    let f = exp(0.0 - first_t * haze())
+    L = L * f + atmosphere(rd0, sun_dir()) * (1.0 - f)
+  }
+  return min(L, MAX_RADIANCE)
+}
+
+# a sample through the lens: pixel (x, y), jittered over a tent filter
+skill tent() {
+  let r = 2.0 * rnd()
+  return if r < 1.0 { sqrt(r) - 1.0 } else { 1.0 - sqrt(2.0 - r) }
+}
+skill pixel(x, y) {
+  let w = width
+  let h = height
+  let sx = (2.0 * (x + 0.5 + tent()) - w) / h
+  let sy = (h - 2.0 * (y + 0.5 + tent())) / h
+  let ro = cam_from()
+  let f = normalize(cam_at() - ro)
+  let r = normalize(cross(f, [0.0, 1.0, 0.0]))
+  let u = cross(r, f)
+  let fv = cam_fov()
+  if fv > 3.2 { fv = fv * 0.01745329 }
+  let rd = normalize(f + (r * sx + u * sy) * tan(fv * 0.5))
+  let ap = cam_aperture()
+  if ap > 0.0 {
+    let fp = ro + rd * (cam_focus() / dot(rd, f))
+    let lr = sqrt(rnd()) * ap
+    let lp = TAU * rnd()
+    ro = ro + r * (lr * cos(lp)) + u * (lr * sin(lp))
+    rd = normalize(fp - ro)
+  }
+  return radiance(ro, rd)
+}
+
+# light as a screen shows it: a filmic curve, then the display's own encoding
+skill srgb(x) {
+  return if x <= 0.0031308 { x * 12.92 } else { 1.055 * pow(x, 0.41666667) - 0.055 }
+}
+skill agx_curve(x) {
+  let x2 = x * x
+  let x4 = x2 * x2
+  return x4 * x2 * 15.5 - x4 * x * 40.14 + x4 * 31.96 - x2 * x * 6.868 + x2 * 0.4298 + x * 0.1191 - 0.00232
+}
+skill look_saturation() { return 1.3 }
+# bright colours roll off toward white as film does, keeping their hue: a sunset stays orange instead of turning yellow
+skill tonemap(c) {
+  let x = max(c * exposure(), 0.0000000001)
+  let v = [0.842479 * x.x + 0.078434 * x.y + 0.079224 * x.z, 0.042328 * x.x + 0.878469 * x.y + 0.079166 * x.z, 0.042376 * x.x + 0.078434 * x.y + 0.879143 * x.z]
+  let lg = clamp(log(v) * 1.44269504, 0.0 - 12.47393, 4.026069)
+  let u = agx_curve((lg + 12.47393) / 16.5)
+  # a little more contrast and colour than neutral
+  let m = pow(max(u, 0.0), 1.25)
+  let lm = dot(m, [0.2126, 0.7152, 0.0722])
+  let w = max(m * look_saturation() + lm * (1.0 - look_saturation()), 0.0)
+  let r = [1.196879 * w.x - 0.098021 * w.y - 0.099030 * w.z, 0.0 - 0.052897 * w.x + 1.151903 * w.y - 0.098961 * w.z, 0.0 - 0.052972 * w.x - 0.098043 * w.y + 1.151074 * w.z]
+  let o = pow(max(r, 0.0), 2.2)
+  return [srgb(saturate(o.x)), srgb(saturate(o.y)), srgb(saturate(o.z))]
+}
+"
+}
+
+# ---- sound: every sample computed on its own, from the score, by the same dialect ---------------------------------------
+skill sound_library() -> Any {
+  return "
+# sin(2 pi u), u in 0 .. 1: exact enough that no instrument hears its own arithmetic
+skill sin1(u) {
+  let x = if u > 0.5 { u - 1.0 } else { u }
+  if x > 0.25 { x = 0.5 - x } else if x < 0.0 - 0.25 { x = 0.0 - 0.5 - x }
+  let a = x * 6.283185307
+  let q = a * a
+  return a * (1.0 + q * (0.0 - 0.16666667 + q * (0.00833333 + q * (0.0 - 0.00019841 + q * 0.0000027526))))
+}
+# a sine at f Hz, d samples after the note began, shifted by ph cycles
+skill osc(f, d, ph) {
+  let u = phase(f, d) + ph
+  return sin1(u - floor(u))
+}
+skill white(i, k) { return hash3(i, k, 77) * 2.0 - 1.0 }
+
+# ---- a piano, from how one is made ----
+# stiff strings: each partial sits a little sharp of its harmonic; the hammer strikes an eighth of the way along, so
+# some partials are never excited; a hard blow is brighter than a soft one; two strings per note, slightly apart, beat
+# against each other; high partials die first, and each note has a fast decay and a long one
+skill piano(d, f, v, hold) {
+  let x = float(d) / rate
+  let nmax = min(26, int(16000.0 / f))
+  let b = 0.00018 * pow(f / 110.0, 1.15) + 0.00002
+  let bright = 1.75 - 0.95 * v
+  let tau = 5.5 * pow(220.0 / f, 0.55)
+  let L = 0.0
+  let R = 0.0
+  for n in range(1, nmax + 1) {
+    let k = float(n)
+    let fk = f * k * sqrt(1.0 + b * k * k)
+    let amp = abs(sin(PI * k * 0.125)) * pow(k, 0.0 - bright) * 2.2 / (1.0 + sqr(fk / 4800.0))
+    let t1 = tau / (1.0 + 0.11 * k)
+    let t2 = t1 * 0.22
+    let env = 0.62 * exp(0.0 - x / t2) + 0.38 * exp(0.0 - x / t1)
+    let s1 = osc(fk * 0.99981, d, 0.0)
+    let s2 = osc(fk * 1.00023, d, k * 0.137)
+    L = L + amp * env * (s1 * 0.6 + s2 * 0.4)
+    R = R + amp * env * (s1 * 0.4 + s2 * 0.6)
+  }
+  # the felt hammer takes a moment to leave the string, and the dampers fall when the key is released
+  let a = 1.0 - exp(0.0 - x / 0.0016)
+  let r = if x > hold { exp(0.0 - (x - hold) / 0.13) } else { 1.0 }
+  # the thud of the action
+  let th = exp(0.0 - x / 0.012) * (osc(95.0, d, 0.0) * 0.5 + osc(180.0, d, 0.0) * 0.3) * v * 0.14
+  return [L, R, 0.0] * (a * r * pow(v, 1.4) * 0.34) + [th, th, 0.0]
+}
+
+# ---- a string section: many players, none quite together ----
+skill strings(d, f, v, hold) {
+  let x = float(d) / rate
+  let at = 1.0 - exp(0.0 - x / 0.28)
+  let r = if x > hold { exp(0.0 - (x - hold) / 0.55) } else { 1.0 }
+  let L = 0.0
+  let R = 0.0
+  for pl in range(0, 6) {
+    let q = float(pl)
+    let cents = (q - 2.5) * 3.4 + sin(q * 7.3) * 1.5
+    let ff = f * exp(cents * 0.00057762)
+    let vr = 4.9 + q * 0.23
+    let vd = 0.0018 * smoothstep(0.2, 1.1, x)
+    let vib = (vd * ff / vr) * sin(TAU * vr * x + q * 2.1) / TAU
+    let m = min(16, int(14000.0 / ff))
+    let s = 0.0
+    for n in range(1, m + 1) {
+      let k = float(n)
+      let fk = ff * k
+      # a sawtooth bow, then the body of the instrument: strong around 450 Hz and 2.8 kHz, thin above
+      let body = 0.75 / (1.0 + sqr((fk - 450.0) / 500.0)) + 0.4 / (1.0 + sqr((fk - 2800.0) / 1100.0)) + 0.1
+      s = s + osc(fk, d, vib * k + q * k * 0.19) * body / k
+    }
+    let pan = (q - 2.5) * 0.14
+    L = L + s * (0.5 - pan)
+    R = R + s * (0.5 + pan)
+  }
+  return [L, R, 0.0] * (at * r * pow(v, 1.2) * 0.075)
+}
+
+# ---- a bell or celesta: partials that are not harmonics ----
+skill bell(d, f, v, hold) {
+  let x = float(d) / rate
+  let s = osc(f, d, 0.0) * exp(0.0 - x / 1.7)
+  s = s + osc(f * 2.0, d, 0.1) * 0.45 * exp(0.0 - x / 1.1)
+  s = s + osc(f * 3.01, d, 0.3) * 0.22 * exp(0.0 - x / 0.8)
+  s = s + osc(f * 4.17, d, 0.5) * 0.16 * exp(0.0 - x / 0.5)
+  s = s + osc(f * 5.43, d, 0.7) * 0.09 * exp(0.0 - x / 0.3)
+  s = s + osc(f * 6.79, d, 0.9) * 0.05 * exp(0.0 - x / 0.2)
+  let a = 1.0 - exp(0.0 - x / 0.0008)
+  let c = s * a * pow(v, 1.3) * 0.24
+  return [c, c, 0.0]
+}
+
+# ---- a double bass, plucked ----
+skill bass(d, f, v, hold) {
+  let x = float(d) / rate
+  let s = 0.0
+  for n in range(1, 11) {
+    let k = float(n)
+    s = s + osc(f * k * (1.0 + 0.00006 * k * k), d, k * 0.07) * exp(0.0 - x * (0.55 + k * 0.5)) / pow(k, 1.25)
+  }
+  let a = 1.0 - exp(0.0 - x / 0.004)
+  let r = if x > hold { exp(0.0 - (x - hold) / 0.09) } else { 1.0 }
+  let c = s * a * r * v * 0.42
+  return [c, c, 0.0]
+}
+
+# ---- drums ----
+skill kick(d, f, v, hold) {
+  let x = float(d) / rate
+  # the pitch falls from a click to the note: its phase is the integral of that fall
+  let ph = f * x + 2.6 * f * 0.036 * (1.0 - exp(0.0 - x / 0.036))
+  let c = sin1(ph - floor(ph)) * exp(0.0 - x / 0.2) + white(d, 3) * exp(0.0 - x / 0.003) * 0.25
+  let o = c * v * 0.8
+  return [o, o, 0.0]
+}
+skill snare(d, f, v, hold) {
+  let x = float(d) / rate
+  let nz = (white(d, 5) - white(d - 1, 5)) * 0.5
+  let c = nz * exp(0.0 - x / 0.075) * 0.6 + osc(f, d, 0.0) * exp(0.0 - x / 0.05) * 0.5
+  let o = c * v * 0.55
+  return [o, o, 0.0]
+}
+skill hat(d, f, v, hold) {
+  let x = float(d) / rate
+  let nz = white(d, 9) - white(d - 1, 9) * 0.97
+  let o = nz * exp(0.0 - x / hold) * v * 0.16
+  return [o, o, 0.0]
+}
+
+# ---- the score: tbl(0) notes, then 7 numbers each, in order of onset:
+# onset sample, last audible sample, milli-Hz, velocity x 1000, instrument, pan x 1000, held samples
+skill play(id, d, f, v, hold) {
+  if id == 0 { return piano(d, f, v, hold) }
+  if id == 1 { return strings(d, f, v, hold) }
+  if id == 2 { return bell(d, f, v, hold) }
+  if id == 3 { return bass(d, f, v, hold) }
+  if id == 4 { return kick(d, f, v, hold) }
+  if id == 5 { return snare(d, f, v, hold) }
+  return hat(d, f, v, hold)
+}
+skill sound(s) {
+  let out = [0.0, 0.0, 0.0]
+  let n = tbl(0)
+  for k in range(0, n) {
+    let b = 1 + k * 7
+    let on = tbl(b)
+    if s < on { break }
+    if s < tbl(b + 1) {
+      let c = play(tbl(b + 4), s - on, float(tbl(b + 2)) * 0.001, float(tbl(b + 3)) * 0.001, float(tbl(b + 6)) / rate)
+      let pan = float(tbl(b + 5)) * 0.001
+      # whatever is left at the end of a note's life fades over 50 ms
+      let w = saturate(float(tbl(b + 1) - s) / 2400.0)
+      out = out + [c.x * (1.0 - pan), c.y * (1.0 + pan), 0.0] * w
+    }
+  }
+  return out
+}
+
+# ---- the room: a hall, as the sum of thousands of its resonances ----
+# each resonance has its own frequency and phase; high ones die sooner, as walls and air absorb them. Left and right
+# hear different ones. The first few echoes are separate, then they blur together.
+let RT = 2.6
+skill impulse(s) {
+  let x = float(s) / rate
+  let L = 0.0
+  let R = 0.0
+  let att = smoothstep(0.0, 0.035, x)
+  for i in range(0, 3000) {
+    let h = hash3(i, 1, 3)
+    let f = 70.0 * exp(h * 5.0)
+    let tau = (RT / 6.9) / (1.0 + f / 4200.0)
+    let a = exp(0.0 - x / tau)
+    if a > 0.0005 {
+      let w = a * osc(f, s, hash3(i, 2, 3)) / sqrt(0.4 + f / 1200.0)
+      if band(i, 1) == 0 { L = L + w } else { R = R + w }
+    }
+  }
+  let e = [L, R, 0.0] * (att * 0.016)
+  # early reflections: walls, ceiling, floor
+  for i in range(0, 14) {
+    let t = 0.011 + hash3(i, 7, 1) * 0.07
+    let sn = int(t * rate)
+    if s == sn {
+      let g = 0.34 * exp(0.0 - t * 14.0) * (if band(i, 1) == 0 { 1.0 } else { 0.0 - 1.0 })
+      e = e + (if band(i, 2) == 0 { [g, g * 0.5, 0.0] } else { [g * 0.5, g, 0.0] })
+    }
+  }
+  return e
+}
+"
+}

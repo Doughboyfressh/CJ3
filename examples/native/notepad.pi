@@ -1,0 +1,189 @@
+# Pi explores a real app: Notepad's menus (File, Edit, View). Safe by design:
+#   only the three top-level menu labels are ever clicked, each followed by Escape; no menu item is clicked, nothing
+#   is typed or saved; if the File/Edit/View row is not found, nothing is clicked at all. Hands only with "act".
+#   out\notepad.exe act    -> what each menu showed, remembered in out\notepad.mem
+import "actlib.pi"
+
+# a pause: Pi has no sleep, so it starts ping (about a second per count) and waits for it
+skill pause(n) -> Any {
+  let h = spawn("ping -n " ++ str(n + 1) ++ " 127.0.0.1")
+  if h == null { return null }
+  return wait(h, 20000)
+}
+
+# the short text lines on the screen, read -> [[text, x0, y0, x1, y1]] (only label-sized lines: menus, buttons)
+skill short_lines(img, u, temps, lex) -> Any {
+  let out = []
+  for l in u[8] {
+    let lw = l[2] - l[0] + 1
+    let lh = l[3] - l[1] + 1
+    if lw <= 140 and lh >= 6 and lh <= 24 {
+      let mm = mark()
+      let t = release(mm, read_box(img, [max(0, l[0] - 3), max(0, l[1] - 3), min(img[0] - 1, l[2] + 3), min(img[1] - 1, l[3] + 3)], temps, lex))
+      if len(t) > 0 { let out = append(out, [t, l[0], l[1], l[2], l[3]]) }
+    }
+  }
+  return out
+}
+
+skill has_word2(w) -> Any {
+  let k = 1
+  while arg(k) != null {
+    if arg(k) == w { return true }
+    let k = k + 1
+  }
+  return false
+}
+
+# close to a word: at most 2 letters off for words of 4 or more (three labels found together in one row back each
+# other up -- "FiIo Ebit vIew" side by side is File, Edit, View), at most 1 for shorter words
+skill near(t, w) -> Any {
+  let d = edits(lower(t), lower(w))
+  if len(w) >= 4 { return d <= 2 }
+  return d <= 1
+}
+
+# look at the whole screen and read its label-sized lines; everything but the small result is freed
+skill look_labels(temps, lex) -> Any {
+  let m = mark()
+  let img = see(1)
+  let u = understand(img[0], img[1], img[2], 1)
+  do print("  scene understood: " ++ str(len(u[8])) ++ " text lines")
+  return release(m, short_lines(img, u, temps, lex))
+}
+
+skill main() -> Any {
+  if arg(1) == "probe" {
+    let h = spawn("notepad.exe")
+    do pause(2)
+    if h == null { return "spawn failed" }
+    return "spawned; still running after 2 s: " ++ str(wait(h, 0) == null)
+  }
+  if act_ok() == false and has_word2("dry") == false { return "start with the word act to let Pi click (it will click only File, Edit and View, each followed by Escape)" }
+  let lex = load_lex("out\\lexicon.txt")
+  # Windows 11 draws its interface in Segoe UI Variable; Pi learns that font too
+  let temps = learn_set(["Segoe UI Variable Text@ct", "Segoe UI@ct"], [12, 13, 14, 15, 16])
+  # Windows 11 Notepad is a store app: it starts through the shell (cmd start), not a bare CreateProcess. With the
+  # word "running" Pi uses the Notepad that is already open (on top).
+  if has_word2("running") == false {
+    let h = spawn("cmd /c start notepad.exe")
+    if h == null { return "could not start Notepad" }
+  }
+  do pause(2)
+  # bring Notepad to the front (a second start reuses the open window, and Windows keeps it behind)
+  if act_ok() { do focus("Notepad") }
+  do pause(1)
+  do print("looking at the screen...")
+  let before = look_labels(temps, lex)
+  do print("read " ++ str(len(before)) ++ " short labels")
+  if has_word2("band") {
+    for b in before {
+      if b[2] >= 180 and b[2] <= 260 { do print("  [" ++ b[0] ++ "] at " ++ str(b[1]) ++ "," ++ str(b[2]) ++ " to " ++ str(b[3]) ++ "," ++ str(b[4])) }
+    }
+  }
+  # the menu row: File, Edit and View side by side on one line, inside the top of the window in front (other
+  # windows behind may have their own File / Edit / View -- an editor does)
+  let fw = fgwin()
+  do print("window in front: " ++ str(fw))
+  let row = null
+  for f in before {
+    if near(f[0], "File") and f[1] >= fw[0] and f[3] <= fw[2] and f[2] >= fw[1] and f[2] <= fw[1] + 150 {
+      let e = null
+      let v = null
+      for g in before {
+        if near(g[0], "Edit") and oabs(g[2] - f[2]) <= 4 and g[1] > f[1] and g[1] - f[3] < 120 { let e = g }
+        if near(g[0], "View") and oabs(g[2] - f[2]) <= 4 and g[1] > f[1] and g[1] - f[3] < 240 { let v = g }
+      }
+      if e != null and v != null {
+        if row == null or f[2] < row[0][2] { let row = [f, e, v] }
+      }
+    }
+  }
+  if row == null {
+    let seen = []
+    for b in before { let seen = append(seen, b[0]) }
+    return "Notepad started, but Pi did not find the File / Edit / View row, so it clicked nothing. Short labels it read: " ++ join(slice(seen, 0, min(40, len(seen))), " | ")
+  }
+  let out = "Notepad's menu row found at y " ++ str(row[0][2]) ++ ": File " ++ str(row[0][1]) ++ ", Edit " ++ str(row[1][1]) ++ ", View " ++ str(row[2][1]) ++ "\n"
+  # open each menu once and keep a snapshot of the area it opens into (3 clicks, 3 Escapes; nothing else)
+  let snaps = []
+  for m in row {
+    do click((m[1] + m[3]) // 2, (m[2] + m[4]) // 2)
+    do pause(1)
+    let mk = mark()
+    let img = see(1)
+    let x0 = max(0, m[1] - 20)
+    let y0 = m[4] + 2
+    let x1 = min(img[0] - 1, m[1] + 380)
+    let y1 = min(img[1] - 1, m[4] + 520)
+    let cw = x1 - x0 + 1
+    let ch = y1 - y0 + 1
+    let a = arr(cw * ch)
+    for y in range(0, ch) {
+      for x in range(0, cw) { do aset(a, y * cw + x, aget(img[2], (y0 + y) * img[0] + x0 + x)) }
+    }
+    let snaps = append(snaps, [m[0], release(mk, [cw, ch, a])])
+    do press(27)
+    do pause(1)
+  }
+  # read the snapshots, learn letters from the words read with confidence, read again
+  let r1 = read_snaps(snaps, temps, lex)
+  let learned = []
+  for s in snaps { let learned = learned ++ harvest_snap(s[1], temps, lex) }
+  let r2 = read_snaps(snaps, temps ++ learned, lex)
+  let truth = ["New tab", "New window", "New Markdown tab", "Open", "Recent", "Save", "Save as", "Save all", "Page setup", "Print", "Close tab", "Close window", "Exit", "Undo", "Cut", "Copy", "Paste", "Delete", "Search with Bing", "Find", "Find next", "Find previous", "Replace", "Go to", "Select all", "Time/Date", "Clear formatting", "Font", "Zoom", "Status bar", "Word wrap", "Markdown"]
+  let out = out ++ "first reading (letters from the font engine): " ++ str(score(r1, truth)) ++ " of " ++ str(len(truth)) ++ " menu items exact\n"
+  let out = out ++ "Pi learned " ++ str(len(learned)) ++ " letter shapes from words it read with confidence on the screen\n"
+  let out = out ++ "second reading (+ the screen's own letters):     " ++ str(score(r2, truth)) ++ " of " ++ str(len(truth)) ++ " menu items exact\n"
+  let mem = []
+  for i in range(0, len(snaps)) {
+    let out = out ++ "  " ++ snaps[i][0] ++ ": " ++ join(r2[i], " | ") ++ "\n"
+    let mem = append(mem, "menu ::: " ++ snaps[i][0] ++ " ::: " ++ join(r2[i], " | "))
+  }
+  do write_file("out\\notepad.mem", join(mem, "\n"))
+  return out ++ "3 clicks and 3 Escapes; nothing typed, saved or chosen. Notepad is left open for you to close. Remembered in out\\notepad.mem"
+}
+
+# every text line of every snapshot, read -> one list of readings per snapshot
+skill read_snaps(snaps, temps, lex) -> Any {
+  let out = []
+  for s in snaps {
+    let img = s[1]
+    let mk = mark()
+    let u = understand(img[0], img[1], img[2], 1)
+    let rs = []
+    for l in u[8] {
+      let ink = box_ink_any(img, max(0, l[0] - 3), max(0, l[1] - 3), min(img[0] - 1, l[2] + 3), min(img[1] - 1, l[3] + 3))
+      let t = trim(read_line_lex(ink[2], ink[0], 0, 0, ink[0] - 1, ink[1] - 1, temps, lex))
+      if len(t) > 0 { let rs = append(rs, t) }
+    }
+    let out = append(out, release(mk, rs))
+  }
+  return out
+}
+
+skill harvest_snap(img, temps, lex) -> Any {
+  let mk = mark()
+  let u = understand(img[0], img[1], img[2], 1)
+  let got = []
+  for l in u[8] {
+    let ink = box_ink_any(img, max(0, l[0] - 3), max(0, l[1] - 3), min(img[0] - 1, l[2] + 3), min(img[1] - 1, l[3] + 3))
+    let got = got ++ harvest_line(ink[2], ink[0], 0, 0, ink[0] - 1, ink[1] - 1, temps, lex)
+  }
+  return release(mk, got)
+}
+
+# how many answer-key items were read exactly (ignoring case) -- the key is only for scoring, Pi never sees it
+skill score(readings, truth) -> Any {
+  let n = 0
+  for t in truth {
+    let hit = false
+    for rs in readings {
+      for r in rs {
+        if lower(r) == lower(t) { let hit = true }
+      }
+    }
+    if hit { let n = n + 1 }
+  }
+  return n
+}

@@ -1,0 +1,15 @@
+scene: 1 panels, 1 bars, 3 buttons, 8 text lines (271 glyph marks), 0 other shapes
+panel 1 at 30,34 size 260x146 #e8e8e8
+  bar at 30,20 size 260x14 #203060 in panel 1 (its title bar)
+  button at 45,145 size 60x18 #4a7bd0 in panel 1
+  button at 125,145 size 60x18 #4a7bd0 in panel 1
+  button at 205,145 size 60x18 #4a7bd0 in panel 1
+  text line at 36,25 width 42 (21 marks)
+  text line at 45,48 width 110 (56 marks)
+  text line at 45,62 width 110 (55 marks)
+  text line at 45,76 width 110 (60 marks)
+  text line at 45,90 width 110 (48 marks)
+  text line at 55,151 width 18 (9 marks)
+  text line at 135,151 width 18 (14 marks)
+  text line at 215,151 width 18 (8 marks)
+known answer: right: 1 panel, 1 bar, 3 buttons, 8 text lines

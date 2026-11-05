@@ -1,0 +1,201 @@
+# nerfdata: posed multi-view images for the neural field. A simple scene (three coloured spheres on a floor, one fixed
+# diffuse light so every view agrees) is ray-marched from cameras on an orbit. Writes view_NNN.ppm and poses.txt
+# (eye xyz, target xyz, fov, train/test) -- exact poses, no structure-from-motion. Real photos + COLMAP poses would
+# drop into the same training pipeline.
+#   nerfdata OUTDIR [width] [ntrain] [ntest]
+
+skill vlen(x, y, z) -> Any { return sqrt(x * x + y * y + z * z) }
+
+# scene distance and material at (x,y,z) -> [distance, r, g, b]
+skill sdbox(x, y, z, bx, by, bz) -> Any {
+  let qx = abs(x) - bx
+  let qy = abs(y) - by
+  let qz = abs(z) - bz
+  let mx = max(qx, 0.0)
+  let my = max(qy, 0.0)
+  let mz = max(qz, 0.0)
+  let inside = min(max(qx, max(qy, qz)), 0.0)
+  return sqrt(mx * mx + my * my + mz * mz) + inside
+}
+skill sd_scene(x, y, z) -> Any {
+  let d = sdbox(x, y + 1.1, z, 2.8, 0.12, 2.8)
+  let cr = 0.62
+  let cg = 0.62
+  let cb = 0.66
+  # a faint checker on the floor
+  let fx = floor(x * 1.0)
+  let fz = floor(z * 1.0)
+  if (int(fx) + int(fz)) % 2 == 0 { cr = 0.5 } else { cr = 0.72 }
+  cg = cr
+  cb = cr * 1.02
+  let s1 = vlen(x + 0.95, y + 0.45, z - 0.1) - 0.55
+  if s1 < d {
+    d = s1
+    cr = 0.85
+    cg = 0.18
+    cb = 0.14
+  }
+  let s2 = vlen(x - 0.85, y + 0.5, z - 0.35) - 0.5
+  if s2 < d {
+    d = s2
+    cr = 0.2
+    cg = 0.7
+    cb = 0.3
+  }
+  let s3 = vlen(x - 0.0, y - 0.35, z + 0.7) - 0.5
+  if s3 < d {
+    d = s3
+    cr = 0.25
+    cg = 0.45
+    cb = 0.95
+  }
+  return [d, cr, cg, cb]
+}
+skill sd_d(x, y, z) -> Any { return sd_scene(x, y, z)[0] }
+
+# the colour a ray (origin ex,ey,ez; direction dx,dy,dz) sees. White where it misses (so the field's white background
+# matches). Lambert + ambient from one fixed light.
+skill trace(ex, ey, ez, dx, dy, dz) -> Any {
+  let t = 0.0
+  let hit = false
+  let px = 0.0
+  let py = 0.0
+  let pz = 0.0
+  for i in range(0, 110) {
+    px = ex + dx * t
+    py = ey + dy * t
+    pz = ez + dz * t
+    let d = sd_d(px, py, pz)
+    if d < 0.001 {
+      hit = true
+      break
+    }
+    t = t + d
+    if t > 12.0 { break }
+  }
+  if not hit { return [1.0, 1.0, 1.0] }
+  let m = sd_scene(px, py, pz)
+  let e = 0.002
+  let nx = sd_d(px + e, py, pz) - sd_d(px - e, py, pz)
+  let ny = sd_d(px, py + e, pz) - sd_d(px, py - e, pz)
+  let nz = sd_d(px, py, pz + e) - sd_d(px, py, pz - e)
+  let nl = vlen(nx, ny, nz) + 0.000001
+  nx = nx / nl
+  ny = ny / nl
+  nz = nz / nl
+  let lx = 0.5
+  let ly = 0.78
+  let lz = 0.38
+  let diff = nx * lx + ny * ly + nz * lz
+  if diff < 0.0 { diff = 0.0 }
+  let sh = 0.25 + 0.8 * diff
+  return [m[1] * sh, m[2] * sh, m[3] * sh]
+}
+
+skill clampb(v) -> Any {
+  let q = int(v * 255.0 + 0.5)
+  if q < 0 { q = 0 }
+  if q > 255 { q = 255 }
+  return q
+}
+skill rt_nd_pack(bt) -> Any {
+  let b = bt
+  let n = peek(b + 8)
+  let p = rt_alloc(n)
+  for i in range(0, n) { do pokeb(p + i, rt_untag(peek(b + 16 + 8 * i)) % 256) }
+  return rt_tag(p)
+}
+skill nd_three(n) -> Any {
+  let s = str(n)
+  while len(s) < 3 { s = "0" ++ s }
+  return s
+}
+
+# render one view -> write a PPM; return nothing
+skill render_view(dir, idx, w, h, ex, ey, ez, tx, ty, tz, fov) -> Any {
+  # camera basis
+  let fx = tx - ex
+  let fy = ty - ey
+  let fz = tz - ez
+  let fl = vlen(fx, fy, fz)
+  fx = fx / fl
+  fy = fy / fl
+  fz = fz / fl
+  # right = normalize(cross(f, up(0,1,0)))
+  let rx = fz
+  let ry = 0.0
+  let rz = 0.0 - fx
+  let rl = vlen(rx, ry, rz) + 0.000001
+  rx = rx / rl
+  rz = rz / rl
+  # up = cross(right, f)
+  let ux = ry * fz - rz * fy
+  let uy = rz * fx - rx * fz
+  let uz = rx * fy - ry * fx
+  let tn = sin(fov * 0.5) / cos(fov * 0.5)
+  let bytes = arr(3 * w * h + 1)
+  let k = 0
+  for py in range(0, h) {
+    let sy = (1.0 - 2.0 * (float(py) + 0.5) / float(h)) * tn
+    for px in range(0, w) {
+      let sx = (2.0 * (float(px) + 0.5) / float(w) - 1.0) * tn
+      let dx = fx + rx * sx + ux * sy
+      let dy = fy + ry * sx + uy * sy
+      let dz = fz + rz * sx + uz * sy
+      let dl = vlen(dx, dy, dz)
+      let col = trace(ex, ey, ez, dx / dl, dy / dl, dz / dl)
+      aset(bytes, k, clampb(col[0]))
+      aset(bytes, k + 1, clampb(col[1]))
+      aset(bytes, k + 2, clampb(col[2]))
+      k = k + 3
+    }
+  }
+  let path = dir ++ "\\view_" ++ nd_three(idx) ++ ".ppm"
+  let hdr = "P6\n" ++ str(w) ++ " " ++ str(h) ++ "\n255\n"
+  write_file(path, hdr)
+  rt_append_file(path, rt_tag_text(rt_nd_pack(bytes), 3 * w * h))
+  return 0
+}
+# a raw byte buffer as a Pi text of n bytes (so rt_append_file writes it)
+skill rt_tag_text(pt, nt) -> Any {
+  let t = rt_text_new(rt_untag(nt))
+  let p = rt_untag(pt)
+  for i in range(0, rt_untag(nt)) { do pokeb(t + 16 + i, peekb(p + i)) }
+  return t
+}
+
+skill main() -> Any {
+  if arg(1) == null { return "nerfdata OUTDIR [width] [ntrain] [ntest]" }
+  let dir = arg(1)
+  let w = if arg(2) != null { int(arg(2)) } else { 56 }
+  let ntrain = if arg(3) != null { int(arg(3)) } else { 36 }
+  let ntest = if arg(4) != null { int(arg(4)) } else { 8 }
+  let fov = 0.9
+  let R = 3.3
+  let poses = ""
+  let t0 = ticks()
+  # training views: an orbit, height gently rising and falling
+  for i in range(0, ntrain) {
+    let a = float(i) / float(ntrain) * 12.566370
+    let rr = R + 0.9 * sin(a * 1.5)
+    let ex = rr * cos(a)
+    let ez = rr * sin(a)
+    let ey = 0.7 + 1.3 * (float(i) / float(ntrain)) + 0.4 * sin(a * 2.0)
+    render_view(dir, i, w, h_of(w), ex, ey, ez, 0.0, 0.0 - 0.15, 0.0, fov)
+    poses = poses ++ format("{:.5f}", ex) ++ " " ++ format("{:.5f}", ey) ++ " " ++ format("{:.5f}", ez) ++ " 0 -0.15 0 " ++ format("{:.5f}", fov) ++ " train\n"
+    print("  train view " ++ str(i + 1) ++ "/" ++ str(ntrain) ++ " (" ++ str((ticks() - t0) // 1000) ++ " s)")
+  }
+  # test views: in between the training angles, different heights
+  for j in range(0, ntest) {
+    let a = (float(j) + 0.5) / float(ntest) * 6.2831853
+    let ex = R * cos(a)
+    let ez = R * sin(a)
+    let ey = 1.4 + 0.5 * cos(a * 3.0)
+    render_view(dir, 1000 + j, w, h_of(w), ex, ey, ez, 0.0, 0.0 - 0.15, 0.0, fov)
+    poses = poses ++ format("{:.5f}", ex) ++ " " ++ format("{:.5f}", ey) ++ " " ++ format("{:.5f}", ez) ++ " 0 -0.15 0 " ++ format("{:.5f}", fov) ++ " test\n"
+  }
+  write_file(dir ++ "\\poses.txt", poses)
+  print("wrote " ++ str(ntrain) ++ " train + " ++ str(ntest) ++ " test views to " ++ dir ++ " in " ++ str((ticks() - t0) // 1000) ++ " s")
+  return 0
+}
+skill h_of(w) -> Any { return w }

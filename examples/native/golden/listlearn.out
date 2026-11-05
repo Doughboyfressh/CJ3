@@ -1,0 +1,43 @@
+Pi starts with 0 list words of its own.
+round 1: solved 20 of 20
+  new word w0(a: L) -> L = filter(e -> (0 == (e % 2)), a)   (saves 8)
+  new word w1(a: L) -> L = map(e -> (e * e), a)   (saves 4)
+  new word w2(a: L) -> L = filter(e -> (0 < e), a)   (saves 4)
+round 2: solved 20 of 20
+
+what Pi says, in its own words (each checked by interp.pi on lists it never saw):
+  sum: sum(x)
+  length: len(x)
+  reverse: rev(x)
+  sort: sort(x)
+  double each: map(e -> (e + e), x)
+  add one to each: map(e -> (e + 1), x)
+  square each: w1(x)
+  keep positives: w2(x)
+  keep evens: w0(x)
+  count positives: len(w2(x))
+  sum of squares: sum(w1(x))
+  largest: maxl(x)
+  spread (max - min): (maxl(x) - minl(x))
+  sort descending: rev(sort(x))
+  sum of positives: sum(w2(x))
+  squares sorted: sort(w1(x))
+  two smallest: take(2, sort(x))
+  count evens: len(w0(x))
+  sum of evens: sum(w0(x))
+  largest two, biggest first: take(2, rev(sort(x)))
+
+learning problems -- without its words: 20 of 20, with 3 words: 20
+
+problems Pi never learned from:
+  sum of doubles:  without: (2 * sum(x))   with: (2 * sum(x))
+  count negatives:  without: len(filter(e -> (e < 0), x))   with: len(filter(e -> (e < 0), x))
+  largest square:  without: maxl(map(e -> (e * e), x))   with: maxl(w1(x))
+  three smallest:  without: take(3, sort(x))   with: take(3, sort(x))
+  positives sorted:  without: sort(filter(e -> (0 < e), x))   with: sort(w2(x))
+  squares of positives:  without: not found   with: w1(w2(x))
+  evens, biggest first:  without: not found   with: rev(sort(w0(x)))
+  largest positive square:  without: (maxl(x) * maxl(x))   with: last(w1(sort(x)))
+  smallest even:  without: minl(filter(e -> (0 == (e % 2)), x))   with: minl(w0(x))
+  largest three, biggest first:  without: take(3, rev(sort(x)))   with: take(3, rev(sort(x)))
+unseen -- without its words: 8 of 10, with its words: 10 of 10

@@ -1,0 +1,20 @@
+# function values: map, filter, reduce (all written in Pi now), captured variables, closures returned from
+# skills and stored in locals, and a closure passed to another skill
+skill adder(n) -> Any { return fn(x) => x + n }
+skill twice(f, v) -> Any { return f(f(v)) }
+
+skill main() -> Any {
+  let nums = [1, 2, 3, 4, 5, 6]
+  let doubled = map(nums, fn(e) => e * 2)
+  let evens = filter(nums, fn(e) => e % 2 == 0)
+  let k = 3
+  let shifted = map(nums, fn(e) => e + k)
+  let sum = fn(a, b) => a + b
+  let s1 = reduce(doubled, sum, 0)
+  let s2 = reduce(evens, sum, 0)
+  let s3 = reduce(shifted, sum, 0)
+  let add10 = adder(10)
+  let add100 = adder(100)
+  let sq = fn(x) => x * x
+  return s1 * 1000000 + s2 * 10000 + s3 * 100 + add10(5) + add100(5) + twice(sq, 3)
+}

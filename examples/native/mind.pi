@@ -1,0 +1,67 @@
+# Pi's core learning loop, built on how the brain learns (see BRAIN.md).
+#
+# ONE language for every domain (numbers, lists, text, grids): integers I, lists L, grids G, element functions F,
+# element tests P. The input is `n` (a number), `x` (a list) or `g` (a grid); `e` is a list element.
+#
+#   DAY   (waking)  curiosity picks the domain where learning is improving fastest (learning progress, Oudeyer);
+#                   a task already in episodic memory is answered from memory (habit, no search); new tasks are
+#                   searched in the current language (planning); an answer counts only if it predicts examples it
+#                   never saw (predictive processing), run by interp.pi; Pi predicts each outcome first and logs
+#                   its surprise (prediction error, dopamine-like).
+#   NIGHT (sleep)   all episodes are replayed together, interleaved (complementary learning systems): the words that
+#                   shorten everything Pi knows the most are added (minimum description length); then downscaling:
+#                   words no memory uses any more go dormant and leave the search (synaptic homeostasis); dreams.
+#
+# The life itself is live() in mindcore.pi, run on a genome (the settings Pi's learning uses; improve.pi changes them).
+#
+#   out\mind.exe [vocabulary-file] [half|full] [nodream] [genome-file] [lesson-file]
+import "mindcore.pi"
+
+skill main() -> Any {
+  let g = default_genome()
+  if arg(4) != null { let g = genome_of(read_file(arg(4))) }
+  if arg(3) == "nodream" { let g = put(g, "dreams", 0) }
+  # a lesson file from the teacher (out\mind.exe vocab full x genome lessons.txt; "-" for none)
+  if arg(5) != null { let g = put(g, "__lessons", load_lessons(read_file(arg(5)))) }
+  let tasks = all_tasks(arg(2) == "half")
+  let life = live(g, arg(1), tasks)
+  let out = life["out"]
+  let lib = life["lib"]
+  let active = life["active"]
+  let consts = life["consts"]
+  let episodes = life["episodes"]
+  let pl = life["pl"]
+  let pre = life["pre"]
+  let domains = ["numbers", "lists", "text", "grids"]
+  let out = out ++ "\nwhat Pi knows, in its own words:\n"
+  for d in domains {
+    for t in tasks[d] {
+      let r = episodes[t[0]]
+      if r == null { let out = out ++ "  " ++ t[0] ++ ": not yet\n" } else { let out = out ++ "  " ++ t[0] ++ ": " ++ show(r) ++ "\n" }
+    }
+  }
+  # the measure: tasks never practised, with and without the language Pi grew
+  let out = out ++ "\nnever practised:\n"
+  let tot0 = 0
+  let tot1 = 0
+  let totn = 0
+  for d in domains {
+    for t in unseen_of(d) {
+      let r0 = attempt_task_g(t, d, [], [], pl, pre, g)
+      let r1 = attempt_task_g(t, d, lib, active[d], [pl[0], pl[1], consts[d], life["counts"][d]], pre, g)
+      let a = "not found"
+      if r0[0] != null {
+        let a = show(r0[0])
+        let tot0 = tot0 + 1
+      }
+      let b = "not found"
+      if r1[0] != null {
+        let b = show(r1[0])
+        let tot1 = tot1 + 1
+      }
+      let totn = totn + 1
+      let out = out ++ "  " ++ t[0] ++ ":  without: " ++ a ++ "   with: " ++ b ++ "\n"
+    }
+  }
+  return out ++ "never practised -- without Pi's words: " ++ str(tot0) ++ " of " ++ str(totn) ++ ", with them: " ++ str(tot1) ++ " of " ++ str(totn)
+}

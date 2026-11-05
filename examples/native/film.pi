@@ -1,0 +1,40 @@
+# film SCENE OUT.mp4 [width] [height] [fps] [seconds] [samples] [quality] [score]: a scene that moves (it reads time) -> a video,
+# every frame path traced with real motion blur. No model, no library, no ffmpeg.
+import "video.pi"
+
+skill main() -> Any {
+  if arg(1) == null or arg(2) == null { return "film SCENE OUT.mp4 [width] [height] [fps] [seconds] [samples] [quality]" }
+  let src = read_file(arg(1))
+  if src == null { return "cannot read " ++ arg(1) }
+  let w = if arg(3) != null { int(arg(3)) } else { 1280 }
+  let h = if arg(4) != null { int(arg(4)) } else { 720 }
+  let fps = if arg(5) != null { int(arg(5)) } else { 24 }
+  let secs = if arg(6) != null { int(arg(6)) } else { 5 }
+  let spp = if arg(7) != null { int(arg(7)) } else { 16 }
+  let quality = if arg(8) != null { int(arg(8)) } else { 18 }
+  let A = null
+  if arg(9) != null {
+    let score = read_file(arg(9))
+    if score == null { return "cannot read " ++ arg(9) }
+    A = vid_audio(score, "", 320)
+  }
+  let S = sh_open(src, w, h)
+  let V = vid_open(arg(2), S, fps, quality, A)
+  let frames = fps * secs
+  // a half-open shutter, as film cameras run
+  let shut = 500000 // fps
+  let t0 = ticks()
+  let last = ticks()
+  for f in range(0, frames) {
+    sh_frame(S, f * 1000000 // fps, shut, spp, (f + 1) * 65536, false)
+    sh_tone(S, spp)
+    vid_frame(V, S)
+    if ticks() - last > 4000 {
+      last = ticks()
+      print("  frame " ++ str(f + 1) ++ " of " ++ str(frames) ++ ", " ++ str((ticks() - t0) // 1000) ++ " s")
+    }
+  }
+  let total = vid_close(V)
+  print("wrote " ++ arg(2) ++ ": " ++ str(frames) ++ " frames, " ++ str(w) ++ " x " ++ str(h) ++ " at " ++ str(spp) ++ " samples, " ++ str(total // 1024) ++ " KB of video, in " ++ str((ticks() - t0) // 1000) ++ " s")
+  return 0
+}

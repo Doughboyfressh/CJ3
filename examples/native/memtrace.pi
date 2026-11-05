@@ -1,0 +1,9 @@
+# memory trace of seeing and understanding the real screen (diagnostic)
+import "vision.pi"
+
+skill main() -> Any {
+  let img = see(1)
+  do print("captured " ++ str(img[0]) ++ "x" ++ str(img[1]) ++ ", heap " ++ str(memused() // 1000000) ++ " MB")
+  let u = understand(img[0], img[1], img[2], 1)
+  return "understood, heap " ++ str(memused() // 1000000) ++ " MB"
+}

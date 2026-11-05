@@ -1,0 +1,43 @@
+# Data on the SSD, worked on by the GPU: one batch at a time, then streamed (the next batches are read from
+# the SSD and sent to the GPU by a background thread while the GPU works on the current one).
+
+skill make(n) -> Any {
+  return ssd(randn([n, 256], 7))
+}
+
+# the GPU work for one batch: two layers forward
+skill work(b, w) -> Any {
+  return sum(relu(matmul(relu(matmul(b, w)), transpose(w))))
+}
+
+skill one_by_one(data, size, w) -> Any {
+  let total = 0
+  for i in range(0, shape(data)[0] // size) {
+    let b = gpu(rows(data, i * size, size))
+    let total = total + work(b, w)
+  }
+  return total
+}
+
+skill streamed(data, size, w) -> Any {
+  let s = stream(data, size, "gpu")
+  let total = 0
+  let b = next(s)
+  while b != null {
+    let total = total + work(b, w)
+    let b = next(s)
+  }
+  return total
+}
+
+skill compare(n, size) -> Any {
+  let data = make(n)
+  let w = gpu(randn([256, 1024], 8) * 0.05)
+  let warm = work(gpu(rows(data, 0, size)), w)
+  let a = profile()
+  let x = one_by_one(data, size, w)
+  let t1 = profile()
+  let y = streamed(data, size, w)
+  let t2 = profile()
+  return [t1.wall_ms, t2.wall_ms, x, y]
+}

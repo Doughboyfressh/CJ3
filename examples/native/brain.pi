@@ -1,0 +1,873 @@
+# Pi's brain: Ornith's weights inside Pi's runtime (user decision 2026-11-03: "a language thats intelligent").
+# Pi reads the words (braintok.pi, its own tokenizer), runs every layer on the GPU with its own engine
+# (forwardlib.pi), and reads the answer back. Ornith's training is the brain's knowledge; Pi is its body.
+#   br = brain_open()                       -> [engine, graph, tokenizer, special ids, the system prompt's state]
+#   think(br, question, maxtokens)          -> [thinking, answer, tokens used, stopped by itself]
+#   say(br, question, maxtokens)            -> the answer without thinking
+import "forwardlib.pi"
+import "braintok.pi"
+
+skill brain_open() -> Any { return brain_open_with(null) }
+skill brain_open_with(edits) -> Any { return brain_open_web(edits, false) }
+
+# the brain with edits to its weights (an edits file for with_edits: "layer percent direction.bin" lines), or none
+# web: the brain also gets the website tools (save_file, start_site, fetch) and sitelib in its run_pi programs
+skill brain_open_web(edits, web) -> Any {
+  let m = dev_open(open_model(MODEL()))
+  if typeof(m) == "text" { return m }
+  if edits != null { let m = with_edits(m, edits) }
+  let g2 = dgraph2(m)
+  if len(g2) == 1 { return g2[0] }
+  let sp = {}
+  for nm in ["<|im_start|>", "<|im_end|>", "<think>", "</think>", "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"] {
+    let id = find_token(m, nm, false)
+    if id >= 0 { let sp = put(sp, nm, id) }
+  }
+  # the system message (the tools, the Pi card) is fed once; its state is kept on the GPU and restored per question
+  let br0 = [m, g2, tk_load(MODEL()), sp]
+  do dev_reset(m)
+  let S = brain_feed(br0, brain_ids(br0, "<|im_start|>system\n" ++ hands_system_web(web) ++ "<|im_end|>"), 0)
+  # [5]: the line-start save for writing code (recurrent state, conv history, the choice's logits) -- see line_bad
+  let ls = [rt_gpu_alloc(40 * ge_STATE()), rt_gpu_alloc(40 * 3 * 8192 * 8), rt_gpu_alloc(248320 * 8)]
+  # [6]: website mode
+  return append(append(append(br0, dev_snapshot(m, S)), ls), web)
+}
+
+# ---- a language that cannot be miswritten: each line of code the brain writes is checked as it ends ----------------
+# depth of ( [ { in Pi code, outside text and comments
+skill pi_depth(code) -> Any {
+  let d = 0
+  let q = ""
+  let bol = true
+  let i = 0
+  let cs = chars(code)
+  let n = len(cs)
+  while i < n {
+    let c = cs[i]
+    if q != "" {
+      if c == "\\" { i += 1 } else { if c == q { q = "" } }
+    } else if c == "\"" or c == "'" {
+      q = c
+    } else if c == "#" or (bol and c == "/" and i + 1 < n and cs[i + 1] == "/") {
+      // # anywhere, // only where it opens the line (as the compiler reads it: elsewhere // is floor division)
+      while i < n and cs[i] != "\n" { i += 1 }
+      i -= 1
+    } else if c == "(" or c == "[" or c == "{" {
+      d += 1
+    } else if c == ")" or c == "]" or c == "}" {
+      d -= 1
+    }
+    if c == "\n" { bol = true } else { if c != " " and c != "\t" { bol = false } }
+    i += 1
+  }
+  return d
+}
+
+# why a finished line is not Pi ("" if it is): depth is the bracket depth where the line starts
+skill line_bad(depth, line) -> Any {
+  let t = trim(line)
+  if t == "" or slice(t, 0, 1) == "#" or slice(t, 0, 2) == "//" or slice(t, 0, 1) == "}" { return "" }
+  let idc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+  let cs = chars(t)
+  let j = 0
+  while j < len(cs) and contains(idc, cs[j]) { j += 1 }
+  let w = slice(t, 0, j)
+  let rest = trim(slice(t, j, len(t)))
+  if depth <= 0 {
+    if w != "skill" { return "code outside every skill" }
+    return ""
+  }
+  if w == "skill" { return "a skill inside a skill" }
+  let foreign = ["def", "elif", "var", "const", "function", "func", "end", "then", "elsif", "val", "auto", "void", "pass", "local", "foreach", "begin", "unless", "until", "echo", "puts", "println", "printf", "console", "fn"]
+  if contains(foreign, w) { return "not Pi: " ++ w }
+  if contains(["int", "float", "double", "string", "bool", "char", "long"], w) and len(rest) > 0 and contains(idc, slice(rest, 0, 1)) { return "Pi has no type declarations" }
+  if contains(["if", "while", "for", "else"], w) and slice(t, len(t) - 1, len(t)) == ":" { return "Pi blocks use { }" }
+  if w == "print" and len(rest) > 0 and slice(rest, 0, 1) != "(" { return "print needs ( )" }
+  return ""
+}
+
+# the chat template around one user message: <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n<think>\n
+# (without thinking, an empty <think>\n\n</think>\n\n)
+skill brain_prompt(br, text, thinking) -> Any {
+  let tk = br[2]
+  let ids = [248045] ++ tk_encode(tk, "user\n" ++ text) ++ [248046] ++ tk_encode(tk, "\n") ++ [248045] ++ tk_encode(tk, "assistant\n") ++ [248068]
+  if thinking { return ids ++ tk_encode(tk, "\n") }
+  return ids ++ tk_encode(tk, "\n\n") ++ [248069] ++ tk_encode(tk, "\n\n")
+}
+
+skill brain_text(br, ids) -> Any {
+  let out = ""
+  for v in ids { let out = out ++ show(token(br[0], v)) }
+  return out
+}
+
+skill brain_run(br, text, maxt, thinking) -> Any {
+  let gen = drun(br[0], br[1], brain_prompt(br, text, thinking), maxt)
+  let th = []
+  let ans = []
+  let inans = thinking == false
+  let stopped = false
+  for v in gen {
+    if v == 248046 or v == 248044 { let stopped = true } else {
+      if v == 248069 { let inans = true } else {
+        if inans { let ans = append(ans, v) } else { let th = append(th, v) }
+      }
+    }
+  }
+  return [trim(brain_text(br, th)), trim(brain_text(br, ans)), len(gen), stopped]
+}
+
+skill think(br, text, maxt) -> Any { return brain_run(br, text, maxt, true) }
+skill say(br, text, maxt) -> Any { return brain_run(br, text, maxt, false)[1] }
+
+# ---- hands: the brain writes Pi, Pi runs it, the result goes back to the brain ------------------------------------
+# In the form Ornith was trained on: a tool (run_pi) listed in the system message, a <tool_call> that ends the brain's
+# turn, the program's output returned as a <tool_response>, and the brain's next turn continuing from there.
+skill hands_card() -> Any {
+  return "You are Pi: a programming language that compiles itself, and that thinks. You understand what you are asked, reason about it, and act through your own language: run_pi compiles and runs a Pi program and shows you what it prints. You remember across conversations (remember / recall).\n\nUse run_pi whenever exact computation would help: arithmetic, counting, checking cases, a search. Call it as often as it helps; keep each program short; if a program fails, fix it and call run_pi again.\nAct early: when you are unsure whether something works in Pi, or whether an idea is right, run a short program and see. A run takes well under a second; reasoning about it takes far longer.\nNever state what a program prints, or the result of a calculation, unless you have run it: run it first, then say it.\nInside a program you are a function too: ask(q) returns your own short answer to q as text; think(q) returns a thought (a number) that think_more(t, q) continues (each call branches from t, so one thought can be explored several ways); thought(t) is a thought's text. Use them where code needs judgment (which name sounds kinder? is this sentence sad?), never for arithmetic.\nWhen a question asks for one result (a number, an expression, a choice), end your answer with that result alone in \\boxed{...}: the exact value, nothing after it.\nYou also have a long-term memory that lasts across conversations: remember saves a short note (a fact you checked, something the user wants you to keep), recall searches your notes; notes that look relevant are shown to you with each question.\n\nPi in brief (one statement per line, no semicolons):\n- A program is skills (functions). skill main() -> Any { ... } runs; its return value is printed. do print(x) prints too.\n- Everything lives inside skills: no code or let at the top level, no skill inside a skill (pass values as arguments; a skill cannot change its caller's names, so return what changed). Comments start with #.\n- let x = 5 binds a name; x = 5 or x += 1 rebinds it. Blocks use braces.\n- if a > b { ... } else if c { ... } else { ... }\n- while i < n { ... }   for i in range(0, n) { ... } (0 .. n-1)   for v in xs { ... }   return x\n- A call whose value is unused is a statement: do f(x)\n- Lists: [1, 2], xs[i], xs[i] = v, len(xs), xs ++ ys joins two lists, append(xs, v) returns a new list, slice(xs, a, b), sort(xs), reverse(xs), sum(xs), contains(xs, v), range(a, b) is a list\n- Maps: {\"a\": 1}, m[\"a\"] (null if absent), m[k] = v, put(m, k, v) returns a new map, get(m, k), keys(m), values(m)\n- Text: \"a\" ++ \"b\", str(x), num(s) (an integer's text -> the integer, else null), chars(s), ord(c) (a digit is ord(c) - 48), len(s), s[i], slice(s, a, b), split(s, sep), join(xs, sep), lower(s), upper(s), trim(s), contains(s, part), format(\"{} and {}\", a, b). Text is bytes: UTF-8 such as æ works (len counts bytes)\n- Numbers: + - * / (real division) // (floor division) % ^ (integer power). Integers are exact at any size (2 ^ 1000 has all 302 digits); reals like 2.5 keep about 16 digits. abs sqrt floor ceil round(x) exp log log10 log2 sin cos tan atan; min(a, b, ...) max(a, b, ...)\n- Functions as values: fn(x) => x * 2; map(xs, f), filter(xs, f), reduce(xs, f, start); typeof(x) is \"int\" \"real\" \"text\" \"list\" \"map\" \"fn\" or \"null\"\n- Also fine: break and continue in loops; if c { a } else { b } as a value anywhere; (a, b) is a list and let (a, b) = f() takes it apart; format(\"{:.2f}\", x) rounds half up\n- That is the whole library: write anything else yourself (a skill of a few lines).\n- Comparisons: == != < <= > >= and or not; true false null\n- No files, network or processes.\n\nExample program:\nskill square(n) -> Any { return n * n }\nskill main() -> Any {\n  let total = 0\n  for k in range(1, 101) {\n    let total = total + square(k)\n  }\n  return total\n}"
+}
+
+# the tool as the template lists it (JSON inside <tools>) and the template's own calling instructions
+skill hands_tools(web) -> Any {
+  let run = "{\"type\": \"function\", \"function\": {\"name\": \"run_pi\", \"description\": \"Compile and run a program written in Pi and return what it prints (its main() return value is printed).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"code\": {\"type\": \"string\", \"description\": \"A complete Pi program with skill main() -> Any { ... }\"}}, \"required\": [\"code\"]}}}"
+  let rem = "{\"type\": \"function\", \"function\": {\"name\": \"remember\", \"description\": \"Save a short note to your long-term memory, kept across conversations.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"note\": {\"type\": \"string\", \"description\": \"The note: one or two sentences\"}}, \"required\": [\"note\"]}}}"
+  let rec = "{\"type\": \"function\", \"function\": {\"name\": \"recall\", \"description\": \"Search your long-term memory for notes about something.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"What to look for\"}}, \"required\": [\"query\"]}}}"
+  if web == false { return run ++ "\n" ++ rem ++ "\n" ++ rec }
+  let sv = "{\"type\": \"function\", \"function\": {\"name\": \"save_file\", \"description\": \"Save a file of your website in its folder (server.pi is the server; any other file, such as index.html, app.js or style.css, can be served by it). Saving replaces the file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\", \"description\": \"A plain file name: letters, digits, dot, dash, underscore\"}, \"content\": {\"type\": \"string\", \"description\": \"The whole file\"}}, \"required\": [\"name\", \"content\"]}}}"
+  let st = "{\"type\": \"function\", \"function\": {\"name\": \"start_site\", \"description\": \"Compile server.pi and start it at http://127.0.0.1:8080, replacing the server that was running. Says whether GET / answered.\", \"parameters\": {\"type\": \"object\", \"properties\": {}, \"required\": []}}}"
+  let fe = "{\"type\": \"function\", \"function\": {\"name\": \"fetch\", \"description\": \"Request a path from your running site and show the reply (status, type, body). With a body it is a POST of that body.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Such as / or /api/items?id=3\"}, \"body\": {\"type\": \"string\", \"description\": \"Optional: the POST body, such as JSON\"}}, \"required\": [\"path\"]}}}"
+  let op = "{\"type\": \"function\", \"function\": {\"name\": \"open_file\", \"description\": \"Show a file of your website as it is saved (with line numbers), or list the site's files when name is empty.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"name\": {\"type\": \"string\", \"description\": \"The file, such as server.pi\"}}, \"required\": [\"name\"]}}}"
+  return run ++ "\n" ++ rem ++ "\n" ++ rec ++ "\n" ++ sv ++ "\n" ++ st ++ "\n" ++ fe ++ "\n" ++ op
+}
+
+# what the brain is told about building websites (web chats only)
+skill web_card() -> Any {
+  return "\n\nYou can build websites: a server written in Pi with a front end it serves.\n- save_file(name, content) saves a file of the site. server.pi is the server: a Pi program whose main() returns serve_http(handler). Other files (index.html, app.js, style.css) hold the front end; the server sends them with site_file(name).\n- start_site() compiles server.pi and starts it at http://127.0.0.1:8080. fetch(path, body) requests a page from the running site; test every route with it, and fix what fails.\n- handler(req) runs for every request: req[\"method\"], req[\"path\"] (without the query), req[\"query\"] (a map of the URL's ?a=1&b=2), req[\"body\"] (text), req[\"form\"] (a posted form as a map). Pass the handler by its name: serve_http(handle).\n- A handler returns text (sent as HTML if it starts with <, as JSON if it starts with { or [), any list or map (sent as JSON), site_file(name), or reply(status, type, body), such as reply(404, \"text/plain\", \"not found\").\n- Values do not survive from one request to the next: keep data in files with site_write(name, text) and site_read(name) (null if there is none). to_json(x) is x as JSON text; parse_json(t) reads JSON (true and false become 1 and 0).\n- In the browser, the front end can call the server with fetch('/api/...') and JSON.\n- run_pi programs also have these words, so test a handler by calling it with a map such as {\"method\": \"GET\", \"path\": \"/\", \"query\": {}, \"body\": \"\", \"form\": {}}. serve_http itself only runs in server.pi, through start_site."
+}
+
+skill hands_system() -> Any { return hands_system_web(false) }
+
+skill hands_system_web(web) -> Any {
+  return "# Tools\n\nYou have access to the following functions:\n\n<tools>\n" ++ hands_tools(web) ++ "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\n" ++ hands_card() ++ (if web { web_card() } else { "" })
+}
+
+# text with the special tokens written out (<|im_start|>, <tool_response> ...) -> token ids
+skill brain_ids(br, text) -> Any {
+  let sp = br[3]
+  let out = []
+  let rest = text
+  while len(rest) > 0 {
+    # the earliest special token in the rest
+    let best = 0 - 1
+    let bname = ""
+    for nm in keys(sp) {
+      let i = brain_find(rest, nm, 0)
+      if i >= 0 and (best < 0 or i < best) {
+        let best = i
+        let bname = nm
+      }
+    }
+    if best < 0 {
+      let out = out ++ tk_encode(br[2], rest)
+      let rest = ""
+    } else {
+      if best > 0 { let out = out ++ tk_encode(br[2], slice(rest, 0, best)) }
+      let out = append(out, sp[bname])
+      let rest = slice(rest, best + len(bname), len(rest))
+    }
+  }
+  return out
+}
+
+# the sandbox: the brain's code may compute and print, nothing else -- no files, processes, network, input devices,
+# screen, GPU, imports, or the runtime's own rt_ functions (and no names that turn on its raw mode)
+skill hands_forbidden() -> Any {
+  return ["write_file", "read_file", "read_at", "read_bytes", "listdir", "fmap", "fbyte", "spawn", "wait", "http", "tcp", "mouse", "key", "screen", "render", "play", "focus", "fgwin", "input", "exit", "gpu_mm", "gpu_seq", "gpu_run", "import", "reach", "peek", "poke", "peekb", "pokeb", "wcall", "wcallp", "gaddr"]
+}
+
+# Words inside text literals and comments are not code; the raw primitives, imports and rt_ / __ names are refused
+# wherever they appear; every other forbidden name only when it is called (followed by "("). The old check refused
+# any program whose text contained such a word -- a word list holding "key" could not run.
+skill hands_check(code) -> Any {
+  let always = ["import", "reach", "peek", "poke", "peekb", "pokeb", "wcall", "wcallp", "gaddr"]
+  let calls = hands_forbidden()
+  let idc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+  let cs = chars(code)
+  let n = len(cs)
+  let i = 0
+  let instr = false
+  while i < n {
+    let c = cs[i]
+    if instr {
+      if c == "\\" {
+        i += 2
+      } else {
+        if c == "\"" { instr = false }
+        i += 1
+      }
+    } else if c == "\"" {
+      instr = true
+      i += 1
+    } else if c == "#" or (c == "/" and i + 1 < n and cs[i + 1] == "/") {
+      while i < n and cs[i] != "\n" { i += 1 }
+    } else if contains(idc, c) {
+      let j = i
+      while j < n and contains(idc, cs[j]) { j += 1 }
+      let word = join(slice(cs, i, j), "")
+      if contains(always, word) or slice(word, 0, 3) == "rt_" or slice(word, 0, 2) == "__" { return word }
+      if contains(calls, word) {
+        let k = j
+        while k < n and cs[k] == " " { k += 1 }
+        if k < n and cs[k] == "(" { return word }
+      }
+      i = j
+    } else {
+      i += 1
+    }
+  }
+  return ""
+}
+
+# every program the brain sends to the compiler, with the result (msg "" = it compiled), appended to
+# out\pi_compiles.txt: langgrow.pi learns the language's next rules from the failures and the fixes after them
+skill pi_compile_log(code, msg) -> Any {
+  let rec = "=== " ++ (if msg == "" { "ok" } else { "fail" }) ++ "\n" ++ msg ++ "\n---\n" ++ code ++ "\n=== end\n"
+  let old = read_file("out\\pi_compiles.txt")
+  if old == null { old = "" }
+  if len(old) > 4000000 { old = slice(old, len(old) - 2000000, len(old)) }
+  return write_file("out\\pi_compiles.txt", old ++ rec)
+}
+
+# compile and run one program (10 s at most) -> its output, or what went wrong
+# ---- the brain inside a program: thoughts as values ---------------------------------------------------------------
+# A hands program may call ask(q) -> the brain's answer; think(q) -> a thought (a number: Pi keeps the brain's state
+# after it); think_more(t, q) -> a new thought that goes on from t; thought(t) -> its text. The calls go to Pi
+# through two files (the program waits; Pi serves it with the brain, then puts the conversation's state back).
+# Prepended to the brain's code after the sandbox check, so only this library touches files.
+skill hands_lib() -> Any {
+  # (a write can fail while the other side has the file open: each one is repeated until it works; the wait between
+  # looks is a short spin, so the program does not hold the file)
+  let s = "skill think_put(path, s) -> Any {\n  while write_file(path, s) == null { let z = 0 }\n  return s\n}\nskill think_call(op, h, q) -> Any {\n  do think_put(\"out/think_resp.txt\", \"\")\n  do think_put(\"out/think_req.txt\", op ++ \"\\n\" ++ str(h) ++ \"\\n\" ++ q)\n  let r = \"\"\n  while len(r) == 0 {\n    for z in range(0, 300000) { let z2 = z }\n    let r = read_file(\"out/think_resp.txt\")\n    if r == null { let r = \"\" }\n  }\n  return r\n}\n"
+  let s = s ++ "skill ask(q) -> Any { return think_call(\"ask\", 0, str(q)) }\nskill think(q) -> Any { return num(think_call(\"think\", 0, str(q))) }\nskill think_more(t, q) -> Any { return num(think_call(\"more\", t, str(q))) }\nskill thought(t) -> Any { return think_call(\"text\", t, \"\") }\n"
+  return s
+}
+
+# one thought: from the state at pos0 (cont: it goes on from an earlier thought), a user turn with q, no thinking;
+# generated until the turn ends -> [position after it, the answer]
+skill thought_gen(br, pos0, q, maxt, cont) -> Any {
+  # a fresh thought is told it answers a program: just the answer, briefly
+  let pre = "<|im_start|>system\nYou are answering a call made by a program. Reply with only what was asked for, as briefly as it allows: no lists of options, no follow-up questions.<|im_end|>\n"
+  if cont { let pre = "\n" }
+  let pos = brain_feed(br, brain_ids(br, pre ++ "<|im_start|>user\n" ++ q ++ "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"), pos0)
+  let m = br[0]
+  let ws = m[6][1]
+  let out = ""
+  let n = 0
+  let going = true
+  while going and n < maxt {
+    do rt_gpu_graph_go(br[1][1], br[1][0])
+    let v = r2i(rt_gpu_get(ws["TOKS"] + 8 * pos, 1)[0], 0)
+    let pos = pos + 1
+    let n = n + 1
+    if v == 248046 or v == 248044 { let going = false } else { let out = out ++ show(token(m, v)) }
+  }
+  return [pos, trim(out)]
+}
+
+skill hands_run(br, pos, code) -> Any {
+  let bad = hands_check(code)
+  if bad != "" { return "not run: " ++ bad ++ " is not allowed here" }
+  // the compiler skips ; itself now (splitting here broke text holding a ; -- CSS, JS, HTML entities)
+  let lib = hands_lib()
+  if len(br) > 6 and br[6] {
+    if brain_find(code, "serve_http(", 0) >= 0 { return "not run: serve_http only runs in server.pi -- save it with save_file, then call start_site (test a handler here by calling it with a request map)" }
+    let sl = read_file("examples\\native\\sitelib.pi")
+    if sl != null { lib = lib ++ sl ++ "\n" }
+  }
+  do write_file("out\\hand.pi", lib ++ code)
+  let h = rt_spawn_out("out\\pic.exe out\\hand.pi out\\hand.exe", "out\\hand_cc.txt")
+  if h == null { return "not run: the compiler did not start" }
+  let rc = wait(h, 60000)
+  if rc != 0 {
+    let msg = read_file("out\\hand_cc.txt")
+    if msg == null { let msg = "" }
+    let msg = trim(slice(msg, 0, 600))
+    do pi_compile_log(code, msg)
+    if brain_find(msg, "cannot start a statement", 0) >= 0 { let msg = msg ++ "\n(A statement is let name = value, do f(x), if / while / for, or return. A call whose value is unused needs do.)" }
+    return "compile error: " ++ msg
+  }
+  do pi_compile_log(code, "")
+  do write_file("out/think_req.txt", "")
+  do write_file("out/think_resp.txt", "")
+  let h2 = rt_spawn_out("out\\hand.exe", "out\\hand_out.txt")
+  if h2 == null { return "not run: the program did not start" }
+  # run it, serving its thoughts; the brain's time does not count against the program's 10 s
+  let t0 = ticks()
+  let served = 0
+  let main = null
+  let th = {}
+  let nh = 0
+  let done = false
+  let over = false
+  while done == false {
+    let rc2 = wait(h2, 20)
+    if rc2 != null {
+      let done = true
+    } else {
+      let req = read_file("out/think_req.txt")
+      if req != null and len(req) > 0 {
+        let s0 = ticks()
+        if main == null { let main = dev_snapshot(br[0], pos) }
+        let parts = split(req, "\n")
+        let op = parts[0]
+        let key = parts[1]
+        let q = join(slice(parts, 2, len(parts)), "\n")
+        let res = ""
+        if op == "text" {
+          if th[key] != null { let res = th[key][1] }
+        } else {
+          let start = 0
+          let cont = false
+          if op == "more" and th[key] != null {
+            let start = dev_restore(br[0], th[key][0])
+            let cont = true
+          } else {
+            do dev_reset(br[0])
+          }
+          let r = thought_gen(br, start, q, 800, cont)
+          let res = r[1]
+          if op != "ask" {
+            let nh = nh + 1
+            let th = put(th, str(nh), [dev_snapshot(br[0], r[0]), r[1]])
+            let res = str(nh)
+          }
+        }
+        if len(res) == 0 { let res = " " }
+        while write_file("out/think_req.txt", "") == null { let z = 0 }
+        while write_file("out/think_resp.txt", res) == null { let z = 0 }
+        let served = served + ticks() - s0
+      }
+      if ticks() - t0 - served > 10000 {
+        do rt_kill(h2)
+        let done = true
+        let over = true
+      }
+    }
+  }
+  # the thoughts' states freed; the conversation's state put back
+  for k in keys(th) { do dev_free(th[k][0]) }
+  if main != null {
+    do dev_restore(br[0], main)
+    do dev_free(main)
+  }
+  if over { return "stopped: still running after 10 s" }
+  let out = read_file("out\\hand_out.txt")
+  if out == null { let out = "" }
+  let out = trim(out)
+  if len(out) > 1500 { let out = slice(out, 0, 1500) ++ " ... (cut)" }
+  return out
+}
+
+# feed tokens into the brain at position pos (in passes of up to 256) and choose the next token -> the new position
+skill brain_feed(br, ids, pos) -> Any {
+  let m = br[0]
+  let p = 0
+  let last = 0
+  while p < len(ids) {
+    let e = p + ge_TMAX()
+    if e > len(ids) { let e = len(ids) }
+    do dstep(m, slice(ids, p, e), pos + p, NLAYER())
+    let last = e - p - 1
+    let p = e
+  }
+  do dhead(m, last, 1)
+  do rt_gpu_put(m[6][1]["POS"] + 8, [(pos + len(ids)) * 1.0])
+  return pos + len(ids)
+}
+
+# ---- the tool loop: one token at a time; when the brain ends a turn with a <tool_call>, Pi carries it out and returns
+# the result as a <tool_response>; the brain's next turn goes on. From position pos (the prompt already fed).
+# -> [position after it, thinking, answer, tokens, stopped by itself, tools used, the text]
+skill hloop(br, pos, maxt) -> Any { return hloopc(br, pos, maxt, 0, false) }
+
+# the tool loop with a thinking cap: after cap tokens of thinking in one turn (cap > 0) Pi closes the thinking --
+# enough planning, act -- so the brain runs a program or answers; the count starts again after each tool reply.
+# ans0: the loop starts inside the answer (the thinking already closed by the caller).
+skill hloopc(br, pos, maxt, cap, ans0) -> Any {
+  let m = br[0]
+  let ws = m[6][1]
+  let all = ""
+  let th = ""
+  let turn = ""
+  let inans = ans0
+  let tt = 0
+  let n = 0
+  let runs = 0
+  let stop = false
+  # the brain's confidence while it writes a program: pnext is p of the token about to come (lsep on the GPU),
+  # ctoks the code's [piece, p] -- the hands report the lines it was least sure of
+  let pnext = 1.0
+  let ctoks = []
+  let cstart = 0 - 1
+  let cend = false
+  # the line check: a save at each line start in code (lsv), its position, the text lengths there, the line's first
+  # token, the first tokens already refused there, and how often the line was taken back
+  let lsv = false
+  # (measurement: out\noveto.flag turns the line check off, to compare with and without it)
+  let veto = read_file("out\\noveto.flag") == null
+  let lpos = 0
+  let lmark = [0, 0, 0]
+  let lfirst = 0 - 1
+  let lbans = []
+  let ltries = 0
+  while stop == false and n < maxt {
+    do rt_gpu_graph_go(br[1][1], br[1][0])
+    let v = r2i(rt_gpu_get(ws["TOKS"] + 8 * pos, 1)[0], 0)
+    let pv = pnext
+    let pos = pos + 1
+    let n = n + 1
+    let piece = show(token(m, v))
+    let all = all ++ piece
+    if v == 248046 or v == 248044 {
+      let call = hands_call(turn)
+      if call == null { let stop = true } else {
+        let res = hands_do(br, pos, call, ctoks)
+        let ctoks = []
+        let cstart = 0 - 1
+        let cend = false
+        let lsv = false
+        let runs = runs + 1
+        let inject = "\n<|im_start|>user\n<tool_response>\n" ++ res ++ "\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+        let all = all ++ inject
+        let th = th ++ "\n[" ++ call[0] ++ " -> " ++ res ++ "]\n"
+        let pos = brain_feed(br, brain_ids(br, inject), pos)
+        let turn = ""
+        let inans = false
+        let tt = 0
+      }
+    } else {
+      if v == 248069 { let inans = true } else {
+        if inans {
+          let turn = turn ++ piece
+          if cstart >= 0 and cend == false {
+            let ctoks = append(ctoks, [piece, pv])
+            if brain_find(turn, "</parameter>", cstart) >= 0 { let cend = true }
+            # the line's first real token: indentation before it moves the save point past it (a refusal must hit the
+            # word that starts the line, never its spaces)
+            if lsv and lfirst < 0 {
+              if trim(piece) == "" and brain_find(piece, "\n", 0) < 0 {
+                do rt_gpu_copy(br[5][0], m[4][10], 40 * ge_STATE())
+                do rt_gpu_copy(br[5][1], ws["HIST"], 40 * 3 * 8192 * 8)
+                do rt_gpu_copy(br[5][2], ws["LOGITS"], 248320 * 8)
+                let lpos = pos
+                let lmark = [len(turn), len(all), len(ctoks)]
+              } else {
+                let lfirst = v
+              }
+            }
+            # a line that ends is checked; a bad one is taken back to its start and its first token refused
+            let rolled = false
+            if veto and cend == false and lsv and lfirst >= 0 and brain_find(piece, "\n", 0) >= 0 {
+              let ltext = slice(turn, lmark[0], len(turn))
+              let line = slice(ltext, 0, brain_find(ltext, "\n", 0))
+              let why = line_bad(pi_depth(slice(turn, cstart, lmark[0])), line)
+              if why != "" and ltries < 3 {
+                do rt_gpu_copy(m[4][10], br[5][0], 40 * ge_STATE())
+                do rt_gpu_copy(ws["HIST"], br[5][1], 40 * 3 * 8192 * 8)
+                do rt_gpu_copy(ws["LOGITS"], br[5][2], 248320 * 8)
+                let lbans = append(lbans, lfirst)
+                for b in lbans { do rt_gpu_put(ws["LOGITS"] + 8 * b, [0.0 - 1000000000.0]) }
+                do ge_go(m[6][0], "amax", 1, 1024, [ws["LOGITS"], ws["AMAX"], 248320], 0)
+                do rt_gpu_put(ws["POS"] + 8, [lpos * 1.0])
+                let pos = lpos
+                let turn = slice(turn, 0, lmark[0])
+                let all = slice(all, 0, lmark[1])
+                let ctoks = slice(ctoks, 0, lmark[2])
+                let ltries = ltries + 1
+                let lfirst = 0 - 1
+                let rolled = true
+                let th = th ++ "\n[a line taken back (" ++ why ++ "): " ++ trim(line) ++ "]\n"
+              }
+            }
+            # a new line starts after this token: save the state there
+            if rolled == false and cend == false {
+              let lastnl = 0 - 1
+              let pcs = chars(piece)
+              for qi in range(0, len(pcs)) {
+                if pcs[qi] == "\n" { let lastnl = qi }
+              }
+              if lastnl >= 0 {
+                if trim(slice(piece, lastnl + 1, len(piece))) == "" {
+                  do rt_gpu_copy(br[5][0], m[4][10], 40 * ge_STATE())
+                  do rt_gpu_copy(br[5][1], ws["HIST"], 40 * 3 * 8192 * 8)
+                  do rt_gpu_copy(br[5][2], ws["LOGITS"], 248320 * 8)
+                  let lsv = true
+                  let lpos = pos
+                  let lmark = [len(turn), len(all), len(ctoks)]
+                  let lfirst = 0 - 1
+                  let lbans = []
+                  let ltries = 0
+                } else {
+                  let lsv = false
+                }
+              }
+            }
+          }
+          if cstart < 0 {
+            let kq = brain_find(turn, "<parameter=code>", max(0, len(turn) - 40))
+            if kq >= 0 { let cstart = kq + 16 }
+          }
+          if cstart >= 0 and cend == false {
+            do ge_go(m[6][0], "lsep", 1, 256, [ws["LOGITS"], ws["AMAX"], 248320], 0)
+            let pnext = rt_gpu_get(ws["AMAX"] + 16, 1)[0]
+          }
+        } else {
+          let th = th ++ piece
+          let tt = tt + 1
+          if cap > 0 and tt >= cap {
+            let close = "\n\nThat is enough planning for now. I will act: run a program to test the idea, or answer if I am sure.\n</think>\n\n"
+            let all = all ++ close
+            let th = th ++ "\n[thinking capped: act]\n"
+            let pos = brain_feed(br, brain_ids(br, close), pos)
+            let inans = true
+            let tt = 0
+          }
+        }
+      }
+    }
+  }
+  let ans = turn
+  let k = brain_find(ans, "<tool_call>", 0)
+  if k >= 0 { let ans = slice(ans, 0, k) }
+  return [pos, trim(th), trim(ans), n, stop, runs, all]
+}
+
+# the loop for conversation: thinking capped at 2,500 tokens a turn (think, act, see, think again), and never silent:
+# when the whole budget runs out with no answer, Pi closes the thinking and the brain answers with what it has (up to
+# 800 more tokens, tools still usable) -- budget forcing. Same result shape as hloop.
+skill hloop_answer(br, pos, maxt) -> Any {
+  let r = hloopc(br, pos, maxt, 2500, false)
+  if r[4] { return r }
+  # cut off while answering: up to 800 more tokens to finish the answer
+  if r[2] != "" {
+    let r3 = hloopc(br, r[0], 800, 150, true)
+    return [r3[0], r[1] ++ "\n" ++ r3[1], r[2] ++ " " ++ r3[2], r[3] + r3[3], r3[4], r[5] + r3[5], r[6] ++ r3[6]]
+  }
+  let close = "\n\nI have reached my thinking budget, so I will stop here and answer with what I have, saying plainly what is still unchecked.\n</think>\n\n"
+  let p2 = brain_feed(br, brain_ids(br, close), r[0])
+  let r2 = hloopc(br, p2, 3000, 150, true)
+  return [r2[0], r[1] ++ "\n" ++ r2[1], r2[2], r[3] + r2[3], r2[4], r[5] + r2[5], r[6] ++ close ++ r2[6]]
+}
+
+# a question with its relevant notes from memory (found by Pi before the brain sees it)
+skill with_notes(text) -> Any {
+  let notes = mem_find(text, 5)
+  if len(notes) == 0 { return text }
+  return text ++ "\n\n(Notes from your memory that may be relevant:\n- " ++ join(notes, "\n- ") ++ ")"
+}
+
+# one question from a fresh start -> [thinking, answer, tokens, stopped by itself, tools used, the whole conversation]
+skill hthink(br, text, maxt) -> Any { return hthinkc(br, text, maxt, 0) }
+
+# hthink with a thinking cap per turn (0: none) -- for measuring the conversation loop's think / act / see rhythm
+skill hthinkc(br, text, maxt, cap) -> Any {
+  let user = "\n<|im_start|>user\n" ++ with_notes(text) ++ "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  let pos = brain_feed(br, brain_ids(br, user), dev_restore(br[0], br[4]))
+  let r = hloopc(br, pos, maxt, cap, false)
+  return [r[1], r[2], r[3], r[4], r[5], "<|im_start|>system\n(the tools and the Pi card)<|im_end|>" ++ user ++ r[6]]
+}
+
+# ---- a conversation: the brain keeps everything said so far (the engine's state goes on between turns) -------------
+skill chat_new(br) -> Any { return [dev_restore(br[0], br[4])] }
+
+# -> [the session after it, thinking, answer, tokens, tools used, started over]
+skill chat_turn(br, sess, text, maxt) -> Any {
+  let fresh = false
+  let s2 = sess
+  let ids = brain_ids(br, "\n<|im_start|>user\n" ++ with_notes(text) ++ "<|im_end|>\n<|im_start|>assistant\n<think>\n")
+  # the message and at least 4,000 tokens of work must fit in the context; else a fresh conversation (notes kept)
+  if sess[0] + len(ids) + 4000 > ge_MAXPOS() {
+    let s2 = chat_new(br)
+    let fresh = true
+  }
+  if s2[0] + len(ids) + 4000 > ge_MAXPOS() { return [s2, "", "That message is too long for me to read at once (" ++ str(len(ids)) ++ " tokens; I can take about " ++ str(ge_MAXPOS() - s2[0] - 4000) ++ ").", 0, 0, fresh, ""] }
+  let pos = brain_feed(br, ids, s2[0])
+  # the budget never runs past the end of the context (3,500 kept for the forced answer)
+  let room = ge_MAXPOS() - pos - 3500
+  if maxt > room { let maxt = room }
+  let r = hloop_answer(br, pos, maxt)
+  return [[r[0]], r[1], r[2], r[3], r[5], fresh, r[6]]
+}
+
+# ---- tools ------------------------------------------------------------------------------------------------------
+# the call in a turn's text -> [function name, its first parameter's value, every parameter by name], or null
+skill hands_call(turn) -> Any {
+  let k = brain_find(turn, "<function=", 0)
+  if k < 0 { return null }
+  let e = brain_find(turn, ">", k)
+  if e < 0 { return null }
+  let name = trim(slice(turn, k + 10, e))
+  let ps = {}
+  let first = null
+  let pk = brain_find(turn, "<parameter=", e)
+  while pk >= 0 {
+    let b = brain_find(turn, ">", pk)
+    if b < 0 { break }
+    let pe = brain_find(turn, "</parameter>", b)
+    if pe < 0 { pe = len(turn) }
+    let v = slice(turn, b + 1, pe)
+    // a file keeps its inner whitespace: only the newline the template puts after the tag and before its end go
+    if slice(v, 0, 1) == "\n" { v = slice(v, 1, len(v)) }
+    if slice(v, len(v) - 1, len(v)) == "\n" { v = slice(v, 0, len(v) - 1) }
+    ps[trim(slice(turn, pk + 11, b))] = v
+    if first == null { first = trim(v) }
+    pk = brain_find(turn, "<parameter=", pe)
+  }
+  if first == null { first = "" }
+  return [name, first, ps]
+}
+
+# the lines of a program the brain was least sure of as it wrote them (a line's p: its least sure token) -> a note
+# for the tool reply, or "". failed: the run went wrong (lines under p 0.5 named); else only lines under 0.1.
+skill doubt_note(ctoks, failed) -> Any {
+  if len(ctoks) == 0 { return "" }
+  let lines = [""]
+  let lp = [1.0]
+  for t in ctoks {
+    let p = t[1]
+    for c in chars(t[0]) {
+      if c == "\n" {
+        lines = append(lines, "")
+        lp = append(lp, 1.0)
+      } else {
+        let li = len(lines) - 1
+        lines[li] = lines[li] ++ c
+        if p < lp[li] { lp[li] = p }
+      }
+    }
+  }
+  # the code was trimmed: its line 1 is the first line with text
+  let off = 0
+  while off < len(lines) and trim(lines[off]) == "" { off += 1 }
+  let thr = 0.1
+  if failed { thr = 0.5 }
+  let note = ""
+  let used = []
+  for k in range(0, 3) {
+    let best = 0 - 1
+    for i in range(off, len(lines)) {
+      let txt = trim(lines[i])
+      if txt != "" and brain_find(txt, "</parameter", 0) < 0 and lp[i] < thr and contains(used, i) == false {
+        if best < 0 or lp[i] < lp[best] { best = i }
+      }
+    }
+    if best >= 0 {
+      used = append(used, best)
+      note = note ++ "\n  line " ++ str(best - off + 1) ++ " (p " ++ format("{:.2f}", lp[best]) ++ "): " ++ slice(trim(lines[best]), 0, 70)
+    }
+  }
+  if note == "" { return "" }
+  return "\n(as you wrote it, you were least sure of:" ++ note ++ ")"
+}
+
+skill hands_do(br, pos, call, ctoks) -> Any {
+  if call[0] == "run_pi" {
+    let out = hands_run(br, pos, call[1])
+    let failed = brain_find(out, "compile error", 0) == 0 or brain_find(out, "stopped", 0) == 0 or brain_find(out, "PiRuntimeError", 0) >= 0 or brain_find(out, "not run", 0) == 0
+    return out ++ doubt_note(ctoks, failed)
+  }
+  if call[0] == "remember" {
+    do mem_add(call[1])
+    return "saved"
+  }
+  if call[0] == "recall" {
+    let found = mem_find(call[1], 8)
+    if len(found) == 0 { return "no notes about that" }
+    return join(found, "\n")
+  }
+  if call[0] == "save_file" { return site_save(get(call[2], "name", ""), get(call[2], "content", "")) }
+  if call[0] == "start_site" { return site_start() }
+  if call[0] == "fetch" { return site_fetch(trim(get(call[2], "path", "/")), get(call[2], "body", "")) }
+  if call[0] == "open_file" { return site_open(trim(get(call[2], "name", ""))) }
+  return "there is no function " ++ call[0]
+}
+
+# ---- the website tools: a site lives in out\site\, its server answers on 127.0.0.1:8080 only --------------------
+skill site_save(name, content) -> Any {
+  let ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+  if len(name) == 0 or len(name) > 80 { return "not saved: give the file a plain name, such as index.html" }
+  for c in chars(name) {
+    if not contains(chars(ok), c) { return "not saved: a file name has only letters, digits, dot, dash and underscore" }
+  }
+  if contains(name, "..") or contains(lower(name), ".exe") or contains(lower(name), "server_full") { return "not saved: that name is not allowed" }
+  if write_file("out\\site\\" ++ name, content) == null { return "not saved: the file could not be written" }
+  return "saved " ++ name ++ " (" ++ str(len(content)) ++ " bytes)"
+}
+
+# a saved file with line numbers (the first 400 lines), or the site's files when name is ""
+skill site_open(name) -> Any {
+  if name == "" {
+    let fs = listdir("out\\site")
+    if fs == null { return "the site has no files yet" }
+    let shown = filter(fs, fn(f) => not contains(["server.exe", "server_full.pi", "server_cc.txt", "server_log.txt"], lower(f)))
+    return "the site's files: " ++ join(shown, ", ")
+  }
+  if contains(name, "..") or contains(name, "\\") or contains(name, "/") or contains(name, ":") { return "a plain file name, please" }
+  let t = read_file("out\\site\\" ++ name)
+  if t == null { return "there is no " ++ name ++ " (open_file with an empty name lists the files)" }
+  let lines = split(t, "\n")
+  let out = []
+  for i in range(0, min(len(lines), 400)) { out ++= [str(i + 1) ++ ": " ++ lines[i]] }
+  let more = if len(lines) > 400 { "\n... (" ++ str(len(lines)) ++ " lines in all)" } else { "" }
+  return join(out, "\n") ++ more
+}
+
+# a reply's status line, type and body (the first 2,500 bytes)
+skill site_show(r) -> Any {
+  let k = brain_find(r, "\r\n\r\n", 0)
+  if k < 0 { return slice(r, 0, 2500) }
+  let head = split(slice(r, 0, k), "\r\n")
+  let body = slice(r, k + 4, len(r))
+  let typ = ""
+  for h in head {
+    if contains(h, "content-type:") { typ = trim(slice(h, 13, len(h))) }
+  }
+  let more = ""
+  if len(body) > 2500 { more = "\n... (" ++ str(len(body)) ++ " bytes in all)" }
+  return head[0] ++ "\ntype: " ++ typ ++ "\n\n" ++ slice(body, 0, 2500) ++ more
+}
+
+skill site_fetch(path, body) -> Any {
+  let p = path
+  if p == "" { p = "/" }
+  if slice(p, 0, 1) != "/" { p = "/" ++ p }
+  p = join(split(p, " "), "%20")
+  let m = if len(body) > 0 { "POST" } else { "GET" }
+  let req = m ++ " " ++ p ++ " HTTP/1.0\r\nHost: 127.0.0.1:8080\r\nContent-Type: application/json\r\nContent-Length: " ++ str(len(body)) ++ "\r\n\r\n" ++ body
+  let r = tcp("127.0.0.1", 8080, req)
+  if r == null or len(r) == 0 { return "nothing answers at 127.0.0.1:8080: save server.pi and call start_site first" }
+  return site_show(r)
+}
+
+skill site_start() -> Any {
+  let code = read_file("out\\site\\server.pi")
+  if code == null { return "there is no server.pi yet: save it with save_file first" }
+  let bad = hands_check(code)
+  if bad != "" { return "not started: " ++ bad ++ " is not allowed in a site" }
+  let lib = read_file("examples\\native\\sitelib.pi")
+  if lib == null { return "not started: sitelib.pi is missing" }
+  // stop the server that is running (it ends on GET /__pi_stop), then build the new one
+  do tcp("127.0.0.1", 8080, "GET /__pi_stop HTTP/1.0\r\n\r\n")
+  do write_file("out\\site\\server_full.pi", lib ++ "\n" ++ code)
+  let h = rt_spawn_out("out\\pic.exe out\\site\\server_full.pi out\\site\\server.exe", "out\\site\\server_cc.txt")
+  if h == null { return "not started: the compiler did not start" }
+  let rc = wait(h, 60000)
+  if rc != 0 {
+    let msg = read_file("out\\site\\server_cc.txt")
+    if msg == null { msg = "" }
+    do pi_compile_log(code, trim(slice(msg, 0, 600)))
+    return "compile error: " ++ trim(slice(msg, 0, 600))
+  }
+  do pi_compile_log(code, "")
+  let h2 = rt_spawn_out("out\\site\\server.exe", "out\\site\\server_log.txt")
+  if h2 == null { return "not started: the server did not start" }
+  for k in range(0, 20) {
+    let rc2 = wait(h2, 150)
+    if rc2 != null {
+      let log = read_file("out\\site\\server_log.txt")
+      if log == null { log = "" }
+      return "the server stopped at once (exit " ++ str(rc2) ++ "): " ++ trim(slice(log, 0, 600))
+    }
+    let r = tcp("127.0.0.1", 8080, "GET / HTTP/1.0\r\nHost: 127.0.0.1:8080\r\n\r\n")
+    if r != null and len(r) > 0 { return "running at http://127.0.0.1:8080 -- GET / answered " ++ split(r, "\r\n")[0] }
+  }
+  return "started, but GET / has not answered after 3 s"
+}
+
+# ---- long-term memory: notes the brain saves, one a line, in Pi's knowledge folder (kept apart: written by the brain,
+# whose weights are Ornith's). Found again by shared rarer words, the newest first on ties.
+skill MEMFILE() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\knowledge\\llm\\ornith\\brain_memory.txt" }
+
+skill mem_all() -> Any {
+  let t = read_file(MEMFILE())
+  if t == null { return [] }
+  let out = []
+  for ln in split(t, "\n") {
+    let x = trim(ln)
+    if len(x) > 0 and slice(x, 0, 1) != "#" { let out = append(out, x) }
+  }
+  return out
+}
+
+skill mem_add(note) -> Any {
+  let t = read_file(MEMFILE())
+  if t == null { let t = "# Pi's brain's notes: written by the brain (Ornith's weights inside Pi), so LLM-derived; kept separate. One note a line.\n" }
+  let one = trim(join(split(note, "\n"), " "))
+  return write_file(MEMFILE(), t ++ one ++ "\n")
+}
+
+skill mem_stop() -> Any {
+  return ["the", "and", "for", "are", "was", "were", "that", "this", "with", "what", "which", "who", "how", "why", "when", "where", "from", "have", "has", "had", "you", "your", "not", "but", "can", "its", "into", "than", "then", "them", "they", "there", "their", "about", "would", "could", "should", "will", "does", "did", "all", "any", "some", "one", "two", "use", "let", "also", "more", "most", "such", "only", "very", "just", "our", "out", "too", "each", "other", "these", "those", "is", "of", "to", "in", "on", "at", "a", "an"]
+}
+
+skill mem_words(s) -> Any {
+  let out = []
+  let w = ""
+  for c in chars(lower(s)) ++ [" "] {
+    if contains("abcdefghijklmnopqrstuvwxyz0123456789", c) { let w = w ++ c } else {
+      if len(w) >= 3 and contains(mem_stop(), w) == false and contains(out, w) == false { let out = append(out, w) }
+      let w = ""
+    }
+  }
+  return out
+}
+
+# the k notes sharing the most words with the query (a word counts more when fewer notes have it)
+skill mem_find(query, k) -> Any {
+  let notes = mem_all()
+  if len(notes) == 0 { return [] }
+  let q = mem_words(query)
+  let nw = []
+  for x in notes { let nw = append(nw, mem_words(x)) }
+  let scored = []
+  for i in range(0, len(notes)) {
+    let sc = 0.0
+    for w in q {
+      if contains(nw[i], w) {
+        let df = 0
+        for ws in nw {
+          if contains(ws, w) { let df = df + 1 }
+        }
+        let sc = sc + 1.0 / df
+      }
+    }
+    if sc > 0.0 { let scored = append(scored, [sc, i]) }
+  }
+  let best = []
+  for t in range(0, k) {
+    let bi = 0 - 1
+    for j in range(0, len(scored)) {
+      if contains(best, scored[j][1]) == false {
+        if bi < 0 { let bi = j } else {
+          if scored[j][0] > scored[bi][0] or (scored[j][0] == scored[bi][0] and scored[j][1] > scored[bi][1]) { let bi = j }
+        }
+      }
+    }
+    if bi >= 0 { let best = append(best, scored[bi][1]) }
+  }
+  let out = []
+  for i in best { let out = append(out, notes[i]) }
+  return out
+}
+
+# the first position of sub in s at or after from, or -1
+skill brain_find(s, sub, from) -> Any {
+  let n = len(s)
+  let k = len(sub)
+  let i = from
+  while i + k <= n {
+    if slice(s, i, i + k) == sub { return i }
+    let i = i + 1
+  }
+  return 0 - 1
+}

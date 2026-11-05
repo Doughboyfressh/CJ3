@@ -1,0 +1,97 @@
+# The sequence solver's core, as an importable module: given the first terms of an integer sequence, find the
+# rule and the next terms. Methods, in order: polynomial (finite differences), geometric, order-2 recurrence.
+
+skill allequal(xs) -> Any {
+  for i in range(1, len(xs)) {
+    if xs[i] != xs[0] { return false }
+  }
+  return true
+}
+
+skill set_at(xs, at, v) -> Any {
+  let out = []
+  for j in range(0, len(xs)) {
+    if j == at { let out = append(out, v) } else { let out = append(out, xs[j]) }
+  }
+  return out
+}
+
+skill poly_next(terms, k) -> Any {
+  let rows = [terms]
+  let cur = terms
+  let found = 0
+  while len(cur) >= 2 and found == 0 {
+    if allequal(cur) {
+      let found = 1
+    } else {
+      let nxt = []
+      for i in range(0, len(cur) - 1) { let nxt = append(nxt, cur[i + 1] - cur[i]) }
+      let cur = nxt
+      let rows = append(rows, cur)
+    }
+  }
+  if found == 0 { return null }
+  let lasts = []
+  for r in rows { let lasts = append(lasts, r[len(r) - 1]) }
+  let d = len(lasts)
+  let out = []
+  for step in range(0, k) {
+    let i = d - 2
+    while i >= 0 {
+      let lasts = set_at(lasts, i, lasts[i] + lasts[i + 1])
+      let i = i - 1
+    }
+    let out = append(out, lasts[0])
+  }
+  return out
+}
+
+skill geo_next(terms, k) -> Any {
+  if terms[0] == 0 { return null }
+  let r = terms[1] // terms[0]
+  for i in range(0, len(terms) - 1) {
+    if terms[i] == 0 { return null }
+    if terms[i + 1] != r * terms[i] { return null }
+  }
+  let out = []
+  let last = terms[len(terms) - 1]
+  for step in range(0, k) {
+    let last = last * r
+    let out = append(out, last)
+  }
+  return out
+}
+
+skill rec2_next(terms, k) -> Any {
+  let t0 = terms[0]
+  let t1 = terms[1]
+  let t2 = terms[2]
+  let t3 = terms[3]
+  let det = t1 * t1 - t0 * t2
+  if det == 0 { return null }
+  let pn = t2 * t1 - t0 * t3
+  let qn = t1 * t3 - t2 * t2
+  if pn % det != 0 or qn % det != 0 { return null }
+  let p = pn // det
+  let q = qn // det
+  for i in range(2, len(terms)) {
+    if terms[i] != p * terms[i - 1] + q * terms[i - 2] { return null }
+  }
+  let g = terms
+  for step in range(0, k) {
+    let n = len(g)
+    let g = append(g, p * g[n - 1] + q * g[n - 2])
+  }
+  return slice(g, len(terms), len(g))
+}
+
+skill seq(terms) -> Any {
+  if len(terms) < 4 { return {"status": "too few terms"} }
+  let p = poly_next(terms, 3)
+  if p != null { return {"status": "found", "kind": "polynomial", "next": p} }
+  let g = geo_next(terms, 3)
+  if g != null { return {"status": "found", "kind": "geometric", "next": g} }
+  let r = rec2_next(terms, 3)
+  if r != null { return {"status": "found", "kind": "recurrence", "next": r} }
+  return {"status": "no rule"}
+}

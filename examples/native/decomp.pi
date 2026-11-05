@@ -1,0 +1,288 @@
+# DECOMPILING A LOCAL LLM INTO PI, from its weights alone (no inference, no llama.cpp). Rule (2026-11-02): what comes
+# out is LLM-DERIVED knowledge -- kept separable in data\knowledge\llm\<model>\, flagged, verified before use.
+#   out\decomp.exe router L1 L2 ...     which words the ROUTER sends to each expert of a layer (router weights against
+#                                       the model's own word vectors, centred over the layer's experts)
+#   out\decomp.exe writes L [experts]   what each expert NEURON writes: its output vector (x the final norm) against
+#                                       the vocabulary's unembedding rows -> each neuron's word; experts labelled by
+#                                       their neurons' words
+# Products on the GPU: kernel "dotmax" (Pi-written PTX; integers in, float multiply-add, best match per chunk out).
+import "ggufl.pi"
+
+skill MODEL() -> Any { return "C:\\Users\\Dough\\Desktop\\Ornith-1.5-35B-A3B-GGUF\\Ornith-1.5-35B-Q4_K_M.gguf" }
+skill OUTDIR() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\knowledge\\llm\\ornith\\" }
+skill NWORDS() -> Any { return 20000 }
+
+skill dotmax_ptx() -> Any {
+  let k = ".version 6.0\n.target sm_50\n.address_size 64\n.visible .entry dotmax(.param .u64 pA, .param .u64 pB, .param .u64 pO, .param .u32 pM, .param .u32 pN, .param .u32 pK, .param .u32 pC)\n{\n"
+  let k = k ++ ".reg .pred %p<8>;\n.reg .u32 %r<32>;\n.reg .u64 %a<24>;\n.reg .f32 %f<8>;\n.reg .s32 %s<4>;\n.reg .s64 %d<4>;\n"
+  let k = k ++ "ld.param.u64 %a1, [pA];\ncvta.to.global.u64 %a1, %a1;\nld.param.u64 %a2, [pB];\ncvta.to.global.u64 %a2, %a2;\nld.param.u64 %a3, [pO];\ncvta.to.global.u64 %a3, %a3;\n"
+  let k = k ++ "ld.param.u32 %r1, [pM];\nld.param.u32 %r2, [pN];\nld.param.u32 %r3, [pK];\nld.param.u32 %r4, [pC];\n"
+  let k = k ++ "mov.u32 %r5, %ctaid.x;\nmov.u32 %r6, %ntid.x;\nmov.u32 %r7, %tid.x;\nmad.lo.u32 %r8, %r5, %r6, %r7;\nmul.lo.u32 %r9, %r1, %r4;\nsetp.ge.u32 %p1, %r8, %r9;\n@%p1 bra DONE;\n"
+  # i = row of A, c = chunk of B's rows [j0, j1)
+  let k = k ++ "div.u32 %r10, %r8, %r4;\nrem.u32 %r11, %r8, %r4;\nadd.u32 %r12, %r2, %r4;\nsub.u32 %r12, %r12, 1;\ndiv.u32 %r12, %r12, %r4;\nmul.lo.u32 %r13, %r11, %r12;\nadd.u32 %r14, %r13, %r12;\nmin.u32 %r14, %r14, %r2;\n"
+  let k = k ++ "mul.lo.u32 %r15, %r10, %r3;\nmul.wide.u32 %a4, %r15, 4;\nadd.u64 %a5, %a1, %a4;\nmov.f32 %f1, 0fFF800000;\nmov.u32 %r16, 0;\nmov.u32 %r17, %r13;\n"
+  let k = k ++ "JL:\nsetp.ge.u32 %p2, %r17, %r14;\n@%p2 bra END;\nmul.lo.u32 %r18, %r17, %r3;\nmul.wide.u32 %a6, %r18, 4;\nadd.u64 %a7, %a2, %a6;\nmov.f32 %f2, 0f00000000;\nmov.u64 %a8, %a5;\nmov.u64 %a9, %a7;\nmov.u32 %r19, 0;\n"
+  let k = k ++ "KL:\nsetp.ge.u32 %p3, %r19, %r3;\n@%p3 bra KE;\nld.global.s32 %s1, [%a8];\nld.global.s32 %s2, [%a9];\ncvt.rn.f32.s32 %f3, %s1;\ncvt.rn.f32.s32 %f4, %s2;\nfma.rn.f32 %f2, %f3, %f4, %f2;\nadd.u64 %a8, %a8, 4;\nadd.u64 %a9, %a9, 4;\nadd.u32 %r19, %r19, 1;\nbra KL;\n"
+  let k = k ++ "KE:\nsetp.gt.f32 %p4, %f2, %f1;\n@%p4 mov.f32 %f1, %f2;\n@%p4 mov.u32 %r16, %r17;\nadd.u32 %r17, %r17, 1;\nbra JL;\n"
+  let k = k ++ "END:\nmul.wide.u32 %a10, %r8, 16;\nadd.u64 %a11, %a3, %a10;\ncvt.rni.s64.f32 %d1, %f1;\nst.global.s64 [%a11], %d1;\ncvt.u64.u32 %a12, %r16;\nst.global.u64 [%a11+8], %a12;\nDONE:\nret;\n}\n"
+  return k
+}
+
+skill rd(s) -> Any { return rd_int(s) }
+
+# the first NWORDS whole-word tokens: [ids, words]
+skill vocab_words(m) -> Any {
+  let ids = []
+  let words = []
+  let i = 0
+  let nv = tensor(m, "token_embd.weight")[1][1]
+  while i < nv and len(ids) < NWORDS() {
+    let tk = token(m, i)
+    if word_token(tk) {
+      let ids = append(ids, i)
+      let words = append(words, slice(tk, 2, len(tk)))
+    }
+    let i = i + 1
+  }
+  return [ids, words]
+}
+
+skill isqrt(x) -> Any {
+  if x <= 0 { return 0 }
+  let r = 1
+  while r * r <= x { let r = r * 2 }
+  let lo = r // 2
+  let hi = r
+  while hi - lo > 1 {
+    let mid = (lo + hi) // 2
+    if mid * mid <= x { let lo = mid } else { let hi = mid }
+  }
+  return lo
+}
+
+# rows of a tensor for the given ids, each scaled to unit length x 1024 -> one flat array (len(ids) x 2048)
+skill unit_rows(m, name, ids) -> Any {
+  let t = tensor(m, name)
+  let n = t[1][0]
+  let out = arr(len(ids) * n)
+  for j in range(0, len(ids)) {
+    let mm = mark()
+    let r = row(m, t, ids[j])
+    let s = 0
+    for q in range(0, n) {
+      let v = aget(r, q) // 4096
+      let s = s + v * v
+    }
+    let len2 = isqrt(s)
+    if len2 < 1 { let len2 = 1 }
+    let rr = arr(n)
+    for q in range(0, n) { do aset(rr, q, (aget(r, q) // 4096) * 1024 // len2) }
+    let rr = release(mm, rr)
+    for q in range(0, n) { do aset(out, j * n + q, aget(rr, q)) }
+  }
+  return out
+}
+
+# a row's chunk winners -> the best k [score, index], best first
+skill top_of(res, rowi, chunks, k) -> Any {
+  let best = []
+  for c in range(0, chunks) {
+    let sc = aget(res, 2 * (rowi * chunks + c))
+    let ix = aget(res, 2 * (rowi * chunks + c) + 1)
+    let best = ins_sorted(best, [sc, ix], k)
+  }
+  return best
+}
+
+skill router(m, wv, words, layer) -> Any {
+  let t = tensor(m, "blk." ++ str(layer) ++ ".ffn_gate_inp.weight")
+  let n = t[1][0]
+  let ne = t[1][1]
+  let b = read_bytes(m[3], m[1] + t[3], 4 * n * ne)
+  let g = arr(ne * n)
+  for i in range(0, ne * n) { do aset(g, i, f32s(b, 4 * i, 16)) }
+  # centred: what this expert prefers over the layer's experts on average
+  for q in range(0, n) {
+    let s = 0
+    for e in range(0, ne) { let s = s + aget(g, e * n + q) }
+    let mean = s // ne
+    for e in range(0, ne) { do aset(g, e * n + q, aget(g, e * n + q) - mean) }
+  }
+  let chunks = 64
+  let res = rt_gpu_dotmax(dotmax_ptx(), g, wv, ne, len(words), n, chunks)
+  if typeof(res) == typeof(0) { return ["GPU error " ++ str(res)] }
+  let lines = []
+  for e in range(0, ne) {
+    let tw = []
+    for x in top_of(res, e, chunks, 8) { let tw = append(tw, words[x[1]]) }
+    let lines = append(lines, "L" ++ str(layer) ++ " expert " ++ str(e) ++ ": " ++ join(tw, " "))
+  }
+  return lines
+}
+
+skill writes(m, uv, words, layer, nexp) -> Any {
+  let t = tensor(m, "blk." ++ str(layer) ++ ".ffn_down_exps.weight")
+  let nh = t[1][0]
+  let n = t[1][1]
+  let nw = tensor(m, "output_norm.weight")
+  let nb = read_bytes(m[3], m[1] + nw[3], 4 * n)
+  let normw = arr(n)
+  for q in range(0, n) { do aset(normw, q, f32s(nb, 4 * q, 12)) }
+  # the neurons' output vectors (expert e, neuron h) = column h of expert e's down matrix, x the final norm
+  let a = arr(nexp * nh * n)
+  let bpr = (nh // 256) * 210
+  for e in range(0, nexp) {
+    for o in range(0, n) {
+      let mm = mark()
+      let bytes = read_bytes(m[3], m[1] + t[3] + (e * n + o) * bpr, bpr)
+      let r = arr(nh)
+      do deq_q6k(bytes, 0, nh // 256, r, 0)
+      let r = release(mm, r)
+      for h in range(0, nh) { do aset(a, (e * nh + h) * n + o, (aget(r, h) // 256) * aget(normw, o) // 4096) }
+    }
+  }
+  let chunks = 16
+  let res = rt_gpu_dotmax(dotmax_ptx(), a, uv, nexp * nh, len(words), n, chunks)
+  if typeof(res) == typeof(0) { return ["GPU error " ++ str(res)] }
+  let lines = []
+  for e in range(0, nexp) {
+    # the expert's words: how many of its neurons each word tops
+    let cw = []
+    let cc = []
+    for h in range(0, nh) {
+      let w = words[top_of(res, e * nh + h, chunks, 1)[0][1]]
+      let k = 0 - 1
+      for i in range(0, len(cw)) {
+        if cw[i] == w { let k = i }
+      }
+      if k < 0 {
+        let cw = append(cw, w)
+        let cc = append(cc, 1)
+      } else { let cc = slice(cc, 0, k) ++ [cc[k] + 1] ++ slice(cc, k + 1, len(cc)) }
+    }
+    let best = []
+    for i in range(0, len(cw)) { let best = ins_sorted(best, [cc[i], cw[i]], 10) }
+    let tw = []
+    for x in best { let tw = append(tw, x[1] ++ "(" ++ str(x[0]) ++ ")") }
+    let lines = append(lines, "L" ++ str(layer) ++ " expert " ++ str(e) ++ " writes: " ++ join(tw, " "))
+  }
+  return lines
+}
+
+# ---- the KEY half (ROME's key -> value view of a feed-forward neuron): what each expert neuron READS -------------
+# its gate row (expert e, neuron h = row e*512 + h of ffn_gate_exps, 2048 wide) against the model's unit word
+# vectors -> the words that switch it on. (Weight-only: the "up" half can flip the sign of what it writes.)
+skill keys_res(m, wv, nwords, layer, nexp, chunks) -> Any {
+  let t = tensor(m, "blk." ++ str(layer) ++ ".ffn_gate_exps.weight")
+  let n = t[1][0]
+  let nh = t[1][1]
+  let a = arr(nexp * nh * n)
+  let bpr = (n // 256) * 144
+  for r in range(0, nexp * nh) {
+    let mm = mark()
+    let bytes = read_bytes(m[3], m[1] + t[3] + r * bpr, bpr)
+    let v = arr(n)
+    do deq_q4k_fast(bytes, 0, n // 256, v, 0)
+    let v = release(mm, v)
+    for q in range(0, n) { do aset(a, r * n + q, aget(v, q) // 4096) }
+  }
+  return rt_gpu_dotmax(dotmax_ptx(), a, wv, nexp * nh, nwords, n, chunks)
+}
+
+# the value half, per neuron (as writes(), without the summary)
+skill values_res(m, uv, nwords, layer, nexp, chunks) -> Any {
+  let t = tensor(m, "blk." ++ str(layer) ++ ".ffn_down_exps.weight")
+  let nh = t[1][0]
+  let n = t[1][1]
+  let nw = tensor(m, "output_norm.weight")
+  let nb = read_bytes(m[3], m[1] + nw[3], 4 * n)
+  let normw = arr(n)
+  for q in range(0, n) { do aset(normw, q, f32s(nb, 4 * q, 12)) }
+  let a = arr(nexp * nh * n)
+  let bpr = (nh // 256) * 210
+  for e in range(0, nexp) {
+    for o in range(0, n) {
+      let mm = mark()
+      let bytes = read_bytes(m[3], m[1] + t[3] + (e * n + o) * bpr, bpr)
+      let r = arr(nh)
+      do deq_q6k(bytes, 0, nh // 256, r, 0)
+      let r = release(mm, r)
+      for h in range(0, nh) { do aset(a, (e * nh + h) * n + o, (aget(r, h) // 256) * aget(normw, o) // 4096) }
+    }
+  }
+  return rt_gpu_dotmax(dotmax_ptx(), a, uv, nexp * nh, nwords, n, chunks)
+}
+
+# every neuron as a rule: "L e.h: reads k1 k2 k3 -> writes v1 v2 v3"
+skill rules(m, wv, uv, words, layer, nexp) -> Any {
+  let chunks = 16
+  let kr = keys_res(m, wv, len(words), layer, nexp, chunks)
+  let vr = values_res(m, uv, len(words), layer, nexp, chunks)
+  if typeof(kr) == typeof(0) or typeof(vr) == typeof(0) { return ["GPU error"] }
+  let nh = 512
+  let lines = []
+  for r in range(0, nexp * nh) {
+    let ks = []
+    for x in top_of(kr, r, chunks, 3) { let ks = append(ks, words[x[1]]) }
+    let vs = []
+    for x in top_of(vr, r, chunks, 3) { let vs = append(vs, words[x[1]]) }
+    let lines = append(lines, "L" ++ str(layer) ++ " " ++ str(r // nh) ++ "." ++ str(r % nh) ++ ": reads " ++ join(ks, " ") ++ " -> writes " ++ join(vs, " "))
+  }
+  return lines
+}
+
+skill main() -> Any {
+  let t0 = ticks()
+  let m = open_model(MODEL())
+  let vw = vocab_words(m)
+  # rules L experts word...: every neuron of the layer's first experts as a key -> value rule; the rules that read
+  # each query word
+  if arg(1) == "rules" {
+    let l = rd(arg(2))
+    let ne = rd(arg(3))
+    let wv = unit_rows(m, "token_embd.weight", vw[0])
+    let uv = unit_rows(m, "output.weight", vw[0])
+    let t1 = ticks()
+    let lines = rules(m, wv, uv, vw[1], l, ne)
+    do write_file(OUTDIR() ++ "rules_L" ++ str(l) ++ ".txt", "# LLM-DERIVED (Ornith-1.5-35B weights), weight-only, unverified\n" ++ join(lines, "\n"))
+    let out = "word vectors " ++ str((t1 - t0) // 1000) ++ " s; " ++ str(len(lines)) ++ " neuron rules (layer " ++ str(l) ++ ", " ++ str(ne) ++ " experts) in " ++ str((ticks() - t1) // 1000) ++ " s\n"
+    let i = 4
+    while arg(i) != null {
+      let q = arg(i)
+      let hits = []
+      for ln in lines {
+        let parts = split(ln, " -> ")
+        if len(hits) < 4 and len(split(" " ++ parts[0] ++ " ", " " ++ q ++ " ")) > 1 { let hits = append(hits, ln) }
+      }
+      let out = out ++ "reads '" ++ q ++ "': " ++ str(len(hits)) ++ " shown\n"
+      for h in hits { let out = out ++ "  " ++ h ++ "\n" }
+      let i = i + 1
+    }
+    return out
+  }
+  if arg(1) == "router" {
+    let wv = unit_rows(m, "token_embd.weight", vw[0])
+    let t1 = ticks()
+    let out = []
+    let i = 2
+    while arg(i) != null {
+      let l = rd(arg(i))
+      let lines = router(m, wv, vw[1], l)
+      do write_file(OUTDIR() ++ "router_L" ++ str(l) ++ ".txt", "# LLM-DERIVED (Ornith-1.5-35B weights), unverified\n" ++ join(lines, "\n"))
+      let out = out ++ slice(lines, 0, 6)
+      let i = i + 1
+    }
+    return "word vectors " ++ str((t1 - t0) // 1000) ++ " s, routers " ++ str((ticks() - t1) // 1000) ++ " s\n" ++ join(out, "\n")
+  }
+  if arg(1) == "writes" {
+    let l = rd(arg(2))
+    let ne = 32
+    if arg(3) != null { let ne = rd(arg(3)) }
+    let uv = unit_rows(m, "output.weight", vw[0])
+    let t1 = ticks()
+    let lines = writes(m, uv, vw[1], l, ne)
+    do write_file(OUTDIR() ++ "writes_L" ++ str(l) ++ ".txt", "# LLM-DERIVED (Ornith-1.5-35B weights), unverified\n" ++ join(lines, "\n"))
+    return "unembedding rows " ++ str((t1 - t0) // 1000) ++ " s, " ++ str(ne) ++ " experts x 512 neurons decompiled in " ++ str((ticks() - t1) // 1000) ++ " s\n" ++ join(slice(lines, 0, 16), "\n")
+  }
+  return "usage: decomp.exe router L... | writes L [experts]"
+}

@@ -1,0 +1,75 @@
+# Wikipedia (Parquet, 41 files) -> plain text on the SSD, read by Pi's own Parquet reader.
+#   out\wikitext.exe test                 row group 0 of file 0: counts, time, the first article -> out\pq_first.txt
+#   out\wikitext.exe convert <from> <to>  files from..to-1 -> out\wiki_NN.txt (articles separated by a "=====" line)
+#   out\wikitext.exe all                  all 41 files, 8 worker processes at once
+import "parquet.pi"
+
+skill DIR() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\corpus\\wikipedia\\20231101.en\\" }
+
+skill fname(i) -> Any {
+  let s = str(i)
+  if i < 10 { let s = "0" ++ s }
+  return DIR() ++ "train-000" ++ s ++ "-of-00041.parquet"
+}
+
+skill two(i) -> Any {
+  if i < 10 { return "0" ++ str(i) }
+  return str(i)
+}
+
+# one file in pieces of 16 row groups (a whole file's text, GBs, times 8 workers would not fit in memory)
+skill convert_file(i) -> Any {
+  let pf = pq_open(fname(i), "text")
+  if pf == null { return 0 }
+  let n = 0
+  let g = 0
+  let piece = 0
+  while g < len(pf[2]) {
+    let m = mark()
+    let parts = []
+    let k = 0
+    let e = min(len(pf[2]), g + 16)
+    for gg in range(g, e) {
+      let ts = pq_texts(pf, gg)
+      let parts = append(parts, join(ts, "\n=====\n"))
+      let k = k + len(ts)
+    }
+    do write_file("out\\wiki\\" ++ two(i) ++ "_" ++ two(piece) ++ ".txt", join(parts, "\n=====\n"))
+    do release(m, 0)
+    let n = n + k
+    let g = e
+    let piece = piece + 1
+  }
+  return n
+}
+
+skill main() -> Any {
+  if arg(1) == "test" {
+    let t0 = ticks()
+    let pf = pq_open(fname(0), "text")
+    let t1 = ticks()
+    let ts = pq_texts(pf, 0)
+    let t2 = ticks()
+    let bytes = 0
+    for t in ts { let bytes = bytes + len(t) }
+    do write_file("out\\pq_first.txt", ts[0])
+    return "file 0: " ++ str(len(pf[2])) ++ " row groups (footer read in " ++ str(t1 - t0) ++ " ms); row group 0: " ++ str(len(ts)) ++ " articles, " ++ str(bytes) ++ " bytes of text, decoded in " ++ str(t2 - t1) ++ " ms"
+  }
+  if arg(1) == "convert" {
+    let total = 0
+    for i in range(num(arg(2)), num(arg(3))) { let total = total + convert_file(i) }
+    return str(total)
+  }
+  if arg(1) == "all" {
+    let t0 = ticks()
+    let hs = []
+    for w in range(0, 8) {
+      let a = 41 * w // 8
+      let b = 41 * (w + 1) // 8
+      let hs = append(hs, spawn(arg(0) ++ " convert " ++ str(a) ++ " " ++ str(b)))
+    }
+    for h in hs { do wait(h, 36000000) }
+    return "all 41 files converted by 8 workers in " ++ str((ticks() - t0) // 1000) ++ " s"
+  }
+  return "usage: wikitext.exe test | convert <from> <to> | all"
+}

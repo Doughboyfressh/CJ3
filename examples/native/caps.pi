@@ -1,0 +1,94 @@
+# Pi's senses and hands, each one used once (see senses.pi).
+#   out\caps.exe            agents, vision, image, audio file, video frames
+#   out\caps.exe web        + browser: fetch https://example.com
+#   out\caps.exe play       + speak: play the tone through the speakers
+#   out\caps.exe act        + hands: move the pointer to the middle of the screen (no click)
+# A child agent is this same program started with the word "child": it answers through a file (shared memory).
+import "senses.pi"
+
+skill has_word(w) -> Any {
+  let k = 1
+  while arg(k) != null {
+    if arg(k) == w { return true }
+    let k = k + 1
+  }
+  return false
+}
+
+skill main() -> Any {
+  if arg(1) == "child" {
+    do write_file("out\\agent_reply.txt", "a child agent of Pi, started by Pi, answering through memory")
+    return "child done"
+  }
+  let out = ""
+  # 1. agents: Pi starts another Pi and waits for its answer
+  let code = agent(arg(0) ++ " child", 20000)
+  let reply = read_file("out\\agent_reply.txt")
+  let out = out ++ "agent: exit " ++ str(code) ++ ", said: " ++ str(reply) ++ "\n"
+  # 2. vision: the screen now, every 8th pixel
+  let img = see(8)
+  let g = shades(img)
+  let tot = 0
+  let hist = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  for r in g {
+    for v in r {
+      let tot = tot + v
+      let hist = slice(hist, 0, v) ++ [hist[v] + 1] ++ slice(hist, v + 1, 10)
+    }
+  }
+  let cells = img[0] * img[1]
+  let hs = []
+  for v in hist { let hs = append(hs, str(v)) }
+  let out = out ++ "vision: " ++ str(img[0]) ++ " x " ++ str(img[1]) ++ " seen; mean shade " ++ str(tot // max(1, cells)) ++ " of 9; shades " ++ join(hs, " ") ++ "\n"
+  # 3. image output: what Pi saw, saved
+  do bmp_write("out\\screen.bmp", img[0], img[1], img[2])
+  let out = out ++ "image: out\\screen.bmp written\n"
+  # 4. audio output: a rising pair of tones (A4 then E5), as a .wav
+  let rate = 22050
+  let a = tone(440, 250, rate)
+  let b = tone(659, 250, rate)
+  let s = arr(len(a) + len(b))
+  for i in range(0, len(a)) { do aset(s, i, aget(a, i)) }
+  for i in range(0, len(b)) { do aset(s, len(a) + i, aget(b, i)) }
+  do wav_write("out\\pi_tone.wav", s, rate)
+  let out = out ++ "audio: out\\pi_tone.wav written (" ++ str(len(s)) ++ " samples)\n"
+  if has_word("play") {
+    do voice("out\\pi_tone.wav")
+    let out = out ++ "audio: played\n"
+  }
+  # 5. video output: 12 frames of a bar sweeping across, one .bmp per frame
+  let frames = []
+  for f in range(0, 12) {
+    let w = 64
+    let h = 36
+    let p = arr(w * h)
+    for y in range(0, h) {
+      for x in range(0, w) {
+        let c = 1056816
+        if x >= f * 5 and x < f * 5 + 6 { let c = 16766720 }
+        do aset(p, y * w + x, c)
+      }
+    }
+    let frames = append(frames, [w, h, p])
+  }
+  let n = frames_write("out\\frame", frames)
+  let out = out ++ "video: " ++ str(n) ++ " frames out\\frame1000.bmp .. out\\frame1011.bmp\n"
+  # 6. browser: a real page over https
+  if has_word("web") {
+    let page = fetch("https://example.com/")
+    if page == null { let out = out ++ "browser: no answer\n" } else {
+      let t = "?"
+      let at = split(page, "<title>")
+      if len(at) > 1 { let t = split(at[1], "</title>")[0] }
+      let out = out ++ "browser: https://example.com/ -> " ++ str(len(page)) ++ " bytes, title: " ++ t ++ "\n"
+    }
+  }
+  # 7. hands: only with "act"
+  let mx = img[0] * 8 // 2
+  let my = img[1] * 8 // 2
+  if has_word("act") {
+    do mouse(mx, my, 0)
+    let out = out ++ "hands: pointer moved to " ++ str(mx) ++ ", " ++ str(my) ++ "\n"
+  } else { let out = out ++ "hands: off (start with the word act to let Pi move the pointer)\n" }
+  return out
+}

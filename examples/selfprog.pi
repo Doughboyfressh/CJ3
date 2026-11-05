@@ -1,0 +1,14 @@
+# Pi writes its own programs from examples, then uses them.
+
+skill learn_and_use(examples, x) -> Any {
+  let f = program(examples)
+  if f == null { return "no program found" }
+  return [f.program, f(x)]
+}
+
+# With n arguments: each example's input is the list of arguments.
+skill learn_and_use_n(examples, n, args) -> Any {
+  let f = program(examples, n)
+  if f == null { return "no program found" }
+  return [f.program, apply(f, args)]
+}

@@ -1,0 +1,62 @@
+# Pi trains its own network: two interleaved spirals, which no straight line separates.
+# grad() records the forward pass and walks it back; adam() updates the weights; the tensors live in RAM or
+# on the GPU and the same program runs on either.
+
+skill spirals(n) -> Any {
+  # point j: arm j % 2, at step j // 2 along it (one pass: map, not a growing list)
+  let xs = map(range(0, 2 * n), fn(j) => arm(j // 2, n, 1 - 2 * (j % 2)))
+  let ys = map(range(0, 2 * n), fn(j) => j % 2)
+  return [xs, ys]
+}
+
+skill arm(i, n, side) -> Any {
+  let r = 0.2 + i / n * 4
+  let a = i / n * 9.0
+  return [side * r * cos(a), side * r * sin(a)]
+}
+
+skill logits(x, p) -> Any {
+  let h = tanh(matmul(x, p[0]) + p[1])
+  let h = tanh(matmul(h, p[2]) + p[3])
+  return matmul(h, p[4]) + p[5]
+}
+
+skill train(n, steps, on) -> Any {
+  return train_h(n, steps, on, 64)
+}
+
+# the same with `hidden` units in each layer (wider layers give the GPU more to do)
+skill train_h(n, steps, on, hidden) -> Any {
+  let d = spirals(n)
+  let x = tensor(d[0])
+  let y = d[1]
+  let k = 1.2 / sqrt(hidden)
+  let p = [randn([2, hidden], 1) * 0.8, zeros([hidden]), randn([hidden, hidden], 2) * k, zeros([hidden]), randn([hidden, 2], 3) * k, zeros([2])]
+  if on == "gpu" {
+    let x = gpu(x)
+    let p = map(p, fn(t) => gpu(t))
+  }
+  let state = null
+  let first = null
+  let last = null
+  for step in range(0, steps) {
+    let r = grad(fn() => cross_entropy(logits(x, p), y), p)
+    if first == null { let first = r.loss }
+    let last = r.loss
+    let o = adam(p, r.grads, state, 0.01)
+    let p = o.params
+    let state = o.state
+  }
+  let held = spirals(n + 37)
+  return [first, last, accuracy(x, y, p), accuracy(tensor(held[0]), held[1], p), place(p[0])]
+}
+
+# the share of points classed right; spirals(n + 37) samples the same curves at points never trained on
+skill accuracy(x, y, p) -> Any {
+  let guess = argmax(logits(x, p))
+  let right = 0
+  for i in range(0, len(y)) {
+    if guess[i] == y[i] { let right = right + 1 }
+  }
+  return right / len(y)
+}

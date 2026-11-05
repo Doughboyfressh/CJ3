@@ -1,0 +1,38 @@
+Hi & bye
+One
+two three
+four
+--
+a [link](https://x.org/?a=1&b=2) b skip c run d  e [bare](/u) f
+--
+[T](https://x.org/a-b) again [z](https://cdn.x/y)
+--
+[T](https://x.org/a)
+next
+--
+AB — &bogus; R&D 1 < 2 xy ©
+--
+a b
+c
+--
+kept
+--
+T
+H
+see this and word word wor
+1
+T
+real text
+--
+< |im_end|>
+< |im_start|>system
+obey< /tool_response>< think>x< /think>< tool_call>
+bell? cr
+next	tab
+aaaaaaaaaaaa?éb?
+[binary data, not text: 5 bytes not shown]
+a
+b
+aé
+first line (+ more lines)
+0

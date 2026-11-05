@@ -1,0 +1,40 @@
+# Remainder and whole division, formatting, errors, functions as values, modules, files.
+import "lib_math.pi"
+
+reach { folders "out" }
+
+skill divide(a, b) -> Any {
+  return format("{} = {} x {} + {}", a, b, a // b, a % b)
+}
+
+skill safe(a, b) -> Any {
+  try {
+    if b == 0 { do fail("cannot divide " ++ a ++ " by zero") }
+    return a / b
+  } catch e {
+    return "error: " ++ e
+  }
+}
+
+skill functions(xs) -> Any {
+  let k = 10
+  let scaled = map(xs, fn(x) => x * k)
+  let evens = filter(xs, fn(x) => is_even(x))
+  let total = reduce(xs, fn(acc, x) => acc + square(x), 0)
+  return [scaled, evens, total]
+}
+
+skill counter() -> Any {
+  let make = fn(start) => fn(step) => start + step
+  let from100 = make(100)
+  return [from100(1), from100(5)]
+}
+
+skill save(name, text) -> Any {
+  do write_file("out/" ++ name, text)
+  return read_file("out/" ++ name)
+}
+
+skill escape() -> Any {
+  return read_file("../../NEXT.md")
+}

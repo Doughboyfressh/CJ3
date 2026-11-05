@@ -1,0 +1,756 @@
+# Pi grows its own instruction set. Programs are Pi postfix (n, a1 = a(n-1), a2 = a(n-2), 1, 2, 3, + - * // %); the
+# GPU runs every program of a length at once (one thread each, a Forth-like interpreter Pi writes as PTX). After
+# solving PRACTICE sequences, Pi compresses its own solutions: the sub-programs that recur most (closed, or with one
+# or two holes) become WORDS -- new single tokens of the GPU's instruction set (a word table the kernel executes). The
+# same search length then reaches bigger programs. The TEST sequences (oeis.pi's 300, never practised) are judged on
+# unseen terms (9-12 solved, 13-20 holds) by each sequence's shortest fitting program, as gpuseq.pi.
+#   out\wordgpu.exe [practice] [rounds] [practice length] [test length]
+import "inflate.pi"
+
+skill OEIS() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\sources\\oeis\\stripped.gz" }
+
+skill sint(t) -> Any {
+  let v = 0
+  let neg = false
+  for i in range(0, len(t)) {
+    let c = ord(slice(t, i, i + 1))
+    if c == 45 { let neg = true } else {
+      if c < 48 or c > 57 { return null }
+      let v = v * 10 + (c - 48)
+    }
+  }
+  if neg { return 0 - v }
+  return v
+}
+
+skill read_seqs(limit_bytes) -> Any {
+  let b = read_bytes(OEIS(), 0, 40000000)
+  if b == null { return null }
+  let r = gunzip_prefix(b, limit_bytes)
+  if r == null { return null }
+  let out = []
+  let blk = []
+  for line in split(arr_text(r[0], 0, r[1]), "\n") {
+    if slice(line, 0, 1) == "A" {
+      let parts = split(line, " ,")
+      if len(parts) == 2 {
+        let ts = split(parts[1], ",")
+        if len(ts) >= 13 {
+          let terms = []
+          let ok = true
+          for i in range(0, 12) {
+            let t = ts[i]
+            if len(t) == 0 or len(t) > 8 { let ok = false } else {
+              let v = sint(t)
+              if v == null { let ok = false } else { let terms = append(terms, v) }
+            }
+          }
+          if ok {
+            let same = true
+            for v in terms {
+              if v != terms[0] { let same = false }
+            }
+            if same == false {
+              let extra = []
+              let k = 12
+              while k < len(ts) and k < 20 {
+                let t = ts[k]
+                let v = null
+                if len(t) > 0 and len(t) <= 15 { let v = sint(t) }
+                if v != null { let extra = append(extra, v) } else { let k = 99 }
+                let k = k + 1
+              }
+              let blk = append(blk, [parts[0], terms, extra])
+              if len(blk) >= 1000 {
+                let out = append(out, blk)
+                let blk = []
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return append(out, blk)
+}
+
+# ---- the kernel: Pi's postfix language with a word table, on the GPU --------------------------------------------
+skill leaf_block(tr) -> Any {
+  let k = "mov.s64 %d5, %d4;\nsetp.eq.u32 %p10, " ++ tr ++ ", 1;\n@%p10 mov.s64 %d5, %d2;\nsetp.eq.u32 %p10, " ++ tr ++ ", 2;\n@%p10 mov.s64 %d5, %d3;\n"
+  let k = k ++ "setp.eq.u32 %p10, " ++ tr ++ ", 3;\n@%p10 mov.s64 %d5, 1;\nsetp.eq.u32 %p10, " ++ tr ++ ", 4;\n@%p10 mov.s64 %d5, 2;\nsetp.eq.u32 %p10, " ++ tr ++ ", 5;\n@%p10 mov.s64 %d5, 3;\n"
+  return k ++ "mul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nst.local.s64 [%a10], %d5;\nadd.u32 %r19, %r19, 1;\n"
+}
+
+skill push_block(dr) -> Any { return "mul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nst.local.s64 [%a10], " ++ dr ++ ";\nadd.u32 %r19, %r19, 1;\n" }
+
+# the top of the stack replaced by isprime / ndiv / digsum / isqrt of it (token in register tr, 11..14)
+skill unary_block(tr, sfx) -> Any {
+  let k = "mul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nld.local.s64 %d6, [%a10+-8];\n"
+  let k = k ++ "setp.eq.u32 %p21, " ++ tr ++ ", 11;\n@%p21 bra UP" ++ sfx ++ ";\nsetp.eq.u32 %p21, " ++ tr ++ ", 12;\n@%p21 bra UD" ++ sfx ++ ";\nsetp.eq.u32 %p21, " ++ tr ++ ", 13;\n@%p21 bra US" ++ sfx ++ ";\n"
+  # isqrt
+  let k = k ++ "setp.lt.s64 %p22, %d6, 0;\n@%p22 bra NEXTSEQ;\ncvt.rn.f64.s64 %f1, %d6;\nsqrt.rn.f64 %f1, %f1;\ncvt.rzi.s64.f64 %d8, %f1;\n"
+  let k = k ++ "UQA" ++ sfx ++ ":\nmul.lo.s64 %d9, %d8, %d8;\nsetp.gt.s64 %p22, %d9, %d6;\n@!%p22 bra UQB" ++ sfx ++ ";\nsub.s64 %d8, %d8, 1;\nbra UQA" ++ sfx ++ ";\n"
+  let k = k ++ "UQB" ++ sfx ++ ":\nadd.s64 %d10, %d8, 1;\nmul.lo.s64 %d9, %d10, %d10;\nsetp.le.s64 %p22, %d9, %d6;\n@!%p22 bra UEND" ++ sfx ++ ";\nmov.s64 %d8, %d10;\nbra UQB" ++ sfx ++ ";\n"
+  # isprime
+  let k = k ++ "UP" ++ sfx ++ ":\nmov.s64 %d8, 0;\nsetp.lt.s64 %p22, %d6, 2;\n@%p22 bra UEND" ++ sfx ++ ";\nsetp.gt.s64 %p22, %d6, 1000000;\n@%p22 bra NEXTSEQ;\nmov.s64 %d8, 1;\nmov.s64 %d9, 2;\n"
+  let k = k ++ "UPL" ++ sfx ++ ":\nmul.lo.s64 %d10, %d9, %d9;\nsetp.gt.s64 %p22, %d10, %d6;\n@%p22 bra UEND" ++ sfx ++ ";\nrem.s64 %d11, %d6, %d9;\nsetp.eq.s64 %p22, %d11, 0;\n@%p22 mov.s64 %d8, 0;\n@%p22 bra UEND" ++ sfx ++ ";\nadd.s64 %d9, %d9, 1;\nbra UPL" ++ sfx ++ ";\n"
+  # number of divisors
+  let k = k ++ "UD" ++ sfx ++ ":\nmov.s64 %d8, 0;\nsetp.lt.s64 %p22, %d6, 1;\n@%p22 bra UEND" ++ sfx ++ ";\nsetp.gt.s64 %p22, %d6, 1000000;\n@%p22 bra NEXTSEQ;\nmov.s64 %d9, 1;\n"
+  let k = k ++ "UDL" ++ sfx ++ ":\nmul.lo.s64 %d10, %d9, %d9;\nsetp.gt.s64 %p22, %d10, %d6;\n@%p22 bra UEND" ++ sfx ++ ";\nrem.s64 %d11, %d6, %d9;\nsetp.ne.s64 %p22, %d11, 0;\n@%p22 bra UDN" ++ sfx ++ ";\nadd.s64 %d8, %d8, 2;\nsetp.eq.s64 %p22, %d10, %d6;\n@%p22 sub.s64 %d8, %d8, 1;\n"
+  let k = k ++ "UDN" ++ sfx ++ ":\nadd.s64 %d9, %d9, 1;\nbra UDL" ++ sfx ++ ";\n"
+  # digit sum of |a|
+  let k = k ++ "US" ++ sfx ++ ":\nabs.s64 %d9, %d6;\nmov.s64 %d8, 0;\nUSL" ++ sfx ++ ":\nsetp.eq.s64 %p22, %d9, 0;\n@%p22 bra UEND" ++ sfx ++ ";\nrem.s64 %d10, %d9, 10;\nadd.s64 %d8, %d8, %d10;\ndiv.s64 %d9, %d9, 10;\nbra USL" ++ sfx ++ ";\n"
+  return k ++ "UEND" ++ sfx ++ ":\nst.local.s64 [%a10+-8], %d8;\n"
+}
+
+skill op_block(tr, sfx) -> Any {
+  let k = "sub.u32 %r19, %r19, 1;\nmul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nld.local.s64 %d7, [%a10];\nld.local.s64 %d6, [%a10+-8];\nadd.s64 %d8, %d6, %d7;\n"
+  let k = k ++ "setp.eq.u32 %p11, " ++ tr ++ ", 7;\n@%p11 sub.s64 %d8, %d6, %d7;\nsetp.eq.u32 %p11, " ++ tr ++ ", 8;\n@%p11 mul.lo.s64 %d8, %d6, %d7;\nsetp.lt.u32 %p12, " ++ tr ++ ", 9;\n@%p12 bra STORE" ++ sfx ++ ";\n"
+  let k = k ++ "setp.eq.s64 %p13, %d7, 0;\n@%p13 bra NEXTSEQ;\ndiv.s64 %d9, %d6, %d7;\nrem.s64 %d10, %d6, %d7;\nsetp.ne.s64 %p14, %d10, 0;\nxor.b64 %d11, %d10, %d7;\nsetp.lt.s64 %p15, %d11, 0;\nand.pred %p16, %p14, %p15;\n@%p16 sub.s64 %d9, %d9, 1;\n@%p16 add.s64 %d10, %d10, %d7;\nmov.s64 %d8, %d9;\nsetp.eq.u32 %p11, " ++ tr ++ ", 10;\n@%p11 mov.s64 %d8, %d10;\n"
+  return k ++ "STORE" ++ sfx ++ ":\nst.local.s64 [%a10+-8], %d8;\n"
+}
+
+# a promoted word compiled to PTX: pop its arguments, its definition as straight-line code (no table, no dispatch)
+skill compiled_word(w, def, ar) -> Any {
+  let k = "CW" ++ str(w) ++ ":\n"
+  if ar == 2 { let k = k ++ "sub.u32 %r19, %r19, 1;\nmul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nld.local.s64 %d13, [%a10];\n" }
+  if ar >= 1 { let k = k ++ "sub.u32 %r19, %r19, 1;\nmul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nld.local.s64 %d14, [%a10];\n" }
+  let j = 0
+  for t in def {
+    let sfx = "C" ++ str(w) ++ "_" ++ str(j)
+    if t == 100 { let k = k ++ push_block("%d14") }
+    if t == 101 { let k = k ++ push_block("%d13") }
+    if t < 6 {
+      let src = "%d4"
+      if t == 1 { let src = "%d2" }
+      if t == 2 { let src = "%d3" }
+      if t >= 3 { let src = str(t - 2) }
+      let k = k ++ "mov.s64 %d5, " ++ src ++ ";\n" ++ push_block("%d5")
+    }
+    if t >= 11 and t <= 14 { let k = k ++ "mov.u32 %r31, " ++ str(t) ++ ";\n" ++ unary_block("%r31", sfx) }
+    if t >= 6 and t <= 10 {
+      let k = k ++ "sub.u32 %r19, %r19, 1;\nmul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nld.local.s64 %d7, [%a10];\nld.local.s64 %d6, [%a10+-8];\n"
+      if t == 6 { let k = k ++ "add.s64 %d8, %d6, %d7;\n" }
+      if t == 7 { let k = k ++ "sub.s64 %d8, %d6, %d7;\n" }
+      if t == 8 { let k = k ++ "mul.lo.s64 %d8, %d6, %d7;\n" }
+      if t == 9 or t == 10 {
+        let k = k ++ "setp.eq.s64 %p13, %d7, 0;\n@%p13 bra NEXTSEQ;\ndiv.s64 %d9, %d6, %d7;\nrem.s64 %d10, %d6, %d7;\nsetp.ne.s64 %p14, %d10, 0;\nxor.b64 %d11, %d10, %d7;\nsetp.lt.s64 %p15, %d11, 0;\nand.pred %p16, %p14, %p15;\n@%p16 sub.s64 %d9, %d9, 1;\n@%p16 add.s64 %d10, %d10, %d7;\n"
+        if t == 9 { let k = k ++ "mov.s64 %d8, %d9;\n" } else { let k = k ++ "mov.s64 %d8, %d10;\n" }
+      }
+      let k = k ++ "st.local.s64 [%a10+-8], %d8;\n"
+    }
+    let j = j + 1
+  }
+  return k ++ "bra EVNEXT;\n"
+}
+
+skill ptx() -> Any { return ptx_c([]) }
+
+# the kernel; words listed in `comp` ([index, definition, arity]) are compiled in, the rest run from the table
+skill ptx_c(comp) -> Any {
+  let k = ".version 6.0\n.target sm_50\n.address_size 64\n"
+  let k = k ++ ".visible .entry seqw(.param .u64 pT, .param .u32 pS, .param .u32 pL, .param .u32 pB, .param .u32 pN, .param .u64 pO, .param .u64 pM, .param .u64 pW)\n{\n"
+  let k = k ++ ".reg .pred %p<24>;\n.reg .u32 %r<40>;\n.reg .s64 %d<24>;\n.reg .u64 %a<32>;\n.reg .f64 %f<4>;\n.local .align 8 .b64 stk[48];\n.local .align 4 .b32 tok[32];\n.local .align 4 .b32 lf[32];\n"
+  let k = k ++ "ld.param.u64 %a1, [pT];\ncvta.to.global.u64 %a1, %a1;\nld.param.u32 %r1, [pS];\nld.param.u32 %r2, [pL];\nld.param.u32 %r3, [pB];\nld.param.u32 %r4, [pN];\nld.param.u64 %a2, [pO];\ncvta.to.global.u64 %a2, %a2;\nld.param.u64 %a18, [pW];\ncvta.to.global.u64 %a18, %a18;\n"
+  let k = k ++ "mov.u32 %r6, %ctaid.x;\nmov.u32 %r7, %ntid.x;\nmov.u32 %r8, %tid.x;\nmad.lo.u32 %r9, %r6, %r7, %r8;\nsetp.ge.u32 %p1, %r9, %r4;\n@%p1 bra DONE;\nld.param.u64 %a13, [pM];\ncvt.u64.u32 %a14, %r9;\nadd.u64 %a13, %a13, %a14;\ncvt.u64.u32 %a16, %r3;\n"
+  let k = k ++ "mov.u64 %a3, tok;\nmov.u64 %a4, stk;\nmov.u64 %a24, lf;\nmov.u64 %a15, %a13;\nmov.u32 %r11, 0;\nmov.u32 %r12, 0;\nmov.u32 %r32, 0;\n"
+  # decode the program and check that it is well formed (each token's arity from the base or the word table)
+  let k = k ++ "DEC:\nsetp.ge.u32 %p2, %r11, %r2;\n@%p2 bra DECEND;\nrem.u64 %a17, %a15, %a16;\ndiv.u64 %a15, %a15, %a16;\ncvt.u32.u64 %r13, %a17;\nmul.wide.u32 %a5, %r11, 4;\nadd.u64 %a6, %a3, %a5;\nst.local.u32 [%a6], %r13;\n"
+  # a1 / a2 used (directly) -> the program can only be checked from term 1 / 2
+  let k = k ++ "setp.eq.u32 %p23, %r13, 1;\n@%p23 max.u32 %r32, %r32, 1;\nsetp.eq.u32 %p23, %r13, 2;\n@%p23 mov.u32 %r32, 2;\n"
+  let k = k ++ "setp.lt.u32 %p3, %r13, 6;\n@%p3 bra LEAF;\nsetp.lt.u32 %p3, %r13, 11;\n@%p3 bra BIN;\nsetp.lt.u32 %p3, %r13, 15;\n@%p3 bra UNA;\nsub.u32 %r23, %r13, 15;\nmul.lo.u32 %r24, %r23, 18;\nmul.wide.u32 %a19, %r24, 4;\nadd.u64 %a19, %a18, %a19;\nld.global.u32 %r25, [%a19];\nld.global.u32 %r26, [%a19+4];\nmov.u32 %r27, 0;\nWS:\nsetp.ge.u32 %p4, %r27, %r26;\n@%p4 bra WSE;\nadd.u32 %r28, %r27, 2;\nmul.wide.u32 %a20, %r28, 4;\nadd.u64 %a21, %a19, %a20;\nld.global.u32 %r30, [%a21];\nsetp.eq.u32 %p23, %r30, 1;\n@%p23 max.u32 %r32, %r32, 1;\nsetp.eq.u32 %p23, %r30, 2;\n@%p23 mov.u32 %r32, 2;\nadd.u32 %r27, %r27, 1;\nbra WS;\nWSE:\nsetp.lt.u32 %p4, %r12, %r25;\n@%p4 bra DONE;\nsub.u32 %r12, %r12, %r25;\nadd.u32 %r12, %r12, 1;\nsub.u32 %r34, %r12, 1;\nmul.wide.u32 %a25, %r34, 4;\nadd.u64 %a26, %a24, %a25;\nmov.u32 %r37, 99;\nst.local.u32 [%a26], %r37;\nbra DECNEXT;\n"
+  let k = k ++ "UNA:\nsetp.lt.u32 %p4, %r12, 1;\n@%p4 bra DONE;\nsub.u32 %r34, %r12, 1;\nmul.wide.u32 %a25, %r34, 4;\nadd.u64 %a26, %a24, %a25;\nmov.u32 %r37, 99;\nst.local.u32 [%a26], %r37;\nbra DECNEXT;\n"
+  let k = k ++ "BIN:\nsetp.lt.u32 %p4, %r12, 2;\n@%p4 bra DONE;\nsub.u32 %r34, %r12, 2;\nmul.wide.u32 %a25, %r34, 4;\nadd.u64 %a26, %a24, %a25;\nld.local.u32 %r35, [%a26];\nld.local.u32 %r36, [%a26+4];\n"
+  let k = k ++ "setp.lt.u32 %p20, %r35, 6;\nsetp.lt.u32 %p21, %r36, 6;\nand.pred %p20, %p20, %p21;\n@!%p20 bra BINOK;\n"
+  # b+a, b*a (commutative, leaves out of order)
+  let k = k ++ "setp.eq.u32 %p21, %r13, 6;\nsetp.eq.u32 %p22, %r13, 8;\nor.pred %p21, %p21, %p22;\nsetp.gt.u32 %p22, %r35, %r36;\nand.pred %p22, %p21, %p22;\n@%p22 bra DONE;\n"
+  # x-x, x//x, x%x
+  let k = k ++ "setp.eq.u32 %p21, %r13, 7;\nsetp.ge.u32 %p22, %r13, 9;\nor.pred %p21, %p21, %p22;\nsetp.eq.u32 %p22, %r35, %r36;\nand.pred %p22, %p21, %p22;\n@%p22 bra DONE;\n"
+  # x*1, 1*x, x//1
+  let k = k ++ "setp.eq.u32 %p21, %r13, 8;\nsetp.eq.u32 %p22, %r35, 3;\nsetp.eq.u32 %p23, %r36, 3;\nor.pred %p22, %p22, %p23;\nand.pred %p22, %p21, %p22;\n@%p22 bra DONE;\n"
+  let k = k ++ "setp.eq.u32 %p21, %r13, 9;\nsetp.eq.u32 %p22, %r36, 3;\nand.pred %p22, %p21, %p22;\n@%p22 bra DONE;\n"
+  let k = k ++ "BINOK:\nmov.u32 %r37, 99;\nst.local.u32 [%a26], %r37;\nsub.u32 %r12, %r12, 1;\nbra DECNEXT;\nLEAF:\nmul.wide.u32 %a25, %r12, 4;\nadd.u64 %a26, %a24, %a25;\nst.local.u32 [%a26], %r13;\nadd.u32 %r12, %r12, 1;\nDECNEXT:\nadd.u32 %r11, %r11, 1;\nbra DEC;\nDECEND:\nsetp.ne.u32 %p5, %r12, 1;\n@%p5 bra DONE;\n"
+  # every sequence, terms 2..7
+  let k = k ++ "mov.u32 %r14, 0;\nSEQ:\nsetp.ge.u32 %p6, %r14, %r1;\n@%p6 bra DONE;\nmul.lo.u32 %r15, %r14, 12;\nmov.u32 %r16, %r32;\n"
+  let k = k ++ "TERM:\nsetp.gt.u32 %p7, %r16, 7;\n@%p7 bra MATCH;\nadd.u32 %r17, %r15, %r16;\nmul.wide.u32 %a7, %r17, 8;\nadd.u64 %a8, %a1, %a7;\nld.global.s64 %d1, [%a8];\nmov.s64 %d2, 0;\nmov.s64 %d3, 0;\nsetp.ge.u32 %p23, %r16, 1;\n@%p23 ld.global.s64 %d2, [%a8+-8];\nsetp.ge.u32 %p23, %r16, 2;\n@%p23 ld.global.s64 %d3, [%a8+-16];\ncvt.s64.u32 %d4, %r16;\nmov.u32 %r18, 0;\nmov.u32 %r19, 0;\n"
+  let k = k ++ "EV:\nsetp.ge.u32 %p8, %r18, %r2;\n@%p8 bra EVEND;\nmul.wide.u32 %a5, %r18, 4;\nadd.u64 %a6, %a3, %a5;\nld.local.u32 %r20, [%a6];\nsetp.ge.u32 %p9, %r20, 6;\n@%p9 bra NOTLEAF;\n" ++ leaf_block("%r20") ++ "bra EVNEXT;\n"
+  let k = k ++ "NOTLEAF:\nsetp.ge.u32 %p9, %r20, 11;\n@%p9 bra WORDS;\n" ++ op_block("%r20", "M") ++ "bra EVNEXT;\n"
+  # promoted words: straight to their compiled code
+  let k = k ++ "WORDS:\nsetp.ge.u32 %p9, %r20, 15;\n@%p9 bra WORDS2;\n" ++ unary_block("%r20", "M") ++ "bra EVNEXT;\nWORDS2:\n"
+  for c in comp { let k = k ++ "setp.eq.u32 %p20, %r20, " ++ str(15 + c[0]) ++ ";\n@%p20 bra CW" ++ str(c[0]) ++ ";\n" }
+  let k = k ++ "bra WORD;\n"
+  for c in comp { let k = k ++ compiled_word(c[0], c[1], c[2]) }
+  # a word: pop its arguments, run its definition (base tokens, 100 = first argument, 101 = second)
+  let k = k ++ "WORD:\nsub.u32 %r23, %r20, 15;\nmul.lo.u32 %r24, %r23, 18;\nmul.wide.u32 %a19, %r24, 4;\nadd.u64 %a19, %a18, %a19;\nld.global.u32 %r25, [%a19];\nld.global.u32 %r26, [%a19+4];\n"
+  let k = k ++ "setp.eq.u32 %p13, %r25, 2;\n@%p13 bra AR2;\nsetp.eq.u32 %p13, %r25, 1;\n@%p13 bra AR1;\nbra ARD;\n"
+  let k = k ++ "AR2:\nsub.u32 %r19, %r19, 1;\nmul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nld.local.s64 %d13, [%a10];\n"
+  let k = k ++ "AR1:\nsub.u32 %r19, %r19, 1;\nmul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nld.local.s64 %d14, [%a10];\n"
+  let k = k ++ "ARD:\nmov.u32 %r27, 0;\nWL:\nsetp.ge.u32 %p17, %r27, %r26;\n@%p17 bra EVNEXT;\nadd.u32 %r28, %r27, 2;\nmul.wide.u32 %a20, %r28, 4;\nadd.u64 %a21, %a19, %a20;\nld.global.u32 %r30, [%a21];\n"
+  let k = k ++ "setp.eq.u32 %p18, %r30, 100;\n@%p18 bra PA0;\nsetp.eq.u32 %p18, %r30, 101;\n@%p18 bra PA1;\nsetp.ge.u32 %p18, %r30, 6;\n@%p18 bra WOP;\n" ++ leaf_block("%r30") ++ "bra WNEXT;\n"
+  let k = k ++ "PA0:\n" ++ push_block("%d14") ++ "bra WNEXT;\nPA1:\n" ++ push_block("%d13") ++ "bra WNEXT;\n"
+  let k = k ++ "WOP:\nsetp.ge.u32 %p18, %r30, 11;\n@%p18 bra WUN;\n" ++ op_block("%r30", "W") ++ "bra WNEXT;\nWUN:\n" ++ unary_block("%r30", "W") ++ "WNEXT:\nadd.u32 %r27, %r27, 1;\nbra WL;\n"
+  let k = k ++ "EVNEXT:\nadd.u32 %r18, %r18, 1;\nbra EV;\n"
+  let k = k ++ "EVEND:\nld.local.s64 %d12, [%a4];\nsetp.ne.s64 %p19, %d12, %d1;\n@%p19 bra NEXTSEQ;\nadd.u32 %r16, %r16, 1;\nbra TERM;\n"
+  let k = k ++ "MATCH:\nmul.wide.u32 %a11, %r14, 8;\nadd.u64 %a12, %a2, %a11;\natom.global.min.u64 %a22, [%a12], %a13;\n"
+  return k ++ "NEXTSEQ:\nadd.u32 %r14, %r14, 1;\nbra SEQ;\nDONE:\nret;\n}\n"
+}
+
+# ---- programs as trees (CPU) -------------------------------------------------------------------------------------
+skill arity(t, words) -> Any {
+  if t < 6 or t == 100 or t == 101 { return 0 }
+  if t < 11 { return 2 }
+  if t < 15 { return 1 }
+  return words[t - 15][0]
+}
+
+skill parse_post(toks, words) -> Any {
+  let st = []
+  for t in toks {
+    let a = arity(t, words)
+    let ch = slice(st, len(st) - a, len(st))
+    let st = append(slice(st, 0, len(st) - a), [t, ch])
+  }
+  return st[0]
+}
+
+skill subst(tree, args) -> Any {
+  if tree[0] == 100 { return args[0] }
+  if tree[0] == 101 { return args[1] }
+  let ch = []
+  for c in tree[1] { let ch = append(ch, subst(c, args)) }
+  return [tree[0], ch]
+}
+
+# words replaced by their definitions (definitions are base tokens only)
+skill expand(tree, words) -> Any {
+  let ch = []
+  for c in tree[1] { let ch = append(ch, expand(c, words)) }
+  if tree[0] < 15 or tree[0] == 100 or tree[0] == 101 { return [tree[0], ch] }
+  return subst(parse_post(words[tree[0] - 15][1], words), ch)
+}
+
+skill postfix(tree) -> Any {
+  let out = []
+  for c in tree[1] { let out = out ++ postfix(c) }
+  return append(out, tree[0])
+}
+
+skill tsize(tree) -> Any {
+  let n = 1
+  for c in tree[1] { let n = n + tsize(c) }
+  return n
+}
+
+skill ev(tree, n, x, y) -> Any {
+  let t = tree[0]
+  if t < 6 {
+    if t == 0 { return n }
+    if t == 1 { return x }
+    if t == 2 { return y }
+    return t - 2
+  }
+  if t >= 11 and t <= 14 {
+    let u = ev(tree[1][0], n, x, y)
+    if u == null { return null }
+    return unary_cpu(t, u)
+  }
+  let a = ev(tree[1][0], n, x, y)
+  let b = ev(tree[1][1], n, x, y)
+  if a == null or b == null { return null }
+  if t == 6 { return a + b }
+  if t == 7 { return a - b }
+  if t == 8 { return a * b }
+  if b == 0 { return null }
+  if t == 9 { return a // b }
+  return a % b
+}
+
+# as the GPU computes them (arguments over 10^6 to isprime / ndiv: no match)
+skill unary_cpu(t, a) -> Any {
+  if t == 14 {
+    if a < 0 { return null }
+    let r = 0
+    while (r + 1) * (r + 1) <= a { let r = r + 1 }
+    return r
+  }
+  if t == 13 {
+    let v = a
+    if v < 0 { let v = 0 - v }
+    let s = 0
+    while v > 0 {
+      let s = s + v % 10
+      let v = v // 10
+    }
+    return s
+  }
+  if a > 1000000 { return null }
+  if t == 11 {
+    if a < 2 { return 0 }
+    let d = 2
+    while d * d <= a {
+      if a % d == 0 { return 0 }
+      let d = d + 1
+    }
+    return 1
+  }
+  if a < 1 { return 0 }
+  let c = 0
+  let d = 1
+  while d * d <= a {
+    if a % d == 0 {
+      let c = c + 2
+      if d * d == a { let c = c - 1 }
+    }
+    let d = d + 1
+  }
+  return c
+}
+
+skill predict(tree, terms, from, to) -> Any {
+  let seq = slice(terms, 0, from)
+  for n in range(from, to) {
+    let v = ev(tree, n, seq[n - 1], seq[n - 2])
+    if v == null { return null }
+    if v > 1000000000000000 or v < 0 - 1000000000000000 { return null }
+    let seq = append(seq, v)
+  }
+  return seq
+}
+
+skill tname(t) -> Any { return ["n", "a1", "a2", "1", "2", "3", "+", "-", "*", "//", "%", "isprime", "ndiv", "digsum", "isqrt"][t] }
+
+skill show(tree) -> Any {
+  let t = tree[0]
+  if t == 100 { return "A" }
+  if t == 101 { return "B" }
+  if t < 6 { return tname(t) }
+  if t < 11 { return "(" ++ show(tree[1][0]) ++ " " ++ tname(t) ++ " " ++ show(tree[1][1]) ++ ")" }
+  if t < 15 { return tname(t) ++ "(" ++ show(tree[1][0]) ++ ")" }
+  let parts = []
+  for c in tree[1] { let parts = append(parts, show(c)) }
+  return "w" ++ str(t - 15) ++ "(" ++ join(parts, ", ") ++ ")"
+}
+
+skill tokens(id, L, B) -> Any {
+  let out = []
+  let v = id
+  for i in range(0, L) {
+    let out = append(out, v % B)
+    let v = v // B
+  }
+  return out
+}
+
+# ---- the GPU sweep: each sequence's shortest fitting program (as tokens), or null ---------------------------------
+skill search(seqs, words, maxl) -> Any { return search_c(seqs, words, maxl, false) }
+
+# words: [arity, definition, uses]; with promote, words used by 5+ verified solutions run as compiled PTX
+skill search_c(seqs, words, maxl, promote) -> Any {
+  let S = len(seqs)
+  let tg = arr(S * 12)
+  for s in range(0, S) {
+    for k in range(0, 12) { do aset(tg, s * 12 + k, seqs[s][1][k]) }
+  }
+  let wt = arr(18 * imax(1, len(words)))
+  for w in range(0, len(words)) {
+    do aset(wt, 18 * w, words[w][0])
+    do aset(wt, 18 * w + 1, len(words[w][1]))
+    for j in range(0, len(words[w][1])) { do aset(wt, 18 * w + 2 + j, words[w][1][j]) }
+  }
+  let B = 15 + len(words)
+  let comp = []
+  if promote {
+    for w in range(0, len(words)) {
+      if words[w][2] >= 5 { let comp = append(comp, [w, words[w][1], words[w][0]]) }
+    }
+  }
+  let k = ptx_c(comp)
+  let firstl = arr(S)
+  let first = arr(S)
+  let L = 1
+  let N = B
+  while L <= maxl {
+    let off = 0
+    while off < N {
+      let cnt = N - off
+      if cnt > 2000000000 { let cnt = 2000000000 }
+      let m = mark()
+      let r = rt_gpu_seqw(k, tg, S, L, B, cnt, off, wt)
+      let got = []
+      if typeof(r) != typeof(0) {
+        for s in range(0, S) {
+          let v = aget(r, s)
+          if v >= 0 { let got = append(got, [s, v]) }
+        }
+      } else { do print("GPU error " ++ str(r)) }
+      let got = release(m, got)
+      for x in got {
+        if aget(firstl, x[0]) == 0 or (aget(firstl, x[0]) == L and x[1] < aget(first, x[0])) {
+          do aset(first, x[0], x[1])
+          do aset(firstl, x[0], L)
+        }
+      }
+      let off = off + cnt
+    }
+    let L = L + 1
+    let N = N * B
+  }
+  let out = []
+  for s in range(0, S) {
+    if aget(firstl, s) > 0 { let out = append(out, tokens(aget(first, s), aget(firstl, s), B)) } else { let out = append(out, null) }
+  }
+  return out
+}
+
+skill imax(a, b) -> Any {
+  if a > b { return a }
+  return b
+}
+
+# [solved on terms 9-12, holds on 13-20] for one sequence's program
+skill judge(sq, toks, words) -> Any {
+  if toks == null { return [false, false] }
+  let tree = expand(parse_post(toks, words), words)
+  let p = predict(tree, sq[1], 8, 12)
+  if p == null { return [false, false] }
+  for n in range(8, 12) {
+    if p[n] != sq[1][n] { return [false, false] }
+  }
+  if len(sq[2]) == 0 { return [true, false] }
+  let full = predict(tree, sq[1] ++ sq[2], 12, 12 + len(sq[2]))
+  if full == null { return [true, false] }
+  for n in range(0, len(sq[2])) {
+    if full[12 + n] != sq[2][n] { return [true, false] }
+  }
+  return [true, true]
+}
+
+# ---- learning words: the sub-programs of Pi's verified solutions that save the most tokens -----------------------
+skill nodes(tree) -> Any {
+  let out = [tree]
+  for c in tree[1] { let out = out ++ nodes(c) }
+  return out
+}
+
+# a copy of the tree with the node at preorder position `at` replaced by a hole (code h)
+skill hole(tree, at, h) -> Any {
+  let r = hole_r(tree, at, h, 0)
+  return r[0]
+}
+
+skill hole_r(tree, at, h, pos) -> Any {
+  if pos == at { return [[h, []], pos + tsize(tree)] }
+  let ch = []
+  let p = pos + 1
+  for c in tree[1] {
+    let r = hole_r(c, at, h, p)
+    let ch = append(ch, r[0])
+    let p = r[1]
+  }
+  return [[tree[0], ch], p]
+}
+
+# every pattern of a solution: [arity, postfix] -- closed sub-programs (size 3-12) and ones with one or two holes
+# (holes are disjoint sub-programs; in preorder the first hole comes first, so 100 precedes 101 in the postfix too)
+skill patterns(tree) -> Any {
+  let out = []
+  for nd in nodes(tree) {
+    let sz = tsize(nd)
+    if sz >= 3 and sz <= 12 {
+      let out = append(out, [0, postfix(nd)])
+      for i in range(1, sz) {
+        let p1 = hole(nd, i, 100)
+        let n1 = tsize(p1)
+        if n1 >= 3 { let out = append(out, [1, postfix(p1)]) }
+        for j in range(i + 1, n1) {
+          let p2 = hole(p1, j, 101)
+          if tsize(p2) >= 4 { let out = append(out, [2, postfix(p2)]) }
+        }
+      }
+    }
+  }
+  return out
+}
+
+skill contains_code(xs, c) -> Any {
+  for x in xs {
+    if x == c { return true }
+  }
+  return false
+}
+
+skill khash(ar, toks) -> Any {
+  let h = 7 + ar
+  for t in toks { let h = (h * 131 + t + 1) % 1000000007 }
+  return h * 64 + len(toks) + 1
+}
+
+# chunked list: [full chunks, current chunk]
+skill cl_get(c, i) -> Any {
+  let k = i // 1000
+  if k < len(c[0]) { return c[0][k][i % 1000] }
+  return c[1][i % 1000]
+}
+
+skill cl_push(c, x) -> Any {
+  let cur = append(c[1], x)
+  if len(cur) >= 1000 { return [append(c[0], cur), []] }
+  return [c[0], cur]
+}
+
+skill learn_words(sols, words, k) -> Any {
+  let hsz = 1048576
+  let hk = arr(hsz)
+  let hi = arr(hsz)
+  let cnt = arr(hsz)
+  let stamp = arr(hsz)
+  let defs = [[], []]
+  let nd = 0
+  let sn = 0
+  for tree in sols {
+    let sn = sn + 1
+    for pt in patterns(tree) {
+      let key = khash(pt[0], pt[1])
+      let sl = key % hsz
+      while aget(hk, sl) != 0 and aget(hk, sl) != key { let sl = (sl + 1) % hsz }
+      if aget(hk, sl) == 0 and nd < hsz - 1 {
+        do aset(hk, sl, key)
+        do aset(hi, sl, nd + 1)
+        let defs = cl_push(defs, pt)
+        let nd = nd + 1
+      }
+      let ix = aget(hi, sl) - 1
+      if ix >= 0 {
+        if aget(stamp, ix) != sn {
+          do aset(stamp, ix, sn)
+          do aset(cnt, ix, aget(cnt, ix) + 1)
+        }
+      }
+    }
+  }
+  # the existing words (never learned twice)
+  let have = []
+  for w in words { let have = append(have, khash(w[0], w[1])) }
+  let out = words
+  let added = 0
+  while added < k {
+    let bi = 0 - 1
+    let bs = 0
+    for i in range(0, nd) {
+      if aget(cnt, i) >= 2 {
+        let d = cl_get(defs, i)
+        let saved = len(d[1]) - d[0] - 1
+        let sc = aget(cnt, i) * saved
+        if sc > bs and contains_code(have, khash(d[0], d[1])) == false {
+          let bs = sc
+          let bi = i
+        }
+      }
+    }
+    if bi < 0 { let added = k } else {
+      let d = cl_get(defs, bi)
+      let out = append(out, [d[0], d[1], 0])
+      let have = append(have, khash(d[0], d[1]))
+      let added = added + 1
+    }
+  }
+  return out
+}
+
+skill WORDFILE() -> Any { return "examples\\native\\learned\\seqwords.txt" }
+
+# one word per line: arity | definition tokens | uses (verified practice solutions that used it)
+skill load_words() -> Any {
+  let t = read_file(WORDFILE())
+  if t == null { return [] }
+  let out = []
+  for l in split(t, "\n") {
+    let p = split(l, "|")
+    if len(p) == 3 {
+      let d = []
+      for x in split(p[1], ",") { let d = append(d, sint(x)) }
+      let out = append(out, [sint(p[0]), d, sint(p[2])])
+    }
+  }
+  return out
+}
+
+skill save_words(words) -> Any {
+  let ls = []
+  for w in words { let ls = append(ls, str(w[0]) ++ "|" ++ join(map_strs(w[1]), ",") ++ "|" ++ str(w[2])) }
+  return write_file(WORDFILE(), join(ls, "\n"))
+}
+
+# how many verified solutions use each word (tokens before expansion)
+skill count_uses(words, progs) -> Any {
+  let out = []
+  for w in range(0, len(words)) {
+    let c = 0
+    for toks in progs {
+      if contains_code(toks, 15 + w) { let c = c + 1 }
+    }
+    let out = append(out, [words[w][0], words[w][1], words[w][2] + c])
+  }
+  return out
+}
+
+# holds on a sequence set with a vocabulary (the validation gate)
+skill holds_on(seqs, words, maxl) -> Any {
+  let ps = search(seqs, words, maxl)
+  let h = 0
+  for s in range(0, len(seqs)) {
+    if judge(seqs[s], ps[s], words)[1] { let h = h + 1 }
+  }
+  return h
+}
+
+# the longest search that stays within a budget of programs (B^L <= budget)
+skill fit_len(B, budget, maxl) -> Any {
+  let L = 1
+  let n = B
+  while L < maxl and n * B <= budget {
+    let L = L + 1
+    let n = n * B
+  }
+  return L
+}
+
+skill map_strs(xs) -> Any {
+  let out = []
+  for x in xs { let out = append(out, str(x)) }
+  return out
+}
+
+skill word_text(w) -> Any {
+  let t = parse_post(w[1], [])
+  return show(t)
+}
+
+# check: Pi's remembered words run interpreted (from the table) and compiled (straight-line PTX) -- the same programs?
+skill check(lt) -> Any {
+  let chunks = read_seqs(12000000)
+  let test = []
+  let i = 0
+  for c in chunks {
+    for sq in c {
+      if i % 5 == 0 and len(test) < 300 { let test = append(test, sq) }
+      let i = i + 1
+    }
+  }
+  let words = load_words()
+  let allc = []
+  for w in words { let allc = append(allc, [w[0], w[1], 5]) }
+  let t0 = ticks()
+  let a = search_c(test, allc, lt, false)
+  let t1 = ticks()
+  let b = search_c(test, allc, lt, true)
+  let t2 = ticks()
+  let same = 0
+  let held = 0
+  for s in range(0, len(test)) {
+    if str(a[s]) == str(b[s]) { let same = same + 1 }
+    if judge(test[s], b[s], allc)[1] { let held = held + 1 }
+  }
+  return str(len(words)) ++ " words, length " ++ str(lt) ++ ": interpreted " ++ str(t1 - t0) ++ " ms, COMPILED " ++ str(t2 - t1) ++ " ms; identical programs for " ++ str(same) ++ " of " ++ str(len(test)) ++ " sequences; holds " ++ str(held)
+}
+
+skill main() -> Any {
+  if arg(1) == "check" { return check(sint(arg(2))) }
+  let npr = 2000
+  if arg(1) != null { let npr = sint(arg(1)) }
+  let rounds = 2
+  if arg(2) != null { let rounds = sint(arg(2)) }
+  let lp = 8
+  if arg(3) != null { let lp = sint(arg(3)) }
+  # length 9 stays available up to 22 tokens (22^9 = 1.2e12): a 10th word must not cost a whole length level
+  let budget = 1300000000000
+  let cap = 10
+  let t0 = ticks()
+  let chunks = read_seqs(12000000)
+  let test = []
+  let practice = []
+  let val = []
+  let i = 0
+  for c in chunks {
+    for sq in c {
+      if i % 5 == 0 {
+        if len(test) < 300 { let test = append(test, sq) }
+      } else {
+        if len(practice) < npr { let practice = append(practice, sq) } else {
+          if len(val) < 300 { let val = append(val, sq) }
+        }
+      }
+      let i = i + 1
+    }
+  }
+  let words = load_words()
+  let out = "practice " ++ str(len(practice)) ++ ", validation " ++ str(len(val)) ++ " (decides which words stay), test " ++ str(len(test)) ++ " (only measured). Pi remembers " ++ str(len(words)) ++ " words from earlier runs.\n"
+  let r = 0
+  while r <= rounds {
+    let tr = ticks()
+    let B = 15 + len(words)
+    let lt = fit_len(B, budget, 9)
+    let ts = search_c(test, words, lt, true)
+    let solved = 0
+    let held = 0
+    for s in range(0, len(test)) {
+      let j = judge(test[s], ts[s], words)
+      if j[0] { let solved = solved + 1 }
+      if j[1] { let held = held + 1 }
+    }
+    let ncomp = 0
+    for w in words {
+      if w[2] >= 5 { let ncomp = ncomp + 1 }
+    }
+    let out = out ++ "round " ++ str(r) ++ ": " ++ str(len(words)) ++ " words (" ++ str(ncomp) ++ " compiled into the GPU code), test length " ++ str(lt) ++ ": TEST solved " ++ str(solved) ++ ", HOLDS " ++ str(held) ++ " of 300 (" ++ str((ticks() - tr) // 1000) ++ " s)\n"
+    do print(out)
+    if r < rounds {
+      let tp = ticks()
+      let ps = search(practice, words, lp)
+      let sols = []
+      let progs = []
+      for s in range(0, len(practice)) {
+        if judge(practice[s], ps[s], words)[0] {
+          let sols = append(sols, expand(parse_post(ps[s], words), words))
+          let progs = append(progs, ps[s])
+        }
+      }
+      let words = count_uses(words, progs)
+      # new candidates; over the cap, the least-used words make room
+      let cand = learn_words(sols, words, 3)
+      let fresh = slice(cand, len(words), len(cand))
+      let kept = words
+      while len(kept) + len(fresh) > cap and len(kept) > 0 {
+        let lo = 0
+        for w in range(0, len(kept)) {
+          if kept[w][2] < kept[lo][2] { let lo = w }
+        }
+        let kept = slice(kept, 0, lo) ++ slice(kept, lo + 1, len(kept))
+      }
+      let trial = kept ++ fresh
+      # the validation gate: the new vocabulary must hold more validation sequences than the old one
+      let lv = fit_len(15 + imax(len(words), len(trial)), budget // 4, 9)
+      let hv0 = holds_on(val, words, lv)
+      let hv1 = holds_on(val, trial, lv)
+      let out = out ++ "  practice " ++ str(len(sols)) ++ " verified (" ++ str((ticks() - tp) // 1000) ++ " s); candidates:"
+      for w in fresh { let out = out ++ "  " ++ str(w[0]) ++ "/" ++ word_text(w) }
+      if hv1 > hv0 {
+        let words = trial
+        let out = out ++ "\n  validation " ++ str(hv0) ++ " -> " ++ str(hv1) ++ ": KEPT (" ++ str(len(words)) ++ " words)\n"
+      } else { let out = out ++ "\n  validation " ++ str(hv0) ++ " -> " ++ str(hv1) ++ ": ROLLED BACK\n" }
+      do save_words(words)
+    }
+    let r = r + 1
+  }
+  do save_words(words)
+  let out = out ++ "Pi's vocabulary now (" ++ WORDFILE() ++ "):\n"
+  for w in range(0, len(words)) { let out = out ++ "  w" ++ str(w) ++ "/" ++ str(words[w][0]) ++ " = " ++ word_text(words[w]) ++ "   used by " ++ str(words[w][2]) ++ " verified solutions\n" }
+  return out ++ "total " ++ str((ticks() - t0) // 1000) ++ " s"
+}
+
+skill index_of(xs, x) -> Any {
+  for i in range(0, len(xs)) {
+    if xs[i] == x { return i }
+  }
+  return 0 - 1
+}

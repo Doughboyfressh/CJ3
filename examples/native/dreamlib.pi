@@ -1,0 +1,97 @@
+# The shared core of Pi's program-induction experiments: an op language over integers, a run function, an
+# exhaustive search, and a deterministic PRNG. An op is [kind, arg]: 0 add arg, 1 multiply by arg, 2 multiply by
+# the input n, 3 square, 4 macro (arg is a list of ops -- a learned compound run as one step).
+skill apply_op(op, r, n) -> Any {
+  let k = op[0]
+  if k == 0 { return r + op[1] }
+  if k == 1 { return r * op[1] }
+  if k == 2 { return r * n }
+  if k == 3 { return r * r }
+  let sub = op[1]
+  for s in sub { let r = apply_op(s, r, n) }
+  return r
+}
+
+skill run(prog, n) -> Any {
+  let r = n
+  for op in prog { let r = apply_op(op, r, n) }
+  return r
+}
+
+skill alphabet() -> Any {
+  return [[0, 1], [0, 2], [0, 3], [0, -1], [1, 2], [1, 3], [2, 0], [3, 0]]
+}
+
+skill power(a, l) -> Any {
+  let p = 1
+  for i in range(0, l) { let p = p * a }
+  return p
+}
+
+skill nth_prog(alpha, l, idx) -> Any {
+  let prog = []
+  let a = len(alpha)
+  let x = idx
+  for pos in range(0, l) {
+    let prog = append(prog, alpha[x % a])
+    let x = x // a
+  }
+  return prog
+}
+
+skill matches(prog, ex) -> Any {
+  for e in ex {
+    if run(prog, e[0]) != e[1] { return false }
+  }
+  return true
+}
+
+skill solve(alpha, maxlen, ex) -> Any {
+  let tried = 0
+  let a = len(alpha)
+  for l in range(1, maxlen + 1) {
+    for idx in range(0, power(a, l)) {
+      let tried = tried + 1
+      let prog = nth_prog(alpha, l, idx)
+      if matches(prog, ex) { return [prog, tried] }
+    }
+  }
+  return [null, tried]
+}
+
+skill nextseed(s) -> Any { return (s * 1103515245 + 12345) % 2147483648 }
+# use the high bits: an LCG with a power-of-two modulus has very low-period low bits
+skill pick(s, n) -> Any {
+  let s = nextseed(s)
+  return [(s // 65536) % n, s]
+}
+
+# input/output examples for inputs lo..hi-1
+skill examples_of(target, lo, hi) -> Any {
+  let ex = []
+  for n in range(lo, hi) { let ex = append(ex, [n, run(target, n)]) }
+  return ex
+}
+
+# a random target program of length 1..genlen over the alphabet -> [target, seed]
+skill dream_target(seed, alpha, genlen) -> Any {
+  let r = pick(seed, genlen)
+  let tl = r[0] + 1
+  let seed = r[1]
+  let target = []
+  for i in range(0, tl) {
+    let r = pick(seed, len(alpha))
+    let target = append(target, alpha[r[0]])
+    let seed = r[1]
+  }
+  return [target, seed]
+}
+
+# did `prog` reproduce `target` on held-out inputs 6..8 (inputs not used to find it)?
+skill verifies(prog, target) -> Any {
+  if prog == null { return 0 }
+  for n in range(6, 9) {
+    if run(prog, n) != run(target, n) { return 0 }
+  }
+  return 1
+}

@@ -1,0 +1,22 @@
+# real numbers: division, real literals, mixed int/real arithmetic, floor div/mod, comparisons, equality.
+# Values are checked by equality (B) so float formatting is not relied on; a few exact short decimals are also
+# printed as text (S), which does match the interpreter.
+skill S(x) -> Any { return str(x) ++ "|" }
+skill B(b) -> Any {
+  if b { return "1" }
+  return "0"
+}
+skill main() -> Any {
+  let out = B(7 / 2 == 3.5) ++ B(6 / 2 == 3) ++ B(10 / 4 == 2.5) ++ B(1 / 8 == 0.125)
+  let out = out ++ B(2.5 + 2.5 == 5) ++ B(10.0 - 3 == 7) ++ B(3 * 1.5 == 4.5) ++ B(2 + 3 == 5)
+  let out = out ++ B(1.5e3 == 1500) ++ B(0.25 + 0.25 == 0.5) ++ B(0 - 3.5 == 0 - 3.5)
+  let out = out ++ B(7.5 // 2 == 3) ++ B(7.5 % 2 == 1.5) ++ B(0 - 7.5 // 2 == 0 - 4) ++ B(0 - 7.5 % 2 == 0.5)
+  let out = out ++ B(3.0 == 3) ++ B(3.5 == 3) ++ B(2.5 < 3) ++ B(3 < 2.5) ++ B(2.0 <= 2) ++ B(3.5 > 3) ++ B(2 < 2.5)
+  let out = out ++ B(0.1 + 0.2 > 0.3) ++ B(1.0 / 3.0 < 0.34)
+  let r = 2.5
+  let total = 0.0
+  for i in range(0, 4) { let total = total + r }
+  let out = out ++ B(total == 10)
+  let out = out ++ S(6 / 2) ++ S(3 * 1.5) ++ S(7 / 2) ++ S(0.125) ++ S(1.5e3) ++ S(10.0 - 3)
+  return out
+}

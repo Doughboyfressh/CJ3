@@ -1,0 +1,271 @@
+# Curiosity: aim learning at the edge of ability. Two learners see the same dreams and add the same number of
+# macros per round; only one is curious. The plain learner takes step-pairs from every dream it solves. The
+# curious learner studies only FRONTIER dreams -- not solvable within 2 steps with its current vocabulary, but
+# solvable within 3 -- and learns the pairs that would bring them within reach. Both are scored each round on the
+# same fixed held-out test set as rounds.pi (60 base programs, length 3..6, never used for learning), search depth
+# 2, honest protocol (search on inputs 1..5, verify on unseen 6..8). Deterministic -> golden.
+import "dreamlib.pi"
+
+# allocation-free candidate checks (the runtime has no garbage collector, so the inner loop must not build lists)
+skill fits1(o0, ex) -> Any {
+  for e in ex {
+    if apply_op(o0, e[0], e[0]) != e[1] { return false }
+  }
+  return true
+}
+skill fits2(o0, o1, ex) -> Any {
+  for e in ex {
+    let n = e[0]
+    if apply_op(o1, apply_op(o0, n, n), n) != e[1] { return false }
+  }
+  return true
+}
+skill fits3(o0, o1, o2, ex) -> Any {
+  for e in ex {
+    let n = e[0]
+    if apply_op(o2, apply_op(o1, apply_op(o0, n, n), n), n) != e[1] { return false }
+  }
+  return true
+}
+
+# shortest fitting program of length <= maxlen, as alphabet indices, or null
+skill search(alpha, maxlen, ex) -> Any {
+  let a = len(alpha)
+  for i in range(0, a) {
+    if fits1(alpha[i], ex) { return [i] }
+  }
+  if maxlen < 2 { return null }
+  for i in range(0, a) {
+    for j in range(0, a) {
+      if fits2(alpha[i], alpha[j], ex) { return [i, j] }
+    }
+  }
+  if maxlen < 3 { return null }
+  for i in range(0, a) {
+    for j in range(0, a) {
+      for k in range(0, a) {
+        if fits3(alpha[i], alpha[j], alpha[k], ex) { return [i, j, k] }
+      }
+    }
+  }
+  return null
+}
+
+skill prog_of(alpha, ids) -> Any {
+  let p = []
+  for i in ids { let p = append(p, alpha[i]) }
+  return p
+}
+
+# search on inputs 1..5, keep it only if it also holds on unseen 6..8
+skill solve_v(alpha, maxlen, target) -> Any {
+  let ids = search(alpha, maxlen, examples_of(target, 1, 6))
+  if ids == null { return null }
+  if verifies(prog_of(alpha, ids), target) == 0 { return null }
+  return ids
+}
+
+skill base_prog(seed, lo, hi) -> Any {
+  let base = alphabet()
+  let r = pick(seed, hi - lo + 1)
+  let l = lo + r[0]
+  let seed = r[1]
+  let t = []
+  for j in range(0, l) {
+    let r = pick(seed, len(base))
+    let t = append(t, base[r[0]])
+    let seed = r[1]
+  }
+  return [t, seed]
+}
+
+skill test_set() -> Any {
+  let base = alphabet()
+  let seed = 4242
+  let out = []
+  for l in range(3, 7) {
+    for i in range(0, 15) {
+      let t = []
+      for j in range(0, l) {
+        let r = pick(seed, len(base))
+        let t = append(t, base[r[0]])
+        let seed = r[1]
+      }
+      let out = append(out, t)
+    }
+  }
+  return out
+}
+
+skill score(alpha, tests) -> Any {
+  let n = 0
+  for t in tests {
+    let m = mark()
+    let ok = 0
+    if solve_v(alpha, 2, t) != null { let ok = 1 }
+    let n = n + release(m, ok)
+  }
+  return n
+}
+
+skill bump(count, key) -> Any {
+  let h = count[key]
+  if h == null { let h = 0 }
+  return put(count, key, h + 1)
+}
+
+# one round for one learner -> [new alphabet, learned keys, studied dreams]
+skill learn(alpha, dreams, learned, curious, k) -> Any {
+  let count = {}
+  let studied = 0
+  for target in dreams {
+    let m = mark()
+    let use = null
+    if curious {
+      if solve_v(alpha, 2, target) == null {
+        let s = solve_v(alpha, 3, target)
+        if s != null {
+          if len(s) == 3 { let use = s }
+        }
+      }
+    } else {
+      let s = solve_v(alpha, 3, target)
+      if s != null {
+        if len(s) >= 2 { let use = s }
+      }
+    }
+    let use = release(m, use)
+    if use != null {
+      let studied = studied + 1
+      for i in range(0, len(use) - 1) { let count = bump(count, str(use[i]) ++ "|" ++ str(use[i + 1])) }
+    }
+  }
+  let add = []
+  for t in range(0, k) {
+    let bestk = ""
+    let bestc = 0
+    for key in keys(count) {
+      if contains(learned, key) == false and count[key] > bestc {
+        let bestc = count[key]
+        let bestk = key
+      }
+    }
+    if bestk != "" {
+      let learned = append(learned, bestk)
+      let parts = split(bestk, "|")
+      let add = append(add, [4, [alpha[num(parts[0])], alpha[num(parts[1])]]])
+    }
+  }
+  return [alpha ++ add, learned, studied]
+}
+
+# curious learner: frontier dreams (not within 2 steps, but within 3), then greedily choose the macros that each
+# bring the MOST still-unreachable frontier dreams within 2 steps -- checked by actually trying them
+skill learn_cover(alpha, dreams, learned, k) -> Any {
+  let frontier = []
+  let sols = []
+  for target in dreams {
+    let m = mark()
+    let s3 = null
+    if solve_v(alpha, 2, target) == null {
+      let s = solve_v(alpha, 3, target)
+      if s != null {
+        if len(s) == 3 { let s3 = s }
+      }
+    }
+    let s3 = release(m, s3)
+    if s3 != null {
+      let frontier = append(frontier, target)
+      let sols = append(sols, s3)
+    }
+  }
+  let studied = len(frontier)
+  let cands = []
+  for s in sols {
+    for i in range(0, 2) {
+      let key = str(s[i]) ++ "|" ++ str(s[i + 1])
+      if contains(cands, key) == false and contains(learned, key) == false { let cands = append(cands, key) }
+    }
+  }
+  let add = []
+  let left = frontier
+  for t in range(0, k) {
+    let bestk = ""
+    let bestn = 0
+    let bestleft = left
+    for key in cands {
+      if contains(learned, key) == false {
+        let mk = mark()
+        let parts = split(key, "|")
+        let m = [4, [alpha[num(parts[0])], alpha[num(parts[1])]]]
+        let trial = alpha ++ add ++ [m]
+        let got = 0
+        let rest = []
+        for target in left {
+          if solve_v(trial, 2, target) != null { let got = got + 1 } else { let rest = append(rest, target) }
+        }
+        let pr = release(mk, [got, rest])
+        let got = pr[0]
+        let rest = pr[1]
+        if got > bestn {
+          let bestn = got
+          let bestk = key
+          let bestleft = rest
+        }
+      }
+    }
+    if bestk != "" {
+      let learned = append(learned, bestk)
+      let parts = split(bestk, "|")
+      let add = append(add, [4, [alpha[num(parts[0])], alpha[num(parts[1])]]])
+      let left = bestleft
+    }
+  }
+  return [alpha ++ add, learned, studied]
+}
+
+skill one_seed(seed, tests) -> Any {
+  let plain = alphabet()
+  let cur = alphabet()
+  let lp = []
+  let lc = []
+  let line = ""
+  let ps = 0
+  let cs = 0
+  for r in range(0, 8) {
+    let ps = score(plain, tests)
+    let cs = score(cur, tests)
+    let line = line ++ " " ++ str(ps) ++ "/" ++ str(cs)
+    let dreams = []
+    for d in range(0, 40) {
+      let bp = base_prog(seed, 3, 6)
+      let dreams = append(dreams, bp[0])
+      let seed = bp[1]
+    }
+    let a = learn(plain, dreams, lp, false, 4)
+    let plain = a[0]
+    let lp = a[1]
+    let b = learn_cover(cur, dreams, lc, 4)
+    let cur = b[0]
+    let lc = b[1]
+  }
+  let pf = score(plain, tests)
+  let cf = score(cur, tests)
+  return [line ++ " -> final " ++ str(pf) ++ "/" ++ str(cf), pf, cf]
+}
+
+skill main() -> Any {
+  let tests = test_set()
+  let report = "plain/curious solved of 60, rounds 0..7 then after round 7
+"
+  let tp = 0
+  let tc = 0
+  for sd in [31337, 2718, 1618] {
+    let o = one_seed(sd, tests)
+    let report = report ++ "seed " ++ str(sd) ++ ":" ++ o[0] ++ "
+"
+    let tp = tp + o[1]
+    let tc = tc + o[2]
+  }
+  return report ++ "total final: plain " ++ str(tp) ++ ", curious " ++ str(tc) ++ " (of 180)"
+}

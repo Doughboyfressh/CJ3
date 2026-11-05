@@ -1,0 +1,25 @@
+# Dreaming: Pi invents its own problems and learns to solve them, with no dataset and no outside model. It makes
+# a random straight-line integer program (a "dream"), runs it to get examples, HIDES it, searches for any program
+# fitting the examples, and counts it solved only if the rediscovered program also reproduces the target on
+# HELD-OUT inputs. Every problem is graded perfectly because Pi built the answer first. Deterministic -> golden.
+import "dreamlib.pi"
+
+skill main() -> Any {
+  let alpha = alphabet()
+  let seed = 12345
+  let solved = 0
+  let tried = 0
+  let compressed = 0
+  for d in range(0, 50) {
+    let dt = dream_target(seed, alpha, 3)
+    let target = dt[0]
+    let seed = dt[1]
+    let ex = examples_of(target, 1, 6)
+    let s = solve(alpha, 3, ex)
+    let ok = verifies(s[0], target)
+    let solved = solved + ok
+    let tried = tried + s[1]
+    if ok == 1 and len(s[0]) < len(target) { let compressed = compressed + 1 }
+  }
+  return "dreams 50, solved " ++ str(solved) ++ ", compressed " ++ str(compressed) ++ ", candidates " ++ str(tried)
+}

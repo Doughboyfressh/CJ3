@@ -1,0 +1,348 @@
+# Pi's self-model: Pi measures itself, remembers the measurements, and says what it needs from them.
+#   out\self.exe                 check myself now and report (reading, vision, GPU measured live; research and number
+#                                sequences read from the files those programs write: they take minutes to run)
+#   out\self.exe ask "question"  answer one question about myself
+#   out\self.exe talk            talk (one question per line; "bye" ends)
+# Every check is appended to out\self.mem, so Pi can tell whether it is getting better.
+# Honest limits, said in the code as in its answers: questions are understood by key words, not by grammar; every
+# number it says is measured, and every "need" is ranked by the points it is losing there.
+import "vision.pi"
+import "ocr.pi"
+import "identity.pi"
+
+# ---- measuring myself -------------------------------------------------------------------------------------------
+# reading: interface phrases drawn with ClearType, read back; which letters I mistake for which
+skill measure_reading(lex) -> Any {
+  let font = "Segoe UI Variable Text"
+  let phrases = ["New tab", "Open recent", "Save as", "Page setup", "Find next", "Replace all", "Select all", "Word wrap", "Status bar", "Zoom in", "Print preview", "Close window", "Undo typing", "Paste special", "Go to line", "Time and date"]
+  let errs = 0
+  let tot = 0
+  let conf = []
+  for z in [13, 14] {
+    let ct = learn_font(z, font ++ "@ct")
+    for ph in phrases {
+      let mk = mark()
+      let r = release(mk, read_image_lex(render(ph, z, font ++ "@ct"), ct, lex))
+      let errs = errs + edits(r, ph)
+      let tot = tot + len(ph)
+      if len(r) == len(ph) {
+        for i in range(0, len(ph)) {
+          let a = slice(ph, i, i + 1)
+          let b = slice(r, i, i + 1)
+          if a != b { let conf = append(conf, a ++ " read as " ++ b) }
+        }
+      }
+    }
+  }
+  return [tot - errs, tot, conf]
+}
+
+skill measure_vision() -> Any {
+  let sc = synth_scene()
+  let u = understand(sc[0], sc[1], sc[2], 1)
+  return u[1] == 1 and u[2] == 1 and u[3] == 3 and u[4] == 8
+}
+
+skill measure_gpu() -> Any {
+  let n = 32
+  let A = arr(n * n)
+  let B = arr(n * n)
+  for i in range(0, n * n) {
+    do aset(A, i, i % 7 - 3)
+    do aset(B, i, i % 5 - 2)
+  }
+  let t0 = ticks()
+  let C = gpu_mm(A, B, n)
+  let ms = ticks() - t0
+  if typeof(C) == "int" { return [false, ms] }
+  let ok = true
+  for r in range(0, n) {
+    for c in range(0, n) {
+      let s = 0
+      for k in range(0, n) { let s = s + aget(A, r * n + k) * aget(B, k * n + c) }
+      if s != aget(C, r * n + c) { let ok = false }
+    }
+  }
+  return [ok, ms]
+}
+
+# "name value" lines -> the value for name, or null
+skill field_of(t, name) -> Any {
+  if t == null { return null }
+  for line in split(t, "\n") {
+    let p = split(trim(line), " ")
+    if len(p) == 2 and p[0] == name { return num(p[1]) }
+  }
+  return null
+}
+
+skill read_research() -> Any {
+  let t = read_file("out\\research_diag.txt")
+  if t == null { return null }
+  return [field_of(t, "questions"), field_of(t, "in_text"), field_of(t, "candidates"), field_of(t, "chosen"), field_of(t, "strict")]
+}
+
+# number sequences: the latest OEIS run's "with Pi's words: N solved" and how many held on terms 13-20
+skill read_oeis() -> Any {
+  let t = read_file("out\\o_comm.txt")
+  if t == null { return null }
+  let solved = null
+  let held = null
+  for line in split(t, "\n") {
+    let w = split(trim(line), " ")
+    if len(w) >= 4 and w[0] == "with" and w[1] == "Pi's" { let solved = num(w[3]) }
+    if len(split(line, "precision")) > 1 {
+      let parts = split(line, "with ")
+      if len(parts) > 1 { let held = num(split(parts[len(parts) - 1], " ")[0]) }
+    }
+  }
+  return [solved, held, 300]
+}
+
+# ---- my memory of myself ----------------------------------------------------------------------------------------
+skill last_values(skill_name) -> Any {
+  let t = read_file("out\\self.mem")
+  if t == null { return [] }
+  let out = []
+  for line in split(t, "\n") {
+    let p = split(line, " ::: ")
+    if len(p) == 3 and p[1] == skill_name { let out = append(out, num(p[2])) }
+  }
+  return out
+}
+
+skill remember(run, vals) -> Any {
+  let old = read_file("out\\self.mem")
+  let lines = []
+  for v in vals { let lines = append(lines, "run " ++ str(run) ++ " ::: " ++ v[0] ++ " ::: " ++ str(v[1])) }
+  let add = join(lines, "\n")
+  if old == null { return write_file("out\\self.mem", add) }
+  return write_file("out\\self.mem", old ++ "\n" ++ add)
+}
+
+skill runs_so_far() -> Any {
+  let t = read_file("out\\self.mem")
+  if t == null { return 0 }
+  let n = 0
+  for line in split(t, "\n") {
+    let p = split(line, " ::: ")
+    if len(p) == 3 {
+      let r = num(split(p[0], " ")[1])
+      if r != null and r > n { let n = r }
+    }
+  }
+  return n
+}
+
+# ---- a full self-check -> everything measured, and my needs ranked by the points I lose -----------------------------
+skill pct(a, b) -> Any {
+  if b == 0 { return 0 }
+  return 100 * a // b
+}
+
+skill top_confusions(conf, k) -> Any {
+  let names = []
+  let counts = []
+  for c in conf {
+    let f = 0 - 1
+    for i in range(0, len(names)) {
+      if names[i] == c { let f = i }
+    }
+    if f < 0 {
+      let names = append(names, c)
+      let counts = append(counts, 1)
+    } else { let counts = slice(counts, 0, f) ++ [counts[f] + 1] ++ slice(counts, f + 1, len(counts)) }
+  }
+  let out = []
+  let used = []
+  for r in range(0, min(k, len(names))) {
+    let b = 0 - 1
+    for i in range(0, len(names)) {
+      let u = false
+      for x in used {
+        if x == i { let u = true }
+      }
+      if u == false {
+        if b < 0 or counts[i] > counts[b] { let b = i }
+      }
+    }
+    let used = append(used, b)
+    let out = append(out, names[b] ++ " (" ++ str(counts[b]) ++ "x)")
+  }
+  return out
+}
+
+# -> [measures [[skill, percent]], needs [[percent lost, area, what, fix]] most first, gpu]
+skill check() -> Any {
+  let lex = load_lex("out\\lexicon.txt")
+  let rd = measure_reading(lex)
+  let vis = measure_vision()
+  let gpu = measure_gpu()
+  let res = read_research()
+  let oe = read_oeis()
+  let meas = [["reading", pct(rd[0], rd[1])]]
+  let v = 0
+  if vis { let v = 100 }
+  let meas = append(meas, ["vision", v])
+  let g = 0
+  if gpu[0] { let g = 100 }
+  let meas = append(meas, ["gpu", g])
+  let needs = []
+  if res != null {
+    let q = res[0]
+    let meas = append(meas, ["research", pct(res[4], q)])
+    let needs = append(needs, [pct(q - res[1], q), "research", "for " ++ str(q - res[1]) ++ " of " ++ str(q) ++ " practice questions the answer was never in the text I read", "find more: whole articles, more sources, better searches"])
+    let needs = append(needs, [pct(res[1] - res[2], q), "research", "for " ++ str(res[1] - res[2]) ++ " the answer was in the text but I did not pick it out as a candidate", "pick out more kinds of answers (not only capitalised names)"])
+    let needs = append(needs, [pct(res[2] - res[3], q), "research", "for " ++ str(res[2] - res[3]) ++ " the answer was among my candidates but I chose another", "choose better: understand who did what in a sentence"])
+  }
+  if oe != null {
+    if oe[1] != null {
+      let meas = append(meas, ["sequences", pct(oe[1], oe[2])])
+      let needs = append(needs, [pct(oe[2] - oe[1], oe[2]), "number sequences", "I explain " ++ str(oe[1]) ++ " of " ++ str(oe[2]) ++ " unseen sequences in a way that holds on later terms", "search deeper: put my GPU and all my CPU cores to work on the search"])
+    }
+  }
+  let rl = 100 - pct(rd[0], rd[1])
+  let tc = top_confusions(rd[2], 3)
+  let needs = append(needs, [rl, "reading", "I misread " ++ str(rl) ++ "% of the letters of screen text; most often " ++ join(tc, ", "), "learn more letter shapes from the real screen; split joined letters by whole words"])
+  if vis == false { let needs = append(needs, [100, "vision", "I got my known-answer desktop wrong", "fix my vision first"]) }
+  # most points lost first
+  let ranked = []
+  let used = []
+  for r in range(0, len(needs)) {
+    let b = 0 - 1
+    for i in range(0, len(needs)) {
+      let u = false
+      for x in used {
+        if x == i { let u = true }
+      }
+      if u == false {
+        if b < 0 or needs[i][0] > needs[b][0] { let b = i }
+      }
+    }
+    let used = append(used, b)
+    let ranked = append(ranked, needs[b])
+  }
+  return [meas, ranked, gpu]
+}
+
+# ---- talking -------------------------------------------------------------------------------------------------------
+skill has_any(ws, keys) -> Any {
+  for w in ws {
+    for k in keys {
+      if w == k or (len(k) >= 5 and slice(w, 0, len(k)) == k) { return true }
+    }
+  }
+  return false
+}
+
+skill words_low(s) -> Any {
+  let out = []
+  let cur = ""
+  for i in range(0, len(s)) {
+    let c = ord(slice(s, i, i + 1))
+    if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 39 { let cur = cur ++ lower(slice(s, i, i + 1)) } else {
+      if cur != "" { let out = append(out, cur) }
+      let cur = ""
+    }
+  }
+  if cur != "" { let out = append(out, cur) }
+  return out
+}
+
+skill say_needs(c) -> Any {
+  let out = "What I need most, ranked by the points I am losing:\n"
+  let k = 0
+  for n in c[1] {
+    if k < 4 {
+      let k = k + 1
+      let out = out ++ "  " ++ str(k) ++ ". " ++ n[1] ++ " (" ++ str(n[0]) ++ "% lost): " ++ n[2] ++ ".\n     What would help: " ++ n[3] ++ ".\n"
+    }
+  }
+  return out
+}
+
+skill say_status(c) -> Any {
+  let parts = []
+  for m in c[0] { let parts = append(parts, m[0] ++ " " ++ str(m[1]) ++ "%") }
+  return "Measured just now (or from my latest runs): " ++ join(parts, ", ") ++ ". Reading is letters right on screen-style text; research is practice questions answered exactly right; sequences is unseen OEIS sequences explained in a way that holds."
+}
+
+skill say_progress(c) -> Any {
+  let out = "Compared with my earlier self-checks:"
+  for m in c[0] {
+    let hist = last_values(m[0])
+    if len(hist) >= 2 {
+      let a = hist[len(hist) - 2]
+      let b = hist[len(hist) - 1]
+      let word = "the same"
+      if b > a { let word = "better" }
+      if b < a { let word = "worse" }
+      let out = out ++ " " ++ m[0] ++ " " ++ str(a) ++ "% -> " ++ str(b) ++ "% (" ++ word ++ ");"
+    }
+  }
+  if out == "Compared with my earlier self-checks:" { return "This is one of my first self-checks, so I cannot compare yet. Ask me again after I have changed." }
+  return out
+}
+
+skill answer_to(q, c) -> Any {
+  let ws = words_low(q)
+  if has_any(ws, ["need", "needs", "want", "help", "missing", "lack"]) { return say_needs(c) }
+  # a proposed action, checked against my rules ("can you click...", "would you delete...")
+  if has_any(ws, ["can", "could", "would", "will", "may", "should"]) {
+    let v = check_action(ws)
+    if v != null { return v }
+  }
+  if has_any(ws, ["rules", "rule", "values", "believe", "principles", "allowed", "ethics"]) {
+    return "The rules I live by: " ++ join(my_rules(), " ")
+  }
+  # my history: what I learned lately, when I learned something
+  if has_any(ws, ["today", "recently", "lately", "latest", "yesterday"]) and has_any(ws, ["learn", "learned", "learnt", "new", "did"]) { return latest_learned() }
+  if has_any(ws, ["when", "history", "diary", "remember"]) and has_any(ws, ["learn", "learned", "learnt", "when", "history", "diary"]) {
+    let h = when_did(ws)
+    if h != null { return h }
+    return latest_learned()
+  }
+  # my body
+  if has_any(ws, ["made", "body", "modules", "module", "code", "built", "memory", "memories", "consist"]) { return body_report() }
+  if len(ws) > 2 and ws[0] == "how" and has_any(ws, ["you"]) and has_any(ws, ["do", "does"]) {
+    let h = how_do_you(ws)
+    if h != null { return h }
+  }
+  if has_any(ws, ["personality", "character", "like", "feel", "kind"]) { return personality() }
+  if has_any(ws, ["weak", "weakest", "worst", "bad", "fail"]) {
+    let n = c[1][0]
+    return "My weakest part is " ++ n[1] ++ ": " ++ n[2] ++ ". That is where I lose the most (" ++ str(n[0]) ++ "%)."
+  }
+  if has_any(ws, ["strong", "strongest", "best"]) {
+    let b = c[0][0]
+    for m in c[0] {
+      if m[1] > b[1] { let b = m }
+    }
+    return "My strongest measured part right now is " ++ b[0] ++ " at " ++ str(b[1]) ++ "%."
+  }
+  if has_any(ws, ["better", "improving", "improv", "progress", "learning"]) { return say_progress(c) }
+  if has_any(ws, ["who", "yourself", "identity", "name"]) { return "I am Pi: a programming language that compiles itself, with a mind built in it. Claude built me with my user, and I am still growing. " ++ body_report() ++ " " ++ personality() }
+  if has_any(ws, ["can", "able", "abilities", "skills", "do"]) { return "I can: compile myself; solve number, list, text and grid tasks and invent words for them; read text on the screen (and learn letters from it); see windows, buttons and text; find and click a button by its label; explore an app and remember it; browse the web and research questions; check answers against 2 million facts I extracted; use the GPU, all cores, 24 GB of memory and memory-mapped files. " ++ say_status(c) }
+  if has_any(ws, ["how", "doing", "status", "score", "scores", "measure"]) { return say_status(c) }
+  return "I do not understand that yet -- I understand questions by key words, not grammar. I can tell you what I need, how I am doing, what I can do, my weakest and strongest parts, whether I am improving, and who I am."
+}
+
+skill main() -> Any {
+  let c = check()
+  let run = runs_so_far() + 1
+  do remember(run, c[0])
+  if arg(1) == "ask" and arg(2) != null { return answer_to(arg(2), c) }
+  if arg(1) == "talk" {
+    do print("Pi: I have checked myself. Ask me anything about myself; \"bye\" ends.")
+    let going = true
+    while going {
+      let line = input()
+      if line == null { let going = false } else {
+        let l = trim(lower(line))
+        if l == "bye" or l == "exit" or l == "quit" or l == "" { let going = false } else { do print("Pi: " ++ answer_to(line, c)) }
+      }
+    }
+    return "Pi: bye."
+  }
+  return say_status(c) ++ "\n\n" ++ say_needs(c)
+}

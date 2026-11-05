@@ -1,0 +1,748 @@
+# Pi's own forward pass for Ornith: the checks, benchmarks and experiments (the engine itself is forwardlib.pi)
+import "forwardlib.pi"
+
+skill main() -> Any {
+  # pprof [T]: where a prefill pass of T tokens (default 256) spends its GPU time -- one real pass first (it sets the
+  # routing), then each piece of layer 0 (delta net) and layer 3 (attention) launched 100 times and timed (the tick clock moves in ~15.6 ms steps); scaled to
+  # the 30 delta-net and 10 attention layers. (Repeats overwrite state: numbers only, not outputs.)
+  # tincheck: tokinT (the GPU start of a pass) against the old host way, for 256 tokens at position 5000: the largest
+  # difference in the embeddings X and in the rope table ROPE
+  # xdump FILE [pos0]: 256 fixed tokens through all 40 layers at position pos0 (default 0), the final hidden state X
+  # (256 x 2048 doubles) written to FILE -- two builds' files compared byte for byte prove a kernel change exact
+  # mtest: one d.out-shaped call (n 4096, mode 2) and one a.out-shaped call (n 4096, mode 0) through mseg and through
+  # the prefill path (xprepT + msegw2) on the same real buffers: the largest output difference of each
+  if arg(1) == "mtest" {
+    let m = dev_open(open_model(MODEL()))
+    if typeof(m) == "text" { return m }
+    let ids = []
+    for t in range(0, 256) { let ids = append(ids, (t * 7919 + 17) % 248000) }
+    do dev_reset(m)
+    do dstep(m, ids, 0, NLAYER())
+    do rt_gpu_sync()
+    let eng = m[4]
+    let fs = m[6][0]
+    let ws = m[6][1]
+    let b = eng[0]
+    let L = m[6][2][0]
+    let L3 = m[6][2][3]
+    let out = ""
+    for which in ["a.out", "d.out", "att.dw", "fin.aw"] {
+      let x = ws["FIN"]
+      let z = ws["Z"]
+      let sn = b + L["ssm_norm.weight"][3]
+      let w = L["ssm_out.weight"]
+      let mode = 2
+      if which == "a.out" {
+        let x = ws["ATT"]
+        let z = 0
+        let sn = 0
+        let w = L3["attn_output.weight"]
+        let mode = 0
+      }
+      # the crossings: ATT with d.out's weights (mode 0), FIN with a.out's weights (mode 0)
+      if which == "att.dw" {
+        let x = ws["ATT"]
+        let mode = 0
+      }
+      if which == "fin.aw" {
+        let w = L3["attn_output.weight"]
+        let mode = 0
+      }
+      let segs = [[w, ws["G"], 0]]
+      let ints = [ge_rows(w), w[2], ge_rowbytes(w), 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      let ps = [x, 0, 0, z, sn, b + w[3], ws["G"], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+      do ge_go(fs, "mseg", (2048 + 7) // 8, 256, ps ++ [4096, 256, mode, 1] ++ ints, 0)
+      do rt_gpu_sync()
+      let ya = rt_gpu_get(ws["G"], 256 * 2048)
+      do rt_gpu_dump(ws["G"], 256 * 2048 * 8, "out/mt_old_" ++ which ++ ".bin")
+      do rt_gpu_zero(ws["G"], 256 * 2048 * 8)
+      do ge_mseg(eng, fs, x, 0, 0, z, sn, segs, 4096, 256, mode, 0)
+      do rt_gpu_sync()
+      let yb = rt_gpu_get(ws["G"], 256 * 2048)
+      do rt_gpu_dump(ws["G"], 256 * 2048 * 8, "out/mt_new_" ++ which ++ ".bin")
+      let worst = 0.0
+      let wi = 0
+      let same = 0
+      for i in range(0, 256 * 2048) {
+        let d = abs(ya[i] - yb[i])
+        if d > worst {
+          let worst = d
+          let wi = i
+        }
+        if ya[i] == yb[i] { let same = same + 1 }
+      }
+      if which == "a.out" {
+        do rt_gpu_dump(eng[16], 256 * 4096 * 4, "out\\mt_xp.bin")
+        do rt_gpu_dump(x, 256 * 4096 * 8, "out\\mt_att.bin")
+      }
+      let out = out ++ which ++ " (type " ++ str(w[2]) ++ "): " ++ str(same) ++ " of " ++ str(256 * 2048) ++ " identical, worst " ++ str(worst) ++ " at token " ++ str(wi // 2048) ++ " row " ++ str(wi % 2048) ++ " (mseg " ++ str(ya[wi]) ++ ", new " ++ str(yb[wi]) ++ ")\n"
+    }
+    return out
+  }
+  if arg(1) == "xdump" {
+    let m = dev_open(open_model(MODEL()))
+    if typeof(m) == "text" { return m }
+    let ids = []
+    for t in range(0, 256) { let ids = append(ids, (t * 7919 + 17) % 248000) }
+    let p0 = 0
+    if arg(3) != null { let p0 = rd_int(arg(3)) }
+    do dev_reset(m)
+    if p0 > 0 {
+      let pre = []
+      for t in range(0, p0) { let pre = append(pre, (t * 104729 + 3) % 248000) }
+      let p = 0
+      while p < p0 {
+        let e = p + 256
+        if e > p0 { let e = p0 }
+        do dstep(m, slice(pre, p, e), p, NLAYER())
+        let p = e
+      }
+    }
+    do dstep(m, ids, p0, NLAYER())
+    do rt_gpu_sync()
+    do rt_gpu_dump(m[6][1]["X"], 256 * 2048 * 8, arg(2))
+    return "dumped X after 256 tokens at position " ++ str(p0) ++ " to " ++ arg(2)
+  }
+  if arg(1) == "tincheck" {
+    let m = dev_open(open_model(MODEL()))
+    if typeof(m) == "text" { return m }
+    let ws = m[6][1]
+    let T = 256
+    let ids = []
+    for t in range(0, T) { let ids = append(ids, (t * 7919 + 17) % 248000) }
+    do dstep_in_host(m, ids, 5000)
+    do rt_gpu_sync()
+    let xa = rt_gpu_get(ws["X"], T * 2048)
+    let ra = rt_gpu_get(ws["ROPE"], T * 64)
+    do rt_gpu_zero(ws["X"], T * 2048 * 8)
+    do rt_gpu_zero(ws["ROPE"], T * 64 * 8)
+    do dstep_in(m, ids, 5000)
+    do rt_gpu_sync()
+    let xb = rt_gpu_get(ws["X"], T * 2048)
+    let rb = rt_gpu_get(ws["ROPE"], T * 64)
+    let dx = 0.0
+    let same = 0
+    for i in range(0, T * 2048) {
+      let d = abs(xa[i] - xb[i])
+      if d > dx { let dx = d }
+      if xa[i] == xb[i] { let same = same + 1 }
+    }
+    let dr = 0.0
+    for i in range(0, T * 64) {
+      let d = abs(ra[i] - rb[i])
+      if d > dr { let dr = d }
+    }
+    return "tokinT vs host: embeddings " ++ str(same) ++ " of " ++ str(T * 2048) ++ " identical, largest difference " ++ str(dx) ++ "; rope largest difference " ++ str(dr * 1000000000000.0) ++ "e-12"
+  }
+  if arg(1) == "pprof" {
+    let m = dev_open(open_model(MODEL()))
+    if typeof(m) == "text" { return m }
+    let T = 256
+    if arg(2) != null { let T = rd_int(arg(2)) }
+    let ids = []
+    for t in range(0, T) { let ids = append(ids, 1000 + (t * 7919) % 50000) }
+    do dev_reset(m)
+    let t0 = ticks()
+    do dstep(m, ids, 0, NLAYER())
+    do rt_gpu_sync()
+    let whole = ticks() - t0
+    let t0 = ticks()
+    do dstep(m, ids, T, NLAYER())
+    do rt_gpu_sync()
+    let whole2 = ticks() - t0
+    let eng = m[4]
+    let fs = m[6][0]
+    let ws = m[6][1]
+    let b = eng[0]
+    let st = 0
+    let out = "prefill of " ++ str(T) ++ " tokens: whole pass " ++ str(whole) ++ " ms (cold), " ++ str(whole2) ++ " ms (warm) = " ++ str(T * 1000 // max(1, whole2)) ++ " tokens/s\n"
+    if arg(3) == "graph" {
+      # the real decode step: the whole-token graph (tokin, 40 layers, head), 100 replays
+      let g2 = dgraph2(m)
+      do rt_gpu_graph_go(g2[1], g2[0])
+      do rt_gpu_sync()
+      let t0 = ticks()
+      for r in range(0, 100) { do rt_gpu_graph_go(g2[1], g2[0]) }
+      do rt_gpu_sync()
+      let out = out ++ "decode graph: " ++ str((ticks() - t0) * 10) ++ " us a token\n"
+    }
+    let total = 0
+    for piece in ["d.in", "d.conv", "d.dnet", "d.out", "a.qkv", "a.prep", "a.attn", "a.comb", "a.out", "f.norm", "f.route", "f.egu", "f.sgu", "f.edown", "f.sdown", "f.comb", "h.head", "t.tokin"] {
+      let L = m[6][2][0]
+      let il = 0
+      let reps = 30
+      if slice(piece, 0, 2) == "a." {
+        let L = m[6][2][3]
+        let il = 3
+        let reps = 10
+      }
+      let kc = ws["KC"]
+      let vc = ws["VC"]
+      let nt = (T * 2048 + 63) // 64
+      # "graph" (decode-like): the 100 launches are captured into a graph and replayed 10 times -- no host launches
+      let gm = arg(3) == "graph"
+      do rt_gpu_sync()
+      if gm {
+        let st = rt_gpu_stream()
+        do rt_gpu_capture(st)
+      }
+      let t0 = ticks()
+      for r in range(0, 100) {
+        if piece == "d.in" { do ge_mseg(eng, fs, ws["X"], b + L["attn_norm.weight"][3], 0, 0, 0, [[L["attn_qkv.weight"], ws["MIX"], 0], [L["attn_gate.weight"], ws["Z"], 0], [L["ssm_beta.weight"], ws["B"], 0], [L["ssm_alpha.weight"], ws["A"], 0]], 2048, T, 1, st) }
+        if piece == "d.conv" { do ge_go(fs, "conv", 128, 64, [ws["MIX"], ws["HIST"], b + L["ssm_conv1d.weight"][3], ws["CV"], T], st) }
+        if piece == "d.dnet" { do ge_go(fs, "dnet4", 512, 32, [eng[10], ws["CV"], ws["B"], ws["A"], b + L["ssm_dt.bias"][3], b + L["ssm_a"][3], ws["FIN"], T], st) }
+        if piece == "d.out" { do ge_mseg(eng, fs, ws["FIN"], 0, 0, ws["Z"], b + L["ssm_norm.weight"][3], [[L["ssm_out.weight"], ws["H"], ws["X"]]], 4096, T, 2, st) }
+        if piece == "a.qkv" { do ge_mseg(eng, fs, ws["X"], b + L["attn_norm.weight"][3], 0, 0, 0, [[L["attn_q.weight"], ws["QF"], 0], [L["attn_k.weight"], ws["KF"], 0], [L["attn_v.weight"], ws["VF"], 0]], 2048, T, 1, st) }
+        if piece == "a.prep" { do ge_go(fs, "qkprep", T * 18, 256, [ws["QF"], ws["KF"], ws["VF"], b + L["attn_q_norm.weight"][3], b + L["attn_k_norm.weight"][3], ws["ROPE"], ws["Q"], kc, vc, ws["POS"], 0], st) }
+        if piece == "a.attn" { do ge_go(fs, "attn2", T * 16 * ge_SPLITS(), 256, [ws["Q"], kc, vc, ws["POS"], ws["PM"], ws["PL"], ws["PO"], ge_SPLITS()], st) }
+        if piece == "a.comb" { do ge_go(fs, "acomb", T * 16, 256, [ws["PM"], ws["PL"], ws["PO"], ws["QF"], ws["ATT"], ge_SPLITS()], st) }
+        if piece == "a.out" { do ge_mseg(eng, fs, ws["ATT"], 0, 0, 0, 0, [[L["attn_output.weight"], ws["H"], ws["X"]]], 4096, T, 0, st) }
+        if piece == "f.norm" { do ge_mseg(eng, fs, ws["H"], b + L["post_attention_norm.weight"][3], ws["XN"], 0, 0, [[L["ffn_gate_inp.weight"], ws["LG"], 0], [L["ffn_gate_inp_shexp.weight"], ws["SG"], 0]], 2048, T, 1, st) }
+        if piece == "f.route" { do ge_go(fs, "route", T, 256, [ws["LG"], ws["E"], ws["W"]], st) }
+        if piece == "f.egu" { do ge_mgu(eng, fs, L["ffn_gate_exps.weight"], L["ffn_up_exps.weight"], 512, ws["E"], T * 8, ws["XN"], 8, ws["HX"], st) }
+        if piece == "f.sgu" { do ge_mgu(eng, fs, L["ffn_gate_shexp.weight"], L["ffn_up_shexp.weight"], 512, ws["ZEROS"], T, ws["XN"], 1, ws["SHH"], st) }
+        if piece == "f.edown" { do ge_mxd(eng, L["ffn_down_exps.weight"], 2048, ws["E"], T * 8, ws["HX"], 1, ws["D"], st) }
+        if piece == "f.sdown" { do ge_mseg(eng, fs, ws["SHH"], 0, 0, 0, 0, [[L["ffn_down_shexp.weight"], ws["SHD"], 0]], 512, T, 0, st) }
+        if piece == "f.comb" { do ge_go(fs, "combine", nt, 64, [ws["H"], ws["D"], ws["W"], ws["SG"], ws["SHD"], ws["X"], T], st) }
+        if piece == "h.head" { do dhead_go(m, 0, st) }
+        if piece == "t.tokin" { do ge_go(fs, "tokin", 1, 256, [ws["AMAX"], ws["POS"], ws["TOKS"], eng[0] + tensor(m, "token_embd.weight")[3], ws["X"], ws["ROPE"], ge_rowbytes(tensor(m, "token_embd.weight")), tensor(m, "token_embd.weight")[2]], st) }
+      }
+      if gm == false { do rt_gpu_sync() }
+      let each = (ticks() - t0) * 1000 // 100
+      if gm {
+        let g = rt_gpu_capture_end(st)
+        do rt_gpu_graph_go(g, st)
+        do rt_gpu_sync()
+        let t0 = ticks()
+        for r in range(0, 100) { do rt_gpu_graph_go(g, st) }
+        do rt_gpu_sync()
+        let each = (ticks() - t0) * 1000 // 10000
+        let st = 0
+      }
+      let layers = 30
+      if slice(piece, 0, 2) == "a." { let layers = 10 }
+      if slice(piece, 0, 2) == "f." { let layers = 40 }
+      if slice(piece, 0, 2) == "h." or slice(piece, 0, 2) == "t." { let layers = 1 }
+      let total = total + each * layers
+      let out = out ++ "  " ++ piece ++ ": " ++ str(each) ++ " us each x " ++ str(layers) ++ " layers = " ++ str(each * layers) ++ " us\n"
+    }
+    return out ++ "  sum of the pieces: " ++ str(total) ++ " us"
+  }
+  # predict W1 W2 ...: the prompt's tokens (the first as written, the rest with a leading space), Pi's own forward
+  # pass through all 41 layers and the output head -> Pi's top 5 next tokens
+  # q6check: the fast Q6_K row decoder against the verified one, on output.weight rows 0, 1000 and 248319
+  if arg(1) == "q6check" {
+    let m = open_model(MODEL())
+    let t = tensor(m, "output.weight")
+    let bad = 0
+    for r in [0, 1000, 248319] {
+      let a = row(m, t, r)
+      let b = read_bytes(m[3], m[1] + t[3] + r * 1680, 1680)
+      let w = arr(2048)
+      do deq_q6k_row(b, 8, w)
+      for i in range(0, 2048) {
+        if aget(a, i) != aget(w, i) { let bad = bad + 1 }
+      }
+    }
+    return "fast Q6_K decoder: " ++ str(bad) ++ " differences in 3 x 2048 weights"
+  }
+  # gprof: what each piece of a layer costs on the GPU path (100 repeats each)
+  if arg(1) == "gprof" {
+    let m = open_model(MODEL())
+    let eng = ge_open(m)
+    if len(eng) == 1 { return eng[0] }
+    let gm = append(m, eng)
+    let e = wrow(m, tensor(m, "token_embd.weight"), 9338)
+    let x = []
+    for j in range(0, 2048) { let x = append(x, aget(e, j) * 1.0 / 16777216.0) }
+    let tg = tensor(m, "blk.0.ffn_gate_exps.weight")
+    let out = ""
+    let t = ticks()
+    for i in range(0, 100) { do mv(gm, tg, 512, 512, x) }
+    let out = out ++ "mv 512 rows: " ++ str((ticks() - t) * 10) ++ " us\n"
+    let t = ticks()
+    for i in range(0, 100) { do tensor(m, "blk.30.ffn_down_shexp.weight") }
+    let out = out ++ "tensor lookup: " ++ str((ticks() - t) * 10) ++ " us\n"
+    let t = ticks()
+    for i in range(0, 100) { do f32_vec(m, "blk.0.post_attention_norm.weight", 2048) }
+    let out = out ++ "f32_vec 2048: " ++ str((ticks() - t) * 10) ++ " us\n"
+    let w = f32_vec(m, "blk.0.post_attention_norm.weight", 2048)
+    let t = ticks()
+    for i in range(0, 100) { do rmsnorm(x, w) }
+    let out = out ++ "rmsnorm 2048: " ++ str((ticks() - t) * 10) ++ " us\n"
+    let t = ticks()
+    for i in range(0, 100) {
+      let y = []
+      for j in range(0, 2048) { let y = append(y, x[j] + x[j]) }
+    }
+    let out = out ++ "2048 appends: " ++ str((ticks() - t) * 10) ++ " us\n"
+    let t = ticks()
+    for i in range(0, 100) { do slice(x, 128, 256) }
+    let out = out ++ "slice 128: " ++ str((ticks() - t) * 10) ++ " us\n"
+    let t = ticks()
+    for i in range(0, 10) { do moe(gm, x, 5) }
+    let out = out ++ "moe (whole): " ++ str((ticks() - t) * 100) ++ " us\n"
+    return out
+  }
+  # gpucheck: the GPU engine's kernels against Pi's exact CPU rows, on Q4_K, Q6_K and F32 tensors
+  if arg(1) == "gpucheck" {
+    let t0 = ticks()
+    let m = open_model(MODEL())
+    let eng = ge_open(m)
+    if len(eng) == 1 { return eng[0] }
+    let out = "engine open: " ++ str(eng[8]) ++ " bytes on the GPU in " ++ str(ticks() - t0) ++ " ms\n"
+    let gm = append(m, eng)
+    let e = wrow(m, tensor(m, "token_embd.weight"), 9338)
+    let x = []
+    for j in range(0, 2048) { let x = append(x, aget(e, j) * 1.0 / 16777216.0) }
+    let x = rmsnorm(x, f32_vec(m, "blk.0.attn_norm.weight", 2048))
+    for name in ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.attn_qkv.weight", "blk.0.ffn_gate_inp.weight", "output.weight", "blk.3.attn_q.weight", "blk.0.ssm_alpha.weight"] {
+      let t = tensor(m, name)
+      let r0 = 40
+      let k = 24
+      if t[1][1] < 64 { let r0 = 0 }
+      if t[1][1] < 24 { let k = t[1][1] }
+      let tc = ticks()
+      let a = mv(m, t, r0, k, x)
+      let tcpu = ticks() - tc
+      let tg = ticks()
+      let b = mv(gm, t, r0, k, x)
+      let tgpu = ticks() - tg
+      let worst = 0.0
+      let big = 0.0
+      for i in range(0, k) {
+        let d = a[i] - b[i]
+        if d < 0.0 { let d = 0.0 - d }
+        if d > worst { let worst = d }
+        let v = a[i]
+        if v < 0.0 { let v = 0.0 - v }
+        if v > big { let big = v }
+      }
+      let out = out ++ "  " ++ name ++ " (type " ++ str(t[2]) ++ ", n " ++ str(t[1][0]) ++ "): max |cpu - gpu| " ++ str(worst) ++ " of max |value| " ++ str(big) ++ "   cpu " ++ str(tcpu) ++ " ms, gpu " ++ str(tgpu) ++ " ms\n"
+    }
+    return out
+  }
+  # batch JOBS OUT: Ornith experiments -- each line of JOBS is "id maxtokens id1 id2 ..." (a prompt as token ids);
+  # each prompt runs on the GPU (prompt in passes of up to 256, then the whole-step graph 32 tokens at a time) until
+  # <|im_end|> or maxtokens; OUT gets "id count ms tokens..." per job (rewritten after every job)
+  # capture JOBS DIR STRIDE: Ornith experiments -- each line of JOBS is "id t1 t2 ..." (a whole sequence); it is run
+  # through the model in passes of 256 and every layer's expert-block output at positions that are multiples of STRIDE
+  # is written to DIR\<id>_<pass>.bin (float32 [40 layers][256 / STRIDE rows][2048])
+  if arg(1) == "capture" {
+    let m = dev_open(open_model(MODEL()))
+    if typeof(m) == "text" { return m }
+    let stride = rd_int(arg(4))
+    let rows = (ge_TMAX() + stride - 1) // stride
+    let lb = rows * 2048 * 4
+    let buf = rt_gpu_alloc(NLAYER() * lb)
+    let m = with_hooks(m, {"abl": null, "cap": [buf, stride, lb]})
+    let nj = 0
+    for ln in split(read_file(arg(2)), "\n") {
+      let ps = split(trim(ln), " ")
+      if len(ps) > 1 {
+        let mm = mark()
+        let ids = []
+        for k in range(1, len(ps)) { let ids = append(ids, rd_int(ps[k])) }
+        do dev_reset(m)
+        let p = 0
+        let c = 0
+        while p < len(ids) {
+          let e = p + ge_TMAX()
+          if e > len(ids) { let e = len(ids) }
+          do dstep(m, slice(ids, p, e), p, NLAYER())
+          do rt_gpu_dump(buf, NLAYER() * lb, arg(3) ++ "\\" ++ ps[0] ++ "_" ++ str(c) ++ ".bin")
+          let p = e
+          let c = c + 1
+        }
+        do release(mm, 0)
+        let nj = nj + 1
+      }
+    }
+    return "capture: " ++ str(nj) ++ " sequences"
+  }
+  # meancap JOBS OUT: Ornith experiments -- each line of JOBS is "id n p1 c1 ... pn cn t1 t2 ..." (a whole sequence and
+  # n marked positions with classes 1..3); the sequence runs through the model in passes of 256 and every layer's
+  # expert-block output at the marked positions is summed per class on the GPU; OUT gets the sums (doubles
+  # [40 layers][4 classes][2048])
+  if arg(1) == "meancap" {
+    let m = dev_open(open_model(MODEL()))
+    if typeof(m) == "text" { return m }
+    let ws = m[6][1]
+    let sums = rt_gpu_alloc(NLAYER() * 4 * 2048 * 8)
+    do rt_gpu_zero(sums, NLAYER() * 4 * 2048 * 8)
+    let m = with_hooks(m, {"abl": null, "cap": null, "acc": sums})
+    let nj = 0
+    for ln in split(read_file(arg(2)), "\n") {
+      let ps = split(trim(ln), " ")
+      if len(ps) > 2 {
+        let mm = mark()
+        let nm = rd_int(ps[1])
+        let ids = []
+        for k in range(2 + 2 * nm, len(ps)) { let ids = append(ids, rd_int(ps[k])) }
+        do dev_reset(m)
+        let p = 0
+        while p < len(ids) {
+          let e = p + ge_TMAX()
+          if e > len(ids) { let e = len(ids) }
+          let mask = arr(e - p)
+          for k in range(0, e - p) { do aset(mask, k, 0) }
+          for k in range(0, nm) {
+            let q = rd_int(ps[2 + 2 * k])
+            if q >= p and q < e { do aset(mask, q - p, rd_int(ps[3 + 2 * k])) }
+          }
+          do rt_gpu_put(ws["MASK"], mask)
+          do dstep(m, slice(ids, p, e), p, NLAYER())
+          let p = e
+        }
+        do release(mm, 0)
+        let nj = nj + 1
+      }
+    }
+    do rt_gpu_dump(sums, NLAYER() * 4 * 2048 * 8, arg(3))
+    return "meancap: " ++ str(nj) ++ " sequences"
+  }
+  if arg(1) == "batch" {
+    let m = dev_open(open_model(MODEL()))
+    if typeof(m) == "text" { return m }
+    if arg(4) != null { let m = with_edits(m, arg(4)) }
+    let g2 = dgraph2(m)
+    if len(g2) == 1 { return g2[0] }
+    let jobs = split(read_file(arg(2)), "\n")
+    let done = ""
+    let nj = 0
+    for ln in jobs {
+      let ps = split(trim(ln), " ")
+      if len(ps) > 2 {
+        let mm = mark()
+        let ids = []
+        for k in range(2, len(ps)) { let ids = append(ids, rd_int(ps[k])) }
+        let tq = ticks()
+        let gen = drun(m, g2, ids, rd_int(ps[1]))
+        let sv = []
+        for v in gen { let sv = append(sv, str(v)) }
+        let line = ps[0] ++ " " ++ str(len(gen)) ++ " " ++ str(ticks() - tq) ++ " " ++ join(sv, " ") ++ "\n"
+        let done = release(mm, done ++ line)
+        do write_file(arg(3), done)
+        let nj = nj + 1
+      }
+    }
+    return "batch: " ++ str(nj) ++ " jobs"
+  }
+  # ---- every activation on the GPU ----
+  # dlayers N W1 W2 ...: N layers on the GPU-resident path and on the checked host path -> the largest difference in
+  #   the hidden states (localises any kernel fault)
+  # dcheck W1 W2 ...: the whole prompt pass on the GPU -> top 5, and the same through the host path
+  # dgenerate N W1 W2 ...: the prompt, then N tokens, everything on the GPU (only each token's id comes back)
+  # dgencheck W1 W2 ...: one incremental token on the GPU against a full GPU pass over the same sequence
+  if arg(1) == "dlayers" or arg(1) == "dcheck" or arg(1) == "dgenerate" or arg(1) == "dgenerate1" or arg(1) == "dgencheck" {
+    let t0 = ticks()
+    let m = dev_open(open_model(MODEL()))
+    if typeof(m) == "text" { return m }
+    let first = 2
+    let count = 0
+    if arg(1) == "dlayers" or arg(1) == "dgenerate" or arg(1) == "dgenerate1" {
+      let first = 3
+      let count = rd_int(arg(2))
+    }
+    let ids = []
+    let i = first
+    while arg(i) != null {
+      let id = find_token(m, arg(i), i > first)
+      if id < 0 { return "no single token for " ++ arg(i) }
+      let ids = append(ids, id)
+      let i = i + 1
+    }
+    let ws = m[6][1]
+    do print("engine + activation kernels ready in " ++ str(ticks() - t0) ++ " ms; prompt tokens " ++ str(ids))
+    let T = len(ids)
+    if arg(1) == "dlayers" {
+      do dev_reset(m)
+      let td = ticks()
+      do dstep(m, ids, 0, count)
+      let xd = rt_gpu_get(ws["X"], T * 2048)
+      let tdev = ticks() - td
+      do dev_reset(m)
+      let xs = []
+      for id in ids { let xs = append(xs, embed(m, id)) }
+      let r = step_n(m, xs, new_caches(m), 0, count)
+      let worst = 0.0
+      let big = 0.0
+      for t in range(0, T) {
+        for j in range(0, 2048) {
+          let d = xd[t * 2048 + j] - r[0][t][j]
+          if d < 0.0 { let d = 0.0 - d }
+          if d > worst { let worst = d }
+          let v = r[0][t][j]
+          if v < 0.0 { let v = 0.0 - v }
+          if v > big { let big = v }
+        }
+      }
+      return str(count) ++ " layers: GPU-resident " ++ str(tdev) ++ " ms; max |difference| " ++ str(worst) ++ " of max |value| " ++ str(big)
+    }
+    do dev_reset(m)
+    let tp = ticks()
+    do dstep(m, ids, 0, NLAYER())
+    let top = dhead(m, T - 1, 5)
+    let out = "prompt pass on the GPU " ++ str(ticks() - tp) ++ " ms:"
+    for x in top { let out = out ++ " [" ++ show(token(m, x[1])) ++ "] " ++ str(x[0]) }
+    if arg(1) == "dcheck" {
+      do dev_reset(m)
+      let xs = []
+      for id in ids { let xs = append(xs, embed(m, id)) }
+      let th = ticks()
+      let r = step(m, xs, new_caches(m), 0)
+      let hb = head(m, r[0][T - 1], 5)
+      let out = out ++ "\nhost path " ++ str(ticks() - th) ++ " ms:"
+      for x in hb { let out = out ++ " [" ++ show(token(m, x[1])) ++ "] " ++ str(x[0]) }
+      return out
+    }
+    do print(out)
+    let nxt = top[0][1]
+    let gr = dgraph(m)
+    if len(gr) == 1 { return gr[0] }
+    if arg(2) == "prof" {
+      # true GPU time per kernel for one decode token: 1000 launches of one kernel recorded as a graph, replayed
+      let out = "GPU time per call, one token (calls per token):\n"
+      let tq = ticks()
+      for k in range(0, 100) { do rt_gpu_graph_go(gr[1], gr[0]) }
+      do rt_gpu_sync()
+      let out = out ++ "  whole token (graph): " ++ str((ticks() - tq) * 10) ++ " us\n"
+      for w in ["mq 30", "mo 30", "ma 10", "mao 10", "mr 40", "mgr 40", "mgs 40", "edown 40", "msd 40", "mh 1", "dnet2 30", "conv 30", "route 40", "combine 40", "attn 10", "qkprep 10"] {
+        let nm = split(w, " ")[0]
+        let st = rt_gpu_stream()
+        do rt_gpu_capture(st)
+        for k in range(0, 1000) { do prof_one(m, nm, st) }
+        let g = rt_gpu_capture_end(st)
+        do rt_gpu_graph_go(g, st)
+        do rt_gpu_sync()
+        let tq = ticks()
+        for k in range(0, 4) { do rt_gpu_graph_go(g, st) }
+        do rt_gpu_sync()
+        let us = (ticks() - tq) * 1000 // 4000
+        let out = out ++ "  " ++ w ++ ": " ++ str((ticks() - tq) // 4) ++ " ns-ish x1000 -> " ++ str(us) ++ " us each, " ++ str(us * rd_int(split(w, " ")[1])) ++ " us a token\n"
+      }
+      return out
+    }
+    if arg(1) == "dgencheck" {
+      let ti = ticks()
+      do dstep_in(m, [nxt], T)
+      do rt_gpu_graph_go(gr[1], gr[0])
+      let a = dhead(m, 0, 5)
+      let tinc = ticks() - ti
+      do dev_reset(m)
+      do dstep(m, ids ++ [nxt], 0, NLAYER())
+      let bb = dhead(m, T, 5)
+      let out = "after [" ++ show(token(m, nxt)) ++ "]:\n  incremental (" ++ str(tinc) ++ " ms):"
+      for x in a { let out = out ++ " [" ++ show(token(m, x[1])) ++ "] " ++ str(x[0]) }
+      let out = out ++ "\n  full pass:"
+      for x in bb { let out = out ++ " [" ++ show(token(m, x[1])) ++ "] " ++ str(x[0]) }
+      return out
+    }
+    let text = ""
+    for w in ids { let text = text ++ show(token(m, w)) }
+    if arg(1) == "dgenerate" {
+      # everything on the GPU: replay the whole step count times, then read the tokens back once
+      let g2 = dgraph2(m)
+      if len(g2) == 1 { return g2[0] }
+      do rt_gpu_put(ws["POS"] + 8, [T * 1.0])
+      let tg = ticks()
+      for k in range(0, count) { do rt_gpu_graph_go(g2[1], g2[0]) }
+      do rt_gpu_sync()
+      let el = ticks() - tg
+      let got = rt_gpu_get(ws["TOKS"] + 8 * T, count)
+      let last = rt_gpu_get(ws["AMAX"], 2)
+      for v in got { let text = text ++ show(token(m, r2i(v, 0))) }
+      let text = text ++ show(token(m, r2i(last[1], 0)))
+      return "generated " ++ str(count) ++ " tokens on the GPU in " ++ str(el) ++ " ms (" ++ str(count * 1000 // (el + 1)) ++ " tokens/s):\n" ++ text
+    }
+    let tg = ticks()
+    let pos = T
+    for k in range(0, count) {
+      let text = text ++ show(token(m, nxt))
+      let mm = mark()
+      do dstep_in(m, [nxt], pos)
+      do rt_gpu_graph_go(gr[1], gr[0])
+      let r = rt_gpu_get(ws["AMAX"], 2)
+      let nxt = release(mm, r2i(r[1], 0))
+      let pos = pos + 1
+    }
+    let text = text ++ show(token(m, nxt))
+    let el = ticks() - tg
+    return "generated " ++ str(count) ++ " tokens in " ++ str(el) ++ " ms (" ++ str(count * 1000 // (el + 1)) ++ " tokens/s, " ++ str(el // (count + 1)) ++ " ms each):\n" ++ text
+  }
+  # generate N W1 W2 ...: the prompt in one pass, then N tokens one pass each, greedy, every layer's memory kept
+  # gencheck W1 W2 ...: one incremental token checked against a full pass over the same sequence
+  if arg(1) == "generate" or arg(1) == "gencheck" {
+    let t0 = ticks()
+    let m = open_model(MODEL())
+    let eng = ge_open(m)
+    if len(eng) == 1 { return eng[0] }
+    let m = append(append(m, eng), f32_cache(m))
+    let first = 2
+    let count = 0
+    if arg(1) == "generate" {
+      let first = 3
+      let count = rd_int(arg(2))
+    }
+    let ids = []
+    let i = first
+    while arg(i) != null {
+      let id = find_token(m, arg(i), i > first)
+      if id < 0 { return "no single token for " ++ arg(i) }
+      let ids = append(ids, id)
+      let i = i + 1
+    }
+    do print("engine ready in " ++ str(ticks() - t0) ++ " ms; prompt tokens " ++ str(ids))
+    let tc = ticks()
+    let caches = new_caches(m)
+    do print("conv taps decoded in " ++ str(ticks() - tc) ++ " ms")
+    do ge_reset(eng)
+    let xs = []
+    for id in ids { let xs = append(xs, embed(m, id)) }
+    let tp = ticks()
+    let r = step(m, xs, caches, 0)
+    let caches = r[1]
+    let top = head(m, r[0][len(xs) - 1], 5)
+    do print("prompt pass " ++ str(ticks() - tp) ++ " ms -> next token [" ++ show(token(m, top[0][1])) ++ "] logit " ++ str(top[0][0]))
+    let nxt = top[0][1]
+    if arg(1) == "gencheck" {
+      let ti = ticks()
+      let r2 = step(m, [embed(m, nxt)], caches, len(ids))
+      let a = head(m, r2[0][0], 5)
+      let tinc = ticks() - ti
+      let full = forward(m, ids ++ [nxt])
+      let b = head(m, full[len(full) - 1], 5)
+      let out = "after [" ++ show(token(m, nxt)) ++ "]:\n  incremental (" ++ str(tinc) ++ " ms):"
+      for x in a { let out = out ++ " [" ++ show(token(m, x[1])) ++ "] " ++ str(x[0]) }
+      let out = out ++ "\n  full pass:"
+      for x in b { let out = out ++ " [" ++ show(token(m, x[1])) ++ "] " ++ str(x[0]) }
+      let worst = 0.0
+      for k in range(0, 5) {
+        let d = a[k][0] - b[k][0]
+        if d < 0.0 { let d = 0.0 - d }
+        if d > worst { let worst = d }
+        if a[k][1] != b[k][1] { let worst = 1000000.0 }
+      }
+      return out ++ "\n  max logit difference " ++ str(worst)
+    }
+    let text = ""
+    for w in ids { let text = text ++ show(token(m, w)) }
+    let tg = ticks()
+    let pos = len(ids)
+    for k in range(0, count) {
+      let text = text ++ show(token(m, nxt))
+      let ts = ticks()
+      let mm = mark()
+      let r = step(m, [embed(m, nxt)], caches, pos)
+      let best = head(m, r[0][0], 1)
+      let kept = release(mm, [r[1], best[0][1]])
+      let caches = kept[0]
+      let nxt = kept[1]
+      let pos = pos + 1
+      do print("  token " ++ str(k + 1) ++ " (" ++ str(ticks() - ts) ++ " ms): [" ++ show(token(m, nxt)) ++ "]")
+    }
+    let text = text ++ show(token(m, nxt))
+    let el = ticks() - tg
+    return "generated " ++ str(count) ++ " tokens in " ++ str(el) ++ " ms (" ++ str(count * 1000 // (el + 1)) ++ " tokens/s):\n" ++ text
+  }
+  if arg(1) == "predict" or arg(1) == "gpredict" {
+    let t0 = ticks()
+    let m = open_model(MODEL())
+    if arg(1) == "gpredict" {
+      let eng = ge_open(m)
+      if len(eng) == 1 { return eng[0] }
+      do print("GPU engine: " ++ str(eng[8]) ++ " bytes of the model on the GPU in " ++ str(ticks() - t0) ++ " ms")
+      let m = append(append(m, eng), f32_cache(m))
+    }
+    let ids = []
+    let i = 2
+    while arg(i) != null {
+      let id = find_token(m, arg(i), i > 2)
+      if id < 0 { return "no single token for " ++ arg(i) }
+      let ids = append(ids, id)
+      let i = i + 1
+    }
+    do print("prompt token ids " ++ str(ids) ++ "  (" ++ str(ticks() - t0) ++ " ms so far)")
+    let tf = ticks()
+    let xs = forward(m, ids)
+    # the final hidden state, kept so the head can be rerun without the whole pass
+    let fl = []
+    for v in xs[len(xs) - 1] { let fl = append(fl, str(v)) }
+    let fname = "out\\piforward_final.txt"
+    if len(m) > 4 { let fname = "out\\piforward_final_gpu.txt" }
+    do write_file(fname, join(fl, " "))
+    do print("forward pass " ++ str(ticks() - tf) ++ " ms")
+    let th = ticks()
+    let top = head(m, xs[len(xs) - 1], 5)
+    do print("output head " ++ str(ticks() - th) ++ " ms")
+    let out = "Pi's next-token prediction (" ++ str((ticks() - t0) // 1000) ++ " s total):\n"
+    for x in top { let out = out ++ "  " ++ str(x[1]) ++ " [" ++ token(m, x[1]) ++ "]  logit " ++ str(x[0]) ++ "\n" }
+    return out
+  }
+  # lin LAYER t1 t2 ...: the linear-attention layer over the tokens' embeddings; the last position's output
+  if arg(1) == "lin" {
+    let t0 = ticks()
+    let m = open_model(MODEL())
+    let layer = rd_int(arg(2))
+    let xs = []
+    let i = 3
+    while arg(i) != null {
+      let e = wrow(m, tensor(m, "token_embd.weight"), rd_int(arg(i)))
+      let x = []
+      for j in range(0, 2048) { let x = append(x, aget(e, j) * 1.0 / 16777216.0) }
+      let xs = append(xs, x)
+      let i = i + 1
+    }
+    let outs = linear_attn(m, xs, layer)
+    let last = outs[len(outs) - 1]
+    let ys = []
+    for j in range(0, 8) { let ys = append(ys, str(last[j])) }
+    let mx = 0.0
+    for v in last {
+      if v > mx { let mx = v }
+      if 0.0 - v > mx { let mx = 0.0 - v }
+    }
+    return "linear layer " ++ str(layer) ++ ", " ++ str(len(xs)) ++ " tokens (" ++ str(ticks() - t0) ++ " ms)\n  last out[0..8] " ++ join(ys, " ") ++ "\n  max |out| " ++ str(mx)
+  }
+  # attn LAYER t1 t2 ...: the attention layer over the tokens' embeddings; the last position's output
+  if arg(1) == "attn" {
+    let t0 = ticks()
+    let m = open_model(MODEL())
+    let layer = rd_int(arg(2))
+    let xs = []
+    let i = 3
+    while arg(i) != null {
+      let e = wrow(m, tensor(m, "token_embd.weight"), rd_int(arg(i)))
+      let x = []
+      for j in range(0, 2048) { let x = append(x, aget(e, j) * 1.0 / 16777216.0) }
+      let xs = append(xs, x)
+      let i = i + 1
+    }
+    let outs = attention(m, xs, layer)
+    let last = outs[len(outs) - 1]
+    let ys = []
+    for j in range(0, 8) { let ys = append(ys, str(last[j])) }
+    let mx = 0.0
+    for v in last {
+      if v > mx { let mx = v }
+      if 0.0 - v > mx { let mx = 0.0 - v }
+    }
+    return "layer " ++ str(layer) ++ ", " ++ str(len(xs)) ++ " tokens (" ++ str(ticks() - t0) ++ " ms)\n  last out[0..8] " ++ join(ys, " ") ++ "\n  max |out| " ++ str(mx)
+  }
+  if arg(1) == "moe" {
+    let t0 = ticks()
+    let m = open_model(MODEL())
+    let tok = rd_int(arg(2))
+    let layer = rd_int(arg(3))
+    let e = wrow(m, tensor(m, "token_embd.weight"), tok)
+    let x = []
+    for i in range(0, 2048) { let x = append(x, aget(e, i) * 1.0 / 16777216.0) }
+    let r = moe(m, x, layer)
+    let ws = []
+    for w in r[2] { let ws = append(ws, str(w)) }
+    let ys = []
+    for i in range(0, 8) { let ys = append(ys, str(r[0][i])) }
+    return "token " ++ str(tok) ++ " layer " ++ str(layer) ++ " (" ++ str(ticks() - t0) ++ " ms)\n  experts " ++ str(r[1]) ++ "\n  weights " ++ join(ws, " ") ++ "\n  shared gate " ++ str(r[3]) ++ "\n  out[0..8] " ++ join(ys, " ")
+  }
+  return "usage: piforward.exe moe TOKEN LAYER"
+}

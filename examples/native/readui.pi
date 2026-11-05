@@ -1,0 +1,46 @@
+# Reading real-screen text: interface phrases at interface sizes (12-15 px), in Windows 11's interface font, drawn with
+# ClearType like the screen (coloured letter edges). Read three ways:
+#   grey letters        -- templates learned from greyscale smoothing (how Pi learned until now)
+#   ClearType letters   -- templates learned from ClearType itself
+#   + words             -- ClearType letters, each word settled by Pi's vocabulary
+# Phrases are never learned whole: templates are single letters. Score: characters right (1 - edits / length).
+import "ocr.pi"
+
+skill pct(e, n) -> Any { return str(100 - 100 * e // n) ++ "%" }
+
+skill main() -> Any {
+  let font = "Segoe UI Variable Text"
+  let sizes = [12, 13, 14, 15]
+  let phrases = ["New tab", "Open recent", "Save as", "Page setup", "Find next", "Replace all", "Select all", "Word wrap", "Status bar", "Zoom in", "Print preview", "Close window", "Undo typing", "Paste special", "Go to line", "Time and date"]
+  let lex = load_lex("out\\lexicon.txt")
+  let out = "interface text, " ++ font ++ ", drawn with ClearType\n"
+  let t0 = 0
+  let t1 = 0
+  let t2 = 0
+  let tl = 0
+  for z in sizes {
+    let grey = learn_font(z, font)
+    let ct = learn_font(z, font ++ "@ct")
+    let e0 = 0
+    let e1 = 0
+    let e2 = 0
+    let ln = 0
+    let sample = ""
+    for ph in phrases {
+      let mm = mark()
+      let img = render(ph, z, font ++ "@ct")
+      let rs = release(mm, [read_image(img, grey), read_image(img, ct), read_image_lex(img, ct, lex)])
+      let e0 = e0 + edits(rs[0], ph)
+      let e1 = e1 + edits(rs[1], ph)
+      let e2 = e2 + edits(rs[2], ph)
+      let ln = ln + len(ph)
+      if sample == "" { let sample = rs[0] ++ " / " ++ rs[1] ++ " / " ++ rs[2] }
+    }
+    let t0 = t0 + e0
+    let t1 = t1 + e1
+    let t2 = t2 + e2
+    let tl = tl + ln
+    let out = out ++ "  " ++ str(z) ++ "px: grey letters " ++ pct(e0, ln) ++ ", ClearType letters " ++ pct(e1, ln) ++ ", + words " ++ pct(e2, ln) ++ "   e.g. " ++ sample ++ "\n"
+  }
+  return out ++ "ALL: grey letters " ++ pct(t0, tl) ++ ", ClearType letters " ++ pct(t1, tl) ++ ", + words " ++ pct(t2, tl)
+}

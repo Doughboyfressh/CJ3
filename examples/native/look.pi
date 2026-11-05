@@ -1,0 +1,72 @@
+# Pi looks, understands and reads (see vision.pi and ocr.pi).
+#   out\look.exe              a synthetic desktop with a known answer (1 panel, 1 bar, 3 buttons, 8 text lines)
+#   out\look.exe screen [s]   the real screen, every s-th pixel (default 1); writes out\look_screen.bmp, and at full
+#                             resolution reads the first text lines (the screen's usual fonts, sizes 12-16)
+# Both write the picture with what Pi understood drawn on it: panels red, bars orange, buttons green, text blue.
+import "vision.pi"
+import "ocr.pi"
+
+# the ink of one text line, cut out with a margin: dark text on light or light text on dark (decided by the line's
+# own mean brightness) -> [w, h, ink arr]
+skill line_ink(img, l) -> Any {
+  let W = img[0]
+  let H = img[1]
+  let x0 = max(0, l[0] - 2)
+  let y0 = max(0, l[1] - 2)
+  let x1 = min(W - 1, l[2] + 2)
+  let y1 = min(H - 1, l[3] + 2)
+  let w = x1 - x0 + 1
+  let h = y1 - y0 + 1
+  let a = arr(w * h)
+  let tot = 0
+  for y in range(0, h) {
+    for x in range(0, w) {
+      let c = aget(img[2], (y0 + y) * W + x0 + x)
+      let lum = (299 * (c // 65536) + 587 * ((c // 256) % 256) + 114 * (c % 256)) // 1000
+      do aset(a, y * w + x, lum)
+      let tot = tot + lum
+    }
+  }
+  let light_bg = tot // max(1, w * h) >= 128
+  for i in range(0, w * h) {
+    if light_bg { do aset(a, i, 255 - aget(a, i)) }
+  }
+  return [w, h, a]
+}
+
+skill main() -> Any {
+  if arg(1) == "screen" {
+    let step = 1
+    if arg(2) != null { let step = num(arg(2)) }
+    let img = see(step)
+    let u = understand(img[0], img[1], img[2], step)
+    do bmp_write("out\\look_screen.bmp", img[0], img[1], annotate(img[0], img[1], img[2], u[7]))
+    let lines = split(u[0], "\n")
+    let out = join(slice(lines, 0, min(len(lines), 12)), "\n") ++ "\n(out\\look_screen.bmp shows it)\n"
+    if step == 1 {
+      let lex = load_lex("out\\lexicon.txt")
+      let temps = []
+      for f in ["Segoe UI Variable Text@ct", "Segoe UI@ct", "Consolas@ct", "Cascadia Mono@ct"] {
+        for s in [12, 13, 14, 15, 16] { let temps = temps ++ learn_font(s, f) }
+      }
+      let out = out ++ "reading (" ++ str(len(temps)) ++ " letter templates):\n"
+      let k = 0
+      for l in u[8] {
+        if k < 20 {
+          let li = box_ink_any(img, max(0, l[0] - 2), max(0, l[1] - 2), min(img[0] - 1, l[2] + 2), min(img[1] - 1, l[3] + 2))
+          let t = read_line_lex(li[2], li[0], 0, 0, li[0] - 1, li[1] - 1, temps, lex)
+          let out = out ++ "  " ++ str(l[0]) ++ "," ++ str(l[1]) ++ ": " ++ t ++ "\n"
+          let k = k + 1
+        }
+      }
+    }
+    return out
+  }
+  let sc = synth_scene()
+  let u = understand(sc[0], sc[1], sc[2], 1)
+  do bmp_write("out\\look_synth.bmp", sc[0], sc[1], annotate(sc[0], sc[1], sc[2], u[7]))
+  let ok = u[1] == 1 and u[2] == 1 and u[3] == 3 and u[4] == 8
+  let verdict = "WRONG (wanted 1 panel, 1 bar, 3 buttons, 8 text lines)"
+  if ok { let verdict = "right: 1 panel, 1 bar, 3 buttons, 8 text lines" }
+  return u[0] ++ "known answer: " ++ verdict
+}

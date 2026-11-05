@@ -1,0 +1,70 @@
+# maps: what a map means must not depend on how it is stored. Small and indexed maps (8 or more pairs carry a hash
+# index), maps copied by put, maps the compiler lets grow in place (a local map only its own name sees), x[k] = v,
+# keys of every kind, insertion order, equality across representations, and maps kept through a region's release.
+
+skill grow(n) -> Any {
+  // only m sees this map: put and m[k] = v change it in place
+  let m = {}
+  for i in range(0, n) {
+    m = put(m, "k" ++ str(i), i * i)
+  }
+  for i in range(0, n) {
+    if i % 3 == 0 { m["k" ++ str(i)] = 0 - i }
+  }
+  return m
+}
+
+skill count_words(words) -> Any {
+  let counts = {}
+  for w in words {
+    counts[w] = get(counts, w, 0) + 1
+  }
+  return counts
+}
+
+skill main() -> Any {
+  // a literal with more than 8 pairs (indexed) and one with fewer
+  let big = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8, "i": 9, "j": 10}
+  let small = {"x": 1, "y": 2}
+  print(big["a"], big["j"], big["zz"], small["y"], len(big), keys(big))
+  // put copies: the old map is unchanged
+  let big2 = put(big, "k", 11)
+  let big3 = put(big2, "a", 100)
+  print(len(big), len(big2), big["a"], big3["a"], big2["k"], big["k"], keys(big3))
+  // keys of every kind: 1 and 1.0 are one key, "1" another; -0.0 is 0
+  let mixed = {}
+  mixed = put(mixed, 1, "one")
+  mixed = put(mixed, "1", "text one")
+  mixed = put(mixed, 2.5, "two and a half")
+  mixed = put(mixed, null, "nothing")
+  mixed = put(mixed, [1, 2], "a list")
+  mixed = put(mixed, 0, "zero")
+  mixed = put(mixed, 1.0, "one again")
+  for i in range(0, 6) { mixed = put(mixed, "pad" ++ str(i), i) }
+  print(mixed[1], mixed[1.0], mixed["1"], mixed[2.5], mixed[null], mixed[[1, 2]], mixed[-0.0], len(mixed))
+  print(keys(mixed))
+  // grown in place, then read
+  let g = grow(1000)
+  print(len(g), g["k0"], g["k1"], g["k3"], g["k999"], g["k1000"], contains(g, "k500"), contains(g, "nope"))
+  let ks = keys(g)
+  print(ks[0], ks[1], ks[998], ks[999])
+  // the same pairs built two ways are equal (indexed or not, grown or copied)
+  let a = {}
+  let b = {}
+  for i in range(0, 20) { a = put(a, i, i + 1) }
+  let c = a
+  for i in range(0, 20) { b = put(b, i, i + 1) }
+  print(a == b, c == a, len(c))
+  // words
+  let cw = count_words(split("the cat and the hat and the bat sat on the mat with the cat", " "))
+  print(cw["the"], cw["cat"], cw["and"], cw["mat"], cw["dog"], keys(cw))
+  // through a region: a map made inside, kept, still found
+  let mm = mark()
+  let kept = release(mm, grow(50))
+  print(len(kept), kept["k7"], kept["k9"], kept["k49"])
+  // values, nested maps, a map as a value
+  let nest = {"inner": big, "list": [1, 2, 3]}
+  nest = put(nest, "deep", {"a": {"b": {"c": 42}}})
+  print(nest["inner"]["j"], nest["deep"]["a"]["b"]["c"], values(small))
+  return "ok"
+}

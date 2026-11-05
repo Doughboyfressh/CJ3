@@ -1,0 +1,64 @@
+# answer(s): Pi's small front door. It reads the shape of the request and hands it to the right solver -- a
+# comma-separated list of integers goes to the sequence solver, anything else to the equation solver. Both
+# solvers are imported, so this is also the first program built from more than one Pi module.
+import "seqlib.pi"
+import "eqlib.pi"
+
+# an integer from text, by digit accumulation (not num(), which the interpreter returns as a float)
+skill parse_int(s) -> Any {
+  let cs = chars(trim(s))
+  let i = 0
+  let neg = 0
+  if len(cs) > 0 and cs[0] == "-" {
+    let neg = 1
+    let i = 1
+  }
+  let v = 0
+  while i < len(cs) {
+    let v = v * 10 + (ord(cs[i]) - 48)
+    let i = i + 1
+  }
+  if neg { return 0 - v }
+  return v
+}
+
+skill parse_ints(s) -> Any {
+  let out = []
+  for p in split(s, ",") { let out = append(out, parse_int(p)) }
+  return out
+}
+
+# a request is a sequence when it is a comma list of numbers with no equation or expression markers
+skill looks_like_seq(s) -> Any {
+  if contains(s, "=") { return false }
+  if contains(s, "x") { return false }
+  return contains(s, ",")
+}
+
+skill answer(s) -> Any {
+  if looks_like_seq(s) { return {"kind": "sequence", "result": seq(parse_ints(s))} }
+  return {"kind": "equation", "result": equation(s)}
+}
+
+skill B(b) -> Any {
+  if b { return "1" }
+  return "0"
+}
+
+skill main() -> Any {
+  # routed to the sequence solver
+  let a = answer("2, 4, 6, 8")
+  let out = B(a["kind"] == "sequence") ++ B(a["result"]["next"] == [10, 12, 14])
+  let b = answer("1, 1, 2, 3, 5, 8")
+  let out = out ++ B(b["result"]["kind"] == "recurrence") ++ B(b["result"]["next"] == [13, 21, 34])
+  let g = answer("3, 6, 12, 24")
+  let out = out ++ B(g["result"]["kind"] == "geometric") ++ B(g["result"]["next"] == [48, 96, 192])
+  # routed to the equation solver
+  let e = answer("2*x + 3 = 11")
+  let out = out ++ B(e["kind"] == "equation") ++ B(e["result"]["x"] == 4)
+  let q = answer("x^2 - 5*x + 6 = 0")
+  let out = out ++ B(q["result"]["roots"] == [2, 3])
+  let v = answer("2*(3 + 4)^2")
+  let out = out ++ B(v["result"]["value"] == 98)
+  return out
+}

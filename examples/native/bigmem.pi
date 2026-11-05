@@ -1,0 +1,6 @@
+# allocate past the old 4 GB cap (diagnostic)
+skill main() -> Any {
+  let a = arr(700000000)
+  do aset(a, 699999999, 7)
+  return "allocated " ++ str(len(a)) ++ " cells (5.6 GB); last = " ++ str(aget(a, 699999999)) ++ "; heap in use " ++ str(memused() // 1000000) ++ " MB"
+}

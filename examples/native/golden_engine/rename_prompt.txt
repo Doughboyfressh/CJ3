@@ -1,0 +1,24 @@
+Here is a Pi program:
+
+skill is_prime(n) -> Any {
+  if n < 2 { return false }
+  if n < 4 { return true }
+  let i = 2
+  while i * i <= n {
+    if n % i == 0 { return false }
+    i += 1
+  }
+  return true
+}
+
+skill main() -> Any {
+  let primes = []
+  let n = 2
+  while len(primes) < 100 {
+    if is_prime(n) { primes = append(primes, n) }
+    n += 1
+  }
+  return sum(primes)
+}
+
+Rename the variable primes to found everywhere and show the whole program, with nothing else.

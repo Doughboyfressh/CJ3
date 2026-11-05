@@ -1,0 +1,7 @@
+# recursion
+skill fib(n) -> Any {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+
+skill main() -> Any { return fib(25) }

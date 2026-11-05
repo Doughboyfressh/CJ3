@@ -1,0 +1,13 @@
+# Reading and writing: Pi reads a passage, answers questions about it, and says its answers in English.
+
+skill explain(q) -> Any { return say(answer(q)) }
+
+skill read_and_say(passage, question) -> Any { return say(read(passage, question)) }
+
+skill interview(passage, questions) -> Any {
+  let out = []
+  for q in questions {
+    let out = append(out, q ++ " " ++ say(read(passage, q)))
+  }
+  return join(out, "\n")
+}

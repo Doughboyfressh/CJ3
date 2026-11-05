@@ -1,0 +1,277 @@
+# Number sequences on the GPU: every small program at once. Each GPU thread is one candidate program (postfix, up to
+# 7 tokens over n, a(n-1), a(n-2), 1, 2, 3, + - * // %), checked against every target sequence on terms 2..7 (with the
+# sequence's own earlier terms, so recurrences are included). The kernel is PTX that Pi writes (no toolkit); Pi's
+# runtime launches it through nvcuda.dll (gpu_seq). The CPU then checks each sequence's SHORTEST fitting program --
+# chosen without looking at held-out terms -- on terms 9-12 (solved) and 13-20 (holds), as oeis.pi does.
+# Test set: the same 300 OEIS sequences as oeis.pi (usable sequences, every 5th, never practised).
+#   out\gpuseq.exe [test sequences] [max length]
+import "inflate.pi"
+
+skill OEIS() -> Any { return "C:\\Users\\Dough\\laya-plus\\data\\sources\\oeis\\stripped.gz" }
+
+skill sint(t) -> Any {
+  let v = 0
+  let neg = false
+  for i in range(0, len(t)) {
+    let c = ord(slice(t, i, i + 1))
+    if c == 45 { let neg = true } else {
+      if c < 48 or c > 57 { return null }
+      let v = v * 10 + (c - 48)
+    }
+  }
+  if neg { return 0 - v }
+  return v
+}
+
+# usable sequences as oeis.pi reads them: [id, 12 terms, terms 13-20]
+skill read_seqs(limit_bytes) -> Any {
+  let b = read_bytes(OEIS(), 0, 40000000)
+  if b == null { return null }
+  let r = gunzip_prefix(b, limit_bytes)
+  if r == null { return null }
+  let out = []
+  let blk = []
+  for line in split(arr_text(r[0], 0, r[1]), "\n") {
+    if slice(line, 0, 1) == "A" {
+      let parts = split(line, " ,")
+      if len(parts) == 2 {
+        let ts = split(parts[1], ",")
+        if len(ts) >= 13 {
+          let terms = []
+          let ok = true
+          for i in range(0, 12) {
+            let t = ts[i]
+            if len(t) == 0 or len(t) > 8 { let ok = false } else {
+              let v = sint(t)
+              if v == null { let ok = false } else { let terms = append(terms, v) }
+            }
+          }
+          if ok {
+            let same = true
+            for v in terms {
+              if v != terms[0] { let same = false }
+            }
+            if same == false {
+              let extra = []
+              let k = 12
+              while k < len(ts) and k < 20 {
+                let t = ts[k]
+                let v = null
+                if len(t) > 0 and len(t) <= 15 { let v = sint(t) }
+                if v != null { let extra = append(extra, v) } else { let k = 99 }
+                let k = k + 1
+              }
+              let blk = append(blk, [parts[0], terms, extra])
+              if len(blk) >= 1000 {
+                let out = append(out, blk)
+                let blk = []
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return append(out, blk)
+}
+
+# the kernel: thread = program id -> base-11 tokens; valid postfix only; for each sequence s, terms n = 2..7 must
+# equal the program on (n, a(n-1), a(n-2)); // and % are FLOOR division and modulo, as in Pi; x/0 = no match
+skill ptx() -> Any {
+  let k = ".version 6.0\n.target sm_50\n.address_size 64\n"
+  let k = k ++ ".visible .entry seqk(.param .u64 pT, .param .u32 pS, .param .u32 pL, .param .u32 pB, .param .u32 pN, .param .u64 pO, .param .u64 pM)\n{\n"
+  let k = k ++ ".reg .pred %p<24>;\n.reg .u32 %r<40>;\n.reg .s64 %d<24>;\n.reg .u64 %a<24>;\n"
+  let k = k ++ ".local .align 8 .b64 stk[8];\n.local .align 4 .b32 tok[8];\n"
+  let k = k ++ "ld.param.u64 %a1, [pT];\ncvta.to.global.u64 %a1, %a1;\nld.param.u32 %r1, [pS];\nld.param.u32 %r2, [pL];\nld.param.u32 %r3, [pB];\nld.param.u32 %r4, [pN];\nld.param.u64 %a2, [pO];\ncvta.to.global.u64 %a2, %a2;\n"
+  let k = k ++ "mov.u32 %r6, %ctaid.x;\nmov.u32 %r7, %ntid.x;\nmov.u32 %r8, %tid.x;\nmad.lo.u32 %r9, %r6, %r7, %r8;\nsetp.ge.u32 %p1, %r9, %r4;\n@%p1 bra DONE;\nld.param.u64 %a13, [pM];\ncvt.u64.u32 %a14, %r9;\nadd.u64 %a13, %a13, %a14;\ncvt.u64.u32 %a16, %r3;\n"
+  let k = k ++ "mov.u64 %a3, tok;\nmov.u64 %a4, stk;\nmov.u64 %a15, %a13;\nmov.u32 %r11, 0;\nmov.u32 %r12, 0;\n"
+  # decode the tokens and check the stack discipline
+  let k = k ++ "DEC:\nsetp.ge.u32 %p2, %r11, %r2;\n@%p2 bra DECEND;\nrem.u64 %a17, %a15, %a16;\ndiv.u64 %a15, %a15, %a16;\ncvt.u32.u64 %r13, %a17;\nmul.wide.u32 %a5, %r11, 4;\nadd.u64 %a6, %a3, %a5;\nst.local.u32 [%a6], %r13;\nsetp.lt.u32 %p3, %r13, 6;\n@%p3 bra LEAF;\nsetp.lt.u32 %p4, %r12, 2;\n@%p4 bra DONE;\nsub.u32 %r12, %r12, 1;\nbra DECNEXT;\nLEAF:\nadd.u32 %r12, %r12, 1;\nDECNEXT:\nadd.u32 %r11, %r11, 1;\nbra DEC;\nDECEND:\nsetp.ne.u32 %p5, %r12, 1;\n@%p5 bra DONE;\n"
+  # every sequence
+  let k = k ++ "mov.u32 %r14, 0;\nSEQ:\nsetp.ge.u32 %p6, %r14, %r1;\n@%p6 bra DONE;\nmul.lo.u32 %r15, %r14, 12;\nmov.u32 %r16, 2;\n"
+  let k = k ++ "TERM:\nsetp.gt.u32 %p7, %r16, 7;\n@%p7 bra MATCH;\nadd.u32 %r17, %r15, %r16;\nmul.wide.u32 %a7, %r17, 8;\nadd.u64 %a8, %a1, %a7;\nld.global.s64 %d1, [%a8];\nld.global.s64 %d2, [%a8+-8];\nld.global.s64 %d3, [%a8+-16];\ncvt.s64.u32 %d4, %r16;\nmov.u32 %r18, 0;\nmov.u32 %r19, 0;\n"
+  # evaluate the program
+  let k = k ++ "EV:\nsetp.ge.u32 %p8, %r18, %r2;\n@%p8 bra EVEND;\nmul.wide.u32 %a5, %r18, 4;\nadd.u64 %a6, %a3, %a5;\nld.local.u32 %r20, [%a6];\nsetp.ge.u32 %p9, %r20, 6;\n@%p9 bra OP;\n"
+  let k = k ++ "mov.s64 %d5, %d4;\nsetp.eq.u32 %p10, %r20, 1;\n@%p10 mov.s64 %d5, %d2;\nsetp.eq.u32 %p10, %r20, 2;\n@%p10 mov.s64 %d5, %d3;\nsetp.eq.u32 %p10, %r20, 3;\n@%p10 mov.s64 %d5, 1;\nsetp.eq.u32 %p10, %r20, 4;\n@%p10 mov.s64 %d5, 2;\nsetp.eq.u32 %p10, %r20, 5;\n@%p10 mov.s64 %d5, 3;\n"
+  let k = k ++ "mul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nst.local.s64 [%a10], %d5;\nadd.u32 %r19, %r19, 1;\nbra EVNEXT;\n"
+  let k = k ++ "OP:\nsub.u32 %r19, %r19, 1;\nmul.wide.u32 %a9, %r19, 8;\nadd.u64 %a10, %a4, %a9;\nld.local.s64 %d7, [%a10];\nld.local.s64 %d6, [%a10+-8];\nadd.s64 %d8, %d6, %d7;\nsetp.eq.u32 %p11, %r20, 7;\n@%p11 sub.s64 %d8, %d6, %d7;\nsetp.eq.u32 %p11, %r20, 8;\n@%p11 mul.lo.s64 %d8, %d6, %d7;\nsetp.lt.u32 %p12, %r20, 9;\n@%p12 bra STORE;\n"
+  let k = k ++ "setp.eq.s64 %p13, %d7, 0;\n@%p13 bra NEXTSEQ;\ndiv.s64 %d9, %d6, %d7;\nrem.s64 %d10, %d6, %d7;\nsetp.ne.s64 %p14, %d10, 0;\nxor.b64 %d11, %d10, %d7;\nsetp.lt.s64 %p15, %d11, 0;\nand.pred %p16, %p14, %p15;\n@%p16 sub.s64 %d9, %d9, 1;\n@%p16 add.s64 %d10, %d10, %d7;\nmov.s64 %d8, %d9;\nsetp.eq.u32 %p11, %r20, 10;\n@%p11 mov.s64 %d8, %d10;\n"
+  let k = k ++ "STORE:\nst.local.s64 [%a10+-8], %d8;\nEVNEXT:\nadd.u32 %r18, %r18, 1;\nbra EV;\n"
+  let k = k ++ "EVEND:\nld.local.s64 %d12, [%a4];\nsetp.ne.s64 %p17, %d12, %d1;\n@%p17 bra NEXTSEQ;\nadd.u32 %r16, %r16, 1;\nbra TERM;\n"
+  # a match: keep the smallest (shortest-first, then first) program id for the sequence
+  let k = k ++ "MATCH:\nmul.wide.u32 %a11, %r14, 8;\nadd.u64 %a12, %a2, %a11;\natom.global.min.u64 %a18, [%a12], %a13;\n"
+  let k = k ++ "NEXTSEQ:\nadd.u32 %r14, %r14, 1;\nbra SEQ;\nDONE:\nret;\n}\n"
+  return k
+}
+
+skill tokens(id, L) -> Any {
+  let out = []
+  let v = id
+  for i in range(0, L) {
+    let out = append(out, v % 11)
+    let v = v // 11
+  }
+  return out
+}
+
+skill tname(t) -> Any { return ["n", "a1", "a2", "1", "2", "3", "+", "-", "*", "//", "%"][t] }
+
+# the program as text (infix)
+skill show(toks) -> Any {
+  let st = []
+  for t in toks {
+    if t < 6 { let st = append(st, tname(t)) } else {
+      let b = st[len(st) - 1]
+      let a = st[len(st) - 2]
+      let st = append(slice(st, 0, len(st) - 2), "(" ++ a ++ " " ++ tname(t) ++ " " ++ b ++ ")")
+    }
+  }
+  return st[0]
+}
+
+# Pi's own evaluation (floor // and %); null on division by zero
+skill run(toks, n, x, y) -> Any {
+  let st = []
+  for t in toks {
+    if t < 6 {
+      let v = n
+      if t == 1 { let v = x }
+      if t == 2 { let v = y }
+      if t == 3 { let v = 1 }
+      if t == 4 { let v = 2 }
+      if t == 5 { let v = 3 }
+      let st = append(st, v)
+    } else {
+      let b = st[len(st) - 1]
+      let a = st[len(st) - 2]
+      let v = a + b
+      if t == 7 { let v = a - b }
+      if t == 8 { let v = a * b }
+      if t == 9 or t == 10 {
+        if b == 0 { return null }
+        let v = a // b
+        if t == 10 { let v = a % b }
+      }
+      let st = append(slice(st, 0, len(st) - 2), v)
+    }
+  }
+  return st[0]
+}
+
+# the program's terms from index `from` on, each from the program's own previous terms (true terms before `from`)
+skill predict(toks, terms, from, to) -> Any {
+  let seq = slice(terms, 0, from)
+  for n in range(from, to) {
+    let v = run(toks, n, seq[n - 1], seq[n - 2])
+    if v == null { return null }
+    if v > 1000000000000000 or v < 0 - 1000000000000000 { return null }
+    let seq = append(seq, v)
+  }
+  return seq
+}
+
+skill main() -> Any {
+  let ntest = 300
+  if arg(1) != null { let ntest = sint(arg(1)) }
+  let maxl = 7
+  if arg(2) != null { let maxl = sint(arg(2)) }
+  let t0 = ticks()
+  let chunks = read_seqs(12000000)
+  let test = []
+  let i = 0
+  for c in chunks {
+    for sq in c {
+      if i % 5 == 0 and len(test) < ntest { let test = append(test, sq) }
+      let i = i + 1
+    }
+  }
+  let S = len(test)
+  let tg = arr(S * 12)
+  for s in range(0, S) {
+    for k in range(0, 12) { do aset(tg, s * 12 + k, test[s][1][k]) }
+  }
+  let t1 = ticks()
+  # the GPU sweep: lengths 1..maxl; a sequence's answer = its first (shortest) fitting program
+  let first = arr(S)
+  let firstl = arr(S)
+  let total = 0
+  let launches = []
+  let k = ptx()
+  let L = 1
+  let N = 11
+  while L <= maxl {
+    let tl = ticks()
+    let nf = 0
+    # an even length is never a valid program (each operator joins two values)
+    if L % 2 == 1 {
+      let off = 0
+      while off < N {
+        let cnt = N - off
+        if cnt > 2000000000 { let cnt = 2000000000 }
+        let m = mark()
+        let r = gpu_seq(k, tg, S, L, 11, cnt, off)
+        let got = []
+        if typeof(r) != typeof(0) {
+          for s in range(0, S) {
+            let v = aget(r, s)
+            if v >= 0 { let got = append(got, [s, v]) }
+          }
+        }
+        let got = release(m, got)
+        for x in got {
+          if aget(firstl, x[0]) == 0 or (aget(firstl, x[0]) == L and x[1] < aget(first, x[0])) {
+            if aget(firstl, x[0]) == 0 { let nf = nf + 1 }
+            do aset(first, x[0], x[1])
+            do aset(firstl, x[0], L)
+          }
+        }
+        let off = off + cnt
+      }
+    }
+    let total = total + nf
+    let launches = append(launches, "L" ++ str(L) ++ ": " ++ str(N) ++ " programs, " ++ str(nf) ++ " new sequences, " ++ str(ticks() - tl) ++ " ms")
+    let L = L + 1
+    let N = N * 11
+  }
+  let t2 = ticks()
+  # the CPU's verdict on unseen terms
+  let fit = 0
+  let solved = 0
+  let held = 0
+  let shown = []
+  let heldids = []
+  for s in range(0, S) {
+    if aget(firstl, s) > 0 {
+      let fit = fit + 1
+      let toks = tokens(aget(first, s), aget(firstl, s))
+      let sq = test[s]
+      let p = predict(toks, sq[1], 8, 12)
+      let ok = p != null
+      if ok {
+        for n in range(8, 12) {
+          if p[n] != sq[1][n] { let ok = false }
+        }
+      }
+      if ok {
+        let solved = solved + 1
+        let full = predict(toks, sq[1] ++ sq[2], 12, 12 + len(sq[2]))
+        let h = full != null and len(sq[2]) > 0
+        if h {
+          for n in range(0, len(sq[2])) {
+            if full[12 + n] != sq[2][n] { let h = false }
+          }
+        }
+        if h {
+          let held = held + 1
+          let heldids = append(heldids, sq[0] ++ " " ++ show(toks))
+          if len(shown) < 25 { let shown = append(shown, sq[0] ++ "  a(n) = " ++ show(toks)) }
+        }
+      }
+    }
+  }
+  let out = "OEIS test " ++ str(S) ++ " (read in " ++ str((t1 - t0) // 1000) ++ " s). GPU: " ++ join(launches, "; ") ++ "\n"
+  let out = out ++ "GPU sweep " ++ str((t2 - t1) // 1000) ++ " s, " ++ str(total) ++ " sequences fitted on terms 3-8\n"
+  let out = out ++ "sequences with a fitting program " ++ str(fit) ++ "; its shortest program SOLVES terms 9-12: " ++ str(solved) ++ "; also HOLDS on 13-20: " ++ str(held) ++ " of " ++ str(S) ++ "\n"
+  do write_file("out\\gpuseq_held.txt", join(heldids, "\n"))
+  return out ++ join(shown, "\n")
+}

@@ -1,0 +1,63 @@
+# enginecheck: the comparisons enginetest.cmd makes (one per run, so a failure names itself) -> "ok ..." or "FAIL ..."
+#   enginecheck trace A B TOL   two logit traces ("step token logit" lines): the same tokens, |logit| apart <= TOL
+#   enginecheck kern A B TOL    flashk outputs ("name e type n rows y..."): every value within TOL relative (or 1e-6)
+#   enginecheck same A B        byte-identical files
+#   enginecheck has A TEXT      file A contains TEXT
+
+skill ec_num(t) -> Any {
+  if contains(t, ".") or contains(t, "e") { return float(t) }
+  return int(t)
+}
+
+skill ec_abs(x) -> Any { return if x < 0 { 0 - x } else { x } }
+
+skill ec_lines(path) -> Any {
+  let t = read_file(path)
+  if t == null { return null }
+  let out = []
+  for ln in split(t, "\n") {
+    if len(trim(ln)) > 0 { out ++= [split(trim(ln), " ")] }
+  }
+  return out
+}
+
+skill main() -> Any {
+  let mode = arg(1)
+  let what = mode ++ " " ++ str(arg(2))
+  if mode == "same" or mode == "has" {
+    let a = read_file(arg(2))
+    if a == null { return "FAIL " ++ what ++ ": missing" }
+    if mode == "has" {
+      if contains(a, arg(3)) { return "ok   " ++ what ++ " has " ++ arg(3) }
+      return "FAIL " ++ what ++ " lacks " ++ arg(3)
+    }
+    let b = read_file(arg(3))
+    if b == a { return "ok   " ++ what ++ " == " ++ arg(3) }
+    return "FAIL " ++ what ++ " differs from " ++ arg(3)
+  }
+  let a = ec_lines(arg(2))
+  let b = ec_lines(arg(3))
+  let tol = float(arg(4))
+  if a == null or b == null { return "FAIL " ++ what ++ ": a file is missing" }
+  if len(a) != len(b) { return "FAIL " ++ what ++ ": " ++ str(len(a)) ++ " lines against " ++ str(len(b)) }
+  let worst = 0.0
+  for i in range(0, len(a)) {
+    let x = a[i]
+    let y = b[i]
+    if mode == "trace" {
+      if x[1] != y[1] { return "FAIL " ++ what ++ ": token " ++ x[1] ++ " against " ++ y[1] ++ " at step " ++ x[0] }
+      let d = ec_abs(ec_num(x[2]) - ec_num(y[2]))
+      if d > worst { worst = d }
+    } else {
+      if x[0] != y[0] or len(x) != len(y) { return "FAIL " ++ what ++ ": the tests differ at line " ++ str(i) }
+      for j in range(5, len(x)) {
+        let u = ec_num(x[j])
+        let v = ec_num(y[j])
+        let d = ec_abs(u - v) / max(ec_abs(v), 1.0e-6)
+        if ec_abs(u - v) > 1.0e-6 and d > worst { worst = d }
+      }
+    }
+  }
+  if worst > tol { return "FAIL " ++ what ++ ": worst difference " ++ str(worst) ++ " > " ++ str(tol) }
+  return "ok   " ++ what ++ ": worst difference " ++ str(worst)
+}

@@ -1,0 +1,184 @@
+# Does Pi's learning COMPOUND? Generations of self-made curriculum, scored on a fixed hard test it never practises.
+#
+#   bootstrap   one ordinary life on the base curriculum (mindcore live()): Pi's first words
+#   each generation:
+#     measure   the HARD TEST: 14 hand-written tasks whose plain programs are long (9-17 pieces), not built from Pi's
+#               words and never practised -- solved count and search effort
+#     make      a harder curriculum from Pi's OWN current words and operations (random compositions whose plain form is
+#               long, with new behaviour)
+#     practise  solve those with the current vocabulary; what it solves becomes experience
+#     sleep     learn words from all experience (MDL), replay, downscale per domain
+#   If the hard-test score rises across generations, learning compounds: what was learned makes the next learning reach
+#   further.
+#
+#   out\generations.exe [generations]
+import "mindcore.pi"
+
+skill t_rotr2(g) -> Any { return t_fliph(transpose(g)) }
+
+skill hard_tasks() -> Any {
+  return [
+    ["numbers", ["x^16", fn(x) => x * x * x * x * x * x * x * x * x * x * x * x * x * x * x * x]],
+    ["numbers", ["x^9 + x", fn(x) => x * x * x * x * x * x * x * x * x + x]],
+    ["numbers", ["x^12 + 1", fn(x) => x * x * x * x * x * x * x * x * x * x * x * x + 1]],
+    ["numbers", ["(x^3 + 1)^2", fn(x) => (x * x * x + 1) * (x * x * x + 1)]],
+    ["lists", ["sum of squares of positives", fn(xs) => sum(tmap(tfilter(xs, fn(v) => v > 0), fn(v) => v * v))]],
+    ["lists", ["largest square of an even", fn(xs) => tmax(tmap(tfilter(xs, fn(v) => v % 2 == 0), fn(v) => v * v))]],
+    ["lists", ["sum of doubled evens", fn(xs) => sum(tmap(tfilter(xs, fn(v) => v % 2 == 0), fn(v) => v * 2))]],
+    ["lists", ["count of positive evens", fn(xs) => len(tfilter(tfilter(xs, fn(v) => v > 0), fn(v) => v % 2 == 0))]],
+    ["text", ["uppercase, reversed, first three", fn(xs) => ttake(3, reverse(tmap(xs, fn(v) => v - 32)))]],
+    ["text", ["letters after m, uppercased", fn(xs) => tmap(tfilter(xs, fn(v) => v > 109), fn(v) => v - 32)]],
+    ["text", ["letters before n, counted, plus 1", fn(xs) => len(tfilter(xs, fn(v) => v < 110)) + 1]],
+    ["grids", ["rotate right, recolour 1 to 5, flip", fn(g) => reverse(t_rotr2(t_recol(g, 1, 5)))]],
+    ["grids", ["mirror, transpose, recolour 1 to 5", fn(g) => t_recol(transpose(t_fliph(g)), 1, 5)]],
+    ["grids", ["rotate 180, stacked twice", fn(g) => reverse(t_fliph(g)) ++ reverse(t_fliph(g))]]
+  ]
+}
+
+skill measure(lib, active, consts, pl, pre, g) -> Any {
+  let solved = 0
+  let work = 0
+  let names = []
+  for dt in hard_tasks() {
+    let d = dt[0]
+    let r = attempt_task_g(dt[1], d, lib, active[d], [pl[0], pl[1], consts[d], null], pre, g)
+    let work = work + r[1]
+    if r[0] != null {
+      let solved = solved + 1
+      let names = append(names, dt[1][0] ++ " = " ++ show(r[0]))
+    }
+  }
+  return [solved, work, names]
+}
+
+# a curriculum Pi makes from its own words: compositions whose plain form is long, with new behaviour
+skill make_curriculum(d, lib, active, pl, s, how_many, known, frontier) -> Any {
+  let xty = "I"
+  if d != "numbers" { let xty = "L" }
+  if d == "grids" { let xty = "G" }
+  let forms = forms_for(lib, active, xty)
+  # frontier practice: compositions of PLAIN operations (none of Pi's words), bigger than it easily solves
+  let lo = 7
+  let hi = 16
+  let depth = 3
+  if frontier {
+    let forms = forms_for([], [], xty)
+    let lo = 9
+    let hi = 13
+    let depth = 4
+  }
+  let out = []
+  let tries = 0
+  while len(out) < how_many and tries < 200 {
+    let tries = tries + 1
+    let s = rnd(s)
+    let ty = xty
+    if pick(s, 3) == 0 { let ty = "I" }
+    let gr = gen(ty, depth, s, forms, xty, pl)
+    let s = gr[1]
+    let t = gr[0]
+    if t != null {
+      let plain = expand(t, lib)
+      let sz = tsize(plain)
+      if sz >= lo and sz <= hi and known[ser(t)] == null {
+        let ok = true
+        let outs = []
+        for v in train_inputs(d) ++ held_inputs(d) {
+          let y = sev(t, null, v, null, lib)
+          if y == null { let ok = false } else { let outs = append(outs, y) }
+        }
+        if ok {
+          let same = true
+          for y in outs {
+            if y != outs[0] { let same = false }
+          }
+          if same { let ok = false }
+        }
+        if ok {
+          let tree = t
+          let known = put(known, ser(t), true)
+          let out = append(out, ["made: " ++ ser(t), fn(v) => sev(tree, null, v, null, lib)])
+        }
+      }
+    }
+  }
+  return [out, s, known]
+}
+
+skill main() -> Any {
+  let gens = 4
+  if arg(1) != null { let gens = num(arg(1)) }
+  # out\generations.exe [generations] [frontier]: frontier = practise plain-operation tasks with a bigger search budget
+  let frontier = arg(2) == "frontier"
+  let g = default_genome()
+  # lessons from the teacher (out\generations.exe gens own|frontier lessons.txt)
+  if arg(3) != null { let g = put(g, "__lessons", load_lessons(read_file(arg(3)))) }
+  let gp = g
+  if frontier { let gp = put(put(g, "maxsize", 10), "cap", 300000) }
+  let life = live(g, null, all_tasks(false))
+  let lib = life["lib"]
+  let active = life["active"]
+  let consts = life["consts"]
+  let pl = life["pl"]
+  let pre = life["pre"]
+  let taskdom = life["taskdom"]
+  let episodes = life["episodes"]
+  let domains = ["numbers", "lists", "text", "grids"]
+  let out = "Pi bootstrapped one ordinary life: " ++ str(len(lib)) ++ " words.\n"
+  let seed = 9090
+  let known = {}
+  for gen_i in range(0, gens + 1) {
+    let m = measure(lib, active, consts, pl, pre, g)
+    let out = out ++ "generation " ++ str(gen_i) ++ ": HARD TEST " ++ str(m[0]) ++ " of " ++ str(len(hard_tasks())) ++ " solved, effort " ++ str(m[1]) ++ ", " ++ str(len(lib)) ++ " words\n"
+    do print("generation " ++ str(gen_i) ++ ": hard test " ++ str(m[0]) ++ ", effort " ++ str(m[1]))
+    if gen_i == gens {
+      let out = out ++ "\nhard tasks solved at the end:\n"
+      for x in m[2] { let out = out ++ "  " ++ x ++ "\n" }
+    } else {
+      # make and practise a harder curriculum from Pi's own words
+      let made = 0
+      let got = 0
+      for d in domains {
+        let c = make_curriculum(d, lib, active[d], pl, seed, 6, known, frontier)
+        let seed = c[1]
+        let known = c[2]
+        for t in c[0] {
+          let made = made + 1
+          let r = attempt_task_g(t, d, lib, active[d], [pl[0], pl[1], consts[d], null], pre, gp)
+          if r[0] != null {
+            let got = got + 1
+            let episodes = put(episodes, t[0], r[0])
+            let taskdom = put(taskdom, t[0], d)
+          }
+        }
+      }
+      # sleep: words from all experience, replay, downscale per domain
+      let names = keys(episodes)
+      let sols = []
+      for k in names { let sols = append(sols, episodes[k]) }
+      let real = []
+      for k in names { let real = append(real, slice(k, 0, 6) != "dream:") }
+      let l = learn_g(lib, sols, g["nightwords"], real, g["realw"], g["floor"])
+      let lib = l[0]
+      let neww = []
+      for a in l[2] { let neww = append(neww, "w" ++ str(a[0]) ++ " = " ++ show(lib[a[0]][0])) }
+      let replayed = l[1]
+      for wi in range(0, len(lib)) {
+        let ns = []
+        for t in replayed { let ns = append(ns, rw(t, wi, lib[wi][0])) }
+        let replayed = ns
+      }
+      let episodes = {}
+      for j in range(0, len(names)) { let episodes = put(episodes, names[j], replayed[j]) }
+      for dd in domains {
+        let sd = []
+        for j in range(0, len(names)) {
+          if taskdom[names[j]] == dd { let sd = append(sd, replayed[j]) }
+        }
+        let active = put(active, dd, awake_words(lib, sd))
+      }
+      let out = out ++ "  made " ++ str(made) ++ " tasks from its own words, solved " ++ str(got) ++ "; new words: " ++ join(neww, "; ") ++ "\n"
+    }
+  }
+  return out
+}

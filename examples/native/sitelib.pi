@@ -1,0 +1,284 @@
+# sitelib: what a Pi website gets. The brain's start_site puts this in front of out\site\server.pi and compiles it;
+# in web chats run_pi programs get it too, so handlers can be tested. The server listens on 127.0.0.1:8080 ONLY, and
+# its files are confined to out\site\ (server.pi itself cannot be overwritten from the site).
+#   serve_http(handler)        handler(req) for every request; req: method path query body form headers
+#   reply(status, type, body)  a reply with its own status / content type
+#   site_file(name)            a saved file as a reply (type from the extension), 404 if there is none
+#   site_read(name) / site_write(name, text)   the site's files (null if absent)
+#   to_json(x) / parse_json(t) JSON both ways
+
+# a site file's path, or null: letters, digits, . _ - and / for a folder; no "..", nothing absolute
+skill site_path(name) -> Any {
+  if typeof(name) != "text" or len(name) == 0 or len(name) > 120 { return null }
+  let ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/"
+  for c in chars(name) {
+    if not contains(chars(ok), c) { return null }
+  }
+  if contains(name, "..") or slice(name, 0, 1) == "/" { return null }
+  return "out\\site\\" ++ join(split(name, "/"), "\\")
+}
+
+skill site_read(name) -> Any {
+  let p = site_path(name)
+  if p == null { return null }
+  return read_file(p)
+}
+
+skill site_write(name, text) -> Any {
+  let p = site_path(name)
+  if p == null or lower(name) == "server.pi" or slice(lower(name), len(name) - 4, len(name)) == ".exe" { return null }
+  return write_file(p, str(text))
+}
+
+# ---- JSON ----------------------------------------------------------------------------------------------------------
+skill site_jstr(s) -> Any {
+  let out = []
+  for c in chars(s) {
+    if c == "\"" { out ++= ["\\\""] } else if c == "\\" { out ++= ["\\\\"] } else if c == "\n" { out ++= ["\\n"] } else if c == "\r" { out ++= ["\\r"] } else if c == "\t" { out ++= ["\\t"] } else if ord(c) < 32 { out ++= [" "] } else { out ++= [c] }
+  }
+  return "\"" ++ join(out, "") ++ "\""
+}
+
+skill to_json(x) -> Any {
+  let t = typeof(x)
+  if t == "text" { return site_jstr(x) }
+  if t == "list" {
+    let parts = []
+    for v in x { parts ++= [to_json(v)] }
+    return "[" ++ join(parts, ",") ++ "]"
+  }
+  if t == "map" {
+    let parts = []
+    for k in keys(x) { parts ++= [site_jstr(str(k)) ++ ":" ++ to_json(x[k])] }
+    return "{" ++ join(parts, ",") ++ "}"
+  }
+  if t == "null" { return "null" }
+  return str(x)
+}
+
+skill site_ws(cs, i) -> Any {
+  let i = i
+  while i < len(cs) and (cs[i] == " " or cs[i] == "\n" or cs[i] == "\r" or cs[i] == "\t") { i += 1 }
+  return i
+}
+
+# one JSON value from character i -> [value, next i]; true / false are 1 / 0 (Pi's truth values)
+skill site_jval(cs, i0) -> Any {
+  let i = site_ws(cs, i0)
+  if i >= len(cs) { return [null, i] }
+  let c = cs[i]
+  if c == "{" {
+    let m = {}
+    i = site_ws(cs, i + 1)
+    if i < len(cs) and cs[i] == "}" { return [m, i + 1] }
+    while i < len(cs) {
+      let k = site_jval(cs, i)
+      i = site_ws(cs, k[1])
+      if i < len(cs) and cs[i] == ":" { i += 1 }
+      let v = site_jval(cs, i)
+      m = put(m, str(k[0]), v[0])
+      i = site_ws(cs, v[1])
+      if i < len(cs) and cs[i] == "," { i += 1 } else { return [m, i + 1] }
+    }
+    return [m, i]
+  }
+  if c == "[" {
+    let xs = []
+    i = site_ws(cs, i + 1)
+    if i < len(cs) and cs[i] == "]" { return [xs, i + 1] }
+    while i < len(cs) {
+      let v = site_jval(cs, i)
+      xs ++= [v[0]]
+      i = site_ws(cs, v[1])
+      if i < len(cs) and cs[i] == "," { i += 1 } else { return [xs, i + 1] }
+    }
+    return [xs, i]
+  }
+  if c == "\"" {
+    let out = []
+    i += 1
+    while i < len(cs) and cs[i] != "\"" {
+      if cs[i] == "\\" and i + 1 < len(cs) {
+        let e = cs[i + 1]
+        if e == "n" { out ++= ["\n"] } else if e == "t" { out ++= ["\t"] } else if e == "r" { out ++= ["\r"] } else if e == "u" and i + 5 < len(cs) {
+          out ++= [chr(site_hex(join(slice(cs, i + 2, i + 6), "")))]
+          i += 4
+        } else { out ++= [e] }
+        i += 2
+      } else {
+        out ++= [cs[i]]
+        i += 1
+      }
+    }
+    return [join(out, ""), i + 1]
+  }
+  if c == "t" { return [true, i + 4] }
+  if c == "f" { return [false, i + 5] }
+  if c == "n" { return [null, i + 4] }
+  let j = i
+  while j < len(cs) and contains(chars("+-0123456789.eE"), cs[j]) { j += 1 }
+  let t = join(slice(cs, i, j), "")
+  if contains(t, ".") or contains(t, "e") { return [float(t), j] }
+  return [int(t), j]
+}
+
+skill parse_json(t) -> Any {
+  if typeof(t) != "text" { return null }
+  return site_jval(chars(t), 0)[0]
+}
+
+# ---- requests and replies ------------------------------------------------------------------------------------------
+skill site_hex(h) -> Any {
+  let v = 0
+  for c in chars(lower(h)) {
+    let d = ord(c) - 48
+    if d > 9 { d = ord(c) - 87 }
+    if d < 0 or d > 15 { return 0 }
+    v = v * 16 + d
+  }
+  return v
+}
+
+# %41 and + in a URL or a form -> the text they stand for
+skill url_decode(s) -> Any {
+  let cs = chars(s)
+  let a = arr(len(cs) + 1)
+  let n = 0
+  let i = 0
+  while i < len(cs) {
+    if cs[i] == "%" and i + 2 < len(cs) {
+      aset(a, n, site_hex(cs[i + 1] ++ cs[i + 2]))
+      i += 3
+    } else {
+      if cs[i] == "+" { aset(a, n, 32) } else { aset(a, n, ord(cs[i])) }
+      i += 1
+    }
+    n += 1
+  }
+  return arr_text(a, 0, n)
+}
+
+# a=1&b=two -> {"a": "1", "b": "two"}
+skill site_query(q) -> Any {
+  let m = {}
+  for part in split(q, "&") {
+    if len(part) > 0 {
+      let kv = split(part, "=")
+      let v = ""
+      if len(kv) > 1 { v = url_decode(join(slice(kv, 1, len(kv)), "=")) }
+      m = put(m, url_decode(kv[0]), v)
+    }
+  }
+  return m
+}
+
+# one request from a connection -> a map, or null
+skill site_request(c) -> Any {
+  let data = ""
+  let head = null
+  let rest = ""
+  while head == null {
+    let chunk = rt_recv_some(c)
+    if len(chunk) == 0 { return null }
+    data = data ++ chunk
+    let parts = split(data, "\r\n\r\n")
+    if len(parts) > 1 {
+      head = parts[0]
+      rest = join(slice(parts, 1, len(parts)), "\r\n\r\n")
+    }
+    if len(data) > 1000000 { return null }
+  }
+  let lines = split(head, "\r\n")
+  let first = split(lines[0], " ")
+  if len(first) < 2 { return null }
+  let clen = 0
+  let headers = {}
+  for ln in slice(lines, 1, len(lines)) {
+    let kv = split(ln, ":")
+    if len(kv) >= 2 {
+      let k = lower(trim(kv[0]))
+      let v = trim(join(slice(kv, 1, len(kv)), ":"))
+      headers = put(headers, k, v)
+      if k == "content-length" { clen = int(v) }
+    }
+  }
+  while len(rest) < clen and len(rest) < 8000000 {
+    let chunk = rt_recv_some(c)
+    if len(chunk) == 0 { break }
+    rest = rest ++ chunk
+  }
+  let qs = split(first[1], "?")
+  let query = {}
+  if len(qs) > 1 { query = site_query(join(slice(qs, 1, len(qs)), "?")) }
+  let form = {}
+  if contains(get(headers, "content-type", ""), "urlencoded") { form = site_query(rest) }
+  return {"method": upper(first[0]), "path": url_decode(qs[0]), "query": query, "body": rest, "form": form, "headers": headers}
+}
+
+skill reply(status, type, body) -> Any { return {"__reply": 1, "status": status, "type": type, "body": str(body)} }
+
+skill site_type(name) -> Any {
+  let n = lower(name)
+  let ext = split(n, ".")
+  let e = ext[len(ext) - 1]
+  let types = {"html": "text/html; charset=utf-8", "htm": "text/html; charset=utf-8", "css": "text/css; charset=utf-8", "js": "text/javascript; charset=utf-8", "json": "application/json", "svg": "image/svg+xml", "png": "image/png", "jpg": "image/jpeg", "ico": "image/x-icon", "txt": "text/plain; charset=utf-8"}
+  return get(types, e, "application/octet-stream")
+}
+
+skill site_file(name) -> Any {
+  let t = site_read(name)
+  if t == null { return reply(404, "text/plain; charset=utf-8", "no file " ++ str(name)) }
+  return reply(200, site_type(name), t)
+}
+
+# what a handler returned -> the HTTP reply text
+skill site_reply_text(r) -> Any {
+  let status = 200
+  let typ = "text/plain; charset=utf-8"
+  let body = ""
+  if typeof(r) == "map" and r["__reply"] == 1 {
+    status = r["status"]
+    typ = r["type"]
+    body = r["body"]
+  } else if typeof(r) == "text" {
+    body = r
+    let t = trim(r)
+    if slice(t, 0, 1) == "<" { typ = "text/html; charset=utf-8" }
+    if slice(t, 0, 1) == "{" or slice(t, 0, 1) == "[" { typ = "application/json" }
+  } else {
+    body = to_json(r)
+    typ = "application/json"
+  }
+  let why = {"200": "OK", "201": "Created", "204": "No Content", "301": "Moved", "302": "Found", "400": "Bad Request", "403": "Forbidden", "404": "Not Found", "500": "Server Error"}
+  return "HTTP/1.1 " ++ str(status) ++ " " ++ get(why, str(status), "OK") ++ "\r\nContent-Type: " ++ typ ++ "\r\nContent-Length: " ++ str(len(body)) ++ "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" ++ body
+}
+
+# the server: one request at a time, each in its own memory region; GET /__pi_stop ends it (start_site uses that)
+skill serve_http(handler_given) -> Any {
+  let s = rt_listen(8080)
+  if s == null { return "serve_http: 127.0.0.1:8080 is taken" }
+  print("serving http://127.0.0.1:8080")
+  while true {
+    let c = rt_accept(s)
+    if c != null {
+      let mm = mark()
+      let req = site_request(c)
+      let stop = false
+      if req != null {
+        if req["path"] == "/__pi_stop" {
+          stop = true
+          rt_send_all(c, site_reply_text("stopped"))
+        } else {
+          rt_send_all(c, site_reply_text(handler_given(req)))
+        }
+      }
+      rt_closesock(c)
+      release(mm, 0)
+      if stop {
+        rt_closesock(s)
+        return "stopped"
+      }
+    }
+  }
+  return null
+}

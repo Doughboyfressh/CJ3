@@ -1,0 +1,41 @@
+# How fast Pi itself runs: loops, skill calls, closures, and building data.
+
+skill loop(n) -> Any {
+  let s = 0
+  for i in range(0, n) {
+    let s = s + i
+  }
+  return s
+}
+
+skill fib(n) -> Any {
+  if n < 2 { return n }
+  return fib(n - 1) + fib(n - 2)
+}
+
+skill closures(n) -> Any {
+  return sum(map(range(0, n), fn(x) => x * 2 + 1))
+}
+
+skill arm(i, n, side) -> Any {
+  let r = 0.2 + i / n * 4
+  let a = i / n * 9.0
+  return [side * r * cos(a), side * r * sin(a)]
+}
+
+skill points(n) -> Any {
+  return len(map(range(0, 2 * n), fn(j) => arm(j // 2, n, 1 - 2 * (j % 2))))
+}
+
+skill timed() -> Any {
+  let a = profile()
+  let x1 = loop(200000)
+  let t1 = profile()
+  let x2 = fib(20)
+  let t2 = profile()
+  let x3 = closures(200000)
+  let t3 = profile()
+  let x4 = points(4000)
+  let t4 = profile()
+  return {"loop 200k": t1.wall_ms, "fib(20) = 21891 calls": t2.wall_ms, "map 200k closures": t3.wall_ms, "8000 points": t4.wall_ms, "check": [x1, x2, x3, x4]}
+}

@@ -1,0 +1,5 @@
+# Pi is a self-hosting compiler: test.cmd's golden comparisons and the runtime read source bytes
+# directly, and line endings here are deliberate (mostly LF; flashbrain.pi is CRLF). Freeze them --
+# git must never convert EOL on add or checkout, so a fresh clone is byte-identical to what builds
+# and tests green on this machine.
+* -text

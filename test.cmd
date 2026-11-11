@@ -6,6 +6,7 @@ rem    (pic.pi changed): `build.cmd reseed` makes g2 the new seed once this suit
 rem 2. Every program in examples\native\golden\ is compiled by g2 and run, fed golden\<name>.in as its input if
 rem    there is one (else no input); its output must match the golden file byte for byte.
 rem 3. The agent's memory: two runs sharing a memory file.
+rem Set PI_NO_GPU=1 on a machine without an NVIDIA GPU (CI does) to skip the one GPU golden program.
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 if not exist out mkdir out
@@ -21,6 +22,11 @@ fc /b out\t_g2.exe seed\pic.exe >nul
 if errorlevel 1 (echo note seed is stale: run build.cmd reseed once this passes) else (echo ok   seed is current)
 for %%f in (examples\native\golden\*.out) do (
   set p=%%~nf
+  set skip=0
+  if defined PI_NO_GPU if /i "!p!"=="gpuforms" set skip=1
+  if !skip!==1 (
+    echo skip !p!: needs an NVIDIA GPU
+  ) else (
   set /a n+=1
   if exist out\t_!p!.exe del out\t_!p!.exe
   out\t_g2.exe examples\native\!p!.pi out\t_!p!.exe >nul
@@ -35,6 +41,7 @@ for %%f in (examples\native\golden\*.out) do (
     )
     fc /b out\t_!p!.txt %%f >nul
     if errorlevel 1 (echo FAIL !p!: output differs from golden & set fail=1) else (echo ok   !p!)
+  )
   )
 )
 rem 3. The agent remembers across runs: teach it with a memory file, start it afresh, ask; the answers must match.

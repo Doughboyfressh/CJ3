@@ -15,4 +15,6 @@ jobs:
       # fixpoint, then every golden program is compiled, run and compared.
       - name: Self-compile fixpoint and golden programs
         shell: cmd
+        env:
+          PI_NO_GPU: "1"   # hosted runners have no NVIDIA GPU, so gpuforms is skipped
         run: test.cmd

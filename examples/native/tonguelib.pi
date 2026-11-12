@@ -1,0 +1,765 @@
+# tonguelib: Pi learns a language from examples. No rule of the language is written here, and nothing is trained:
+# what an utterance means is worked out by compression and proven against everything Pi has heard.
+#
+# An example is an utterance (words) and what it means (words of another kind: actions, the pieces of a program).
+# What Pi learns is an ordered list of rules, each a pattern and a template:
+#       $1 twice  ->  $1 $1            "whatever $1 means, twice over"
+#       walk      ->  WALK
+# A pattern's variables stand for any phrase Pi can already read; the template writes the meaning from theirs.
+# To read an utterance Pi takes the first rule whose pattern fits it, reads the phrases the variables took, and
+# fills the template in. The rules are the whole of what was learned, and they can be read.
+#
+#   DAY    each example, shortest first. One Pi reads rightly is passed over. One it reads wrongly: perhaps the
+#          rules it has only stand in the wrong order (try moving one). Otherwise a new rule: every way of
+#          putting variables where it can already read a phrase, the template that writes the meaning with the
+#          fewest plain words -- and of those, the smallest rule that holds for every example heard so far.
+#          A sentence with one word Pi has never met, which it could otherwise read: the word is given the
+#          meaning the sentence needs (a word learned from hearing it once).
+#          The example itself, word for word, is the rule of last resort.
+#   NIGHT  compression. Two rules that differ by one word here and one word there are one rule with a variable,
+#          and the two words have meanings of their own (so "left" comes to mean something though nobody ever
+#          said "left" alone). A sentence once kept whole is explained again with what was learned since. A word with a meaning, standing in a rule whose template spells that meaning out,
+#          becomes a variable. A rule the others now cover is dropped. Every step must leave all that was heard
+#          read rightly, or it is undone.
+#
+# This file is the learner (tg_learn: examples -> rules; tg_read: rules, words -> meaning). tongue.pi measures it on
+# SCAN; heed.pi uses it for Pi's own work: English instructions, read as programs and run.
+
+
+# ---- reading: rules -> the meaning of an utterance, or null ---------------------------------------------------
+skill tg_isvar(w) -> Any { return w == "$1" or w == "$2" }
+
+# can this pattern fit these words at all? (a quick no, before any phrase is read)
+skill tg_fits(pat, words) -> Any {
+  let np = len(pat)
+  let nw = len(words)
+  if np > nw { return false }
+  if tg_isvar(pat[0]) == false {
+    if pat[0] != words[0] { return false }
+  }
+  if tg_isvar(pat[np - 1]) == false {
+    if pat[np - 1] != words[nw - 1] { return false }
+  }
+  let vars = 0
+  for w in pat {
+    if tg_isvar(w) { let vars = vars + 1 }
+  }
+  if vars == 0 and np != nw { return false }
+  return true
+}
+
+# pattern[pi ..] against words[wi ..]; env = [what $1 means, what $2 means] -> env, or null
+skill tg_bind(pat, pi, words, wi, rules, env) -> Any {
+  let np = len(pat)
+  let nw = len(words)
+  if pi == np {
+    if wi == nw { return env }
+    return null
+  }
+  let item = pat[pi]
+  if tg_isvar(item) == false {
+    if wi < nw {
+      if words[wi] == item { return tg_bind(pat, pi + 1, words, wi + 1, rules, env) }
+    }
+    return null
+  }
+  # a variable takes one word or more and leaves one for each item still to come; the last item takes the rest
+  let rest = np - pi - 1
+  let last = nw - rest
+  let e = wi + 1
+  if rest == 0 { let e = nw }
+  if e <= wi { return null }
+  while e <= last {
+    let ok = true
+    if rest > 0 {
+      let nx = pat[pi + 1]
+      if tg_isvar(nx) == false {
+        if words[e] != nx { let ok = false }
+      }
+    }
+    if ok {
+      let m = tg_read(rules, slice(words, wi, e))
+      if m != null {
+        let env2 = [m, env[1]]
+        if item == "$2" { let env2 = [env[0], m] }
+        let r = tg_bind(pat, pi + 1, words, e, rules, env2)
+        if r != null { return r }
+      }
+    }
+    let e = e + 1
+  }
+  return null
+}
+
+skill tg_fill(tpl, env) -> Any {
+  let out = []
+  for w in tpl {
+    if w == "$1" { let out = out ++ env[0] } else {
+      if w == "$2" { let out = out ++ env[1] } else { let out = append(out, w) }
+    }
+  }
+  return out
+}
+
+skill tg_read(rules, words) -> Any {
+  if len(words) == 0 { return null }
+  for r in rules {
+    if tg_fits(r[0], words) {
+      let env = tg_bind(r[0], 0, words, 0, rules, [null, null])
+      if env != null { return tg_fill(r[1], env) }
+    }
+  }
+  return null
+}
+
+# ---- what is known so far, against what has been heard -----------------------------------------------------------
+# heard = every example Pi was given, shortest first; the first n of them it has been through. Those must be read
+# rightly. Of the later ones, some may be MISread for now (given a wrong meaning; one Pi cannot read at all is no
+# fault, it will come) -- that is how it learns which rule goes before which -- but no step may add to them.
+# -> how many later examples are misread
+skill tg_misreads(rules, heard, n) -> Any {
+  let i = 0
+  let bad = 0
+  for ex in heard {
+    if i >= n {
+      let m = mark()
+      let got = tg_read(rules, ex[0])
+      let wrong = got != null and got != ex[1]
+      let wrong = release(m, wrong)
+      if wrong { let bad = bad + 1 }
+    }
+    let i = i + 1
+  }
+  return bad
+}
+
+# the first n read rightly, and no more than limit of the later ones misread -> how many are, or -1 if not so
+skill tg_faults(rules, heard, n, limit) -> Any {
+  let i = 0
+  let bad = 0
+  for ex in heard {
+    let m = mark()
+    let got = tg_read(rules, ex[0])
+    let st = 0
+    if got != ex[1] {
+      if i < n { let st = 2 } else {
+        if got != null { let st = 1 }
+      }
+    }
+    let st = release(m, st)
+    if st == 2 { return 0 - 1 }
+    if st == 1 {
+      let bad = bad + 1
+      if bad > limit { return 0 - 1 }
+    }
+    let i = i + 1
+  }
+  return bad
+}
+
+skill tg_all_right(rules, heard, n, limit) -> Any { return tg_faults(rules, heard, n, limit) >= 0 }
+
+# a rule holds if every example Pi has been through that it fits comes out as that example's meaning
+skill tg_holds(rule, rules, heard, n) -> Any {
+  let i = 0
+  for ex in heard {
+    if i < n {
+      if tg_fits(rule[0], ex[0]) {
+        let env = tg_bind(rule[0], 0, ex[0], 0, rules, [null, null])
+        if env != null {
+          if tg_fill(rule[1], env) != ex[1] { return false }
+        }
+      }
+    }
+    let i = i + 1
+  }
+  return true
+}
+
+# a rule's size: a plain word costs 4, a variable 1 -- so the rule that says the most with variables is smallest
+skill tg_cost(r) -> Any {
+  let c = 0
+  for w in r[0] {
+    if tg_isvar(w) { let c = c + 1 } else { let c = c + 4 }
+  }
+  for w in r[1] {
+    if tg_isvar(w) { let c = c + 1 } else { let c = c + 4 }
+  }
+  return c
+}
+
+skill tg_nvars(pat) -> Any {
+  let n = 0
+  for w in pat {
+    if tg_isvar(w) { let n = n + 1 }
+  }
+  return n
+}
+
+# ---- day: a rule for an example Pi cannot read ------------------------------------------------------------------
+# the template that writes o from the meanings in vals with the fewest plain words -> [template, $1 used, $2 used]
+skill tg_segment(o, vals) -> Any {
+  let n = len(o)
+  let cost = arr(n + 1)
+  let pick = arr(n + 1)
+  let i = n - 1
+  while i >= 0 {
+    let c = aget(cost, i + 1) + 4
+    let ch = 0
+    for k in range(0, 2) {
+      let m = vals[k]
+      if m != null {
+        let k2 = len(m)
+        if k2 > 0 and i + k2 <= n {
+          if aget(cost, i + k2) + 1 < c {
+            if slice(o, i, i + k2) == m {
+              let c = aget(cost, i + k2) + 1
+              let ch = k + 1
+            }
+          }
+        }
+      }
+    }
+    do aset(cost, i, c)
+    do aset(pick, i, ch)
+    let i = i - 1
+  }
+  let tpl = []
+  let u1 = false
+  let u2 = false
+  let i = 0
+  while i < n {
+    let ch = aget(pick, i)
+    if ch == 0 {
+      let tpl = append(tpl, o[i])
+      let i = i + 1
+    } else {
+      if ch == 1 {
+        let tpl = append(tpl, "$1")
+        let u1 = true
+      } else {
+        let tpl = append(tpl, "$2")
+        let u2 = true
+      }
+      let i = i + len(vals[ch - 1])
+    }
+  }
+  return [tpl, u1, u2]
+}
+
+# the words of c that Pi cannot read alone
+skill tg_strangers(rules, c) -> Any {
+  let out = []
+  for w in c {
+    if contains(out, w) == false {
+      if tg_read(rules, [w]) == null { let out = append(out, w) }
+    }
+  }
+  return out
+}
+
+# every rule this one example suggests, each with its size: [size, rule]
+skill tg_candidates(rules, ex) -> Any {
+  let c = ex[0]
+  let o = ex[1]
+  let n = len(c)
+  # the phrases inside it that Pi can already read
+  let spans = []
+  for i in range(0, n) {
+    for j in range(i + 1, n + 1) {
+      if j - i < n {
+        let m = tg_read(rules, slice(c, i, j))
+        if m != null {
+          if len(m) > 0 { let spans = append(spans, [i, j, m]) }
+        }
+      }
+    }
+  }
+  let out = []
+  # a word Pi cannot read alone, in a sentence it could otherwise read: what must the word mean for the sentence to
+  # mean this? (each short stretch of the meaning is tried as the word's own)
+  for w in tg_strangers(rules, c) {
+    let tried = {}
+    for i in range(0, len(o)) {
+      for j in range(i + 1, min(len(o), i + 3) + 1) {
+        let mw = slice(o, i, j)
+        let key = join(mw, " ")
+        if tried[key] == null {
+          let tried = put(tried, key, true)
+          let lexical = [[w], mw]
+          if tg_read([lexical] ++ rules, c) == o { let out = append(out, [tg_cost(lexical), lexical]) }
+        }
+      }
+    }
+  }
+  for a in spans {
+    let pat = slice(c, 0, a[0]) ++ ["$1"] ++ slice(c, a[1], n)
+    let sg = tg_segment(o, [a[2], null])
+    if sg[1] {
+      let r = [pat, sg[0]]
+      let out = append(out, [tg_cost(r), r])
+    }
+    for b in spans {
+      if b[0] >= a[1] {
+        let pat2 = slice(c, 0, a[0]) ++ ["$1"] ++ slice(c, a[1], b[0]) ++ ["$2"] ++ slice(c, b[1], n)
+        let sg2 = tg_segment(o, [a[2], b[2]])
+        if sg2[1] and sg2[2] {
+          let r2 = [pat2, sg2[0]]
+          let out = append(out, [tg_cost(r2), r2])
+        }
+      }
+    }
+  }
+  return out
+}
+
+skill tg_insert(rules, pos, r) -> Any { return slice(rules, 0, pos) ++ [r] ++ slice(rules, pos, len(rules)) }
+
+skill tg_remove(rules, pos) -> Any { return slice(rules, 0, pos) ++ slice(rules, pos + 1, len(rules)) }
+
+# the rules may be right and only stand in the wrong order: move one, if that reads this example and all before it
+skill tg_reorder(rules, heard, n, ex, limit) -> Any {
+  let nr = len(rules)
+  for i in range(0, nr) {
+    let r = rules[i]
+    let without = tg_remove(rules, i)
+    for p in range(0, nr) {
+      if p != i {
+        let m = mark()
+        let rules2 = tg_insert(without, p, r)
+        let ok = tg_read(rules2, ex[0]) == ex[1]
+        if ok { let ok = tg_all_right(rules2, heard, n, limit) }
+        if ok { return rules2 }
+        let ok = release(m, ok)
+      }
+    }
+  }
+  return null
+}
+
+# the smallest size among cands not yet tried (-1: none left)
+skill tg_next_cost(cands, above) -> Any {
+  let best = 0 - 1
+  for cd in cands {
+    if cd[0] > above {
+      if best < 0 or cd[0] < best { let best = cd[0] }
+    }
+  }
+  return best
+}
+
+# ex is the n-th example of heard (counting from 1) -> the rules, now reading it rightly
+skill tg_explain(rules, heard, n, ex) -> Any {
+  let got = tg_read(rules, ex[0])
+  if got == ex[1] { return rules }
+  let limit = tg_misreads(rules, heard, n)
+  if got != null {
+    let moved = tg_reorder(rules, heard, n, ex, limit)
+    if moved != null { return moved }
+  }
+  let cands = tg_candidates(rules, ex)
+  let level = tg_next_cost(cands, 0)
+  while level > 0 {
+    for cd in cands {
+      if cd[0] == level {
+        if tg_holds(cd[1], rules, heard, n) {
+          # where it leaves the fewest later examples misread; of such places, the lowest (a new rule gives way
+          # to the old ones unless what Pi has heard says otherwise)
+          let best = null
+          let bestf = limit
+          let pos = len(rules)
+          while pos >= 0 {
+            let m = mark()
+            let f = 0 - 1
+            let rules2 = tg_insert(rules, pos, cd[1])
+            if tg_read(rules2, ex[0]) == ex[1] { let f = tg_faults(rules2, heard, n, bestf) }
+            let f = release(m, f)
+            if f >= 0 {
+              if best == null or f < bestf {
+                let best = pos
+                let bestf = f
+              }
+            }
+            let pos = pos - 1
+          }
+          if best != null { return tg_insert(rules, best, cd[1]) }
+        }
+      }
+    }
+    let level = tg_next_cost(cands, level)
+  }
+  # the rule of last resort: this utterance means exactly this
+  return [[ex[0], ex[1]]] ++ rules
+}
+
+# ---- night: compression -----------------------------------------------------------------------------------------
+skill tg_free_var(pat) -> Any {
+  if contains(pat, "$1") == false { return "$1" }
+  if contains(pat, "$2") == false { return "$2" }
+  return null
+}
+
+# two rules alike but for one word in the pattern and one word (wherever it comes) in the template -> one rule with
+# a variable there, and a meaning for each of the two words. -> the new rules, or null
+skill tg_merge(rules, i, j, heard, n, limit) -> Any {
+  let a = rules[i]
+  let b = rules[j]
+  if len(a[0]) != len(b[0]) or len(a[1]) != len(b[1]) { return null }
+  if len(a[0]) < 2 { return null }
+  let v = tg_free_var(a[0])
+  if v == null { return null }
+  let at = 0 - 1
+  for k in range(0, len(a[0])) {
+    if a[0][k] != b[0][k] {
+      if at >= 0 { return null }
+      if tg_isvar(a[0][k]) or tg_isvar(b[0][k]) { return null }
+      let at = k
+    }
+  }
+  if at < 0 { return null }
+  let ta = null
+  let tb = null
+  let tpl = []
+  for k in range(0, len(a[1])) {
+    if a[1][k] == b[1][k] { let tpl = append(tpl, a[1][k]) } else {
+      if tg_isvar(a[1][k]) or tg_isvar(b[1][k]) { return null }
+      if ta == null {
+        let ta = a[1][k]
+        let tb = b[1][k]
+      }
+      if a[1][k] != ta or b[1][k] != tb { return null }
+      let tpl = append(tpl, v)
+    }
+  }
+  if ta == null { return null }
+  # the two words must be free to mean this (or mean it already)
+  let ma = tg_read(rules, [a[0][at]])
+  let mb = tg_read(rules, [b[0][at]])
+  if ma != null and ma != [ta] { return null }
+  if mb != null and mb != [tb] { return null }
+  let merged = [slice(a[0], 0, at) ++ [v] ++ slice(a[0], at + 1, len(a[0])), tpl]
+  let base = []
+  if ma == null { let base = append(base, [[a[0][at]], [ta]]) }
+  if mb == null { let base = append(base, [[b[0][at]], [tb]]) }
+  for k in range(0, len(rules)) {
+    if k != i and k != j { let base = append(base, rules[k]) }
+  }
+  # the one rule may need a different place from the two it replaces: as low as it can stand
+  let pos = len(base)
+  while pos >= 0 {
+    let out = tg_insert(base, pos, merged)
+    if tg_all_right(out, heard, n, limit) { return out }
+    let pos = pos - 1
+  }
+  return null
+}
+
+# a word with a meaning of its own, in a rule whose template spells that meaning out, becomes a variable
+skill tg_generalise(rules, i, heard, n, limit) -> Any {
+  let r = rules[i]
+  if len(r[0]) < 2 { return null }
+  let v = tg_free_var(r[0])
+  if v == null { return null }
+  for k in range(0, len(r[0])) {
+    let w = r[0][k]
+    if tg_isvar(w) == false {
+      let m = tg_read(rules, [w])
+      if m != null {
+        if len(m) > 0 {
+          let sg = tg_segment(r[1], [null, null])
+          if v == "$1" { let sg = tg_segment(r[1], [m, null]) } else { let sg = tg_segment(r[1], [null, m]) }
+          if sg[1] or sg[2] {
+            let nr = [slice(r[0], 0, k) ++ [v] ++ slice(r[0], k + 1, len(r[0])), sg[0]]
+            let rules2 = slice(rules, 0, i) ++ [nr] ++ slice(rules, i + 1, len(rules))
+            if tg_holds(nr, rules2, heard, n) {
+              if tg_all_right(rules2, heard, n, limit) { return rules2 }
+            }
+          }
+        }
+      }
+    }
+  }
+  return null
+}
+
+# drop what the other rules now cover, the biggest rule first
+skill tg_prune(rules, heard, n) -> Any {
+  let going = true
+  while going {
+    let going = false
+    let limit = tg_misreads(rules, heard, n)
+    let best = 0 - 1
+    let bcost = 0
+    for i in range(0, len(rules)) {
+      let c = tg_cost(rules[i])
+      if c > bcost {
+        if tg_all_right(tg_remove(rules, i), heard, n, limit) {
+          let best = i
+          let bcost = c
+        }
+      }
+    }
+    if best >= 0 {
+      let rules = tg_remove(rules, best)
+      let going = true
+    }
+  }
+  return rules
+}
+
+skill tg_night(rules, heard, n) -> Any {
+  let going = true
+  while going {
+    let going = false
+    let nr = len(rules)
+    let limit = tg_misreads(rules, heard, n)
+    let found = null
+    for i in range(0, nr) {
+      if found == null {
+        for j in range(i + 1, nr) {
+          if found == null { let found = tg_merge(rules, i, j, heard, n, limit) }
+        }
+      }
+    }
+    if found == null {
+      for i in range(0, nr) {
+        if found == null { let found = tg_generalise(rules, i, heard, n, limit) }
+      }
+    }
+    if found != null {
+      let rules = found
+      let going = true
+    }
+  }
+  return tg_prune(rules, heard, n)
+}
+
+# ---- a life of listening: examples shortest first, a night after each length ------------------------------------
+skill tg_pad(k) -> Any {
+  let s = str(k)
+  while len(s) < 4 { let s = "0" ++ s }
+  return s
+}
+
+skill tg_by_length(examples) -> Any {
+  let ks = []
+  let byk = {}
+  for ex in examples {
+    let k = tg_pad(len(ex[0])) ++ " " ++ tg_pad(len(ex[1])) ++ " " ++ join(ex[0], " ")
+    let ks = append(ks, k)
+    let byk = put(byk, k, ex)
+  }
+  let out = []
+  for k in sort(ks) { let out = append(out, byk[k]) }
+  return out
+}
+
+skill tg_learn(examples) -> Any {
+  let heard = tg_by_length(examples)
+  let total = len(heard)
+  let rules = []
+  let n = 0
+  let cur = 0
+  # each step in its own region: what a step tried and threw away is given back, only the rules are kept
+  for ex in heard {
+    let m = mark()
+    if len(ex[0]) != cur {
+      if cur > 0 { let rules = tg_night(rules, heard, n) }
+      let cur = len(ex[0])
+    }
+    let n = n + 1
+    let rules = tg_explain(rules, heard, n, ex)
+    let rules = release(m, rules)
+  }
+  let m = mark()
+  let rules = tg_night(rules, heard, total)
+  let rules = release(m, rules)
+  # once more through everything: a rule made early may have been unsettled by one made later
+  for ex in heard {
+    let m = mark()
+    let rules = tg_explain(rules, heard, total, ex)
+    let rules = release(m, rules)
+  }
+  let m = mark()
+  let rules = tg_night(rules, heard, total)
+  let rules = release(m, rules)
+  # replay: a sentence once kept whole, word for word, is explained again with all that has been learned since --
+  # and what explains it now is kept if it makes the whole smaller ("sum of squares" gives up "squares")
+  let going = true
+  while going {
+    let going = false
+    let i = 0
+    while i < len(rules) and going == false {
+      let r = rules[i]
+      if len(r[0]) >= 2 and tg_nvars(r[0]) == 0 {
+        let m2 = mark()
+        let again = tg_explain(tg_remove(rules, i), heard, total, [r[0], r[1]])
+        let again = tg_night(again, heard, total)
+        let better = tg_size(again) < tg_size(rules)
+        if better { let better = tg_all_right(again, heard, total, 0) }
+        if better {
+          let rules = release(m2, again)
+          let going = true
+        } else { let better = release(m2, better) }
+      }
+      let i = i + 1
+    }
+  }
+  return rules
+}
+
+skill tg_size(rules) -> Any {
+  let c = 0
+  for r in rules { let c = c + tg_cost(r) }
+  return c
+}
+
+# ---- reading with judgement: when a sentence can be read two ways ------------------------------------------------
+# The order of the rules settles only what the examples heard could settle. For the rest Pi keeps count of how
+# its rules have been seen to fit together: which kind of phrase (the rule that read it) has filled which variable
+# of which rule, in the examples it read rightly. A new sentence is then read the way that needs the fewest
+# fittings never seen -- "turn opposite left and walk" as (turn opposite left) and (walk), because "opposite" has
+# only ever been followed by a direction, never by a whole "... and ..." phrase.
+# Every stretch of the sentence is read once, the short ones first, and kept in a table: a stretch's reading is
+# [meaning, the rule that read it (its pattern, as text), fittings never seen, every fitting used], or null. With
+# fam null nothing is counted, and the reading is the plain one (the first rule that fits).
+skill tg_cell(tab, n, i, j) -> Any {
+  let k = j - i
+  return tab[(k - 1) * n - (k - 1) * (k - 2) // 2 + i]
+}
+
+# pattern[pi ..] against words[wi .. j], the variables' phrases taken from the table -> the fitting with the fewest
+# never-seen fittings: [what $1 means, what $2 means, how many never seen, the fittings], or null
+skill tg_cbind(pat, pi, words, wi, j, tab, n, fam, key) -> Any {
+  let np = len(pat)
+  if pi == np {
+    if wi == j { return [null, null, 0, []] }
+    return null
+  }
+  let item = pat[pi]
+  if tg_isvar(item) == false {
+    if wi < j {
+      if words[wi] == item { return tg_cbind(pat, pi + 1, words, wi + 1, j, tab, n, fam, key) }
+    }
+    return null
+  }
+  let rest = np - pi - 1
+  let last = j - rest
+  let e = wi + 1
+  if rest == 0 { let e = j }
+  if e <= wi { return null }
+  let best = null
+  while e <= last {
+    let ok = true
+    if rest > 0 {
+      let nx = pat[pi + 1]
+      if tg_isvar(nx) == false {
+        if words[e] != nx { let ok = false }
+      }
+    }
+    if ok {
+      let sub = tg_cell(tab, n, wi, e)
+      if sub != null {
+        let more = tg_cbind(pat, pi + 1, words, e, j, tab, n, fam, key)
+        if more != null {
+          let fit = key ++ " | " ++ item ++ " | " ++ sub[1]
+          let c = sub[2] + more[2]
+          if fam != null {
+            if fam[fit] == null { let c = c + 1 }
+          }
+          let better = best == null
+          if best != null { let better = c < best[2] }
+          if better {
+            let fits = sub[3] ++ [fit] ++ more[3]
+            if item == "$1" { let best = [sub[0], more[1], c, fits] } else { let best = [more[0], sub[0], c, fits] }
+          }
+        }
+      }
+    }
+    # the plain reading takes the first fitting; the judged one looks at them all
+    if best != null and fam == null { return best }
+    let e = e + 1
+  }
+  return best
+}
+
+skill tg_chart(rules, fam, words) -> Any {
+  let n = len(words)
+  if n == 0 { return null }
+  let keys = []
+  for r in rules { let keys = append(keys, join(r[0], " ")) }
+  let tab = []
+  for k in range(1, n + 1) {
+    for i in range(0, n - k + 1) {
+      let j = i + k
+      let span = slice(words, i, j)
+      let best = null
+      let ri = 0
+      for r in rules {
+        if tg_fits(r[0], span) {
+          if best == null or fam != null {
+            let b = tg_cbind(r[0], 0, words, i, j, tab, n, fam, keys[ri])
+            if b != null {
+              let better = best == null
+              if best != null { let better = b[2] < best[2] }
+              if better { let best = [tg_fill(r[1], [b[0], b[1]]), keys[ri], b[2], b[3]] }
+            }
+          }
+        }
+        let ri = ri + 1
+      }
+      let tab = append(tab, best)
+    }
+  }
+  return tg_cell(tab, n, 0, n)
+}
+
+# what Pi has seen fit where: every fitting in its readings of the examples it heard. Shortest first, and each read
+# with the judgement gathered so far -- a sentence that could be taken two ways with the same meaning ("turn left
+# and walk") is taken the way the shorter ones already point, so that the wrong way is never counted as seen.
+skill tg_familiar(rules, examples) -> Any {
+  let fam = {}
+  for ex in tg_by_length(examples) {
+    let m = mark()
+    let fits = []
+    let r = tg_chart(rules, fam, ex[0])
+    if r != null {
+      if r[0] != ex[1] { let r = tg_chart(rules, null, ex[0]) }
+    }
+    if r != null {
+      if r[0] == ex[1] { let fits = r[3] }
+    }
+    let fits = release(m, fits)
+    for f in fits { let fam = put(fam, f, true) }
+  }
+  return fam
+}
+
+# what a sentence means, read with judgement
+skill tg_understand(rules, fam, words) -> Any {
+  let r = tg_chart(rules, fam, words)
+  if r == null { return null }
+  return r[0]
+}
+
+skill tg_show(rules) -> Any {
+  let out = ""
+  for r in rules { let out = out ++ "    " ++ join(r[0], " ") ++ "  ->  " ++ join(r[1], " ") ++ "\n" }
+  return out
+}
+
+# how many of these Pi reads rightly; the first few it does not are kept to be shown
+skill tg_score(rules, fam, tests) -> Any {
+  let right = 0
+  let wrong = []
+  for ex in tests {
+    let m = mark()
+    let got = tg_understand(rules, fam, ex[0])
+    let ok = got == ex[1]
+    let ok = release(m, ok)
+    if ok { let right = right + 1 } else {
+      if len(wrong) < 3 { let wrong = append(wrong, join(ex[0], " ")) }
+    }
+  }
+  return [right, wrong]
+}

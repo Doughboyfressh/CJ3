@@ -120,6 +120,9 @@ Some words behave in ways worth knowing:
 | `logic.pi` | the reasoning engine: facts and rules as Pi data (`"?x"` variables), backward chaining, built-ins (eq neq lt le add sub mul not); `ask holds values_of` |
 | `english.pi` | English as a front end: grammar as data (typed-slot patterns), morphology, closed-class words, prior-knowledge rules; reading to engine terms, writing back, round-trip check |
 | `agent.pi` | Pi the agent: reads lines, decides statement vs question, reasons, replies in English, self-checks every learned fact, refuses contradictions, remembers in a memory file (`out\agent.exe [memory-file]`) |
+| `tonguelib.pi` | a language learned from examples, with nothing trained: ordered rules `pattern -> template` whose variables stand for phrases (`$1 twice -> $1 $1`), made by compression (the smallest rule that holds for everything heard; two rules that differ by a word become one with a variable; a sentence kept whole is explained again later) and never allowed to misread what was heard; a word learned from one sentence; a sentence that reads two ways is read the way its phrases have been seen to fit |
+| `tongue.pi` | its measure: SCAN (20,910 commands, made from the published grammar) learned from the commands of four words or fewer, asked every held-back split; a made-up language from 14 examples; `curve` for how few examples are enough |
+| `heed.pi` | English instructions for the mind's tasks: the names of practised tasks and the programs the mind found for them become a language; instructions never practised are read as programs and run with no examples; a new word is learned from one sentence |
 | `fib loops primes math bench data closures words reals mathx matht seq equation answer` | the tested programs |
 
 ## How it runs

@@ -1,0 +1,215 @@
+1. Pi practises (each task solved by search, from examples):
+  sum: sum(x)   = [sum(_)]
+  length: len(x)   = [len(_)]
+  reverse: rev(x)   = [rev(_)]
+  sort: sort(x)   = [sort(_)]
+  double each: map(e -> (e + e), x)   = [map(e -> (e + e), _)]
+  add one to each: map(e -> (e + 1), x)   = [map(e -> (e + 1), _)]
+  square each: map(e -> (e * e), x)   = [map(e -> (e * e), _)]
+  keep positives: filter(e -> (0 < e), x)   = [filter(e -> (0 < e), _)]
+  keep evens: filter(e -> (0 == (e % 2)), x)   = [filter(e -> (0 == (e % 2)), _)]
+  count positives: len(filter(e -> (0 < e), x))   = [len(_)] [filter(e -> (0 < e), _)]
+  sum of squares: sum(map(e -> (e * e), x))   = [sum(_)] [map(e -> (e * e), _)]
+  largest: maxl(x)   = [maxl(_)]
+  spread: (maxl(x) - minl(x))   = [(maxl(_) - minl(_))]
+  sort descending: rev(sort(x))   = [rev(_)] [sort(_)]
+  sum of positives: sum(filter(e -> (0 < e), x))   = [sum(_)] [filter(e -> (0 < e), _)]
+  squares sorted: sort(map(e -> (e * e), x))   = [sort(_)] [map(e -> (e * e), _)]
+  two smallest: take(2, sort(x))   = [take(2, _)] [sort(_)]
+  count evens: len(filter(e -> (0 == (e % 2)), x))   = [len(_)] [filter(e -> (0 == (e % 2)), _)]
+  sum of evens: sum(filter(e -> (0 == (e % 2)), x))   = [sum(_)] [filter(e -> (0 == (e % 2)), _)]
+  largest two, biggest first: take(2, rev(sort(x)))   = [take(2, _)] [rev(_)] [sort(_)]
+  clamp negatives to zero: map(e -> if((e < 0), 0, e), x)   = [map(e -> if((e < 0), 0, e), _)]
+  product: fold((acc, e) -> (acc * e), 1, x)   = [fold((acc, e) -> (acc * e), 1, _)]
+  product of squares: fold((acc, e) -> (acc * e), 1, (x ++ x))   = [fold((acc, e) -> (acc * e), 1, _)] [(_ ++ _)]
+  reverse the word: rev(x)   = [rev(_)]
+  word length: len(x)   = [len(_)]
+  first letter: head(x)   = [head(_)]
+  uppercase: map(e -> (e + -32), x)   = [map(e -> (e + -32), _)]
+  mirror: (x ++ rev(x))   = [(_ ++ rev(_))]
+  next letter of each: map(e -> (e + 1), x)   = [map(e -> (e + 1), _)]
+  letters after m: filter(e -> (109 < e), x)   = [filter(e -> (109 < e), _)]
+  first letter as capital: (-32 + head(x))   = [(-32 + _)] [head(_)]
+  uppercase, reversed: rev(map(e -> (e + -32), x))   = [rev(_)] [map(e -> (e + -32), _)]
+  letters before n: filter(e -> (e < 110), x)   = [filter(e -> (e < 110), _)]
+  flip upside down: gflipv(g)   = [gflipv(_)]
+  mirror left-right: gfliph(g)   = [gfliph(_)]
+  transpose: gtrans(g)   = [gtrans(_)]
+  height: gh(g)   = [gh(_)]
+  width: gw(g)   = [gw(_)]
+  rotate 180: gflipv(gfliph(g))   = [gflipv(_)] [gfliph(_)]
+  rotate right: gfliph(gtrans(g))   = [gfliph(_)] [gtrans(_)]
+  rotate left: gflipv(gtrans(g))   = [gflipv(_)] [gtrans(_)]
+  recolour 1 to 5: gmap(e -> recolour(e, 1->5), g)   = [gmap(e -> recolour(e, 1->5), _)]
+  recolour 1 to 5, then flip: gflipv(gmap(e -> recolour(e, 1->5), g))   = [gflipv(_)] [gmap(e -> recolour(e, 1->5), _)]
+
+2. the English Pi made of it: 45 rules from 43 names
+    largest two , biggest first  ->  [take(2, _)] [rev(_)] [sort(_)]
+    recolour 1 to 5  ->  [gmap(e -> recolour(e, 1->5), _)]
+    next letter of each  ->  [map(e -> (e + 1), _)]
+    clamp negatives to zero  ->  [map(e -> if((e < 0), 0, e), _)]
+    add one to each  ->  [map(e -> (e + 1), _)]
+    sorted  ->  [sort(_)]
+    descending  ->  [rev(_)]
+    product of squares  ->  [fold((acc, e) -> (acc * e), 1, _)] [(_ ++ _)]
+    letters before n  ->  [filter(e -> (e < 110), _)]
+    letters after m  ->  [filter(e -> (109 < e), _)]
+    flip upside down  ->  [gflipv(_)]
+    square  ->  [map(e -> (e * e), _)]
+    double  ->  [map(e -> (e + e), _)]
+    positives  ->  [filter(e -> (0 < e), _)]
+    evens  ->  [filter(e -> (0 == (e % 2)), _)]
+    right  ->  [gfliph(_)]
+    left  ->  [gflipv(_)]
+    two smallest  ->  [take(2, _)] [sort(_)]
+    rotate 180  ->  [gflipv(_)] [gfliph(_)]
+    mirror left-right  ->  [gfliph(_)]
+    first letter  ->  [head(_)]
+    height  ->  [gh(_)]
+    largest  ->  [maxl(_)]
+    length  ->  [len(_)]
+    mirror  ->  [(_ ++ rev(_))]
+    product  ->  [fold((acc, e) -> (acc * e), 1, _)]
+    reverse  ->  [rev(_)]
+    sort  ->  [sort(_)]
+    spread  ->  [(maxl(_) - minl(_))]
+    sum  ->  [sum(_)]
+    transpose  ->  [gtrans(_)]
+    uppercase  ->  [map(e -> (e + -32), _)]
+    width  ->  [gw(_)]
+    word $1  ->  $1
+    rotate $1  ->  $1 [gtrans(_)]
+    count $1  ->  [len(_)] $1
+    $1 each  ->  $1
+    keep $1  ->  $1
+    $1 the word  ->  $1
+    $1 of $2  ->  $1 $2
+    squares  ->  [map(e -> (e * e), _)]
+    $1 , reversed  ->  [rev(_)] $1
+    $1 $2  ->  $2 $1
+    $1 as capital  ->  [(-32 + _)] $1
+    $1 , then flip  ->  [gflipv(_)] $1
+
+3. TOLD ONLY -- instructions never practised, no examples:
+  sum of doubles: cannot read
+  count negatives: cannot read
+  largest square: wrong   map(e -> (e * e), maxl(x))
+  three smallest: cannot read
+  positives sorted: right   sort(filter(e -> (0 < e), x))
+  squares of positives: right   map(e -> (e * e), filter(e -> (0 < e), x))   (beyond its search: shown examples and no words, it finds nothing)
+  evens, biggest first: cannot read
+  smallest even: cannot read
+  product of positives: right   fold((acc, e) -> (acc * e), 1, filter(e -> (0 < e), x))   (beyond its search: shown examples and no words, it finds nothing)
+  sum after clamping negatives: cannot read
+  product of evens: right   fold((acc, e) -> (acc * e), 1, filter(e -> (0 == (e % 2)), x))   (beyond its search: shown examples and no words, it finds nothing)
+  uppercase first three: cannot read
+  count letters after m: right   len(filter(e -> (109 < e), x))   (beyond its search: shown examples and no words, it finds nothing)
+  last letter as capital: cannot read
+  uppercase, sorted: cannot read
+  letters after m, reversed: right   rev(filter(e -> (109 < e), x))
+  rotate right, recolour 1 to 5: cannot read
+  mirror, recolour 1 to 7: cannot read
+  area: cannot read
+  rotate left, then flip: right   gflipv(gflipv(gtrans(g)))
+  rotate right twice, recolour 1 to 4: cannot read
+  told only: 7 of 21 done rightly; 4 of those 7 are beyond what its search finds from examples
+
+4. SHOWN ONCE -- for those, examples; Pi searches as before, and learns from the one sentence:
+  sum of doubles: (2 * sum(x))
+  count negatives: len(filter(e -> (e < 0), x))
+  largest square: maxl(map(e -> (e * e), x))
+  three smallest: take(3, sort(x))
+  evens, biggest first: not found by search
+  smallest even: minl(filter(e -> (0 == (e % 2)), x))
+  sum after clamping negatives: sum(filter(e -> (0 < e), x))
+  uppercase first three: take(3, map(e -> (e + -32), x))
+  last letter as capital: (-32 + last(x))
+  uppercase, sorted: sort(map(e -> (e + -32), x))
+  rotate right, recolour 1 to 5: gfliph(gtrans(gmap(e -> recolour(e, 1->5), g)))
+  mirror, recolour 1 to 7: gfliph(gmap(e -> recolour(e, 1->7), g))
+  area: (gh(g) * gw(g))
+  rotate right twice, recolour 1 to 4: gflipv(gfliph(gmap(e -> recolour(e, 1->4), g)))
+  13 sentences heard once each; the English is now 59 rules (was 45):
+    mirror , recolour 1 to 7  ->  [gfliph(_)] [gmap(e -> recolour(e, 1->7), _)]
+    last letter as capital  ->  [(-32 + _)] [last(_)]
+    recolour 1 to 5  ->  [gmap(e -> recolour(e, 1->5), _)]
+    next letter of each  ->  [map(e -> (e + 1), _)]
+    clamp negatives to zero  ->  [map(e -> if((e < 0), 0, e), _)]
+    add one to each  ->  [map(e -> (e + 1), _)]
+    reversed  ->  [rev(_)]
+    sorted  ->  [sort(_)]
+    product of squares  ->  [fold((acc, e) -> (acc * e), 1, _)] [(_ ++ _)]
+    letters before n  ->  [filter(e -> (e < 110), _)]
+    letters after m  ->  [filter(e -> (109 < e), _)]
+    flip upside down  ->  [gflipv(_)]
+    smallest  ->  [sort(_)]
+    evens  ->  [filter(e -> (0 == (e % 2)), _)]
+    square  ->  [map(e -> (e * e), _)]
+    double  ->  [map(e -> (e + e), _)]
+    positives  ->  [filter(e -> (0 < e), _)]
+    negatives  ->  [filter(e -> (e < 0), _)]
+    right  ->  [gfliph(_)]
+    left  ->  [gflipv(_)]
+    two  ->  [take(2, _)]
+    three  ->  [take(3, _)]
+    $1 sorted  ->  [sort(_)] $1
+    smallest even  ->  [minl(_)] [filter(e -> (0 == (e % 2)), _)]
+    rotate 180  ->  [gflipv(_)] [gfliph(_)]
+    mirror left-right  ->  [gfliph(_)]
+    first letter  ->  [head(_)]
+    area  ->  [(gh(_) * gw(_))]
+    height  ->  [gh(_)]
+    largest  ->  [maxl(_)]
+    length  ->  [len(_)]
+    mirror  ->  [(_ ++ rev(_))]
+    product  ->  [fold((acc, e) -> (acc * e), 1, _)]
+    reverse  ->  [rev(_)]
+    sort  ->  [sort(_)]
+    spread  ->  [(maxl(_) - minl(_))]
+    sum  ->  [sum(_)]
+    transpose  ->  [gtrans(_)]
+    uppercase  ->  [map(e -> (e + -32), _)]
+    width  ->  [gw(_)]
+    word $1  ->  $1
+    $1 descending  ->  [rev(_)] $1
+    rotate $1 , $2  ->  $1 [gtrans(_)] $2
+    rotate $1  ->  $1 [gtrans(_)]
+    count $1  ->  [len(_)] $1
+    $1 each  ->  $1
+    keep $1  ->  $1
+    $1 $2  ->  $1 $2
+    $1 the word  ->  $1
+    $1 of doubles  ->  [(2 * _)] $1
+    $1 of $2  ->  $1 $2
+    squares  ->  [map(e -> (e * e), _)]
+    $1 first $2  ->  $2 $1
+    $1 , $2  ->  $2 $1
+    $1 as capital  ->  [(-32 + _)] $1
+    $1 after clamping negatives  ->  $1 [filter(e -> (0 < e), _)]
+    largest $1 , biggest first  ->  $1 [rev(_)] [sort(_)]
+    $1 , then flip  ->  [gflipv(_)] $1
+    rotate $1 twice , recolour 1 to 4  ->  [gflipv(_)] $1 [gmap(e -> recolour(e, 1->4), _)]
+
+5. TOLD AGAIN -- new instructions from the words just learned, no examples:
+  sum of negatives: right   sum(filter(e -> (e < 0), x))   (before stage 4: cannot read)
+  product of negatives: right   fold((acc, e) -> (acc * e), 1, filter(e -> (e < 0), x))   (before stage 4: cannot read)
+  negatives sorted: right   sort(filter(e -> (e < 0), x))   (before stage 4: cannot read)
+  squares of negatives: right   map(e -> (e * e), filter(e -> (e < 0), x))   (before stage 4: cannot read)
+  count doubles: cannot read   (before stage 4: cannot read)
+  product of doubles: wrong   (2 * fold((acc, e) -> (acc * e), 1, x))   (before stage 4: cannot read)
+  largest square of positives: right   maxl(map(e -> (e * e), filter(e -> (0 < e), x)))   (before stage 4: wrong)
+  sum of squares of evens: right   sum(map(e -> (e * e), filter(e -> (0 == (e % 2)), x)))   (before stage 4: right)
+  evens sorted: right   sort(filter(e -> (0 == (e % 2)), x))   (before stage 4: right)
+  squares sorted, biggest first: cannot read   (before stage 4: cannot read)
+  three smallest, biggest first: cannot read   (before stage 4: cannot read)
+  count evens: right   len(filter(e -> (0 == (e % 2)), x))   (before stage 4: right)
+  count letters before n: right   len(filter(e -> (e < 110), x))   (before stage 4: right)
+  letters before n, reversed: right   rev(filter(e -> (e < 110), x))   (before stage 4: right)
+  letters after m, sorted: right   sort(filter(e -> (109 < e), x))   (before stage 4: cannot read)
+  uppercase, reversed, sorted: right   sort(rev(map(e -> (e + -32), x)))   (before stage 4: cannot read)
+  rotate left, recolour 1 to 5: right   gflipv(gtrans(gmap(e -> recolour(e, 1->5), g)))   (before stage 4: cannot read)
+  transpose, then flip: right   gflipv(gtrans(g))   (before stage 4: right)
+  rotate right, then flip: right   gflipv(gfliph(gtrans(g)))   (before stage 4: right)
+  mirror, then flip: wrong   gflipv((g ++ rev(g)))   (before stage 4: wrong)
+  told again: 15 of 20 done rightly (with the English of stage 2 alone: 7 of 20)
+done

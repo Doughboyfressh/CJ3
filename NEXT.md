@@ -1775,3 +1775,51 @@ User approved all five: (1) Pi drafts tokens for its own brain (speculative deco
   every golden file byte-identical to Windows (gpuforms skipped, as on a Windows machine without the GPU).
 - Not on Linux yet: the GPU engine (nvcuda.dll is loaded by name; Linux needs libcuda.so through a dynamic
   loader, which a static file does not have), http() (WinHTTP; plain sockets work), screen / mouse / key / play.
+
+## 2026-11-11 -- A language from examples (user: "try your best ... in your way. Not the traditional way")
+- The choice. The mind learns programs by compress / name / verify; what it could not do is learn what words
+  mean. tonguelib.pi does that by the same three steps and nothing else: no network, no gradient, no counts of
+  co-occurrence. What is learned is an ordered list of rules, pattern -> template, a variable standing for any
+  phrase already readable (`$1 around $2 -> $2 $1 $2 $1 $2 $1 $2 $1`). 16 such rules are the whole of SCAN.
+- Day: an unreadable example gets the smallest rule that holds for everything Pi has been through (variables put
+  where it can already read a phrase; the template that writes the meaning with the fewest plain words); or a
+  word it cannot read alone is given the meaning the sentence needs (one sentence, one word); or, if it was only
+  read wrongly, one rule is moved. Night: two rules that differ by one word become one with a variable, and the
+  two words get meanings of their own ("left" comes to mean I_TURN_LEFT though it is never said alone); a
+  sentence kept whole is explained again with what was learned since; what the rest covers is dropped.
+- Two things the first version got wrong, kept here because they are the instructive part:
+  1. It scored 100% and the score was luck. Adding the one-word step changed the order the same 16 rules ended
+     in, and 600 longer sentences were misread: the short examples never said which of two rules goes first.
+     Fix: when a sentence reads two ways, take the reading whose phrases fit together the way Pi has seen
+     (which rule's phrase filled which variable of which rule, gathered shortest sentences first). "turn opposite
+     left and walk" is then (turn opposite left) and (walk), because "opposite" was only ever followed by a
+     direction.
+  2. "Never misread anything heard", applied as an absolute, deadlocked: one sentence kept whole made a longer
+     one misread, after which every new rule was refused and everything was memorised. Fix: a step may not ADD
+     misreadings, and a new rule goes where it leaves the fewest.
+- SCAN (tongue.pi), the 20,910 commands made from the published grammar (the same pairs as the published file,
+  the same held-back sets). Heard: the commands of four words or fewer that a split allows (268 to 422).
+  simple 20,488 of 20,488; add-jump 7,706 of 7,706; add-turn-left 1,208 of 1,208; around-right 5,685 of 5,685
+  (the published 4,476 and the 1,209 with "turn"); length 3,920 of 3,920. 16 rules each time, 50 s for all five.
+  A made-up language in the manner of the few-shot studies: 14 examples heard, 10 of 10 new sentences.
+  This is not a record: SCAN is solved by several methods built for it. Plain sequence networks famously are
+  not among them (about 1% on add-jump), which is the point of having passed it this way.
+- How few is enough (out/tongue curve; 3,000 commands asked): the 150 shortest suffice. A random share of the 422
+  short ones: 75% -> all five draws perfect; 50% -> three perfect, two at 98-99%; 35% and 25% -> anywhere from
+  44% to 99%; 15% and under -> mostly wrong. Below about 150 examples it does not reliably find the rules.
+- English for the mind's own tasks (heed.pi). A program is a chain of steps and a word means a piece of chain.
+  Heard: the 43 named list, text and grid tasks with the programs the mind found for them. Then:
+  told only (21 instructions never practised, no examples): 7 right, 1 wrong, 13 it could not read (a word
+  never met). 4 of the 7 are tasks the mind's search does not find from examples at all ("squares of
+  positives", "product of evens", ...): the words reached where the search does not.
+  shown once (examples for the 14 it failed; the search finds 13): negatives, three, two, sorted, smallest and
+  area become words, each from one sentence.
+  told again (20 new instructions from those words, no examples): 15 right; 7 with the English of before.
+- What is wrong with it, plainly. (a) A word is learned from the program the search happened to find: "sum of
+  doubles" was solved as 2 * sum(x), so "doubles" came out meaning "twice the result" and "product of doubles"
+  is read wrongly. (b) One meaning per word: "mirror" is x ++ rev(x) from the text tasks and that is what it
+  stays for a grid. (c) No morphology: "square" and "squares" are two words. (d) 43 sentences is a toy; nothing
+  here says how it goes with thousands. (e) Meanings are chains of steps: anything that is not a composition
+  is one opaque piece.
+- Next: read first and check against the examples before searching (the reading is a guess the examples can
+  confirm); senses chosen by type; the mind's nights naming steps that words already name.

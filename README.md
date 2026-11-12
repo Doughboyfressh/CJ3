@@ -19,6 +19,13 @@ brain. No Rust, no interpreter, no CUDA toolkit, no third-party libraries — Pi
   itself — `langgrow.pi` learns new grammar rules from the brain's own compile failures, and only reseeds the
   compiler if the full test suite still passes.
 
+- **Language, its own way.** `tonguelib.pi` learns a language from example sentences with no network and
+  nothing trained: it keeps the smallest set of readable rules that explains everything it heard, and checks
+  each rule against all of it. `tongue.pi` measures it on the SCAN benchmark: from the 422 shortest commands
+  it reads the other 20,488 correctly, including every sentence the benchmark's splits hold back. `heed.pi`
+  uses the same learner on the mind's own tasks: an English instruction Pi was never given is read as a
+  program and run.
+
 ## Quick start
 
 Windows x64:

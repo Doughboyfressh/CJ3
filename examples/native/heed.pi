@@ -1,0 +1,298 @@
+# heed: Pi does what it is told, in English.
+#
+# Pi's mind (mindcore.pi) finds programs from examples: shown what "sum of squares" does to a few lists, it searches
+# out sum(map(e -> e * e, x)). Every task it practises comes with a name. tonguelib.pi learns a language from pairs of
+# utterance and meaning. Put together: the names are the utterances, the programs Pi found are the meanings, and
+# what comes out is English that Pi can act on -- an instruction it was never given, read as a program and run.
+#
+# A meaning here is a chain of steps, outermost first: "sum of squares" is [sum(_)] [map(e -> e * e, _)], the _ being
+# where the next step (and at last the input) goes. A program whose steps are not a chain (the input used twice,
+# as in maxl(x) - minl(x)) is one step, whole. A word's meaning is then a piece of a chain, and to put words
+# together is to join their pieces -- which is all tonguelib knows how to do.
+#
+#   1. Pi practises: each named task solved by search, from examples (no words of its own yet, and no language).
+#   2. It learns English for what it found: the rules tonguelib makes from (name, chain) pairs.
+#   3. TOLD ONLY: instructions never practised, with no examples at all. Pi reads each as a program; the program is
+#      run on inputs and compared with what the instruction's author meant. For each one it gets right, the same
+#      task is also given to the search with examples and no words, to see whether the words reached further.
+#   4. SHOWN ONCE: where the words fail it (a word it has never met), Pi is shown examples, finds the program by
+#      search as it always could -- and now learns the new word from that single sentence.
+#   5. TOLD AGAIN: new instructions built from the words it has just learned, again with no examples.
+import "mindcore.pi"
+import "tonguelib.pi"
+
+# an instruction's words: lower case, a comma a word of its own
+skill hd_words(text) -> Any { return split(join(split(lower(text), ","), " , ")) }
+
+# does t use the input (outside an element function)?
+skill hd_uses(t) -> Any {
+  if t[0] == "v" { return isinput(t[1]) }
+  if t[0] == "q" or t[0] == "p" { return false }
+  for i in range(0, len(t[2])) {
+    if is_fp(t, i) == false {
+      if hd_uses(t[2][i]) { return true }
+    }
+  }
+  return false
+}
+
+# the hole in a step (its own mark: ["p", 0] is already the running value inside a fold)
+skill hd_hole() -> Any { return ["v", "_"] }
+
+skill hd_holed(t) -> Any {
+  if t[0] == "v" {
+    if isinput(t[1]) { return hd_hole() }
+    return t
+  }
+  if t[0] == "q" or t[0] == "p" { return t }
+  let out = []
+  for a in t[2] { let out = append(out, hd_holed(a)) }
+  return [t[0], t[1], out]
+}
+
+skill hd_plug(t, v) -> Any {
+  if t[0] == "v" {
+    if t[1] == "_" { return v }
+    return t
+  }
+  if t[0] == "q" or t[0] == "p" { return t }
+  let out = []
+  for a in t[2] { let out = append(out, hd_plug(a, v)) }
+  return [t[0], t[1], out]
+}
+
+# a program as a chain of steps, outermost first; each step a tree with a hole where the rest goes
+skill hd_chain(t) -> Any {
+  let out = []
+  let cur = t
+  let going = true
+  while going {
+    if cur[0] == "v" { let going = false } else {
+      let which = 0 - 1
+      let count = 0
+      if cur[0] == "op" or cur[0] == "w" {
+        for i in range(0, len(cur[2])) {
+          if is_fp(cur, i) == false {
+            if hd_uses(cur[2][i]) {
+              let which = i
+              let count = count + 1
+            }
+          }
+        }
+      }
+      if count == 1 {
+        let args = []
+        for i in range(0, len(cur[2])) {
+          if i == which { let args = append(args, hd_hole()) } else { let args = append(args, cur[2][i]) }
+        }
+        let out = append(out, [cur[0], cur[1], args])
+        let cur = cur[2][which]
+      } else {
+        # the input used twice, or not at all: what is left is one step, the input its hole
+        let out = append(out, hd_holed(cur))
+        let going = false
+      }
+    }
+  }
+  return out
+}
+
+# a step as one word of meaning, written as Pi writes programs, with _ for the hole
+skill hd_token(step) -> Any { return "[" ++ show(step) ++ "]" }
+
+# the chain as words of meaning; steps: every step met so far, by its word -> [words, steps]
+skill hd_meaning(t, steps) -> Any {
+  let toks = []
+  for st in hd_chain(t) {
+    let k = hd_token(st)
+    let toks = append(toks, k)
+    let steps = put(steps, k, st)
+  }
+  return [toks, steps]
+}
+
+# words of meaning back into a program: each step's hole takes what follows, the last takes the input
+skill hd_program(toks, steps, xin) -> Any {
+  let cur = xin
+  let i = len(toks) - 1
+  while i >= 0 {
+    let st = steps[toks[i]]
+    if st == null { return null }
+    let cur = hd_plug(st, cur)
+    let i = i - 1
+  }
+  return cur
+}
+
+skill hd_input(domain) -> Any {
+  if domain == "grids" { return ["v", "g"] }
+  return ["v", "x"]
+}
+
+# is this program what the task's author meant? run on every input Pi has for the domain, the held-out ones too
+skill hd_right(tree, f, domain) -> Any {
+  if tree == null { return false }
+  for v in train_inputs(domain) ++ held_inputs(domain) {
+    let y = sev(tree, null, v, null, [])
+    if y == null { return false }
+    if y != f(v) { return false }
+  }
+  return true
+}
+
+skill hd_tasks(domain, unseen) -> Any {
+  if unseen {
+    if domain == "lists" { return unseen_lists() }
+    if domain == "text" { return unseen_text() }
+    return unseen_grids()
+  }
+  if domain == "lists" { return list_tasks() }
+  if domain == "text" { return text_tasks() }
+  return grid_tasks()
+}
+
+# ---- new instructions, made of words Pi will by then have met (stage 5): never practised, never shown -----------
+skill hd_new_lists() -> Any {
+  return [
+    ["sum of negatives", fn(xs) => sum(tfilter(xs, fn(v) => v < 0))],
+    ["product of negatives", fn(xs) => t_prod(tfilter(xs, fn(v) => v < 0))],
+    ["negatives sorted", fn(xs) => sort(tfilter(xs, fn(v) => v < 0))],
+    ["squares of negatives", fn(xs) => tmap(tfilter(xs, fn(v) => v < 0), fn(v) => v * v)],
+    ["count doubles", fn(xs) => len(tmap(xs, fn(v) => v * 2))],
+    ["product of doubles", fn(xs) => t_prod(tmap(xs, fn(v) => v * 2))],
+    ["largest square of positives", fn(xs) => tmax(tmap(tfilter(xs, fn(v) => v > 0), fn(v) => v * v))],
+    ["sum of squares of evens", fn(xs) => sum(tmap(tfilter(xs, fn(v) => v % 2 == 0), fn(v) => v * v))],
+    ["evens sorted", fn(xs) => sort(tfilter(xs, fn(v) => v % 2 == 0))],
+    ["squares sorted, biggest first", fn(xs) => reverse(sort(tmap(xs, fn(v) => v * v)))],
+    ["three smallest, biggest first", fn(xs) => reverse(ttake(3, sort(xs)))],
+    ["count evens", fn(xs) => len(tfilter(xs, fn(v) => v % 2 == 0))]
+  ]
+}
+
+skill hd_new_text() -> Any {
+  return [
+    ["count letters before n", fn(xs) => len(tfilter(xs, fn(v) => v < 110))],
+    ["letters before n, reversed", fn(xs) => reverse(tfilter(xs, fn(v) => v < 110))],
+    ["letters after m, sorted", fn(xs) => sort(tfilter(xs, fn(v) => v > 109))],
+    ["uppercase, reversed, sorted", fn(xs) => sort(reverse(tmap(xs, fn(v) => v - 32)))]
+  ]
+}
+
+skill hd_new_grids() -> Any {
+  return [
+    ["rotate left, recolour 1 to 5", fn(g) => t_rotl(t_recol(g, 1, 5))],
+    ["transpose, then flip", fn(g) => reverse(transpose(g))],
+    ["rotate right, then flip", fn(g) => reverse(t_rotr(g))],
+    ["mirror, then flip", fn(g) => reverse(t_fliph(g))]
+  ]
+}
+
+skill hd_new(domain) -> Any {
+  if domain == "lists" { return hd_new_lists() }
+  if domain == "text" { return hd_new_text() }
+  return hd_new_grids()
+}
+
+# read an instruction with no examples -> [the program or null, how it went: "right", "wrong" or "cannot read"]
+skill hd_told(rules, fam, steps, task, domain) -> Any {
+  let toks = tg_understand(rules, fam, hd_words(task[0]))
+  if toks == null { return [null, "cannot read"] }
+  let tree = hd_program(toks, steps, hd_input(domain))
+  if hd_right(tree, task[1], domain) { return [tree, "right"] }
+  return [tree, "wrong"]
+}
+
+skill hd_pct(a, b) -> Any { return str(a) ++ " of " ++ str(b) }
+
+skill main() -> Any {
+  let domains = ["lists", "text", "grids"]
+  let pl = pools()
+  let pre = prelude()
+  let g = default_genome()
+  # 1. practice: by search, from examples
+  do print("1. Pi practises (each task solved by search, from examples):")
+  let pairs = []
+  let steps = {}
+  for d in domains {
+    for t in hd_tasks(d, false) {
+      let r = attempt_task_g(t, d, [], [], pl, pre, g)
+      if r[0] == null { do print("  " ++ t[0] ++ ": not found") } else {
+        let mn = hd_meaning(r[0], steps)
+        let steps = mn[1]
+        let pairs = append(pairs, [hd_words(t[0]), mn[0]])
+        do print("  " ++ t[0] ++ ": " ++ show(r[0]) ++ "   = " ++ join(mn[0], " "))
+      }
+    }
+  }
+  # 2. the language
+  let rules = tg_learn(pairs)
+  let fam = tg_familiar(rules, pairs)
+  do print("")
+  do print("2. the English Pi made of it: " ++ str(len(rules)) ++ " rules from " ++ str(len(pairs)) ++ " names")
+  do print(tg_show(rules))
+  # 3. told only
+  do print("3. TOLD ONLY -- instructions never practised, no examples:")
+  let right = 0
+  let total = 0
+  let beyond = 0
+  let failed = []
+  for d in domains {
+    for t in hd_tasks(d, true) {
+      let r = hd_told(rules, fam, steps, t, d)
+      let total = total + 1
+      let line = "  " ++ t[0] ++ ": " ++ r[1]
+      if r[0] != null { let line = line ++ "   " ++ show(r[0]) }
+      if r[1] == "right" {
+        let right = right + 1
+        # could Pi have found this one from examples, by search, as it found the tasks it practised?
+        let s = attempt_task_g(t, d, [], [], pl, pre, g)
+        if s[0] == null {
+          let beyond = beyond + 1
+          let line = line ++ "   (beyond its search: shown examples and no words, it finds nothing)"
+        }
+      } else { let failed = append(failed, [t, d]) }
+      do print(line)
+    }
+  }
+  do print("  told only: " ++ hd_pct(right, total) ++ " done rightly; " ++ str(beyond) ++ " of those " ++ str(right) ++ " are beyond what its search finds from examples")
+  # 4. shown once
+  do print("")
+  do print("4. SHOWN ONCE -- for those, examples; Pi searches as before, and learns from the one sentence:")
+  let learned = 0
+  for ft in failed {
+    let t = ft[0]
+    let d = ft[1]
+    let r = attempt_task_g(t, d, [], [], pl, pre, g)
+    if r[0] == null { do print("  " ++ t[0] ++ ": not found by search") } else {
+      let mn = hd_meaning(r[0], steps)
+      let steps = mn[1]
+      let pairs = append(pairs, [hd_words(t[0]), mn[0]])
+      let learned = learned + 1
+      do print("  " ++ t[0] ++ ": " ++ show(r[0]))
+    }
+  }
+  let before = len(rules)
+  let rules2 = tg_learn(pairs)
+  let fam2 = tg_familiar(rules2, pairs)
+  do print("  " ++ str(learned) ++ " sentences heard once each; the English is now " ++ str(len(rules2)) ++ " rules (was " ++ str(before) ++ "):")
+  do print(tg_show(rules2))
+  # 5. told again
+  do print("5. TOLD AGAIN -- new instructions from the words just learned, no examples:")
+  let right0 = 0
+  let right2 = 0
+  let total2 = 0
+  for d in domains {
+    for t in hd_new(d) {
+      let r0 = hd_told(rules, fam, steps, t, d)
+      let r2 = hd_told(rules2, fam2, steps, t, d)
+      let total2 = total2 + 1
+      if r0[1] == "right" { let right0 = right0 + 1 }
+      if r2[1] == "right" { let right2 = right2 + 1 }
+      let line = "  " ++ t[0] ++ ": " ++ r2[1]
+      if r2[0] != null { let line = line ++ "   " ++ show(r2[0]) }
+      do print(line ++ "   (before stage 4: " ++ r0[1] ++ ")")
+    }
+  }
+  do print("  told again: " ++ hd_pct(right2, total2) ++ " done rightly (with the English of stage 2 alone: " ++ hd_pct(right0, total2) ++ ")")
+  return "done"
+}

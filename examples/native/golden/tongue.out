@@ -1,0 +1,121 @@
+SCAN: 20910 commands
+
+split: simple
+  heard 422 examples (every one of 4 words or fewer that the split allows)
+  rules made: 16
+    right  ->  I_TURN_RIGHT
+    left  ->  I_TURN_LEFT
+    jump  ->  I_JUMP
+    look  ->  I_LOOK
+    run  ->  I_RUN
+    walk  ->  I_WALK
+    $1 after $2  ->  $2 $1
+    $1 and $2  ->  $1 $2
+    $1 twice  ->  $1 $1
+    $1 thrice  ->  $1 $1 $1
+    turn $1  ->  $1
+    $1 $2  ->  $2 $1
+    turn opposite $1  ->  $1 $1
+    $1 opposite $2  ->  $2 $2 $1
+    turn around $1  ->  $1 $1 $1 $1
+    $1 around $2  ->  $2 $1 $2 $1 $2 $1 $2 $1
+  the longer commands it never heard: 20488 of 20488 read rightly
+
+split: jump
+  heard 268 examples (every one of 4 words or fewer that the split allows)
+  rules made: 16
+    right  ->  I_TURN_RIGHT
+    left  ->  I_TURN_LEFT
+    jump  ->  I_JUMP
+    look  ->  I_LOOK
+    run  ->  I_RUN
+    walk  ->  I_WALK
+    $1 after $2  ->  $2 $1
+    $1 and $2  ->  $1 $2
+    $1 twice  ->  $1 $1
+    $1 thrice  ->  $1 $1 $1
+    turn $1  ->  $1
+    $1 $2  ->  $2 $1
+    turn opposite $1  ->  $1 $1
+    $1 opposite $2  ->  $2 $2 $1
+    turn around $1  ->  $1 $1 $1 $1
+    $1 around $2  ->  $2 $1 $2 $1 $2 $1 $2 $1
+  held back by the split: 7706 of 7706 read rightly
+  the longer commands it never heard: 12936 of 12936 read rightly
+
+split: turn left
+  heard 404 examples (every one of 4 words or fewer that the split allows)
+  rules made: 16
+    right  ->  I_TURN_RIGHT
+    left  ->  I_TURN_LEFT
+    jump  ->  I_JUMP
+    look  ->  I_LOOK
+    run  ->  I_RUN
+    walk  ->  I_WALK
+    $1 after $2  ->  $2 $1
+    $1 and $2  ->  $1 $2
+    $1 twice  ->  $1 $1
+    $1 thrice  ->  $1 $1 $1
+    turn $1  ->  $1
+    $1 $2  ->  $2 $1
+    turn opposite $1  ->  $1 $1
+    $1 opposite $2  ->  $2 $2 $1
+    turn around $1  ->  $1 $1 $1 $1
+    $1 around $2  ->  $2 $1 $2 $1 $2 $1 $2 $1
+  held back by the split: 1208 of 1208 read rightly
+  the longer commands it never heard: 19298 of 19298 read rightly
+
+split: around right
+  heard 407 examples (every one of 4 words or fewer that the split allows)
+  rules made: 16
+    right  ->  I_TURN_RIGHT
+    left  ->  I_TURN_LEFT
+    jump  ->  I_JUMP
+    look  ->  I_LOOK
+    run  ->  I_RUN
+    walk  ->  I_WALK
+    $1 after $2  ->  $2 $1
+    $1 and $2  ->  $1 $2
+    $1 twice  ->  $1 $1
+    $1 thrice  ->  $1 $1 $1
+    turn $1  ->  $1
+    $1 $2  ->  $2 $1
+    turn opposite $1  ->  $1 $1
+    $1 opposite $2  ->  $2 $2 $1
+    turn around $1  ->  $1 $1 $1 $1
+    $1 around $2  ->  $2 $1 $2 $1 $2 $1 $2 $1
+  held back by the split: 5685 of 5685 read rightly
+  the longer commands it never heard: 14818 of 14818 read rightly
+
+split: length
+  heard 414 examples (every one of 4 words or fewer that the split allows)
+  rules made: 16
+    right  ->  I_TURN_RIGHT
+    left  ->  I_TURN_LEFT
+    jump  ->  I_JUMP
+    look  ->  I_LOOK
+    run  ->  I_RUN
+    walk  ->  I_WALK
+    $1 after $2  ->  $2 $1
+    $1 and $2  ->  $1 $2
+    $1 twice  ->  $1 $1
+    $1 thrice  ->  $1 $1 $1
+    turn $1  ->  $1
+    $1 $2  ->  $2 $1
+    turn opposite $1  ->  $1 $1
+    $1 opposite $2  ->  $2 $2 $1
+    turn around $1  ->  $1 $1 $1 $1
+    $1 around $2  ->  $2 $1 $2 $1 $2 $1 $2 $1
+  held back by the split: 3920 of 3920 read rightly
+  the longer commands it never heard: 16576 of 16576 read rightly
+
+a made-up language: heard 14 examples
+  rules made: 7
+    dax  ->  RED
+    lug  ->  BLUE
+    wif  ->  GREEN
+    zup  ->  YELLOW
+    $1 kiki $2  ->  $2 $1
+    $1 fep  ->  $1 $1 $1
+    $1 blicket $2  ->  $1 $2 $1
+  new sentences: 10 of 10 read rightly

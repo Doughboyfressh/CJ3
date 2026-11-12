@@ -1,0 +1,177 @@
+# tongue: the measure of tonguelib.pi -- can Pi learn a language from examples, and put its words together by rule?
+#
+# SCAN (Lake and Baroni 2018) is the standard test of that: 20,910 commands ("jump around left twice and walk") and
+# the actions each stands for. Its splits hold back a kind of sentence -- every command with "jump" in it but the
+# word alone, every "turn left", every "around right", every long one -- and ask for exactly those. Sequence-to-
+# sequence networks trained on thousands of the commands read about 1% of the held-back "jump" sentences rightly.
+#
+# The commands and their meanings are made here from the published grammar: the same 20,910 pairs as the published
+# file, and the same held-back sets (for "around right", the published 4,476 and the 1,209 with "turn" as well).
+# The learner is given pairs only, and only the short ones: every command of four words or fewer that a split allows.
+#
+#   out/tongue            the splits: what Pi heard, the rules it made, how much of the rest it reads rightly
+#   out/tongue curve      how few examples are enough
+#   out/tongue mini       a made-up language from 14 examples (the kind people are tested on)
+#   out/tongue dump       the 20,910 pairs, as the published file writes them
+import "tonguelib.pi"
+
+# ---- SCAN, from its published grammar ---------------------------------------------------------------------------
+#   C -> S and S | S after S | S        S -> V twice | V thrice | V
+#   V -> U | U dir | turn dir | (U | turn) opposite dir | (U | turn) around dir      U -> walk look run jump
+skill rep(xs, k) -> Any {
+  let out = []
+  for i in range(0, k) { let out = out ++ xs }
+  return out
+}
+
+skill scan_all() -> Any {
+  let verbs = [["walk", "I_WALK"], ["look", "I_LOOK"], ["run", "I_RUN"], ["jump", "I_JUMP"]]
+  let dirs = [["left", "I_TURN_LEFT"], ["right", "I_TURN_RIGHT"]]
+  let vs = []
+  for u in verbs { let vs = append(vs, [[u[0]], [u[1]]]) }
+  for d in dirs {
+    let vs = append(vs, [["turn", d[0]], [d[1]]])
+    let vs = append(vs, [["turn", "opposite", d[0]], [d[1], d[1]]])
+    let vs = append(vs, [["turn", "around", d[0]], rep([d[1]], 4)])
+    for u in verbs {
+      let vs = append(vs, [[u[0], d[0]], [d[1], u[1]]])
+      let vs = append(vs, [[u[0], "opposite", d[0]], [d[1], d[1], u[1]]])
+      let vs = append(vs, [[u[0], "around", d[0]], rep([d[1], u[1]], 4)])
+    }
+  }
+  let ss = []
+  for v in vs {
+    let ss = append(ss, v)
+    let ss = append(ss, [v[0] ++ ["twice"], rep(v[1], 2)])
+    let ss = append(ss, [v[0] ++ ["thrice"], rep(v[1], 3)])
+  }
+  let all = []
+  for s in ss { let all = append(all, s) }
+  for s in ss {
+    for t in ss {
+      let all = append(all, [s[0] ++ ["and"] ++ t[0], s[1] ++ t[1]])
+      let all = append(all, [s[0] ++ ["after"] ++ t[0], t[1] ++ s[1]])
+    }
+  }
+  return all
+}
+
+skill has_pair(c, a, b) -> Any {
+  for i in range(0, len(c) - 1) {
+    if c[i] == a and c[i + 1] == b { return true }
+  }
+  return false
+}
+
+# which side of a split an example is on: true = the learner may hear it, false = it is held back for the test
+skill in_train(split, ex) -> Any {
+  let c = ex[0]
+  if split == "jump" { return contains(c, "jump") == false or len(c) == 1 }
+  if split == "turn left" { return has_pair(c, "turn", "left") == false or len(c) == 2 }
+  if split == "around right" { return has_pair(c, "around", "right") == false }
+  if split == "length" { return len(ex[1]) <= 22 }
+  return true
+}
+
+skill run_split(all, split, maxwords) -> Any {
+  let heard = []
+  let held = []
+  let rest = []
+  for ex in all {
+    if in_train(split, ex) {
+      if len(ex[0]) <= maxwords { let heard = append(heard, ex) } else { let rest = append(rest, ex) }
+    } else { let held = append(held, ex) }
+  }
+  let rules = tg_learn(heard)
+  let fam = tg_familiar(rules, heard)
+  let out = "split: " ++ split ++ "\n"
+  let out = out ++ "  heard " ++ str(len(heard)) ++ " examples (every one of " ++ str(maxwords) ++ " words or fewer that the split allows)\n"
+  let out = out ++ "  rules made: " ++ str(len(rules)) ++ "\n" ++ tg_show(rules)
+  if len(held) > 0 {
+    let sc = tg_score(rules, fam, held)
+    let out = out ++ "  held back by the split: " ++ str(sc[0]) ++ " of " ++ str(len(held)) ++ " read rightly\n"
+    for w in sc[1] { let out = out ++ "    wrong: " ++ w ++ "\n" }
+  }
+  let sc2 = tg_score(rules, fam, rest)
+  let out = out ++ "  the longer commands it never heard: " ++ str(sc2[0]) ++ " of " ++ str(len(rest)) ++ " read rightly\n"
+  for w in sc2[1] { let out = out ++ "    wrong: " ++ w ++ "\n" }
+  return out
+}
+
+# how few examples are enough. First the k shortest commands; then, of the 422 with four words or fewer, a share
+# drawn by chance (five draws each) -- so that nothing rests on having heard exactly the right ones. Each time Pi
+# is asked a fixed 3,000 of the 20,910, drawn once.
+skill tg_rnd(s) -> Any { return (s * 1103515245 + 12345) % 2147483648 }
+
+skill curve(all) -> Any {
+  let sorted = tg_by_length(all)
+  let short = slice(sorted, 0, 422)
+  let asked = []
+  let s = 7
+  for ex in all {
+    let s = tg_rnd(s)
+    if (s // 65536) % 7 == 0 and len(asked) < 3000 { let asked = append(asked, ex) }
+  }
+  do print("how few examples are enough (asked: " ++ str(len(asked)) ++ " of the " ++ str(len(all)) ++ " commands, drawn once)")
+  do print("the k shortest commands heard:")
+  for k in [4, 22, 94, 150, 250, 422] {
+    let heard = slice(sorted, 0, k)
+    let rules = tg_learn(heard)
+    let sc = tg_score(rules, tg_familiar(rules, heard), asked)
+    do print("  " ++ str(k) ++ " heard: " ++ str(len(rules)) ++ " rules, " ++ str(sc[0]) ++ " of " ++ str(len(asked)) ++ " read rightly")
+  }
+  do print("a share of the 422 short commands, drawn by chance (five draws): heard -> rules, read rightly")
+  for pct in [75, 50, 35, 25, 15, 10] {
+    for draw in range(0, 5) {
+      let heard = []
+      for ex in short {
+        let s = tg_rnd(s)
+        if (s // 65536) % 100 < pct { let heard = append(heard, ex) }
+      }
+      let t0 = ticks()
+      let rules = tg_learn(heard)
+      let sc = tg_score(rules, tg_familiar(rules, heard), asked)
+      do print("  " ++ str(pct) ++ "%: " ++ str(len(heard)) ++ " heard -> " ++ str(len(rules)) ++ " rules, " ++ str(sc[0]) ++ " of " ++ str(len(asked)) ++ "   (" ++ str((ticks() - t0) // 1000) ++ " s)")
+    }
+  }
+  return "done"
+}
+
+# a made-up language of the kind people are given in few-shot studies (after Lake, Linzen and Baroni 2019: four
+# words that name colours, three that do something to them): 14 examples heard, 10 new sentences asked
+skill pair_of(a, b) -> Any { return [split(a), split(b)] }
+
+skill mini() -> Any {
+  let heard = [pair_of("dax", "RED"), pair_of("lug", "BLUE"), pair_of("wif", "GREEN"), pair_of("zup", "YELLOW"),
+    pair_of("lug fep", "BLUE BLUE BLUE"), pair_of("dax fep", "RED RED RED"),
+    pair_of("lug blicket wif", "BLUE GREEN BLUE"), pair_of("wif blicket dax", "GREEN RED GREEN"),
+    pair_of("lug kiki wif", "GREEN BLUE"), pair_of("dax kiki lug", "BLUE RED"),
+    pair_of("lug fep kiki wif", "GREEN BLUE BLUE BLUE"), pair_of("wif kiki dax blicket lug", "RED BLUE RED GREEN"),
+    pair_of("lug kiki wif fep", "GREEN GREEN GREEN BLUE"), pair_of("wif blicket dax kiki lug", "BLUE GREEN RED GREEN")]
+  let asked = [pair_of("zup fep", "YELLOW YELLOW YELLOW"), pair_of("zup blicket lug", "YELLOW BLUE YELLOW"),
+    pair_of("zup kiki dax", "RED YELLOW"), pair_of("zup fep kiki lug", "BLUE YELLOW YELLOW YELLOW"),
+    pair_of("wif kiki zup fep", "YELLOW YELLOW YELLOW GREEN"), pair_of("lug kiki wif blicket zup", "GREEN YELLOW GREEN BLUE"),
+    pair_of("zup blicket wif kiki dax fep", "RED RED RED YELLOW GREEN YELLOW"),
+    pair_of("zup blicket zup kiki zup fep", "YELLOW YELLOW YELLOW YELLOW YELLOW YELLOW"),
+    pair_of("dax blicket zup", "RED YELLOW RED"), pair_of("wif kiki zup", "YELLOW GREEN")]
+  let rules = tg_learn(heard)
+  let sc = tg_score(rules, tg_familiar(rules, heard), asked)
+  let out = "a made-up language: heard " ++ str(len(heard)) ++ " examples\n  rules made: " ++ str(len(rules)) ++ "\n" ++ tg_show(rules)
+  return out ++ "  new sentences: " ++ str(sc[0]) ++ " of " ++ str(len(asked)) ++ " read rightly"
+}
+
+skill main() -> Any {
+  let all = scan_all()
+  if arg(1) == "curve" { return curve(all) }
+  if arg(1) == "mini" { return mini() }
+  if arg(1) == "dump" {
+    let lines = []
+    for ex in all { let lines = append(lines, "IN: " ++ join(ex[0], " ") ++ " OUT: " ++ join(ex[1], " ")) }
+    return join(lines, "\n")
+  }
+  let out = "SCAN: " ++ str(len(all)) ++ " commands\n\n"
+  for split in ["simple", "jump", "turn left", "around right", "length"] {
+    let out = out ++ run_split(all, split, 4) ++ "\n"
+  }
+  return out ++ mini()
+}

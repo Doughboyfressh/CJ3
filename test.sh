@@ -1,0 +1,45 @@
+#!/bin/sh
+# The Linux suite: what test.cmd checks on Windows, with the Linux compiler (seed/pic).
+#   1. The self-compile fixpoint: the seed builds the compiler, which builds itself, which builds itself again;
+#      the last two must be the same file, byte for byte.
+#   2. The two systems agree: the Linux compiler cross-compiles the Windows compiler, and it must be seed/pic.exe.
+#   3. Every program with a golden file is compiled, run, and its output compared byte for byte -- the same golden
+#      files Windows is held to. Programs that need a Windows-only facility are listed in WINDOWS_ONLY and skipped.
+#   4. The agent remembers across runs.
+cd "$(dirname "$0")" || exit 1
+mkdir -p out
+WINDOWS_ONLY="gpuforms"
+fail=0
+n=0
+rm -f out/t_g0 out/t_g1 out/t_g2
+seed/pic examples/pic.pi out/t_g0 > /dev/null
+[ -x out/t_g0 ] || { echo "FAIL the seed could not compile the compiler"; exit 1; }
+out/t_g0 examples/pic.pi out/t_g1 > /dev/null
+out/t_g1 examples/pic.pi out/t_g2 > /dev/null
+if cmp -s out/t_g1 out/t_g2; then echo "ok   fixpoint"; else echo "FAIL fixpoint: the compiler does not reproduce itself"; fail=1; fi
+if cmp -s out/t_g2 seed/pic; then echo "ok   seed is current"; else echo "note seed is stale: run ./build.sh reseed once this passes"; fi
+out/t_g2 examples/pic.pi out/t_gw.exe windows > /dev/null
+if cmp -s out/t_gw.exe seed/pic.exe; then echo "ok   the Windows compiler built here is seed/pic.exe"; else echo "note seed/pic.exe is not what this source builds: run ./build.sh reseed"; fi
+for f in examples/native/golden/*.out; do
+  p=$(basename "$f" .out)
+  case " $WINDOWS_ONLY " in *" $p "*) echo "skip $p: needs a Windows-only facility"; continue;; esac
+  n=$((n + 1))
+  rm -f "out/t_$p"
+  out/t_g2 "examples/native/$p.pi" "out/t_$p" > /dev/null
+  if [ ! -x "out/t_$p" ]; then echo "FAIL $p: did not compile"; fail=1; continue; fi
+  if [ -f "examples/native/golden/$p.in" ]; then
+    "out/t_$p" < "examples/native/golden/$p.in" > "out/t_$p.txt"
+  else
+    "out/t_$p" < /dev/null > "out/t_$p.txt"
+  fi
+  if cmp -s "out/t_$p.txt" "$f"; then echo "ok   $p"; else echo "FAIL $p: output differs from golden"; fail=1; fi
+done
+if [ -x out/t_agent ]; then
+  rm -f out/t_mem.txt
+  out/t_agent out/t_mem.txt < examples/native/golden/agent_teach.in > /dev/null
+  out/t_agent out/t_mem.txt < examples/native/golden/agent_recall.in > out/t_recall.txt
+  if cmp -s out/t_recall.txt examples/native/golden/agent_recall.expect; then echo "ok   agent remembers across runs"; else echo "FAIL agent memory: it did not remember across runs"; fail=1; fi
+fi
+if [ "$fail" = 0 ]; then echo "ALL PASS: fixpoint and $n programs"; exit 0; fi
+echo "SOME FAILED"
+exit 1

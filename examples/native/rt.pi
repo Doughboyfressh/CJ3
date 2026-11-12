@@ -2,7 +2,9 @@
 #
 # Functions named rt_* are compiled in the raw dialect: values are plain machine integers, conditions test for
 # non-zero, and the primitives reach the machine -- peek(a) / poke(a, v) (8 bytes), peekb / pokeb (1 byte),
-# gaddr(k) (the address of global slot k) and wcall("Name", ...) (a call into kernel32).
+# gaddr(k) (the address of global slot k, 0 .. 31) and wcall("Name", ...) (a call into kernel32). On Linux the same
+# wcall goes to a skill of this file instead (see "Linux" at the end), built on lsys(number, ...) (a system call),
+# ostarget() (1 when compiled for Linux) and faddr("rt_name") (a skill's address).
 #
 # The values every other function sees: an integer n is 2n + 1 (so the low bit is 1); null is 0; anything else
 # is the address of an object [kind, length, payload]: kind 1 text (bytes), 2 list (values), 3 map (key and
@@ -4084,4 +4086,779 @@ skill rt_arr_text(a, ft, tt) -> Any {
   let t = rt_text_new(e - f)
   for i in range(0, e - f) { do pokeb(t + 16 + i, rt_untag(peek(a + 16 + 8 * (f + i))) % 256) }
   return t
+}
+
+# ---- Linux -----------------------------------------------------------------------------------------------------------
+# Everything above speaks to Windows: wcall("Name", ...) calls kernel32, wcallp(address, ...) calls whatever was found
+# at run time. Compiled for Linux, pic sends each wcall("Name", ...) to the skill rt_lx_Name below, and wcallp to the
+# skill rt_lx_GetProcAddress handed out -- skills that do the same job with Linux system calls (lsys). So one runtime
+# serves both systems, and nothing above this line knows which it is running on.
+#   Handles: a file is its Linux descriptor + 4096 (so no handle is 0 or -1); a process is the address of its record.
+#   Memory: scratch comes from Pi's heap and is given back before the skill returns (memused() reads the same on both
+#   systems); whatever outlives the call is mapped apart from the heap.
+#   Globals: 16 the stack pointer the program started with (argc, the arguments, the environment), 17 the command
+#   line built from it, 18 the name last asked of LoadLibraryA / GetProcAddress (for the message when it is missing).
+#   Paths: a \ is read as / (Pi's programs name files the Windows way).
+
+# platform(): "linux" or "windows" -- the system this program was compiled for
+skill rt_platform() -> Any {
+  if ostarget() { return "linux" }
+  return "windows"
+}
+
+skill rt_lx_len(p) -> Any {
+  let n = 0
+  while peekb(p + n) != 0 { let n = n + 1 }
+  return n
+}
+
+skill rt_lx_path(name) -> Any {
+  let n = rt_lx_len(name)
+  let p = rt_alloc(n + 1)
+  for i in range(0, n) {
+    let c = peekb(name + i)
+    if c == 92 { let c = 47 }
+    do pokeb(p + i, c)
+  }
+  do pokeb(p + n, 0)
+  return p
+}
+
+# is the C string at p the text t
+skill rt_lx_is(p, t) -> Any {
+  let n = peek(t + 8)
+  for i in range(0, n) {
+    if peekb(p + i) != peekb(t + 16 + i) { return 0 }
+  }
+  return peekb(p + n) == 0
+}
+
+# n bytes of fresh memory outside the heap (read, write; private, anonymous), or 0
+skill rt_lx_map(n) -> Any {
+  let p = lsys(9, 0, n, 3, 34, 0 - 1, 0)
+  if p < 0 and p > 0 - 4096 { return 0 }
+  return p
+}
+
+skill rt_lx_say(t) -> Any {
+  do lsys(1, 1, t + 16, peek(t + 8))
+  return 0
+}
+
+# a Windows function nothing here stands in for was called: say which, and stop as fail() does
+skill rt_lx_missing() -> Any {
+  let name = peek(gaddr(18))
+  do rt_lx_say("PiRuntimeError: ")
+  if name != 0 { do lsys(1, 1, name, rt_lx_len(name)) }
+  do rt_lx_say(" is a Windows facility that Pi does not have on Linux yet\n")
+  do lsys(231, 1)
+  return 0
+}
+
+# -- the fifteen kernel32 calls of wcall --
+skill rt_lx_ExitProcess(code) -> Any {
+  do lsys(231, code)
+  return 0
+}
+
+skill rt_lx_GetStdHandle(n) -> Any {
+  if n == 0 - 10 { return 4096 }
+  if n == 0 - 11 { return 4097 }
+  return 4098
+}
+
+skill rt_lx_WriteFile(h, buf, n, wr, ov) -> Any {
+  # a new file that starts with the ELF mark is a program: Linux runs it only if it is marked as one (rwxr-xr-x)
+  if n >= 4 and peekb(buf) == 127 and peekb(buf + 1) == 69 and peekb(buf + 2) == 76 and peekb(buf + 3) == 70 {
+    if lsys(8, h - 4096, 0, 1) == 0 { do lsys(91, h - 4096, 493) }
+  }
+  let done = 0
+  let going = 1
+  while going and done < n {
+    let r = lsys(1, h - 4096, buf + done, n - done)
+    if r <= 0 { let going = 0 } else { let done = done + r }
+  }
+  if wr != 0 { do rt_poke32(wr, done) }
+  return done == n
+}
+
+# as much as there is, up to n bytes (a read of nothing at the end of the input still succeeds, as on Windows)
+skill rt_lx_ReadFile(h, buf, n, rd, ov) -> Any {
+  let done = 0
+  let going = 1
+  while going and done < n {
+    let want = n - done
+    if want > 1073741824 { let want = 1073741824 }
+    let r = lsys(0, h - 4096, buf + done, want)
+    if r <= 0 { let going = 0 } else { let done = done + r }
+  }
+  if rd != 0 { do rt_poke32(rd, done) }
+  return 1
+}
+
+# reserve (8192): address space that costs nothing until it is committed; commit (4096): make it readable and
+# writable -- the two steps the heap takes on Windows, as mmap and mprotect
+skill rt_lx_VirtualAlloc(addr, size, kind, prot) -> Any {
+  if addr == 0 {
+    let pr = 0
+    if band(kind, 4096) != 0 { let pr = 3 }
+    let p = lsys(9, 0, size, pr, 16418, 0 - 1, 0)
+    if p < 0 and p > 0 - 4096 { return 0 }
+    return p
+  }
+  let a = addr // 4096 * 4096
+  let e = (addr + size + 4095) // 4096 * 4096
+  if lsys(10, a, e - a, 3) != 0 { return 0 }
+  return addr
+}
+
+# access: 2147483648 read, 1073741824 write, 4 append; disp: 1 new, 2 create or empty, 3 must exist, 4 open or create
+skill rt_lx_CreateFileA(name, access, share, sa, disp, flags, tmpl) -> Any {
+  let top = peek(gaddr(0))
+  let fl = 0
+  if band(access, 1073741824) != 0 {
+    let fl = 1
+    if band(access, 2147483648) != 0 { let fl = 2 }
+  }
+  if band(access, 4) != 0 and fl == 0 { let fl = 1025 }
+  let ro = fl == 0
+  if disp == 1 { let fl = fl + 192 }
+  if disp == 2 { let fl = fl + 576 }
+  if disp == 4 { let fl = fl + 64 }
+  let fd = lsys(2, rt_lx_path(name), fl + 524288, 420)
+  if fd >= 0 and ro {
+    # a folder is not a file to read (Windows refuses; Linux would open it)
+    let st = rt_alloc(144)
+    if lsys(5, fd, st) == 0 and band(rt_peek32(st + 24), 61440) == 16384 {
+      do lsys(3, fd)
+      let fd = 0 - 1
+    }
+  }
+  do poke(gaddr(0), top)
+  if fd < 0 { return 0 - 1 }
+  return fd + 4096
+}
+
+# a descriptor's file size, or -1
+skill rt_lx_fsize(fd) -> Any {
+  let top = peek(gaddr(0))
+  let st = rt_alloc(144)
+  let size = 0 - 1
+  if lsys(5, fd, st) == 0 { let size = peek(st + 48) }
+  do poke(gaddr(0), top)
+  return size
+}
+
+skill rt_lx_GetFileSize(h, high) -> Any {
+  let size = rt_lx_fsize(h - 4096)
+  if size < 0 { return 4294967295 }
+  if high != 0 { do rt_poke32(high, size // 4294967296) }
+  return size % 4294967296
+}
+
+skill rt_lx_CloseHandle(h) -> Any {
+  if h >= 4099 and h < 1052672 {
+    do lsys(3, h - 4096)
+    return 1
+  }
+  # a process record (rt_lx_CreateProcessA): its page goes back
+  if h >= 1052672 and h % 4096 == 0 {
+    if peek(h + 24) == 5788003 { do lsys(11, h, 4096) }
+  }
+  return 1
+}
+
+# the command line as Windows gives it: the arguments in one line, any with a space in it quoted
+skill rt_lx_GetCommandLineA() -> Any {
+  if peek(gaddr(17)) != 0 { return peek(gaddr(17)) }
+  let sp = peek(gaddr(16))
+  let argc = peek(sp)
+  let total = 1
+  for i in range(0, argc) { let total = total + rt_lx_len(peek(sp + 8 + 8 * i)) + 3 }
+  let buf = rt_lx_map(total)
+  let o = 0
+  for i in range(0, argc) {
+    let a = peek(sp + 8 + 8 * i)
+    let k = rt_lx_len(a)
+    let q = k == 0
+    for j in range(0, k) {
+      if peekb(a + j) == 32 { let q = 1 }
+    }
+    if i > 0 {
+      do pokeb(buf + o, 32)
+      let o = o + 1
+    }
+    if q {
+      do pokeb(buf + o, 34)
+      let o = o + 1
+    }
+    for j in range(0, k) { do pokeb(buf + o + j, peekb(a + j)) }
+    let o = o + k
+    if q {
+      do pokeb(buf + o, 34)
+      let o = o + 1
+    }
+  }
+  do pokeb(buf + o, 0)
+  do poke(gaddr(17), buf)
+  return buf
+}
+
+# the "libraries" that have skills standing in for them here: 1 kernel32, 2 ws2_32 (sockets); 0 none
+skill rt_lx_LoadLibraryA(name) -> Any {
+  do poke(gaddr(18), name)
+  if rt_lx_is(name, "kernel32.dll") { return 1 }
+  if rt_lx_is(name, "ws2_32.dll") { return 2 }
+  return 0
+}
+
+skill rt_lx_GetProcAddress(m, name) -> Any {
+  do poke(gaddr(18), name)
+  if m == 1 {
+    if rt_lx_is(name, "CloseHandle") { return faddr("rt_lx_CloseHandle") }
+    if rt_lx_is(name, "ReadFile") { return faddr("rt_lx_ReadFile") }
+    if rt_lx_is(name, "SetFilePointerEx") { return faddr("rt_lx_SetFilePointerEx") }
+    if rt_lx_is(name, "GetTickCount64") { return faddr("rt_lx_GetTickCount64") }
+    if rt_lx_is(name, "QueryPerformanceCounter") { return faddr("rt_lx_QueryPerformanceCounter") }
+    if rt_lx_is(name, "QueryPerformanceFrequency") { return faddr("rt_lx_QueryPerformanceFrequency") }
+    if rt_lx_is(name, "GetFileSizeEx") { return faddr("rt_lx_GetFileSizeEx") }
+    if rt_lx_is(name, "CreateFileMappingA") { return faddr("rt_lx_CreateFileMappingA") }
+    if rt_lx_is(name, "MapViewOfFile") { return faddr("rt_lx_MapViewOfFile") }
+    if rt_lx_is(name, "MoveFileExA") { return faddr("rt_lx_MoveFileExA") }
+    if rt_lx_is(name, "SetConsoleOutputCP") { return faddr("rt_lx_SetConsoleCP") }
+    if rt_lx_is(name, "SetConsoleCP") { return faddr("rt_lx_SetConsoleCP") }
+    if rt_lx_is(name, "GetLocalTime") { return faddr("rt_lx_GetLocalTime") }
+    if rt_lx_is(name, "CreateProcessA") { return faddr("rt_lx_CreateProcessA") }
+    if rt_lx_is(name, "WaitForSingleObject") { return faddr("rt_lx_WaitForSingleObject") }
+    if rt_lx_is(name, "GetExitCodeProcess") { return faddr("rt_lx_GetExitCodeProcess") }
+    if rt_lx_is(name, "TerminateProcess") { return faddr("rt_lx_TerminateProcess") }
+    if rt_lx_is(name, "GetProcessId") { return faddr("rt_lx_GetProcessId") }
+  }
+  if m == 2 {
+    if rt_lx_is(name, "WSAStartup") { return faddr("rt_lx_WSAStartup") }
+    if rt_lx_is(name, "socket") { return faddr("rt_lx_socket") }
+    if rt_lx_is(name, "connect") { return faddr("rt_lx_connect") }
+    if rt_lx_is(name, "send") { return faddr("rt_lx_send") }
+    if rt_lx_is(name, "recv") { return faddr("rt_lx_recv") }
+    if rt_lx_is(name, "closesocket") { return faddr("rt_lx_closesocket") }
+    if rt_lx_is(name, "bind") { return faddr("rt_lx_bind") }
+    if rt_lx_is(name, "listen") { return faddr("rt_lx_listen") }
+    if rt_lx_is(name, "accept") { return faddr("rt_lx_accept") }
+  }
+  return 0
+}
+
+skill rt_lx_SetFilePointerEx(h, off, newp, method) -> Any {
+  let r = lsys(8, h - 4096, off, method)
+  if r < 0 { return 0 }
+  if newp != 0 { do poke(newp, r) }
+  return 1
+}
+
+# -- a folder's names. Windows (NTFS) lists them sorted, . and .. first, letters compared in upper case; Linux lists
+# them in no order at all. So the whole folder is read, sorted that way, and handed out one name at a time.
+# The record (mapped): [bytes mapped, names, next] then a pointer per name, then each name as [kind byte, name, 0].
+skill rt_lx_dots(p) -> Any {
+  if peekb(p) == 46 {
+    if peekb(p + 1) == 0 { return 0 }
+    if peekb(p + 1) == 46 and peekb(p + 2) == 0 { return 1 }
+  }
+  return 2
+}
+
+skill rt_lx_up(c) -> Any {
+  if c >= 97 and c <= 122 { return c - 32 }
+  return c
+}
+
+skill rt_lx_before(a, b) -> Any {
+  let ra = rt_lx_dots(a + 1)
+  let rb = rt_lx_dots(b + 1)
+  if ra != rb { return ra < rb }
+  let i = 1
+  while 1 {
+    let x = rt_lx_up(peekb(a + i))
+    let y = rt_lx_up(peekb(b + i))
+    if x != y { return x < y }
+    if x == 0 { return 0 }
+    let i = i + 1
+  }
+  return 0
+}
+
+skill rt_lx_sift(base, i, n) -> Any {
+  let going = 1
+  while going {
+    let l = 2 * i + 1
+    let big = i
+    if l < n and rt_lx_before(peek(base + 8 * big), peek(base + 8 * l)) { let big = l }
+    if l + 1 < n and rt_lx_before(peek(base + 8 * big), peek(base + 8 * (l + 1))) { let big = l + 1 }
+    if big == i { let going = 0 } else {
+      let t = peek(base + 8 * i)
+      do poke(base + 8 * i, peek(base + 8 * big))
+      do poke(base + 8 * big, t)
+      let i = big
+    }
+  }
+  return 0
+}
+
+skill rt_lx_sort(base, n) -> Any {
+  let i = n // 2 - 1
+  while i >= 0 {
+    do rt_lx_sift(base, i, n)
+    let i = i - 1
+  }
+  let e = n - 1
+  while e > 0 {
+    let t = peek(base)
+    do poke(base, peek(base + 8 * e))
+    do poke(base + 8 * e, t)
+    do rt_lx_sift(base, 0, e)
+    let e = e - 1
+  }
+  return 0
+}
+
+# the next name into Windows' find record: attributes at 0 (16 a folder, 128 a file), the name at 44
+skill rt_lx_fill(rec, fd) -> Any {
+  let e = peek(rec + 24 + 8 * peek(rec + 16))
+  for i in range(0, 320) { do pokeb(fd + i, 0) }
+  let attr = 128
+  if peekb(e) == 4 { let attr = 16 }
+  do rt_poke32(fd, attr)
+  let k = 0
+  while k < 259 and peekb(e + 1 + k) != 0 {
+    do pokeb(fd + 44 + k, peekb(e + 1 + k))
+    let k = k + 1
+  }
+  return 0
+}
+
+# pat is "folder\*" (the only pattern the runtime asks for): every name in that folder
+skill rt_lx_FindFirstFileA(pat, fd) -> Any {
+  let top = peek(gaddr(0))
+  let p = rt_lx_path(pat)
+  let n = rt_lx_len(p)
+  let cut = 0 - 1
+  for i in range(0, n) {
+    if peekb(p + i) == 47 { let cut = i }
+  }
+  let dir = rt_alloc(n + 2)
+  if cut < 0 {
+    do pokeb(dir, 46)
+    do pokeb(dir + 1, 0)
+  } else {
+    let k = cut
+    if k == 0 { let k = 1 }
+    for i in range(0, k) { do pokeb(dir + i, peekb(p + i)) }
+    do pokeb(dir + k, 0)
+  }
+  let d = lsys(2, dir, 589824, 0)
+  if d < 0 {
+    do poke(gaddr(0), top)
+    return 0 - 1
+  }
+  # once through to count the names and their bytes, then again to keep them
+  let buf = rt_alloc(32768)
+  let count = 0
+  let bytes = 0
+  let going = 1
+  while going {
+    let r = lsys(217, d, buf, 32768)
+    if r <= 0 { let going = 0 } else {
+      let o = 0
+      while o < r {
+        let count = count + 1
+        let bytes = bytes + rt_lx_len(buf + o + 19) + 2
+        let o = o + peekb(buf + o + 16) + 256 * peekb(buf + o + 17)
+      }
+    }
+  }
+  let size = 24 + 8 * count + bytes
+  let rec = 0
+  if count > 0 { let rec = rt_lx_map(size) }
+  if rec == 0 {
+    do lsys(3, d)
+    do poke(gaddr(0), top)
+    return 0 - 1
+  }
+  do lsys(8, d, 0, 0)
+  let w = rec + 24 + 8 * count
+  let k = 0
+  let going = 1
+  while going {
+    let r = lsys(217, d, buf, 32768)
+    if r <= 0 { let going = 0 } else {
+      let o = 0
+      while o < r {
+        let ln = rt_lx_len(buf + o + 19)
+        if k < count and w + ln + 2 <= rec + size {
+          do poke(rec + 24 + 8 * k, w)
+          do pokeb(w, peekb(buf + o + 18))
+          for i in range(0, ln + 1) { do pokeb(w + 1 + i, peekb(buf + o + 19 + i)) }
+          let w = w + ln + 2
+          let k = k + 1
+        }
+        let o = o + peekb(buf + o + 16) + 256 * peekb(buf + o + 17)
+      }
+    }
+  }
+  do lsys(3, d)
+  do poke(gaddr(0), top)
+  do poke(rec, size)
+  do poke(rec + 8, k)
+  do poke(rec + 16, 0)
+  do rt_lx_sort(rec + 24, k)
+  do rt_lx_fill(rec, fd)
+  return rec
+}
+
+skill rt_lx_FindNextFileA(h, fd) -> Any {
+  let i = peek(h + 16) + 1
+  if i >= peek(h + 8) { return 0 }
+  do poke(h + 16, i)
+  do rt_lx_fill(h, fd)
+  return 1
+}
+
+skill rt_lx_FindClose(h) -> Any {
+  do lsys(11, h, peek(h))
+  return 1
+}
+
+# -- kernel32 by name (rt_proc("kernel32.dll", ...)) --
+# a clock in nanoseconds: 0 the time of day (since 1970), 1 one that only moves forward
+skill rt_lx_clock(which) -> Any {
+  let top = peek(gaddr(0))
+  let ts = rt_alloc(16)
+  do lsys(228, which, ts)
+  let ns = peek(ts) * 1000000000 + peek(ts + 8)
+  do poke(gaddr(0), top)
+  return ns
+}
+
+skill rt_lx_GetTickCount64() -> Any { return rt_lx_clock(1) // 1000000 }
+
+skill rt_lx_QueryPerformanceCounter(p) -> Any {
+  do poke(p, rt_lx_clock(1))
+  return 1
+}
+
+skill rt_lx_QueryPerformanceFrequency(p) -> Any {
+  do poke(p, 1000000000)
+  return 1
+}
+
+skill rt_lx_GetFileSizeEx(h, p) -> Any {
+  let size = rt_lx_fsize(h - 4096)
+  if size < 0 { return 0 }
+  do poke(p, size)
+  return 1
+}
+
+# a file mapped into memory: the "mapping" is the file's own handle, the view is the whole file, read only
+skill rt_lx_CreateFileMappingA(h, sa, prot, hi, lo, name) -> Any { return h }
+
+skill rt_lx_MapViewOfFile(mp, access, hi, lo, bytes) -> Any {
+  let size = rt_lx_fsize(mp - 4096)
+  if size <= 0 { return 0 }
+  let p = lsys(9, 0, size, 1, 2, mp - 4096, 0)
+  if p < 0 and p > 0 - 4096 { return 0 }
+  return p
+}
+
+skill rt_lx_MoveFileExA(src, dst, flags) -> Any {
+  let top = peek(gaddr(0))
+  let r = lsys(82, rt_lx_path(src), rt_lx_path(dst))
+  do poke(gaddr(0), top)
+  return r == 0
+}
+
+# a Linux terminal reads and writes UTF-8 already
+skill rt_lx_SetConsoleCP(cp) -> Any { return 1 }
+
+skill rt_lx_poke16(p, v) -> Any {
+  do pokeb(p, v % 256)
+  do pokeb(p + 1, v // 256 % 256)
+  return 0
+}
+
+skill rt_lx_be32(p) -> Any {
+  let v = peekb(p) * 16777216 + peekb(p + 1) * 65536 + peekb(p + 2) * 256 + peekb(p + 3)
+  if v >= 2147483648 { return v - 4294967296 }
+  return v
+}
+
+# how many seconds local time is ahead of UTC at the moment secs: read from the system's zone file (/etc/localtime,
+# a table of the moments the offset changed and what it changed to); 0, which is UTC, if there is no such file
+skill rt_lx_tzoff(secs) -> Any {
+  let top = peek(gaddr(0))
+  let off = 0
+  let fd = lsys(2, rt_cstr("/etc/localtime"), 524288, 0)
+  if fd >= 0 {
+    let buf = rt_alloc(16384)
+    let n = lsys(0, fd, buf, 16384)
+    do lsys(3, fd)
+    if n >= 44 and peekb(buf) == 84 and peekb(buf + 1) == 90 and peekb(buf + 2) == 105 and peekb(buf + 3) == 102 {
+      let timecnt = rt_lx_be32(buf + 32)
+      let typecnt = rt_lx_be32(buf + 36)
+      let times = buf + 44
+      let idx = times + 4 * timecnt
+      let types = idx + timecnt
+      if timecnt >= 0 and typecnt > 0 and types + 6 * typecnt <= buf + n {
+        let ty = 0
+        for i in range(0, timecnt) {
+          if rt_lx_be32(times + 4 * i) <= secs { let ty = peekb(idx + i) }
+        }
+        if ty < typecnt { let off = rt_lx_be32(types + 6 * ty) }
+      }
+    }
+  }
+  do poke(gaddr(0), top)
+  return off
+}
+
+# the local date and time into Windows' record of eight 16-bit numbers (year, month, weekday, day, hour, minute,
+# second, millisecond)
+skill rt_lx_GetLocalTime(t) -> Any {
+  let ns = rt_lx_clock(0)
+  let secs = ns // 1000000000
+  let secs = secs + rt_lx_tzoff(secs)
+  let days = secs // 86400
+  let rem = secs % 86400
+  # the calendar date of a day number: the years are counted from a 1 March so the leap day comes last
+  let z = days + 719468
+  let era = z // 146097
+  let doe = z - era * 146097
+  let yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+  let mp = (5 * doy + 2) // 153
+  let d = doy - (153 * mp + 2) // 5 + 1
+  let m = mp + 3
+  if mp >= 10 { let m = mp - 9 }
+  if m <= 2 { let y = y + 1 }
+  do rt_lx_poke16(t, y)
+  do rt_lx_poke16(t + 2, m)
+  do rt_lx_poke16(t + 4, (days + 4) % 7)
+  do rt_lx_poke16(t + 6, d)
+  do rt_lx_poke16(t + 8, rem // 3600)
+  do rt_lx_poke16(t + 10, rem % 3600 // 60)
+  do rt_lx_poke16(t + 12, rem % 60)
+  do rt_lx_poke16(t + 14, ns % 1000000000 // 1000000)
+  return 0
+}
+
+# -- processes. The record (one mapped page): [process id, 1 once it has ended, its exit code, a mark]. The child is
+# made by fork and becomes the program by execve; with no handles to inherit (a program started with no window) its
+# input and output go nowhere, as on Windows.
+skill rt_lx_std(h, nul, fd) -> Any {
+  if h >= 4096 and h < 1052672 { do lsys(33, h - 4096, fd) } else { do lsys(33, nul, fd) }
+  return 0
+}
+
+skill rt_lx_CreateProcessA(app, cmd, pa, ta, inherit, flags, env, cwd, si, pi) -> Any {
+  let top = peek(gaddr(0))
+  let n = rt_lx_len(cmd)
+  # the command line cut into its words (quotes respected, as arg() reads them): each a C string, then the list
+  let text = rt_alloc(n + 1)
+  for i in range(0, n + 1) { do pokeb(text + i, peekb(cmd + i)) }
+  let words = rt_alloc(8 * (n + 2))
+  let argc = 0
+  let p = text
+  let going = 1
+  while going {
+    while peekb(p) == 32 { let p = p + 1 }
+    if peekb(p) == 0 { let going = 0 } else {
+      let quoted = 0
+      if peekb(p) == 34 {
+        let quoted = 1
+        let p = p + 1
+      }
+      do poke(words + 8 * argc, p)
+      let argc = argc + 1
+      if quoted {
+        while peekb(p) != 0 and peekb(p) != 34 { let p = p + 1 }
+      } else {
+        while peekb(p) != 0 and peekb(p) != 32 { let p = p + 1 }
+      }
+      if peekb(p) != 0 {
+        do pokeb(p, 0)
+        let p = p + 1
+      }
+    }
+  }
+  do poke(words + 8 * argc, 0)
+  if argc == 0 {
+    do poke(gaddr(0), top)
+    return 0
+  }
+  let prog = rt_lx_path(peek(words))
+  do poke(words, prog)
+  let argv = words
+  if lsys(21, prog, 1) != 0 {
+    # not a program in reach by that path: a path that names a folder fails as it does on Windows; a bare name
+    # goes to the shell, which looks along PATH
+    let slash = 0
+    for i in range(0, rt_lx_len(prog)) {
+      if peekb(prog + i) == 47 { let slash = 1 }
+    }
+    if slash {
+      do poke(gaddr(0), top)
+      return 0
+    }
+    let argv = rt_alloc(32)
+    let prog = rt_cstr("/bin/sh")
+    do poke(argv, prog)
+    do poke(argv + 8, rt_cstr("-c"))
+    do poke(argv + 16, cmd)
+    do poke(argv + 24, 0)
+  }
+  let rec = rt_lx_map(4096)
+  if rec == 0 {
+    do poke(gaddr(0), top)
+    return 0
+  }
+  let sp = peek(gaddr(16))
+  let envp = sp + 16 + 8 * peek(sp)
+  let devnull = rt_cstr("/dev/null")
+  let pid = lsys(57)
+  if pid == 0 {
+    let nul = lsys(2, devnull, 2, 0)
+    if inherit == 0 {
+      do rt_lx_std(0, nul, 0)
+      do rt_lx_std(0, nul, 1)
+      do rt_lx_std(0, nul, 2)
+    } else {
+      if band(rt_peek32(si + 60), 256) != 0 {
+        do rt_lx_std(peek(si + 80), nul, 0)
+        do rt_lx_std(peek(si + 88), nul, 1)
+        do rt_lx_std(peek(si + 96), nul, 2)
+      }
+    }
+    do lsys(59, prog, argv, envp)
+    do lsys(231, 127)
+  }
+  do poke(gaddr(0), top)
+  if pid < 0 {
+    do lsys(11, rec, 4096)
+    return 0
+  }
+  do poke(rec, pid)
+  do poke(rec + 8, 0)
+  do poke(rec + 16, 259)
+  do poke(rec + 24, 5788003)
+  do poke(pi, rec)
+  do poke(pi + 8, 0)
+  do rt_poke32(pi + 16, pid)
+  do rt_poke32(pi + 20, pid)
+  return 1
+}
+
+# 0 once the process has ended, 258 if it is still running after ms milliseconds (4294967295: wait however long)
+skill rt_lx_WaitForSingleObject(h, ms) -> Any {
+  if peek(h + 8) != 0 { return 0 }
+  let top = peek(gaddr(0))
+  let st = rt_alloc(32)
+  let pid = peek(h)
+  let start = rt_lx_clock(1)
+  let res = 258
+  let going = 1
+  while going {
+    do poke(st, 0)
+    let opt = 1
+    if ms >= 4294967295 { let opt = 0 }
+    let r = lsys(61, pid, st, opt, 0)
+    if r == pid {
+      let s = rt_peek32(st)
+      let code = s // 256 % 256
+      if s % 128 != 0 { let code = 1 }
+      do poke(h + 8, 1)
+      do poke(h + 16, code)
+      let res = 0
+      let going = 0
+    } else {
+      if r < 0 and r != 0 - 4 {
+        do poke(h + 8, 1)
+        do poke(h + 16, 0)
+        let res = 0
+        let going = 0
+      } else {
+        if (rt_lx_clock(1) - start) // 1000000 >= ms { let going = 0 } else {
+          do poke(st + 16, 0)
+          do poke(st + 24, 2000000)
+          do lsys(35, st + 16, 0)
+        }
+      }
+    }
+  }
+  do poke(gaddr(0), top)
+  return res
+}
+
+skill rt_lx_GetExitCodeProcess(h, p) -> Any {
+  do rt_poke32(p, peek(h + 16))
+  return 1
+}
+
+skill rt_lx_TerminateProcess(h, code) -> Any {
+  if peek(h + 8) == 0 { do lsys(62, peek(h), 9) }
+  return 1
+}
+
+skill rt_lx_GetProcessId(h) -> Any { return peek(h) }
+
+# -- sockets (ws2_32 by name): the same calls and the same address record on both systems; a socket is its descriptor
+skill rt_lx_WSAStartup(ver, data) -> Any { return 0 }
+
+skill rt_lx_socket(af, kind, proto) -> Any {
+  let s = lsys(41, af, kind + 524288, proto)
+  if s < 0 { return 0 - 1 }
+  return s
+}
+
+skill rt_lx_connect(s, sa, n) -> Any {
+  if lsys(42, s, sa, n) != 0 { return 0 - 1 }
+  return 0
+}
+
+# 16384: a connection the other side closed gives an error here, not a signal that ends the program
+skill rt_lx_send(s, buf, n, flags) -> Any {
+  let r = lsys(44, s, buf, n, 16384, 0, 0)
+  if r < 0 { return 0 - 1 }
+  return r
+}
+
+skill rt_lx_recv(s, buf, n, flags) -> Any {
+  let r = lsys(45, s, buf, n, 0, 0, 0)
+  if r < 0 { return 0 - 1 }
+  return r
+}
+
+skill rt_lx_closesocket(s) -> Any {
+  do lsys(3, s)
+  return 0
+}
+
+# a port just let go can be taken again at once, as on Windows (Linux would hold it for a minute)
+skill rt_lx_bind(s, sa, n) -> Any {
+  let top = peek(gaddr(0))
+  let one = rt_alloc(8)
+  do poke(one, 1)
+  do lsys(54, s, 1, 2, one, 4)
+  do poke(gaddr(0), top)
+  if lsys(49, s, sa, n) != 0 { return 0 - 1 }
+  return 0
+}
+
+skill rt_lx_listen(s, n) -> Any {
+  if lsys(50, s, n) != 0 { return 0 - 1 }
+  return 0
+}
+
+skill rt_lx_accept(s, a, b) -> Any {
+  let c = lsys(43, s, 0, 0)
+  if c < 0 { return 0 - 1 }
+  return c
 }

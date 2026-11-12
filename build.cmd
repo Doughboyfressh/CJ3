@@ -6,7 +6,9 @@ rem Usage:
 rem   build.cmd                     build out\pic.exe from examples\pic.pi
 rem   build.cmd prog.pi             compile prog.pi -> out\<prog>.exe
 rem   build.cmd prog.pi out.exe     compile prog.pi -> out.exe
-rem   build.cmd reseed              after editing pic.pi: run test.cmd and, if it passes, make the new compiler the seed
+rem   build.cmd prog.pi out linux   the same program for Linux (pic cross-compiles either way)
+rem   build.cmd reseed              after editing pic.pi: run test.cmd and, if it passes, make the new compilers the
+rem                                 seeds (seed\pic.exe for Windows and seed\pic for Linux)
 setlocal
 cd /d "%~dp0"
 if not exist out mkdir out
@@ -21,7 +23,8 @@ if not exist out\pic.exe (echo build: the compiler failed to compile itself & ex
 if "%~1"=="" ( echo Built out\pic.exe & exit /b 0 )
 set "OUT=%~2"
 if "%OUT%"=="" set "OUT=out\%~n1.exe"
-out\pic.exe "%~1" "%OUT%" >nul
+if exist "%OUT%" del "%OUT%"
+if "%~3"=="" (out\pic.exe "%~1" "%OUT%" >nul) else (out\pic.exe "%~1" "%OUT%" %~3 >nul)
 if exist "%OUT%" (echo Built %OUT% & exit /b 0)
 echo build: %~1 did not compile
 exit /b 1
@@ -30,5 +33,6 @@ exit /b 1
 call "%~dp0test.cmd"
 if errorlevel 1 (echo reseed: the suite failed, the seed is unchanged & exit /b 1)
 copy /y out\t_g2.exe seed\pic.exe >nul
-echo reseed: seed\pic.exe is now the compiler built from the current examples\pic.pi
+copy /y out\t_gl seed\pic >nul
+echo reseed: seed\pic.exe and seed\pic are now the compilers built from the current examples\pic.pi
 exit /b 0

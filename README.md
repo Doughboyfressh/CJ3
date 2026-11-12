@@ -24,7 +24,8 @@ brain. No Rust, no interpreter, no CUDA toolkit, no third-party libraries — Pi
   each rule against all of it. `tongue.pi` measures it on the SCAN benchmark: from the 422 shortest commands
   it reads the other 20,488 correctly, including every sentence the benchmark's splits hold back. `heed.pi`
   uses the same learner on the mind's own tasks: an English instruction Pi was never given is read as a
-  program and run.
+  program and run. When it is then shown examples for one it got wrong, it checks its own reading against
+  them and mends it (a new word, a wrong order) before it falls back on searching.
 
 ## Quick start
 

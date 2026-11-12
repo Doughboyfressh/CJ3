@@ -159,7 +159,76 @@ skill tg_faults(rules, heard, n, limit) -> Any {
 
 skill tg_all_right(rules, heard, n, limit) -> Any { return tg_faults(rules, heard, n, limit) >= 0 }
 
-# a rule holds if every example Pi has been through that it fits comes out as that example's meaning
+# The same count, without reading everything again. A rule has no part in reading a sentence unless every plain
+# word of its pattern is in the sentence -- so when one rule is put in or moved, only the sentences it touches
+# can come out differently; the others stand as they stood.
+skill tg_touches(pat, words) -> Any {
+  for w in pat {
+    if tg_isvar(w) == false {
+      if contains(words, w) == false { return false }
+    }
+  }
+  return true
+}
+
+# how each example stands under these rules: 0 no fault, 1 a later one misread, 2 one of the first n not read rightly
+skill tg_standing(rules, heard, n) -> Any {
+  let out = []
+  let i = 0
+  for ex in heard {
+    let m = mark()
+    let got = tg_read(rules, ex[0])
+    let st = 0
+    if got != ex[1] {
+      if i < n { let st = 2 } else {
+        if got != null { let st = 1 }
+      }
+    }
+    let st = release(m, st)
+    let out = append(out, st)
+    let i = i + 1
+  }
+  return out
+}
+
+# tg_faults for rules that differ from those of stand only by where the rule with this pattern is
+skill tg_faults_by(rules, heard, n, limit, stand, pat) -> Any {
+  let i = 0
+  let bad = 0
+  for ex in heard {
+    let st = stand[i]
+    if tg_touches(pat, ex[0]) {
+      let m = mark()
+      let got = tg_read(rules, ex[0])
+      let st = 0
+      if got != ex[1] {
+        if i < n { let st = 2 } else {
+          if got != null { let st = 1 }
+        }
+      }
+      let st = release(m, st)
+    }
+    if st == 2 { return 0 - 1 }
+    if st == 1 {
+      let bad = bad + 1
+      if bad > limit { return 0 - 1 }
+    }
+    let i = i + 1
+  }
+  return bad
+}
+
+# a sentence Pi keeps whole, word for word
+skill tg_by_heart(rules, ex) -> Any {
+  for q in rules {
+    if q[0] == ex[0] and q[1] == ex[1] { return true }
+  }
+  return false
+}
+
+# a rule holds if every example Pi has been through that it fits comes out as that example's meaning -- or is
+# one Pi knows by heart: the exception is already paid for, and standing above the rule it does not refute it
+# ("mirror, then flip" kept whole leaves "$1 , then flip" free to be the rule for everything else)
 skill tg_holds(rule, rules, heard, n) -> Any {
   let i = 0
   for ex in heard {
@@ -167,7 +236,9 @@ skill tg_holds(rule, rules, heard, n) -> Any {
       if tg_fits(rule[0], ex[0]) {
         let env = tg_bind(rule[0], 0, ex[0], 0, rules, [null, null])
         if env != null {
-          if tg_fill(rule[1], env) != ex[1] { return false }
+          if tg_fill(rule[1], env) != ex[1] {
+            if tg_by_heart(rules, ex) == false { return false }
+          }
         }
       }
     }
@@ -318,19 +389,22 @@ skill tg_insert(rules, pos, r) -> Any { return slice(rules, 0, pos) ++ [r] ++ sl
 skill tg_remove(rules, pos) -> Any { return slice(rules, 0, pos) ++ slice(rules, pos + 1, len(rules)) }
 
 # the rules may be right and only stand in the wrong order: move one, if that reads this example and all before it
-skill tg_reorder(rules, heard, n, ex, limit) -> Any {
+skill tg_reorder(rules, heard, n, ex, limit, stand) -> Any {
   let nr = len(rules)
   for i in range(0, nr) {
     let r = rules[i]
-    let without = tg_remove(rules, i)
-    for p in range(0, nr) {
-      if p != i {
-        let m = mark()
-        let rules2 = tg_insert(without, p, r)
-        let ok = tg_read(rules2, ex[0]) == ex[1]
-        if ok { let ok = tg_all_right(rules2, heard, n, limit) }
-        if ok { return rules2 }
-        let ok = release(m, ok)
+    # a rule with no part in reading this example changes nothing by moving
+    if tg_touches(r[0], ex[0]) {
+      let without = tg_remove(rules, i)
+      for p in range(0, nr) {
+        if p != i {
+          let m = mark()
+          let rules2 = tg_insert(without, p, r)
+          let ok = tg_read(rules2, ex[0]) == ex[1]
+          if ok { let ok = tg_faults_by(rules2, heard, n, limit, stand, r[0]) >= 0 }
+          if ok { return rules2 }
+          let ok = release(m, ok)
+        }
       }
     }
   }
@@ -352,9 +426,13 @@ skill tg_next_cost(cands, above) -> Any {
 skill tg_explain(rules, heard, n, ex) -> Any {
   let got = tg_read(rules, ex[0])
   if got == ex[1] { return rules }
-  let limit = tg_misreads(rules, heard, n)
+  let stand = tg_standing(rules, heard, n)
+  let limit = 0
+  for st in stand {
+    if st == 1 { let limit = limit + 1 }
+  }
   if got != null {
-    let moved = tg_reorder(rules, heard, n, ex, limit)
+    let moved = tg_reorder(rules, heard, n, ex, limit, stand)
     if moved != null { return moved }
   }
   let cands = tg_candidates(rules, ex)
@@ -372,7 +450,7 @@ skill tg_explain(rules, heard, n, ex) -> Any {
             let m = mark()
             let f = 0 - 1
             let rules2 = tg_insert(rules, pos, cd[1])
-            if tg_read(rules2, ex[0]) == ex[1] { let f = tg_faults(rules2, heard, n, bestf) }
+            if tg_read(rules2, ex[0]) == ex[1] { let f = tg_faults_by(rules2, heard, n, bestf, stand, cd[1][0]) }
             let f = release(m, f)
             if f >= 0 {
               if best == null or f < bestf {
@@ -585,20 +663,41 @@ skill tg_learn(examples) -> Any {
   let rules = release(m, rules)
   # replay: a sentence once kept whole, word for word, is explained again with all that has been learned since --
   # and what explains it now is kept if it makes the whole smaller ("sum of squares" gives up "squares")
+  # The same for a rule with a word in it that a more general rule could take as a phrase, if only the word had
+  # a meaning ("$1 of squares" beside "$1 of $2"): the rule is replayed as a sentence, its variables standing in
+  # as two made-up words (#1, #2) that mean two made-up things.
   let going = true
   while going {
     let going = false
     let i = 0
     while i < len(rules) and going == false {
       let r = rules[i]
-      if len(r[0]) >= 2 and tg_nvars(r[0]) == 0 {
+      if tg_replayable(rules, i) {
         let m2 = mark()
-        let again = tg_explain(tg_remove(rules, i), heard, total, [r[0], r[1]])
-        let again = tg_night(again, heard, total)
-        let better = tg_size(again) < tg_size(rules)
-        if better { let better = tg_all_right(again, heard, total, 0) }
+        let ex = tg_as_sentence(r)
+        let stand = [[["#1"], ["#1"]], [["#2"], ["#2"]]]
+        let again = tg_explain(stand ++ tg_remove(rules, i), heard, total, ex)
+        # the stand-in words go; nothing learned may speak of them
+        let kept = []
+        let clean = true
+        for q in again {
+          if q != stand[0] and q != stand[1] {
+            if contains(q[0], "#1") or contains(q[0], "#2") or contains(q[1], "#1") or contains(q[1], "#2") { let clean = false }
+            let kept = append(kept, q)
+          }
+        }
+        let better = clean
+        # explained only by keeping it whole once more: nothing was learned, the rules stay as they are
+        if better and len(kept) == len(rules) {
+          if kept[0] == r { let better = false }
+        }
         if better {
-          let rules = release(m2, again)
+          let kept = tg_night(kept, heard, total)
+          let better = tg_size(kept) < tg_size(rules)
+        }
+        if better { let better = tg_all_right(kept, heard, total, 0) }
+        if better {
+          let rules = release(m2, kept)
           let going = true
         } else { let better = release(m2, better) }
       }
@@ -606,6 +705,50 @@ skill tg_learn(examples) -> Any {
     }
   }
   return rules
+}
+
+skill tg_as_sentence(r) -> Any {
+  let words = []
+  for w in r[0] {
+    if w == "$1" { let words = append(words, "#1") } else {
+      if w == "$2" { let words = append(words, "#2") } else { let words = append(words, w) }
+    }
+  }
+  let meaning = []
+  for w in r[1] {
+    if w == "$1" { let meaning = append(meaning, "#1") } else {
+      if w == "$2" { let meaning = append(meaning, "#2") } else { let meaning = append(meaning, w) }
+    }
+  }
+  return [words, meaning]
+}
+
+# worth replaying: a sentence kept whole; or a rule that another rule matches word for word but for variables
+# standing where this one has words Pi cannot read alone
+skill tg_replayable(rules, i) -> Any {
+  let r = rules[i]
+  let n = len(r[0])
+  if n < 2 { return false }
+  if tg_nvars(r[0]) == 0 { return true }
+  let j = 0
+  for q in rules {
+    if j != i and len(q[0]) == n {
+      let fitsit = true
+      let gain = false
+      for k in range(0, n) {
+        if q[0][k] != r[0][k] {
+          if tg_isvar(q[0][k]) and tg_isvar(r[0][k]) == false {
+            if tg_read(rules, [r[0][k]]) == null { let gain = true } else { let fitsit = false }
+          } else {
+            if tg_isvar(q[0][k]) == false or tg_isvar(r[0][k]) == false { let fitsit = false }
+          }
+        }
+      }
+      if fitsit and gain { return true }
+    }
+    let j = j + 1
+  }
+  return false
 }
 
 skill tg_size(rules) -> Any {

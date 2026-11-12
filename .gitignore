@@ -8,4 +8,5 @@ out/
 __pycache__/
 *.pyc
 
-# keep the bootstrap compiler (seed/pic.exe) -- it is required to build Pi and lives outside out/
+# keep the bootstrap compilers (seed/pic.exe for Windows, seed/pic for Linux) -- they are required to build Pi
+# and live outside out/

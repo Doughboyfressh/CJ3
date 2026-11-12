@@ -6,6 +6,8 @@ rem    (pic.pi changed): `build.cmd reseed` makes g2 the new seed once this suit
 rem 2. Every program in examples\native\golden\ is compiled by g2 and run, fed golden\<name>.in as its input if
 rem    there is one (else no input); its output must match the golden file byte for byte.
 rem 3. The agent's memory: two runs sharing a memory file.
+rem The Linux compiler (seed\pic) is built from the same source: g2 cross-compiles it and says whether the one in
+rem seed\ is current. test.sh is this suite on Linux, held to the same golden files.
 rem Set PI_NO_GPU=1 on a machine without an NVIDIA GPU (CI does) to skip the one GPU golden program.
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
@@ -20,6 +22,9 @@ fc /b out\t_g2.exe out\t_g3.exe >nul
 if errorlevel 1 (echo FAIL fixpoint: the compiler does not reproduce itself & set fail=1) else (echo ok   fixpoint: the compiler reproduces itself)
 fc /b out\t_g2.exe seed\pic.exe >nul
 if errorlevel 1 (echo note seed is stale: run build.cmd reseed once this passes) else (echo ok   seed is current)
+out\t_g2.exe examples\pic.pi out\t_gl linux >nul
+fc /b out\t_gl seed\pic >nul
+if errorlevel 1 (echo note the Linux seed is stale: run build.cmd reseed once this passes) else (echo ok   the Linux compiler built here is seed\pic)
 for %%f in (examples\native\golden\*.out) do (
   set p=%%~nf
   set skip=0

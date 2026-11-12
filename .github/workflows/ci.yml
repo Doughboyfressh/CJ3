@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  windows:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -18,3 +18,13 @@ jobs:
         env:
           PI_NO_GPU: "1"   # hosted runners have no NVIDIA GPU, so gpuforms is skipped
         run: test.cmd
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # The same suite with the Linux compiler: its own fixpoint, the Windows compiler cross-built and
+      # compared with seed/pic.exe, and the same golden files.
+      - name: Self-compile fixpoint and golden programs
+        run: ./test.sh

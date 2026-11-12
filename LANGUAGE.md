@@ -1,7 +1,7 @@
 # The Pi language
 
 Pi is a compiled language written in itself. `examples/pic.pi` is the compiler, a Pi program that compiles Pi
-source to a native Windows x64 executable, and it compiles itself. `examples/native/rt.pi` is the runtime
+source to a native x64 executable for Windows or Linux, and it compiles itself. `examples/native/rt.pi` is the runtime
 (memory, text, lists, maps, numbers, files, printing), also Pi, compiled into every program. There is no Rust
 and no interpreter: the Rust interpreter that bootstrapped Pi was retired on 2026-10-31 (it is kept, not run,
 in `C:\Users\Dough\pi_removed\pi_native\`).
@@ -16,6 +16,9 @@ build.cmd reseed              after editing pic.pi or rt.pi: run the tests, then
 test.cmd                      the test suite
 ```
 
+On Linux the same five are `./build.sh`, `./build.sh prog.pi`, `./build.sh prog.pi out/name`, `./build.sh reseed`
+and `./test.sh`; programs are `out/prog`, and the seed is `seed/pic`.
+
 - `seed\pic.exe` is the compiler that starts every build. It is the self-reproducing fixpoint: compiled from
   `examples\pic.pi`, it rebuilds itself byte for byte.
 - `test.cmd` does two things:
@@ -24,6 +27,18 @@ test.cmd                      the test suite
   - It compiles every program that has a golden file in `examples\native\golden\` and compares its output
     byte for byte. The golden outputs were recorded while the interpreter still existed, and matched it.
 - A compiled program prints what `main` returns, then exits 0. `fail(msg)` prints the message and exits 1.
+- **Two systems, one source.** `pic SOURCE OUTPUT` compiles for the system it runs on; a third word, `windows` or
+  `linux`, compiles for that one instead. The two compilers are the same program:
+  - The Windows compiler cross-compiles the Linux compiler byte for byte, and the other way round; both suites
+    check it.
+  - A Linux program is a static ELF file with no libraries: the runtime calls the kernel directly.
+  - `platform()` is `"linux"` or `"windows"`, the system the program was compiled for.
+  - File paths are written the same on both: on Linux a `\` in a path is read as `/`.
+  - `listdir` gives names in the same order on both (as Windows sorts them).
+  - `rt_now()` is local time on both; Linux reads the zone from `/etc/localtime`.
+  - `spawn` starts a program by its path; a bare name (`"python3 x.py"`) goes to `/bin/sh` on Linux.
+  - Not on Linux yet: the GPU words, `http`, `screen`, `mouse`, `key`, `play`, `render`, `fgwin`, `focus`. Using
+    one stops the program with `PiRuntimeError: <name> is a Windows facility that Pi does not have on Linux yet`.
 
 ## Syntax
 
@@ -120,7 +135,7 @@ Some words behave in ways worth knowing:
   - `memused()` is the heap in use, in bytes.
 - **Known limits.**
   - Dividing an integer by zero stops the program.
-  - The runtime is Windows x64 only.
+  - The runtime is x64 only (Windows and Linux).
 
 ## Not yet in Pi
 

@@ -1752,3 +1752,26 @@ User approved all five: (1) Pi drafts tokens for its own brain (speculative deco
   ALLOC-RETURNED pointer -- a COMPUTED mid-buffer offset pointer (rt_tag(rt_untag(buf)+off)) crashes (GPU ptr ~2^60 ->
   bignum mis-marshal) or uploads garbage (host). Stage contiguous + upload from offset 0, or index with peek/poke.
   Voice left as-is: already 54.8 dB SNR and the 1895 source is band-limited (higher sample rate adds nothing).
+
+## 2026-11-11 -- Pi on Linux (user: "you can just make pi Linux compatible as well")
+- pic has a second target. `pic SOURCE OUTPUT linux` writes a static ELF64 file: the same code and the same data
+  table as the Windows file (r15, the skill table, the globals, the text objects -- every offset identical), with
+  the import table's slots left empty. No libc, no dynamic loader.
+- Three new raw primitives: `lsys(n, a..f)` (a Linux system call), `ostarget()` (1 when compiled for Linux),
+  `faddr("rt_name")` (a skill's address). Globals went from 16 to 32 (16: the starting stack pointer, 17: the
+  command line built from argv, 18: the last name asked of LoadLibraryA / GetProcAddress).
+- rt.pi is unchanged above its new last section. Compiled for Linux, `wcall("Name", ...)` becomes a call to the
+  skill `rt_lx_Name`, and `wcallp(addr, ...)` calls whatever `rt_lx_GetProcAddress` handed out -- 15 kernel32
+  calls plus the ones looked up by name (clock, file mapping, rename, processes, sockets), each written in Pi on
+  system calls. A Windows function with no stand-in stops the program with a message naming it.
+- Kept identical on purpose, because the golden files are shared: listdir order (NTFS order, so the folder is read
+  whole and sorted), memused() (scratch is given back before each rt_lx_ skill returns), a folder is not a
+  readable file, a child started with no window has no input or output, `\` in a path.
+- Bootstrap: the old seed could not compile a runtime that uses primitives it did not know, so it went in steps --
+  the compiler learns the primitives, then the runtime uses them, then main() uses platform() -- each step
+  compiled by the one before, ending at a fixpoint.
+- Result: seed/pic (Linux) reproduces itself byte for byte; the Windows compiler cross-compiles to exactly
+  seed/pic and the Linux compiler cross-compiles to exactly seed/pic.exe. test.sh: fixpoint and 37 programs,
+  every golden file byte-identical to Windows (gpuforms skipped, as on a Windows machine without the GPU).
+- Not on Linux yet: the GPU engine (nvcuda.dll is loaded by name; Linux needs libcuda.so through a dynamic
+  loader, which a static file does not have), http() (WinHTTP; plain sockets work), screen / mouse / key / play.

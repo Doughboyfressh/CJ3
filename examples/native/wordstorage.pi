@@ -1,0 +1,17 @@
+# Real learned colour table nested in a vocabulary word, followed by another word that uses it.
+# Both signatures, the nested table, word IDs and outputs must survive the vocabulary codec.
+import "mindcore.pi"
+skill main() -> Any {
+  let input_grid = [[1,2,0]]
+  let output_grid = [[9,8,0]]
+  let table = colour_table([[input_grid,output_grid]])[0][0]
+  let lib = load_lib("I I * p0 2")
+  lib = append(lib, [O("gmap", [table, ["p",0]]), "G", "G"])
+  lib = append(lib, [["w",1,[["p",0]]], "G", "G"])
+  let reloaded = load_lib(save_lib(lib))
+  let answer = sev(["w",2,[V("g")]], null, input_grid, null, reloaded)
+  if reloaded != lib or answer != output_grid { return "FAIL vocabulary round-trip" }
+  let legacy = load_lib("I I 0\nI I w0 p0")
+  if save_lib(legacy) != "I I 0\nI I w0 p0" { return "FAIL legacy vocabulary" }
+  return "Legacy and table-bearing words round-trip with their meanings."
+}

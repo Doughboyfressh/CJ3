@@ -57,6 +57,28 @@ if exist out\t_agent.exe (
   fc /b out\t_recall.txt examples\native\golden\agent_recall.expect >nul
   if errorlevel 1 (echo FAIL agent memory: it did not remember across runs & set fail=1) else (echo ok   agent remembers across runs)
 )
+rem Verify teaching, correction and transfer in separate processes.
+if exist out\t_heed.exe (
+  if exist out\t_heed.lessons del out\t_heed.lessons
+  (
+    out\t_heed.exe memory out\t_heed.lessons teach "sum of ravels" 2,3 10
+    out\t_heed.exe memory out\t_heed.lessons teach "product of ravels" 2,3 24
+    out\t_heed.exe memory out\t_heed.lessons use "product of ravels" 3,5,7
+    out\t_heed.exe memory out\t_heed.lessons use "count ravels" 3,5,7
+    out\t_heed.exe memory out\t_heed.lessons teach "product of ravels" 2,3 12
+    out\t_heed.exe memory out\t_heed.lessons use "product of ravels" 3,5,7
+    out\t_heed.exe memory out\t_heed.lessons teach "sum of twill" 2,3 13
+    out\t_heed.exe memory out\t_heed.lessons teach "sum of twill" 3,4 25
+    out\t_heed.exe memory out\t_heed.lessons use "product of twill" 2,3,4
+    out\t_heed.exe memory out\t_heed.lessons teach "sum of cubes" 2 8
+    out\t_heed.exe memory out\t_heed.lessons teach "sum of cubes" 3 27
+    out\t_heed.exe memory out\t_heed.lessons teach "sum of cubes" 4 64
+    out\t_heed.exe memory out\t_heed.lessons teach "sum of cubes" 2,3 35
+    out\t_heed.exe memory out\t_heed.lessons use "sum of cubes" 4,5
+  ) > out\t_heed_memory.txt
+  fc /b out\t_heed_memory.txt examples\native\golden\heed_memory.expect >nul
+  if errorlevel 1 (echo FAIL Heed lesson memory & set fail=1) else (echo ok   Heed transfers corrections across runs)
+)
 if !fail!==0 (echo ALL PASS: fixpoint and !n! programs & exit /b 0)
 echo SOME FAILED
 exit /b 1

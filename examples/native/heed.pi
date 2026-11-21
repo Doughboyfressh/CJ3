@@ -21,6 +21,7 @@
 import "mindcore.pi"
 import "tonguelib.pi"
 import "scopelearn.pi"
+import "heedmemory.pi"
 
 # an instruction's words: lower case, a comma a word of its own
 skill hd_words(text) -> Any { return split(join(split(lower(text), ","), " , ")) }
@@ -194,11 +195,30 @@ skill hd_new(domain) -> Any {
   return hd_new_grids()
 }
 
-# read an instruction with no examples -> [the program or null, how it went: "right", "wrong" or "cannot read"]
-skill hd_told(rules, fam, steps, task, domain) -> Any {
-  let toks = tg_understand(rules, fam, hd_words(task[0]))
-  if toks == null { return [null, "cannot read"] }
-  let tree = hd_program(toks, steps, hd_input(domain))
+skill hd_read_tree(rules, fam, steps, phrase, domain) -> Any {
+  let toks = tg_understand(rules, fam, hd_words(phrase))
+  if toks == null { return null }
+  return hd_program(toks, steps, hd_input(domain))
+}
+
+# Read learned corrections before less specific grammar rules, only in the taught domain.
+skill hd_told(rules, fam, steps, task, domain, readings) -> Any {
+  if domain == "lists" {
+    let phrase = hm_phrase(task[0])
+    if phrase != null {
+      let laws = readings[phrase[1]]
+      if laws != null {
+        if len(laws) == 0 { return [null,"no consistent meaning"] }
+        if len(laws) > 1 { return [null,hm_ask(phrase[1],laws)] }
+        let fitted = hm_grammar(phrase[1],laws[0],rules,steps)
+        let rules = fitted[0]
+        let steps = fitted[1]
+        let fam = null
+      }
+    }
+  }
+  let tree = hd_read_tree(rules, fam, steps, task[0], domain)
+  if tree == null { return [null, "cannot read"] }
   if hd_right(tree, task[1], domain) { return [tree, "right"] }
   return [tree, "wrong"]
 }
@@ -207,6 +227,14 @@ skill hd_pct(a, b) -> Any { return str(a) ++ " of " ++ str(b) }
 
 skill main() -> Any {
   if arg(1) == "inquire" { return sl_session(arg(2), arg(3)) }
+  if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
+  let readings = {}
+  if arg(1) == "review" {
+    if arg(2) == null { return "Usage: heed review FILE" }
+    let book = hm_load(arg(2))
+    if book == null { return "Unreadable or incomplete lesson file." }
+    for word in keys(book) { readings = put(readings,word,hm_laws(book[word])) }
+  }
   let domains = ["lists", "text", "grids"]
   let pl = pools()
   let pre = prelude()
@@ -238,9 +266,10 @@ skill main() -> Any {
   let total = 0
   let beyond = 0
   let failed = []
+  let previous_readings = readings
   for d in domains {
     for t in hd_tasks(d, true) {
-      let r = hd_told(rules, fam, steps, t, d)
+      let r = hd_told(rules, fam, steps, t, d, readings)
       let total = total + 1
       let line = "  " ++ t[0] ++ ": " ++ r[1]
       if r[0] != null { let line = line ++ "   " ++ show(r[0]) }
@@ -268,6 +297,23 @@ skill main() -> Any {
     if r[0] == null { do print("  " ++ t[0] ++ ": not found by search") } else {
       let mn = hd_meaning(r[0], steps)
       let steps = mn[1]
+      # In a continuing session, carry genuinely ambiguous demonstrations into the
+      # next lesson. Read only practice inputs. Reserve final tasks for transfer.
+      if arg(1) == "review" and d == "lists" {
+        let phrase = hm_phrase(t[0])
+        if phrase != null and readings[phrase[1]] == null {
+          let obs = []
+          for ex in examples_of(t[1], train_inputs(d)) { obs = append(obs,[phrase[0],ex[0],ex[1]]) }
+          let laws = hm_simple(obs)
+          if len(laws) > 1 and hm_question(laws) != null {
+            let records = ""
+            for ex in obs { records = records ++ hm_line(phrase[1],ex) }
+            if not rt_append_file(arg(2),records) { return "Could not save the practice observations." }
+            readings = put(readings,phrase[1],laws)
+            do print("  " ++ hm_ask(phrase[1],laws))
+          }
+        }
+      }
       let pairs = append(pairs, [hd_words(t[0]), mn[0]])
       let learned = learned + 1
       do print("  " ++ t[0] ++ ": " ++ show(r[0]))
@@ -285,8 +331,8 @@ skill main() -> Any {
   let total2 = 0
   for d in domains {
     for t in hd_new(d) {
-      let r0 = hd_told(rules, fam, steps, t, d)
-      let r2 = hd_told(rules2, fam2, steps, t, d)
+      let r0 = hd_told(rules, fam, steps, t, d, previous_readings)
+      let r2 = hd_told(rules2, fam2, steps, t, d, readings)
       let total2 = total2 + 1
       if r0[1] == "right" { let right0 = right0 + 1 }
       if r2[1] == "right" { let right2 = right2 + 1 }

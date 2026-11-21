@@ -1,6 +1,7 @@
 # Pi's mind, the shared core: the language (numbers, lists, text, grids), the search, the night (MDL words,
 # downscaling, replay), number and colour sense, dreaming. Programs that use it: mind.pi (the core loop), arcmind.pi.
 import "interp.pi"
+import "json.pi"
 
 # ---- the language ----------------------------------------------------------------------------------------------
 skill optable() -> Any {
@@ -2348,8 +2349,12 @@ skill load_lib(text) -> Any {
   for line in split(text, "\n") {
     let line = trim(line)
     if line != "" {
-      let toks = split(line, " ")
-      let lib = append(lib, [parse_at(toks, 2, lib)[0], toks[0], toks[1]])
+      if slice(line, 0, 1) == "[" {
+        let lib = append(lib, json_parse(line))
+      } else {
+        let toks = split(line, " ")
+        let lib = append(lib, [parse_at(toks, 2, lib)[0], toks[0], toks[1]])
+      }
     }
   }
   return lib
@@ -2359,8 +2364,8 @@ skill save_lib(lib) -> Any {
   let lines = []
   for w in lib {
     let line = w[1] ++ " " ++ w[2] ++ " " ++ ser(w[0])
-    # a word holding a table cannot be written yet; a placeholder keeps every later word's number right
-    if contains(line, "[") { let line = "I I 0" }
+    # Keep the compact legacy notation when possible. A structured word preserves literal tables and both types.
+    if contains(line, "[") { let line = json_text(w) }
     let lines = append(lines, line)
   }
   return join(lines, "\n")

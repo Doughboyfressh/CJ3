@@ -1,0 +1,265 @@
+# Durable list-word lessons. An observation names the operation, the word, the input and the result.
+# A replay derives meanings from the evidence, including corrections to an earlier observation.
+skill hm_reducers() -> Any { return ["product", "sum", "count", "largest", "smallest"] }
+
+skill hm_reduce(name, input_tree) -> Any {
+  if name == "product" { return O("fold", [O("*", [["p",0], V("e")]), Q(1), input_tree]) }
+  let op = {"sum":"sum", "count":"len", "largest":"maxl", "smallest":"minl"}[name]
+  return O(op, [input_tree])
+}
+
+# law = [pointwise expression in e, apply before reduction?]
+skill hm_predict(law, ex) -> Any {
+  let xs = ex[1]
+  let inner = V("x")
+  if law[1] { inner = O("map", [law[0], inner]) }
+  let tree = hm_reduce(ex[0], inner)
+  if not law[1] { tree = subst_e(law[0], tree) }
+  return sev(tree, null, xs, null, [])
+}
+
+skill hm_fits(law, observations) -> Any {
+  for ex in observations {
+    if hm_predict(law, ex) != ex[2] { return false }
+  }
+  return true
+}
+
+# If the cheap explanations fail, synthesize a numeric program from the observations:
+# after a reduction the input to the unknown function is known. A one-item sum or product
+# also directly observes the element function. Check either proposal against ALL contexts.
+skill hm_scalar(tree) -> Any {
+  if tree[0] == "v" { return tree[1] == "n" }
+  if tree[0] == "q" { return typeof(tree[1]) == "int" }
+  if tree[0] != "op" or contains(["map","filter","gmap","fold","rec2"],tree[1]) { return false }
+  for child in tree[2] { if not hm_scalar(child) { return false } }
+  return true
+}
+
+skill hm_expand(observations) -> Any {
+  let found = []
+  let pl = pools()
+  # Reuse the core searcher's scalar functions first. Jointly observing a sum and a
+  # product can identify an element function even without any single-element example.
+  for level in [1,3] {
+    for candidate in pl[0][level] {
+      for before in [true,false] {
+        let law = [candidate[0],before]
+        if hm_fits(law,observations) { found = append(found,law) }
+      }
+    }
+  }
+  if len(found) > 0 { return found }
+  let pre = prelude()
+  for before in [true, false] {
+    let data = []
+    for ex in observations {
+      if not before or (len(ex[1]) == 1 and ex[0] != "count") {
+        let x = sev(hm_reduce(ex[0], V("x")), null, ex[1], null, [])
+        data = append(data, [x, ex[2]])
+      }
+    }
+    if len(data) > 0 {
+      let m = mark()
+      let result = solve(data, [], [], [], pl, pre, 5, 1800)
+      let tree = release(m, result[0])
+      if tree != null and hm_scalar(tree) {
+        # The scalar solver uses n. Its input becomes the element where the word is applied.
+        let law = [hd_plug(hd_holed(tree), V("e")), before]
+        if hm_fits(law, observations) { found = append(found, law) }
+      }
+    }
+  }
+  return found
+}
+
+skill hm_simple(observations) -> Any {
+  let laws = []
+  for k in range(0 - 4, 5) {
+    for op in ["*", "+"] {
+      for before in [true, false] {
+        let law = [O(op, [V("e"), Q(k)]), before]
+        if hm_fits(law, observations) { laws = append(laws, law) }
+      }
+    }
+  }
+  return laws
+}
+
+skill hm_laws(observations) -> Any {
+  let m = mark()
+  let laws = hm_simple(observations)
+  if len(laws) == 0 { laws = hm_expand(observations) }
+  return release(m,laws)
+}
+
+# Minimize the largest surviving group after an exact answer. Ignore measurements where
+# any candidate is undefined, since undefined is not an instrument or teacher response.
+skill hm_question(laws) -> Any {
+  let best = null
+  let worst = len(laws)
+  for xs in [[2,3], [1], [3,5,7], [0-2,4], [0,1,3], [1,1]] {
+    for reducer in hm_reducers() {
+      let cells = {}
+      let largest = 0
+      let ok = true
+      for law in laws {
+        let y = hm_predict(law, [reducer, xs])
+        if y == null { ok = false } else {
+          let count = get(cells, str(y), 0) + 1
+          cells = put(cells, str(y), count)
+          largest = max(largest, count)
+        }
+      }
+      if ok and largest < worst {
+        worst = largest
+        best = [reducer, xs]
+        if worst == 1 { return best }
+      }
+    }
+  }
+  return best
+}
+
+skill hm_word(s) -> Any {
+  if s == null or s == "" { return false }
+  for c in chars(s) { if not contains("abcdefghijklmnopqrstuvwxyz", c) { return false } }
+  return true
+}
+
+skill hm_number(s) -> Any {
+  if s == null or s == "" { return null }
+  let start = if slice(s,0,1) == "-" { 1 } else { 0 }
+  if len(s) == start { return null }
+  for i in range(start,len(s)) {
+    if not contains("0123456789", slice(s,i,i+1)) { return null }
+  }
+  let v = int(s)
+  if str(v) != s { return null }
+  return v
+}
+
+skill hm_numbers(csv) -> Any {
+  if csv == null { return null }
+  let xs = []
+  for s in split(csv,",") {
+    let v = hm_number(s)
+    if v == null { return null }
+    xs = append(xs,v)
+  }
+  if len(xs) == 0 { return null }
+  return xs
+}
+
+skill hm_csv(xs) -> Any {
+  let parts = []
+  for x in xs { parts = append(parts,str(x)) }
+  return join(parts,",")
+}
+
+skill hm_phrase(phrase) -> Any {
+  if phrase == null { return null }
+  let ws = hd_words(phrase)
+  if len(ws) == 3 and ws[1] == "of" { ws = [ws[0],ws[2]] }
+  if len(ws) != 2 { return null }
+  if not contains(hm_reducers(), ws[0]) or not hm_word(ws[1]) { return null }
+  return ws
+}
+
+skill hm_record(book, word, reducer, xs, y) -> Any {
+  let updated = []
+  for ex in get(book, word, []) {
+    if ex[0] != reducer or ex[1] != xs { updated = append(updated,ex) }
+  }
+  return put(book,word,append(updated,[reducer,xs,y]))
+}
+
+skill hm_load(path) -> Any {
+  let book = {}
+  let text = read_file(path)
+  if text == null or text == "" { return book }
+  if slice(text,len(text)-1,len(text)) != "\n" { return null }
+  for line in split(text,"\n") {
+    if line != "" {
+      let f = split(trim(line)," ")
+      if len(f) != 5 or f[0] != "heed1" { return null }
+      if not hm_word(f[1]) or not contains(hm_reducers(),f[2]) { return null }
+      let xs = hm_numbers(f[3])
+      let y = hm_number(f[4])
+      if xs == null or y == null { return null }
+      book = hm_record(book,f[1],f[2],xs,y)
+    }
+  }
+  return book
+}
+
+# Export each resolved meaning into the same grammar/step vocabulary that ordinary Heed reads.
+skill hm_grammar(word, law, rules, steps) -> Any {
+  let step = if law[1] { O("map",[law[0],hd_hole()]) } else { subst_e(law[0],hd_hole()) }
+  let key = hd_token(step)
+  let meaning = if law[1] { ["$1",key] } else { [key,"$1"] }
+  let lexical = []
+  steps = put(steps,key,step)
+  for name in hm_reducers() {
+    let tree = hm_reduce(name,hd_hole())
+    let token = hd_token(tree)
+    lexical = append(lexical,[[name],[token]])
+    steps = put(steps,token,tree)
+  }
+  let word_rules = [[["$1","of",word],meaning], [["$1",word],meaning]]
+  return [word_rules ++ lexical ++ rules,steps]
+}
+
+skill hm_read(word, law, phrase, xs) -> Any {
+  let fitted = hm_grammar(word,law,[],{})
+  let tree = hd_read_tree(fitted[0],null,fitted[1],phrase,"lists")
+  if tree == null { return null }
+  return sev(tree,null,xs,null,[])
+}
+
+skill hm_line(word, ex) -> Any {
+  return "heed1 " ++ word ++ " " ++ ex[0] ++ " " ++ hm_csv(ex[1]) ++ " " ++ str(ex[2]) ++ "\n"
+}
+
+skill hm_ask(word,laws) -> Any {
+  let q = hm_question(laws)
+  if q == null { return "Still ambiguous. Supply a different example." }
+  return "What is " ++ q[0] ++ " of " ++ word ++ " on " ++ hm_csv(q[1]) ++ "?"
+}
+
+skill hm_command(path, command, phrase, csv, answer) -> Any {
+  let ws = hm_phrase(phrase)
+  let xs = hm_numbers(csv)
+  let extra = arg(7) != null or (command == "use" and answer != null)
+  if ws == null or xs == null or path == null or not contains(["teach","use"],command) or extra {
+    return "Usage: heed memory FILE teach|use \"sum of WORD\" 2,3 [answer]"
+  }
+  let book = hm_load(path)
+  if book == null { return "Unreadable or incomplete lesson file." }
+  let word = ws[1]
+  if command == "teach" {
+    let y = hm_number(answer)
+    if y == null { return "Give a whole-number observation." }
+    let record = hm_line(word,[ws[0],xs,y])
+    if not rt_append_file(path,record) { return "Could not save the observation." }
+    book = hm_load(path)
+    if book == null { return "Could not read the saved observation." }
+  }
+  let obs = book[word]
+  if obs == null { return "Teach an example for " ++ word ++ " first." }
+  let laws = hm_laws(obs)
+  if len(laws) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
+  if len(laws) == 1 {
+    if command == "teach" { return "Learned " ++ word ++ ": " ++ show(laws[0][0]) ++ if laws[0][1] { " before reduction." } else { " after reduction." } }
+    let y = hm_read(word,laws[0],phrase,xs)
+    if y == null { return "Meaning undefined for this input." }
+    return str(y)
+  }
+  if command == "use" {
+    let y = hm_read(word,laws[0],phrase,xs)
+    let agree = y != null
+    for law in laws { if hm_read(word,law,phrase,xs) != y { agree = false } }
+    if agree { return str(y) }
+  }
+  return hm_ask(word,laws)
+}

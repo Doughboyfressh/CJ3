@@ -1,0 +1,14 @@
+What is product of ravels on 2,3?
+Learned ravels: (e * 2) before reduction.
+840
+3
+Learned ravels: (e * 2) after reduction.
+210
+Learned twill: (e + 4) before reduction.
+Learned twill: (e * e) before reduction.
+576
+What is product of cubes on 2,3?
+What is sum of cubes on 2,3?
+What is sum of cubes on 2,3?
+Learned cubes: (e * (e * e)) before reduction.
+189

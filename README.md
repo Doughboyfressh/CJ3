@@ -48,6 +48,33 @@ Linux x64 (nothing to install: the compiler and what it builds are static progra
 
 Either compiler builds for the other system: `pic SOURCE OUTPUT linux` or `pic SOURCE OUTPUT windows`.
 
+## Teach Heed a word
+
+Heed can learn where a word acts in a list instruction. For example, doubling each number and
+doubling the final sum both explain why 2 and 3 give 10. A product distinguishes those readings.
+Run these from the repository root on Linux. Each command starts a fresh process.
+
+```sh
+./build.sh examples/native/heed.pi
+out/heed memory out/lessons.txt teach "sum of ravels" 2,3 10
+# What is product of ravels on 2,3?
+out/heed memory out/lessons.txt teach "product of ravels" 2,3 24
+# Learned ravels: (e * 2) before reduction.
+out/heed memory out/lessons.txt use "product of ravels" 3,5,7
+# 840
+```
+
+On Windows, build with `build.cmd examples\native\heed.pi` and run `out\heed.exe`.
+The lesson file stores observations. Repeating the same word, operation, and input with a new
+answer corrects that observation. The learner tries small shifts and scales first. If all of
+them fail, it tries a bounded search for a scalar expression and checks it against every saved
+example for the word. Supported operations are sum, product, count, largest, and smallest on
+nonempty lists of integers.
+
+Run `out/heed review out/lessons.txt` to use that memory in the ordinary Heed curriculum.
+When practice examples support multiple readings, Heed can save them and ask for a distinguishing
+example. Answer with `teach` and rerun `review` to see how the correction transfers.
+
 ## Layout
 
 | Path | What |

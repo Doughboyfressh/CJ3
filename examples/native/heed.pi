@@ -20,6 +20,7 @@
 #   5. TOLD AGAIN: new instructions built from the words it has just learned, again with no examples.
 import "mindcore.pi"
 import "tonguelib.pi"
+import "scopelearn.pi"
 
 # an instruction's words: lower case, a comma a word of its own
 skill hd_words(text) -> Any { return split(join(split(lower(text), ","), " , ")) }
@@ -205,6 +206,7 @@ skill hd_told(rules, fam, steps, task, domain) -> Any {
 skill hd_pct(a, b) -> Any { return str(a) ++ " of " ++ str(b) }
 
 skill main() -> Any {
+  if arg(1) == "inquire" { return sl_session(arg(2), arg(3)) }
   let domains = ["lists", "text", "grids"]
   let pl = pools()
   let pre = prelude()

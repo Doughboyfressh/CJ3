@@ -22,6 +22,7 @@ import "mindcore.pi"
 import "tonguelib.pi"
 import "scopelearn.pi"
 import "heedmemory.pi"
+import "heedtransform.pi"
 
 # an instruction's words: lower case, a comma a word of its own
 skill hd_words(text) -> Any { return split(join(split(lower(text), ","), " , ")) }
@@ -203,6 +204,15 @@ skill hd_read_tree(rules, fam, steps, phrase, domain) -> Any {
 
 # Read learned corrections before less specific grammar rules, only in the taught domain.
 skill hd_told(rules, fam, steps, task, domain, readings) -> Any {
+  if len(readings) > 0 and (domain == "grids" or domain == "lists") {
+    let kind = if domain == "grids" { "grid" } else { "order" }
+    let transformed = ht_read(kind, task[0], readings, rules, steps, null)
+    if transformed != null {
+      if transformed[0] == null { return transformed }
+      if hd_right(transformed[0],task[1],domain) { return [transformed[0],"right"] }
+      return [transformed[0],"wrong"]
+    }
+  }
   if domain == "lists" {
     let phrase = hm_phrase(task[0])
     if phrase != null {
@@ -228,12 +238,18 @@ skill hd_pct(a, b) -> Any { return str(a) ++ " of " ++ str(b) }
 skill main() -> Any {
   if arg(1) == "inquire" { return sl_session(arg(2), arg(3)) }
   if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
+  if arg(1) == "grid" or arg(1) == "order" { return ht_command(arg(1),arg(2),arg(3),arg(4),arg(5),arg(6)) }
   let readings = {}
+  let practice = []
   if arg(1) == "review" {
     if arg(2) == null { return "Usage: heed review FILE" }
     let book = hm_load(arg(2))
     if book == null { return "Unreadable or incomplete lesson file." }
-    for word in keys(book) { readings = put(readings,word,hm_laws(book[word])) }
+    for word in keys(book) {
+      let tag = split(word,":")
+      if len(tag) == 2 { readings = put(readings,word,ht_laws(tag[0],book[word])) }
+      else { readings = put(readings,word,hm_laws(book[word])) }
+    }
   }
   let domains = ["lists", "text", "grids"]
   let pl = pools()
@@ -250,11 +266,13 @@ skill main() -> Any {
         let mn = hd_meaning(r[0], steps)
         let steps = mn[1]
         let pairs = append(pairs, [hd_words(t[0]), mn[0]])
+        if arg(1) == "review" { practice = append(practice,[d,hd_words(t[0]),hd_holed(r[0])]) }
         do print("  " ++ t[0] ++ ": " ++ show(r[0]) ++ "   = " ++ join(mn[0], " "))
       }
     }
   }
   # 2. the language
+  if arg(1) == "review" { readings = ht_conflicts(readings,practice) }
   let rules = tg_learn(pairs)
   let fam = tg_familiar(rules, pairs)
   do print("")

@@ -182,12 +182,24 @@ skill hm_load(path) -> Any {
   for line in split(text,"\n") {
     if line != "" {
       let f = split(trim(line)," ")
-      if len(f) != 5 or f[0] != "heed1" { return null }
-      if not hm_word(f[1]) or not contains(hm_reducers(),f[2]) { return null }
-      let xs = hm_numbers(f[3])
-      let y = hm_number(f[4])
+      if len(f) != 5 { return null }
+      let key = f[1]
+      let xs = null
+      let y = null
+      if f[0] == "heed2" {
+        if not contains(["grid","order"],f[2]) { return null }
+        let name = join(split(key,"_")," ")
+        if ht_name(name) != name or join(hd_words(name),"_") != key { return null }
+        key = f[2] ++ ":" ++ name
+        xs = ht_value(f[2],f[3])
+        y = ht_value(f[2],f[4])
+      } else {
+        if f[0] != "heed1" or not hm_word(key) or not contains(hm_reducers(),f[2]) { return null }
+        xs = hm_numbers(f[3])
+        y = hm_number(f[4])
+      }
       if xs == null or y == null { return null }
-      book = hm_record(book,f[1],f[2],xs,y)
+      book = hm_record(book,key,f[2],xs,y)
     }
   }
   return book

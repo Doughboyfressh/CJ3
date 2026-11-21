@@ -75,6 +75,20 @@ if exist out\t_heed.exe (
     out\t_heed.exe memory out\t_heed.lessons teach "sum of cubes" 4 64
     out\t_heed.exe memory out\t_heed.lessons teach "sum of cubes" 2,3 35
     out\t_heed.exe memory out\t_heed.lessons use "sum of cubes" 4,5
+    out\t_heed.exe grid out\t_heed.lessons ask mirror
+    out\t_heed.exe grid out\t_heed.lessons teach mirror 1,1/2,3 1,1/3,2
+    out\t_heed.exe grid out\t_heed.lessons use "mirror, then flip" 7,8,9/4,5,6
+    out\t_heed.exe order out\t_heed.lessons ask "biggest first"
+    out\t_heed.exe order out\t_heed.lessons teach "biggest first" 2,1,3 3,2,1
+    out\t_heed.exe order out\t_heed.lessons use "reverse, biggest first" 5,1,2,4
+    out\t_heed.exe order out\t_heed.lessons teach mirror 2,1,3 3,1,2
+    out\t_heed.exe grid out\t_heed.lessons use mirror 9,2/7,4
+    out\t_heed.exe grid out\t_heed.lessons teach mirror 1,1/2,3 2,3/1,1
+    out\t_heed.exe order out\t_heed.lessons use mirror 7,2,9
+    out\t_heed.exe grid out\t_heed.lessons use mirror 8,2/7,9
+    out\t_heed.exe grid out\t_heed.lessons teach tess 1,2/3,4 1,2,1,2/3,4,3,4
+    out\t_heed.exe grid out\t_heed.lessons use tess 7,8/4,5/9,1
+    out\t_heed.exe memory out\t_heed.lessons use "sum of cubes" 4,5
   ) > out\t_heed_memory.txt
   fc /b out\t_heed_memory.txt examples\native\golden\heed_memory.expect >nul
   if errorlevel 1 (echo FAIL Heed lesson memory & set fail=1) else (echo ok   Heed transfers corrections across runs)

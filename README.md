@@ -75,6 +75,42 @@ Run `out/heed review out/lessons.txt` to use that memory in the ordinary Heed cu
 When practice examples support multiple readings, Heed can save them and ask for a distinguishing
 example. Answer with `teach` and rerun `review` to see how the correction transfers.
 
+### Teach a spatial word or an ordering phrase
+
+Grid rows are separated by slashes. Heed chooses a small grid on which the candidate
+programs predict different answers. Give the output grid, then use the word on a new input.
+
+```sh
+out/heed grid out/lessons.txt ask mirror
+# Show mirror on 1,1/2,3.
+out/heed grid out/lessons.txt teach mirror 1,1/2,3 1,1/3,2
+out/heed grid out/lessons.txt use "mirror, then flip" 7,8,9/4,5,6
+# [[6, 5, 4], [9, 8, 7]]
+out/heed order out/lessons.txt teach "biggest first" 2,1,3 3,2,1
+out/heed review out/lessons.txt
+```
+
+Heed stores demonstrations by domain, phrase, and input. A new answer for the same
+input corrects the earlier lesson. In `review`, conflicting practice meanings can trigger a
+grid question. A taught phrase can fill a whole clause, so the same ordering demonstration
+applies to both “squares sorted, biggest first” and “three smallest, biggest first.”
+Standalone grid commands also know `flip` (top to bottom) and `transpose`. Ordering commands
+know `reverse` and `sort`. When the initial candidates all fail, Heed runs its bounded
+program search. It marks the first program that fits every saved example as provisional.
+
+**Why four cells and three labels suffice.** The initial grid candidates are the eight
+rotations and reflections (including identity) and a ninth program that appends the rows
+in reverse order. A rectangle with fewer than four cells has a single row or column, so
+at least one reflection agrees with identity. On a two-by-two grid with at most two
+labels, a nonidentity symmetry always preserves the pattern. A minority label occurs at a
+single corner, at two adjacent corners, or at two opposite corners, or the grid is uniform.
+Each case admits a reflection or half-turn. On `1,1/2,3`, the unique labels 2 and 3
+occupy adjacent corners. Only identity fixes both corners, so all eight symmetries produce
+distinct grids. The ninth program changes the height. Thus four cells is the minimum area
+for one demonstration to distinguish all nine, and three labels is the minimum at that
+area. Heed finds the display by enumerating patterns up to renaming their labels. The
+guarantee applies to noiseless answers from this candidate set.
+
 ## Layout
 
 | Path | What |

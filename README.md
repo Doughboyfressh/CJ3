@@ -114,10 +114,13 @@ guarantee applies to noiseless answers from this candidate set.
 
 ### Learn what controls a transformation
 
-Heed can learn a rule of the form “if this corner equals this label, perform A;
-otherwise perform B.” It considers all four corners, labels observed there, and the
-nine grid operations in either branch. Both branches must have supporting examples.
-Here `zuri` is a new word. Use a fresh lesson file to reproduce the exchange.
+Heed can switch between two grid operations when a cell equals a label or when
+two cells have the same label. It considers the four corners, the four edge
+midpoints, and the center. On an even axis, the earlier middle cell is used.
+A midpoint enters the search once a demonstration has at least three cells along
+that axis. The center needs a demonstration at least three rows tall and three
+columns wide. Both outcomes of a condition need supporting examples. Here
+`zuri` is a new word. Use a fresh lesson file to reproduce the exchange.
 
 ```sh
 out/heed grid out/switches.txt teach zuri 1,2/3,4 2,1/4,3
@@ -131,15 +134,32 @@ out/heed grid out/switches.txt use zuri 1,4/8,7/5,6
 # [[4, 1], [7, 8], [6, 5]]
 ```
 
-For each question Heed tries changing one corner of a demonstrated grid. It picks an
-edit that minimizes the largest group of programs still agreeing on an answer.
-If every edit gives identical predictions, Heed tries a two-by-two grid with four
-distinct labels absent from all the candidate conditions. On this grid every condition
-is false and each of the nine operations has a distinct output. Changing a single
-corner to a candidate label activates just that corner-and-label condition while the
-four cells remain distinct. Together these grids distinguish any two different rules
-in this family. The argument assumes exact demonstrations and a rule in the family;
-the general program search can also fit examples without recovering the intended rule.
+To teach a relationship, show the same operation with different matching labels,
+and show the other operation when the two labels differ. This example starts with
+an ambiguity: either the center must equal 1, or it must match the top-left cell.
+
+```sh
+out/heed grid out/pairs.txt teach oriel 1,2,3/4,1,5/6,7,8 3,2,1/5,1,4/8,7,6
+out/heed grid out/pairs.txt teach oriel 9,2,3/4,8,5/6,7,1 6,7,1/4,8,5/9,2,3
+# Show oriel on 9,2,3/4,1,5/6,7,8.
+out/heed grid out/pairs.txt teach oriel 9,2,3/4,1,5/6,7,8 6,7,8/4,1,5/9,2,3
+out/heed grid out/pairs.txt teach oriel 0,2,3/4,1,5/6,7,8 6,7,8/4,1,5/0,2,3
+out/heed grid out/pairs.txt teach oriel 1,2,3/4,0,5/6,7,8 6,7,8/4,0,5/1,2,3
+# Provisional program for oriel: if(top-left == center, gfliph(_), gflipv(_)).
+out/heed grid out/pairs.txt use oriel 81,2,3/4,81,5/6,7,8
+# [[3, 2, 81], [5, 81, 4], [8, 7, 6]]
+```
+
+For each question Heed tries editing one cell of a demonstrated grid. It can copy
+another cell's label to make a pair agree, or use a fresh label to break a match.
+It chooses an edit that minimizes the largest group of surviving programs that
+predict the same answer. If none splits the candidates, Heed tries a 3×3 grid
+with nine distinct labels absent from their literal conditions. All conditions are
+false on this control. Changing one cell can activate exactly one literal test or
+one pair comparison. Even after making a pair equal, seven cells remain uniquely
+labeled, so the eight symmetries still have distinct outputs and the ninth operation
+still changes the height. These controls distinguish distinct programs in the
+current conditional family, assuming exact answers.
 
 ## Layout
 

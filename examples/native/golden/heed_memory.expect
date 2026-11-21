@@ -32,4 +32,15 @@ Show zuri on 0,2/3,4.
 Provisional program for zuri: if((head(head(_)) == 1), gfliph(_), gflipv(_)).
 [[4, 1], [7, 8], [6, 5]]
 [[6, 9, 2], [8, 4, 7]]
+Learned oriel as gfliph(_).
+Show oriel on 9,2,3/4,1,5/6,7,8.
+Show oriel on 0,2,3/4,1,5/6,7,8.
+Show oriel on 1,2,3/4,0,5/6,7,8.
+Provisional program for oriel: if(top-left == center, gfliph(_), gflipv(_)).
+[[75, 13, 22, 81], [9, 25, 81, 62], [0, 38, 57, 46], [28, 33, 19, 9]]
+[[5, 3, 1], [6, 4, 2]]
+Learned glyph as gfliph(_).
+Show glyph on 1,2,3/4,9,5/6,7,8.
+Provisional program for glyph: if(center == -4, gfliph(_), gflipv(_)).
+[[7, 6, 5], [2, -4, 3], [9, 8, 1], [11, 10, 0]]
 189

@@ -95,6 +95,17 @@ if exist out\t_heed.exe (
     out\t_heed.exe grid out\t_heed.lessons teach zuri 0,2/3,4 3,4/0,2
     out\t_heed.exe grid out\t_heed.lessons use zuri 1,4/8,7/5,6
     out\t_heed.exe grid out\t_heed.lessons use "zuri, then transpose" 2,7/9,4/6,8
+    out\t_heed.exe grid out\t_heed.lessons teach oriel 1,2,3/4,1,5/6,7,8 3,2,1/5,1,4/8,7,6
+    out\t_heed.exe grid out\t_heed.lessons teach oriel 9,2,3/4,8,5/6,7,1 6,7,1/4,8,5/9,2,3
+    out\t_heed.exe grid out\t_heed.lessons teach oriel 9,2,3/4,1,5/6,7,8 6,7,8/4,1,5/9,2,3
+    out\t_heed.exe grid out\t_heed.lessons teach oriel 0,2,3/4,1,5/6,7,8 6,7,8/4,1,5/0,2,3
+    out\t_heed.exe grid out\t_heed.lessons teach oriel 1,2,3/4,0,5/6,7,8 6,7,8/4,0,5/1,2,3
+    out\t_heed.exe grid out\t_heed.lessons use oriel 81,22,13,75/62,81,25,9/46,57,38,0/9,19,33,28
+    out\t_heed.exe grid out\t_heed.lessons use "oriel, then transpose" 1,2/3,4/5,6
+    out\t_heed.exe grid out\t_heed.lessons teach glyph 1,2,3/4,-4,5/6,7,8 3,2,1/5,-4,4/8,7,6
+    out\t_heed.exe grid out\t_heed.lessons teach glyph 1,2,3/4,0,5/6,7,8 6,7,8/4,0,5/1,2,3
+    out\t_heed.exe grid out\t_heed.lessons teach glyph 1,2,3/4,9,5/6,7,8 6,7,8/4,9,5/1,2,3
+    out\t_heed.exe grid out\t_heed.lessons use glyph 5,6,7/3,-4,2/1,8,9/0,10,11
     out\t_heed.exe memory out\t_heed.lessons use "sum of cubes" 4,5
   ) > out\t_heed_memory.txt
   fc /b out\t_heed_memory.txt examples\native\golden\heed_memory.expect >nul

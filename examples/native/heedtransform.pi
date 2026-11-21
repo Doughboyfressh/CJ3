@@ -118,7 +118,7 @@ skill ht_grid_probes() -> Any {
 skill ht_question(domain, name, laws, observations) -> Any {
   if len(laws) == 0 { return "Bounded search found no " ++ domain ++ " transformation for these demonstrations." }
   if len(laws) == 1 {
-    if not contains(ht_pool(domain),laws[0]) { return "Provisional program for " ++ name ++ ": " ++ show(laws[0]) ++ "." }
+    if not contains(ht_pool(domain),laws[0]) { return "Provisional program for " ++ name ++ ": " ++ hc_display(laws[0]) ++ "." }
     return "Learned " ++ name ++ " as " ++ show(laws[0]) ++ "."
   }
   if domain == "grid" and laws[0][1] == "iteG" {

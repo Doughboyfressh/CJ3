@@ -25,4 +25,11 @@ Learned mirror as gflipv(_).
 [[7, 9], [8, 2]]
 Provisional program for tess: ghcat(_, _).
 [[7, 8, 7, 8], [4, 5, 4, 5], [9, 1, 9, 1]]
+Learned zuri as gfliph(_).
+Show zuri on 8,2/3,4.
+Show zuri on 8,2/3,4.
+Show zuri on 0,2/3,4.
+Provisional program for zuri: if((head(head(_)) == 1), gfliph(_), gflipv(_)).
+[[4, 1], [7, 8], [6, 5]]
+[[6, 9, 2], [8, 4, 7]]
 189

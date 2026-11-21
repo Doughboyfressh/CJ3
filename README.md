@@ -95,8 +95,9 @@ input corrects the earlier lesson. In `review`, conflicting practice meanings ca
 grid question. A taught phrase can fill a whole clause, so the same ordering demonstration
 applies to both “squares sorted, biggest first” and “three smallest, biggest first.”
 Standalone grid commands also know `flip` (top to bottom) and `transpose`. Ordering commands
-know `reverse` and `sort`. When the initial candidates all fail, Heed runs its bounded
-program search. It marks the first program that fits every saved example as provisional.
+know `reverse` and `sort`. When a single grid transformation cannot explain the
+demonstrations, Heed also tries conditional rules. If these fail, it runs its bounded
+program search. Programs inferred outside the initial set are marked provisional.
 
 **Why four cells and three labels suffice.** The initial grid candidates are the eight
 rotations and reflections (including identity) and a ninth program that appends the rows
@@ -110,6 +111,35 @@ distinct grids. The ninth program changes the height. Thus four cells is the min
 for one demonstration to distinguish all nine, and three labels is the minimum at that
 area. Heed finds the display by enumerating patterns up to renaming their labels. The
 guarantee applies to noiseless answers from this candidate set.
+
+### Learn what controls a transformation
+
+Heed can learn a rule of the form “if this corner equals this label, perform A;
+otherwise perform B.” It considers all four corners, labels observed there, and the
+nine grid operations in either branch. Both branches must have supporting examples.
+Here `zuri` is a new word. Use a fresh lesson file to reproduce the exchange.
+
+```sh
+out/heed grid out/switches.txt teach zuri 1,2/3,4 2,1/4,3
+out/heed grid out/switches.txt teach zuri 8,7/6,5 6,5/8,7
+# Show zuri on 8,2/3,4.
+out/heed grid out/switches.txt teach zuri 8,2/3,4 3,4/8,2
+# Show zuri on 0,2/3,4.
+out/heed grid out/switches.txt teach zuri 0,2/3,4 3,4/0,2
+# Provisional program for zuri: if((head(head(_)) == 1), gfliph(_), gflipv(_)).
+out/heed grid out/switches.txt use zuri 1,4/8,7/5,6
+# [[4, 1], [7, 8], [6, 5]]
+```
+
+For each question Heed tries changing one corner of a demonstrated grid. It picks an
+edit that minimizes the largest group of programs still agreeing on an answer.
+If every edit gives identical predictions, Heed tries a two-by-two grid with four
+distinct labels absent from all the candidate conditions. On this grid every condition
+is false and each of the nine operations has a distinct output. Changing a single
+corner to a candidate label activates just that corner-and-label condition while the
+four cells remain distinct. Together these grids distinguish any two different rules
+in this family. The argument assumes exact demonstrations and a rule in the family;
+the general program search can also fit examples without recovering the intended rule.
 
 ## Layout
 

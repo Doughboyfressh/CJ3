@@ -54,12 +54,18 @@ skill ht_run(step, value) -> Any {
 
 skill ht_laws(domain, observations) -> Any {
   let laws = []
-  for step in ht_pool(domain) {
+  let pool = ht_pool(domain)
+  for step in pool {
     let fits = true
     for ex in observations { if ht_run(step, ex[1]) != ex[2] { fits = false } }
     if fits { laws = append(laws, step) }
   }
   if len(laws) > 0 { return laws }
+  if domain == "grid" {
+    let region = mark()
+    laws = release(region,hc_laws(pool,observations))
+    if len(laws) > 0 { return laws }
+  }
   # The familiar operations failed. Ask the existing typed program synthesizer for a
   # proposal. Its first fit is provisional and must still explain every demonstration.
   let m = mark()
@@ -109,11 +115,16 @@ skill ht_grid_probes() -> Any {
 }
 
 # Minimize the largest surviving group, then display area, then distinct labels.
-skill ht_question(domain, name, laws) -> Any {
+skill ht_question(domain, name, laws, observations) -> Any {
   if len(laws) == 0 { return "Bounded search found no " ++ domain ++ " transformation for these demonstrations." }
   if len(laws) == 1 {
     if not contains(ht_pool(domain),laws[0]) { return "Provisional program for " ++ name ++ ": " ++ show(laws[0]) ++ "." }
     return "Learned " ++ name ++ " as " ++ show(laws[0]) ++ "."
+  }
+  if domain == "grid" and laws[0][1] == "iteG" {
+    let probe = hc_question(laws,observations)
+    if probe == null { return "Supply a different demonstration for " ++ name ++ "." }
+    return "Show " ++ name ++ " on " ++ ht_format(domain,probe) ++ "."
   }
   let probes = [[1], [1,2], [2,1], [2,1,3]]
   if domain == "grid" { probes = ht_grid_probes() }
@@ -162,7 +173,10 @@ skill ht_read(domain, phrase, readings, rules, steps, book) -> Any {
       if laws == null and ht_name(name) != null { laws = ht_pool(domain) }
     }
     if laws == null { tokens = tokens ++ words } else {
-      if len(laws) != 1 { return [null,ht_question(domain,name,laws)] }
+      if len(laws) != 1 {
+        let evidence = if book == null { get(readings,"#book",{}) } else { book }
+        return [null,ht_question(domain,name,laws,get(evidence,key,[]))]
+      }
       let marker = "#" ++ str(i)
       let token = hd_token(laws[0])
       rules = [[[marker],[token]]] ++ rules
@@ -219,7 +233,10 @@ skill ht_command(domain, path, command, phrase, raw, reply) -> Any {
       if command != "use" or input == null or reply != null { return usage }
     }
   }
-  if command != "use" { return ht_question(domain,name,ht_laws(domain,get(book,key,[]))) }
+  if command != "use" {
+    let observations = get(book,key,[])
+    return ht_question(domain,name,ht_laws(domain,observations),observations)
+  }
   let readings = {}
   let ops = if domain == "grid" { {"flip":"gflipv","transpose":"gtrans"} } else { {"reverse":"rev","sort":"sort"} }
   for op in keys(ops) { readings = put(readings,domain ++ ":" ++ op,[O(ops[op],[hd_hole()])]) }

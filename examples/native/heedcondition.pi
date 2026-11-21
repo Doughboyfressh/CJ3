@@ -1,0 +1,135 @@
+# Each switch tests one corner against an observed label. Both branches must have evidence
+# and every example must agree with the transformation chosen for its branch.
+skill hc_corners() -> Any {
+  let corners = []
+  for row in ["head","last"] {
+    for cell in ["head","last"] { corners = append(corners,O(cell,[O(row,[hd_hole()])])) }
+  }
+  return corners
+}
+
+skill hc_laws(pool, observations) -> Any {
+  if len(observations) < 2 { return [] }
+  let matches = []
+  for ex in observations {
+    let region = mark()
+    let ids = []
+    for i in range(0,len(pool)) {
+      if ht_run(pool[i],ex[1]) == ex[2] { ids = append(ids,i) }
+    }
+    ids = release(region,ids)
+    if len(ids) == 0 { return [] }
+    matches = append(matches,ids)
+  }
+  let laws = []
+  for corner in hc_corners() {
+    let values = []
+    let labels = []
+    for ex in observations {
+      let value = ht_run(corner,ex[1])
+      values = append(values,value)
+      if not contains(labels,value) { labels = append(labels,value) }
+    }
+    if len(labels) > 1 {
+      for label in labels {
+        let yes = range(0,len(pool))
+        let no = yes
+        for i in range(0,len(values)) {
+          let hit = values[i] == label
+          let keep = []
+          let prior = if hit { yes } else { no }
+          for id in prior { if contains(matches[i],id) { keep = append(keep,id) } }
+          if hit { yes = keep } else { no = keep }
+        }
+        let guard = O("==",[corner,Q(label)])
+        for a in yes { for b in no { laws = append(laws,O("iteG",[guard,pool[a],pool[b]])) } }
+      }
+    }
+  }
+  return laws
+}
+
+skill hc_change(grid, corner, value) -> Any {
+  let y = if corner < 2 { 0 } else { len(grid)-1 }
+  let row = grid[y]
+  let x = if corner % 2 == 0 { 0 } else { len(row)-1 }
+  let changed = slice(row,0,x) ++ [value] ++ slice(row,x+1,len(row))
+  return slice(grid,0,y) ++ [changed] ++ slice(grid,y+1,len(grid))
+}
+
+# If a group already ties the best bound, the remaining predictions cannot improve it.
+skill hc_worst(laws, grid, bound) -> Any {
+  let m = mark()
+  let predictions = {}
+  let groups = {}
+  let largest = 0
+  for law in laws {
+    let parts = law[2]
+    let operation = if ht_run(parts[0],grid) { parts[1] } else { parts[2] }
+    let key = hd_token(operation)
+    let answer = predictions[key]
+    if answer == null {
+      answer = ht_format("grid",ht_run(operation,grid))
+      predictions = put(predictions,key,answer)
+    }
+    let count = get(groups,answer,0) + 1
+    groups = put(groups,answer,count)
+    largest = max(largest,count)
+    if largest >= bound { return release(m,largest) }
+  }
+  return release(m,largest)
+}
+
+# Change a single corner of a demonstrated grid. Keep the edit that best splits the
+# surviving programs. Discard the grids and temporary prediction tables after each trial.
+skill hc_probe(laws, controls, labels) -> Any {
+  let best = null
+  let worst = len(laws)
+  for grid in controls {
+    for corner in range(0,4) {
+      for label in labels {
+        let m = mark()
+        let edit = hc_change(grid,corner,label)
+        let score = worst
+        if edit != grid { score = hc_worst(laws,edit,worst) }
+        if score < worst {
+          best = release(m,edit)
+          worst = score
+          if worst == 1 { return best }
+        } else { do release(m,null) }
+      }
+    }
+  }
+  return best
+}
+
+skill hc_question(laws, observations) -> Any {
+  let labels = []
+  for law in laws {
+    let guard = law[2][0]
+    let constant = guard[2][1]
+    let label = constant[1]
+    if not contains(labels,label) { labels = append(labels,label) }
+  }
+  let fresh = []
+  let value = 0
+  while len(fresh) < 4 {
+    if not contains(labels,value) { fresh = append(fresh,value) }
+    value = value + 1
+  }
+  let controls = []
+  for ex in observations { controls = append(controls,ex[1]) }
+  let best = hc_probe(laws,controls,labels ++ [fresh[0]])
+  if best != null { return best }
+  # A thin or symmetric control may hide all the differences. Four distinct neutral
+  # labels separate the nine branch operations; one corner can then activate any guard.
+  let neutral = [slice(fresh,0,2),slice(fresh,2,4)]
+  let bound = hc_worst(laws,neutral,len(laws))
+  let edit = hc_probe(laws,[neutral],labels)
+  if edit == null {
+    if bound < len(laws) { return neutral }
+    return null
+  }
+  if bound <= hc_worst(laws,edit,len(laws)) { return neutral }
+  return edit
+}

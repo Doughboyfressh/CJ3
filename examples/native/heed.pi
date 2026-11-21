@@ -23,6 +23,7 @@ import "tonguelib.pi"
 import "scopelearn.pi"
 import "heedmemory.pi"
 import "heedtransform.pi"
+import "heedcondition.pi"
 
 # an instruction's words: lower case, a comma a word of its own
 skill hd_words(text) -> Any { return split(join(split(lower(text), ","), " , ")) }
@@ -245,6 +246,7 @@ skill main() -> Any {
     if arg(2) == null { return "Usage: heed review FILE" }
     let book = hm_load(arg(2))
     if book == null { return "Unreadable or incomplete lesson file." }
+    readings = put(readings,"#book",book)
     for word in keys(book) {
       let tag = split(word,":")
       if len(tag) == 2 { readings = put(readings,word,ht_laws(tag[0],book[word])) }

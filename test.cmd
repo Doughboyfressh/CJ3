@@ -88,6 +88,13 @@ if exist out\t_heed.exe (
     out\t_heed.exe grid out\t_heed.lessons use mirror 8,2/7,9
     out\t_heed.exe grid out\t_heed.lessons teach tess 1,2/3,4 1,2,1,2/3,4,3,4
     out\t_heed.exe grid out\t_heed.lessons use tess 7,8/4,5/9,1
+    out\t_heed.exe grid out\t_heed.lessons teach zuri 1,2/3,4 2,1/4,3
+    out\t_heed.exe grid out\t_heed.lessons teach zuri 8,7/6,5 6,5/8,7
+    out\t_heed.exe grid out\t_heed.lessons use zuri 1,4/8,7/5,6
+    out\t_heed.exe grid out\t_heed.lessons teach zuri 8,2/3,4 3,4/8,2
+    out\t_heed.exe grid out\t_heed.lessons teach zuri 0,2/3,4 3,4/0,2
+    out\t_heed.exe grid out\t_heed.lessons use zuri 1,4/8,7/5,6
+    out\t_heed.exe grid out\t_heed.lessons use "zuri, then transpose" 2,7/9,4/6,8
     out\t_heed.exe memory out\t_heed.lessons use "sum of cubes" 4,5
   ) > out\t_heed_memory.txt
   fc /b out\t_heed_memory.txt examples\native\golden\heed_memory.expect >nul

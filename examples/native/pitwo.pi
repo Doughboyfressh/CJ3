@@ -1,0 +1,130 @@
+# Two thresholds. One cut cannot fit this sample. Short branches can, once two cuts
+# are allowed. 3,144,320 candidates are tested and not stored.
+# 0, 1, 2, 3, 4, 5 mapping to 0, 1, 2, 4, 6, 16, 25 was not labeled.
+# 27 survivors force 36, 49, and 64. They do not agree at -1, so that input has no answer.
+skill ev(e, x) -> Any {
+  let k = e[0]
+  if k == 0 { return e[1] }
+  if k == 1 { return x }
+  let L = ev(e[1], x)
+  let R = ev(e[2], x)
+  if L == 1000000000 { return 1000000000 }
+  if R == 1000000000 { return 1000000000 }
+  if k == 2 { return L + R }
+  if k == 3 { return L - R }
+  if k == 4 { return L * R }
+  if R == 0 { return 1000000000 }
+  if L % R != 0 { return 1000000000 }
+  return L // R
+}
+skill ev3(c1, c2, a, b, d, x) -> Any {
+  if x < c1 { return ev(a, x) }
+  if x < c2 { return ev(b, x) }
+  return ev(d, x)
+}
+skill fit2(c1, c2, a, b, d) -> Any {
+  if ev3(c1, c2, a, b, d, 0) != 0 { return 0 }
+  if ev3(c1, c2, a, b, d, 1) != 1 { return 0 }
+  if ev3(c1, c2, a, b, d, 2) != 4 { return 0 }
+  if ev3(c1, c2, a, b, d, 3) != 6 { return 0 }
+  if ev3(c1, c2, a, b, d, 4) != 16 { return 0 }
+  if ev3(c1, c2, a, b, d, 5) != 25 { return 0 }
+  return 1
+}
+skill branch(c, t, e, x) -> Any {
+  if x < c { return ev(t, x) }
+  return ev(e, x)
+}
+skill fit1(c, t, e) -> Any {
+  if branch(c, t, e, 0) != 0 { return 0 }
+  if branch(c, t, e, 1) != 1 { return 0 }
+  if branch(c, t, e, 2) != 4 { return 0 }
+  if branch(c, t, e, 3) != 6 { return 0 }
+  if branch(c, t, e, 4) != 16 { return 0 }
+  if branch(c, t, e, 5) != 25 { return 0 }
+  return 1
+}
+skill use2(s, shorts, x) -> Any {
+  return ev3(s[0], s[1], shorts[s[2]], shorts[s[3]], shorts[s[4]], x)
+}
+skill forced(ss, shorts, x) -> Any {
+  if len(ss) == 0 { return [0, 0] }
+  let v = use2(ss[0], shorts, x)
+  if v == 1000000000 { return [0, 0] }
+  for s in ss {
+    if use2(s, shorts, x) != v { return [0, 0] }
+  }
+  return [1, v]
+}
+
+skill main() -> Any {
+  let atoms = [[0, 0], [0, 1], [0, 2], [1]]
+  let ops = [2, 3, 4, 5]
+  let mid = []
+  for op in ops {
+    for a in atoms {
+      for b in atoms {
+        let mid = append(mid, [op, a, b])
+      }
+    }
+  }
+  let deep = []
+  for op in ops {
+    for a in atoms {
+      for b in mid {
+        let deep = append(deep, [op, a, b])
+        let deep = append(deep, [op, b, a])
+      }
+    }
+  }
+  let one = 0
+  let none = 0
+  for c in [0, 1, 2, 3, 4] {
+    for ai in range(0, 4) {
+      for di in range(0, len(deep)) {
+        let none = none + 2
+        if fit1(c, atoms[ai], deep[di]) == 1 { let one = one + 1 }
+        if fit1(c, deep[di], atoms[ai]) == 1 { let one = one + 1 }
+      }
+    }
+  }
+  let shorts = atoms
+  for e in mid { let shorts = append(shorts, e) }
+  let cuts = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]]
+  let ss = []
+  let n = 0
+  let m = len(shorts)
+  for cut in cuts {
+    for i in range(0, m) {
+      for j in range(0, m) {
+        for k in range(0, m) {
+          let n = n + 1
+          if fit2(cut[0], cut[1], shorts[i], shorts[j], shorts[k]) == 1 {
+            let ss = append(ss, [cut[0], cut[1], i, j, k])
+          }
+        }
+      }
+    }
+  }
+  let text = "two cuts force the tail\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(len(deep) == 2048)
+  print(none == 81920)
+  print(one == 0)
+  print(m == 68)
+  print(n == 3144320)
+  print(len(ss) == 27)
+  print(forced(ss, shorts, 6) == [1, 36])
+  print(forced(ss, shorts, 7) == [1, 49])
+  print(forced(ss, shorts, 8) == [1, 64])
+  print(forced(ss, shorts, 0 - 1) == [0, 0])
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

@@ -11,7 +11,7 @@ brain. No Rust, no interpreter, no CUDA toolkit, no third-party libraries — Pi
   other exactly. The Rust interpreter that first bootstrapped Pi has been retired.
 - **Its own runtime.** `examples/native/rt.pi` provides memory, text, lists, maps, exact big integers, files
   and printing. There is no garbage collector; memory is reclaimed in regions (`mark()` / `release()`).
-- **Its own machine.** Softwell is the only GPU, CPU, SSD, and RAM Pi needs: 64 KB of RAM, a 1 MB SSD, and the chip. No CUDA toolkit, no driver, and no physical module.
+- **Its own machine.** Softwell is the only GPU, CPU, SSD, and RAM Pi needs: 64 KB of RAM, an 8 MB SSD, and the chip. No CUDA toolkit, no driver, and no physical module.
 - **A brain.** A language model runs on Pi's own GPU engine and acts *through* Pi: it writes and runs programs
   (`run_pi`), uses a real shell and the web, and keeps a memory across conversations. The language even improves
   itself — `langgrow.pi` learns new grammar rules from the brain's own compile failures, and only reseeds the

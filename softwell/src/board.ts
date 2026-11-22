@@ -1,7 +1,7 @@
 /** The address space the bus reads. A software store, not a DIMM. */
 export const RAM_BYTES = 64 * 1024;
 /** Backing store. Pages move into RAM; nothing runs from the SSD. */
-export const SSD_BYTES = 1024 * 1024;
+export const SSD_BYTES = 8 * 1024 * 1024;
 export const SSD_PAGE = 4096;
 /** Slower than the 32-byte bus, on purpose. */
 export const SSD_BYTES_PER_CYCLE = 4;

@@ -3209,7 +3209,7 @@ skill rt_sw_prog() -> Any { return rt_tag(rt_sw_ram()) }
 # The program is replaced. An allocation already made is no longer in the count.
 skill rt_sw_page(src, nt) -> Any {
   let n = rt_untag(nt)
-  if n < 0 or n > 1048576 { return rt_tag(0 - 800) }
+  if n < 0 or n > 8388608 { return rt_tag(0 - 800) }
   let heap = 0
   if n > 0 { let heap = ((n + 7) // 8) * 8 }
   if heap > 65536 { return rt_tag(0 - 700) }
@@ -3292,10 +3292,10 @@ skill rt_gpu_alloc(nt) -> Any {
 }
 
 
-# 1 MB of SSD. The chip holds one 4 KB page of it, not a second RAM. A miss copies that page at
+# 8 MB of SSD. The chip holds one 4 KB page of it, not a second RAM. A miss copies that page at
 # 4 bytes a cycle, which is 1,024. The bus still counts only the bytes the instruction uses.
 skill rt_sw_ssd() -> Any {
-  if peek(gaddr(30)) == 0 { do poke(gaddr(30), wcall("VirtualAlloc", 0, 1048576, 12288, 4)) }
+  if peek(gaddr(30)) == 0 { do poke(gaddr(30), wcall("VirtualAlloc", 0, 8388608, 12288, 4)) }
   return peek(gaddr(30))
 }
 
@@ -3307,13 +3307,13 @@ skill rt_sw_ssd_alloc(nt) -> Any {
   let n = ((n + 4095) // 4096) * 4096
   let used = peek(gaddr(31))
   let used = ((used + 4095) // 4096) * 4096
-  if used + n > 1048576 { return rt_tag(0 - 800) }
+  if used + n > 8388608 { return rt_tag(0 - 800) }
   do poke(gaddr(31), used + n)
   return rt_tag(used)
 }
 
 skill rt_sw_page_at(off) -> Any {
-  if off < 0 or off >= 1048576 { return 0 }
+  if off < 0 or off >= 8388608 { return 0 }
   let page = off // 4096
   let win = peek(gaddr(23))
   if win == 0 {
@@ -6757,7 +6757,7 @@ skill rt_sw_psum(buf) -> Any {
 # dnet4: one warp is 8 columns of one value head, four parts of 32 rows. The head's state is 128 by 128
 # doubles, 128 KB, on the SSD. q and k of a zero vector normalise to 0, so a zero state stays 0 and the
 # output is 0. One warp of one zero token touches 35,904 bytes, 1,122 bus cycles, and 929 pages.
-# All 32 heads are 4 MB, and this SSD is 1 MB, so a launch past head 7 has nothing to keep.
+# All 32 heads are 4 MB. This SSD is 8 MB, so the state fits beside the history and the expert rows.
 skill rt_sw_dnet4(gx, bx, ps) -> Any {
   let S = rt_sw_arg(ps, 0)
   let CV = rt_sw_arg(ps, 1)
@@ -7027,7 +7027,7 @@ skill rt_pid(ht) -> Any { return rt_tag(rt_u32(wcallp(rt_proc("kernel32.dll", "G
 skill rt_softwell() -> Any {
   let out = rt_list_new(0)
   let out = rt_append(out, rt_tag(65536))
-  let out = rt_append(out, rt_tag(1048576))
+  let out = rt_append(out, rt_tag(8388608))
   let out = rt_append(out, rt_tag(4096))
   let out = rt_append(out, rt_tag(32))
   return rt_append(out, rt_tag(256))

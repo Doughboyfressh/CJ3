@@ -3291,6 +3291,93 @@ skill rt_gpu_alloc(nt) -> Any {
   return rt_tag(base + used)
 }
 
+
+# 1 MB of SSD. The chip holds one 4 KB page of it, not a second RAM. A miss copies that page at
+# 4 bytes a cycle, which is 1,024. The bus still counts only the bytes the instruction uses.
+skill rt_sw_ssd() -> Any {
+  if peek(gaddr(30)) == 0 { do poke(gaddr(30), wcall("VirtualAlloc", 0, 1048576, 12288, 4)) }
+  return peek(gaddr(30))
+}
+
+skill rt_sw_pg() -> Any { return rt_tag(peek(gaddr(24))) }
+
+skill rt_sw_ssd_alloc(nt) -> Any {
+  let n = rt_untag(nt)
+  if n < 1 { let n = 1 }
+  let n = ((n + 4095) // 4096) * 4096
+  let used = peek(gaddr(31))
+  let used = ((used + 4095) // 4096) * 4096
+  if used + n > 1048576 { return rt_tag(0 - 800) }
+  do poke(gaddr(31), used + n)
+  return rt_tag(used)
+}
+
+skill rt_sw_page_at(off) -> Any {
+  if off < 0 or off >= 1048576 { return 0 }
+  let page = off // 4096
+  let win = peek(gaddr(23))
+  if win == 0 {
+    let win = wcall("VirtualAlloc", 0, 4096, 12288, 4)
+    do poke(gaddr(23), win)
+  }
+  if peek(gaddr(20)) != page + 1 {
+    let src = rt_sw_ssd() + page * 4096
+    let i = 0
+    while i < 4096 {
+      do pokeb(win + i, peekb(src + i))
+      let i = i + 1
+    }
+    do poke(gaddr(20), page + 1)
+    do poke(gaddr(24), peek(gaddr(24)) + 1024)
+  }
+  return win + (off % 4096)
+}
+
+skill rt_sw_ssd_ld(base, off) -> Any {
+  let p = rt_sw_page_at(base + off)
+  if p == 0 { return i2f(0) }
+  return peek(p)
+}
+
+skill rt_sw_ssd_st(base, off, v) -> Any {
+  let o = base + off
+  let p = rt_sw_page_at(o)
+  if p == 0 { return 0 }
+  do poke(p, v)
+  do poke(rt_sw_ssd() + o, v)
+  return 0
+}
+
+skill rt_sw_ssd_ld32(base, off) -> Any {
+  let p = rt_sw_page_at(base + off)
+  if p == 0 { return 0 }
+  return rt_peek32(p)
+}
+
+skill rt_sw_ssd_st32(base, off, bits) -> Any {
+  let o = base + off
+  let p = rt_sw_page_at(o)
+  if p == 0 { return 0 }
+  let u = rt_sw_f32_of(bits)
+  do rt_poke32(p, u)
+  do rt_poke32(rt_sw_ssd() + o, u)
+  return 0
+}
+
+skill rt_sw_ssd_put(bt, ot, v) -> Any {
+  do rt_sw_ssd_st(rt_untag(bt), rt_untag(ot), rt_realbits(v))
+  return rt_tag(0)
+}
+
+skill rt_sw_ssd_putf(bt, ot, v) -> Any {
+  do rt_sw_ssd_st32(rt_untag(bt), rt_untag(ot), rt_realbits(v))
+  return rt_tag(0)
+}
+
+skill rt_sw_ssd_real(bt, ot) -> Any {
+  return rt_mkreal(rt_sw_ssd_ld(rt_untag(bt), rt_untag(ot)))
+}
+
 # the bump goes back to the start of the 64 KB. The previous addresses are no longer RAM.
 skill rt_sw_rewind() -> Any {
   do poke(gaddr(21), 0)
@@ -6556,6 +6643,91 @@ skill rt_sw_acomb(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+
+# conv: one thread per channel. History is three doubles at a stride of 8,192, so one channel spans
+# 192 KB and lives on the SSD. The four taps are float32, oldest first. y = silu(h0*a+h1*b+h2*c+x*d).
+skill rt_sw_kconv(gx, bx, ps) -> Any {
+  let M = rt_sw_arg(ps, 0)
+  let H = rt_sw_arg(ps, 1)
+  let TAP = rt_sw_arg(ps, 2)
+  let CV = rt_sw_arg(ps, 3)
+  let T = rt_sw_arg(ps, 4)
+  let chans = rt_untag(gx) * rt_untag(bx)
+  if chans < 0 { let chans = 0 }
+  if T < 0 { let T = 0 }
+  do rt_sw_note(chans * (64 + T * 16))
+  let c = 0
+  while c < chans {
+    let h0 = rt_sw_ssd_ld(H, 8 * c)
+    let h1 = rt_sw_ssd_ld(H, 8 * (c + 8192))
+    let h2 = rt_sw_ssd_ld(H, 8 * (c + 16384))
+    let a = rt_sw_f64_of(rt_sw_ssd_ld32(TAP, 16 * c))
+    let b = rt_sw_f64_of(rt_sw_ssd_ld32(TAP, 16 * c + 4))
+    let cc = rt_sw_f64_of(rt_sw_ssd_ld32(TAP, 16 * c + 8))
+    let d = rt_sw_f64_of(rt_sw_ssd_ld32(TAP, 16 * c + 12))
+    let t = 0
+    while t < T {
+      let x = rt_sw_ssd_ld(M, 8 * (t * 8192 + c))
+      let y = fmul(h0, a)
+      let y = fadd(y, fmul(h1, b))
+      let y = fadd(y, fmul(h2, cc))
+      let y = fadd(y, fmul(x, d))
+      let y = rt_sw_silu64(y)
+      do rt_sw_ssd_st(CV, 8 * (t * 8192 + c), y)
+      let h0 = h1
+      let h1 = h2
+      let h2 = x
+      let t = t + 1
+    }
+    do rt_sw_ssd_st(H, 8 * c, h0)
+    do rt_sw_ssd_st(H, 8 * (c + 8192), h1)
+    do rt_sw_ssd_st(H, 8 * (c + 16384), h2)
+    let c = c + 1
+  }
+  return rt_tag(0)
+}
+
+# combine: X = H + sum of eight expert weights times their rows + sigmoid(shared gate) * shared expert.
+# A row is 2,048 doubles, so the eight rows are 128 KB on the SSD. One element does not bring them all in.
+skill rt_sw_combine(gx, bx, ps) -> Any {
+  let H = rt_sw_arg(ps, 0)
+  let D = rt_sw_arg(ps, 1)
+  let W = rt_sw_arg(ps, 2)
+  let SG = rt_sw_arg(ps, 3)
+  let SHD = rt_sw_arg(ps, 4)
+  let X = rt_sw_arg(ps, 5)
+  let T = rt_sw_arg(ps, 6)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  if lim < 0 { let lim = 0 }
+  let n = T * 2048
+  if T < 0 { let n = 0 }
+  let touched = lim
+  if n < touched { let touched = n }
+  if touched < 0 { let touched = 0 }
+  do rt_sw_note(touched * 160)
+  let i = 0
+  while i < lim {
+    if i < n {
+      let token = i // 2048
+      let elem = i % 2048
+      let acc = i2f(0)
+      let k = 0
+      while k < 8 {
+        let w = rt_sw_ssd_ld(W, 8 * (token * 8 + k))
+        let d = rt_sw_ssd_ld(D, 8 * ((token * 8 + k) * 2048 + elem))
+        let acc = fadd(acc, fmul(w, d))
+        let k = k + 1
+      }
+      let g = rt_sw_sigm64(rt_sw_ssd_ld(SG, 8 * token))
+      let acc = fadd(acc, fmul(g, rt_sw_ssd_ld(SHD, 8 * i)))
+      let acc = fadd(acc, rt_sw_ssd_ld(H, 8 * i))
+      do rt_sw_ssd_st(X, 8 * i, acc)
+    }
+    let i = i + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -6603,6 +6775,8 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "route") { return rt_sw_finish(rt_sw_route(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "attn2") { return rt_sw_finish(rt_sw_attn2(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "acomb") { return rt_sw_finish(rt_sw_acomb(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "conv") { return rt_sw_finish(rt_sw_kconv(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "combine") { return rt_sw_finish(rt_sw_combine(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

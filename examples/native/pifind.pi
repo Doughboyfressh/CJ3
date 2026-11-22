@@ -1,0 +1,96 @@
+# Pi searches programs instead of being handed the law.
+# A program is a constant 0, 1, or 2, the input, or a sum or product of those.
+# There are 548 of them. The ones that match the sample are the survivors.
+# If every survivor gives the same value on a new input, that value is forced.
+# If they disagree, there is no answer.
+# The sample 0, 1, 2, 3 with outputs 0, 2, 6, 12 was not labeled with a formula.
+# The sample 0 to 0 and 1 to 1 is ambiguous. The sample 0, 1, 2 with 1, 3, 5 is a second law.
+skill ev(e, x) -> Any {
+  let k = e[0]
+  if k == 0 { return e[1] }
+  if k == 1 { return x }
+  if k == 2 { return ev(e[1], x) + ev(e[2], x) }
+  return ev(e[1], x) * ev(e[2], x)
+}
+skill fit1(e) -> Any {
+  if ev(e, 0) != 0 { return 0 }
+  if ev(e, 1) != 2 { return 0 }
+  if ev(e, 2) != 6 { return 0 }
+  if ev(e, 3) != 12 { return 0 }
+  return 1
+}
+skill fit2(e) -> Any {
+  if ev(e, 0) != 0 { return 0 }
+  if ev(e, 1) != 1 { return 0 }
+  return 1
+}
+skill fit3(e) -> Any {
+  if ev(e, 0) != 1 { return 0 }
+  if ev(e, 1) != 3 { return 0 }
+  if ev(e, 2) != 5 { return 0 }
+  return 1
+}
+skill forced(ss, x) -> Any {
+  let v = ev(ss[0], x)
+  for e in ss {
+    if ev(e, x) != v { return [0, 0] }
+  }
+  return [1, v]
+}
+
+skill main() -> Any {
+  let atoms = [[0, 0], [0, 1], [0, 2], [1]]
+  let mid = []
+  for op in [2, 3] {
+    for a in atoms {
+      for b in atoms {
+        let mid = append(mid, [op, a, b])
+      }
+    }
+  }
+  let progs = atoms
+  for e in mid { let progs = append(progs, e) }
+  for op in [2, 3] {
+    for a in atoms {
+      for b in mid {
+        let progs = append(progs, [op, a, b])
+        let progs = append(progs, [op, b, a])
+      }
+    }
+  }
+  let s1 = []
+  let s2 = []
+  let s3 = []
+  for e in progs {
+    if fit1(e) == 1 { let s1 = append(s1, e) }
+    if fit2(e) == 1 { let s2 = append(s2, e) }
+    if fit3(e) == 1 { let s3 = append(s3, e) }
+  }
+  let a4 = forced(s1, 4)
+  let a5 = forced(s1, 5)
+  let a7 = forced(s1, 7)
+  let a10 = forced(s1, 10)
+  let u2 = forced(s2, 2)
+  let b8 = forced(s3, 8)
+  let text = "every survivor agrees\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(len(progs) == 548)
+  print(len(s1) == 6)
+  print(len(s2) == 58)
+  print(len(s3) == 10)
+  print(a4 == [1, 20])
+  print(a5 == [1, 30])
+  print(a7 == [1, 56])
+  print(a10 == [1, 110])
+  print(u2 == [0, 0])
+  print(b8 == [1, 17])
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

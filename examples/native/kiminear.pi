@@ -1,0 +1,75 @@
+# A token is near its own inflected form, and not near an unrelated word.
+# The cutoff was fixed before the held-out rows were read: cosine above 0.32 is near,
+# cosine below 0.20 is not. Train: cat/cats, book/books, walk/walking are near.
+# cat/Paris, book/France, hello/world, and walk/run are not.
+# Held out, and not used to pick the cutoff: bird/birds, house/houses, play/playing,
+# ship/ships, phone/phones are near. bird/phone, house/play, ship/Paris, play/ship are not.
+# Paris/France was 0.24, between the two cutoffs, so a place name is not this rule.
+# The plural direction itself does not line up. This is nearness, not a vector you can add.
+skill bf16(u) -> Any {
+  let expb = (u // 128) % 256
+  let mant = u % 128
+  if expb == 0 { return 0.0 }
+  let mag = (128.0 + mant) / 128.0 * exp((expb - 127) * 0.6931471805599453)
+  if u >= 32768 { return 0.0 - mag }
+  return mag
+}
+skill take(line) -> Any {
+  let parts = split(line, " ")
+  let a = arr(7168)
+  for i in range(0, 7168) { do aset(a, i, num(parts[i + 1])) }
+  return [parts[0], a]
+}
+skill cosine(a, b) -> Any {
+  let dot = 0.0
+  let na = 0.0
+  let nb = 0.0
+  for i in range(0, 7168) {
+    let x = bf16(aget(a, i))
+    let y = bf16(aget(b, i))
+    let dot = dot + x * y
+    let na = na + x * x
+    let nb = nb + y * y
+  }
+  return dot / (exp(0.5 * log(na)) * exp(0.5 * log(nb)))
+}
+
+skill main() -> Any {
+  let rows = {}
+  for line in split(trim(read_file("examples/native/kimi_near.txt")), "\n") {
+    let got = take(line)
+    let rows = put(rows, got[0], got[1])
+  }
+  let near = 0
+  let far = 0
+  if cosine(rows["cat"], rows["cats"]) > 0.32 { let near = near + 1 }
+  if cosine(rows["book"], rows["books"]) > 0.32 { let near = near + 1 }
+  if cosine(rows["walk"], rows["walking"]) > 0.32 { let near = near + 1 }
+  if cosine(rows["bird"], rows["birds"]) > 0.32 { let near = near + 1 }
+  if cosine(rows["house"], rows["houses"]) > 0.32 { let near = near + 1 }
+  if cosine(rows["play"], rows["playing"]) > 0.32 { let near = near + 1 }
+  if cosine(rows["ship"], rows["ships"]) > 0.32 { let near = near + 1 }
+  if cosine(rows["phone"], rows["phones"]) > 0.32 { let near = near + 1 }
+  if cosine(rows["cat"], rows["Paris"]) < 0.20 { let far = far + 1 }
+  if cosine(rows["book"], rows["France"]) < 0.20 { let far = far + 1 }
+  if cosine(rows["hello"], rows["world"]) < 0.20 { let far = far + 1 }
+  if cosine(rows["walk"], rows["run"]) < 0.20 { let far = far + 1 }
+  if cosine(rows["bird"], rows["phone"]) < 0.20 { let far = far + 1 }
+  if cosine(rows["house"], rows["play"]) < 0.20 { let far = far + 1 }
+  if cosine(rows["ship"], rows["Paris"]) < 0.20 { let far = far + 1 }
+  if cosine(rows["play"], rows["ship"]) < 0.20 { let far = far + 1 }
+  let text = "near its own form\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(len(rows) == 21)
+  print(near == 8)
+  print(far == 8)
+  print(read == 1024)
+  print(got == text)
+  return 0
+}

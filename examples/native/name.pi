@@ -1,0 +1,194 @@
+# Naming. A chain of two list-words has size 3. A real memory counts double, so each use saves 2
+# and the word itself costs 6. The floor for a size-3 word is 4, and six uses clear it (2*6 - 6 = 6).
+# Those six tasks are the ones whose cheapest program is that chain.
+# Meet-in-the-middle can finish a number from two halves already in the budget, so the sum of
+# (the chain, plus one) is just that sum plus the length. It does not need a new name.
+# A list gets no second half. Four list-words cost 5u and do not fit in maxsize 4.
+# After the chain is one word, that list is the word applied twice, which costs 3u.
+# The name and the six answers are one SSD record. A cold read is 1,024 cycles.
+# The six tasks are not searched again.
+
+import "mindcore.pi"
+
+skill sq1(v) -> Any { return (v + 1) * (v + 1) }
+
+skill chain_sum(xs) -> Any {
+  let s = 0
+  for v in xs { let s = s + sq1(v) }
+  return s
+}
+skill chain_head(xs) -> Any { return sq1(xs[0]) }
+skill chain_last(xs) -> Any { return sq1(xs[len(xs) - 1]) }
+skill chain_max(xs) -> Any {
+  let m = sq1(xs[0])
+  for v in xs {
+    let q = sq1(v)
+    if q > m { let m = q }
+  }
+  return m
+}
+skill chain_min(xs) -> Any {
+  let m = sq1(xs[0])
+  for v in xs {
+    let q = sq1(v)
+    if q < m { let m = q }
+  }
+  return m
+}
+skill insort(xs) -> Any {
+  let out = []
+  for v in xs {
+    let i = 0
+    let placed = false
+    while placed == false {
+      if i == len(out) {
+        let out = append(out, v)
+        let placed = true
+      } else {
+        if out[i] > v {
+          let out = slice(out, 0, i) ++ [v] ++ slice(out, i, len(out))
+          let placed = true
+        } else {
+          let i = i + 1
+        }
+      }
+    }
+  }
+  return out
+}
+skill chain_sort(xs) -> Any {
+  let ys = []
+  for v in xs { let ys = append(ys, sq1(v)) }
+  return insort(ys)
+}
+skill chain_deep(xs) -> Any {
+  let ys = []
+  for v in xs {
+    let a = sq1(v)
+    let ys = append(ys, (a + 1) * (a + 1))
+  }
+  return ys
+}
+
+skill call_w(i, arg) -> Any { return ["w", i, [arg]] }
+
+skill run_task(f, lib, active, pl, pre) -> Any {
+  let tr = examples_of(f, train_inputs("lists"))
+  let hl = examples_of(f, held_inputs("lists"))
+  return solve(tr, hl, lib, active, pl, pre, 4, 20000)
+}
+
+skill agrees(t, f, lib) -> Any {
+  let ok = true
+  for xs in held_inputs("lists") {
+    if sev(t, null, xs, null, lib) != f(xs) { let ok = false }
+  }
+  return ok
+}
+
+skill main() -> Any {
+  let text = "heed1 brins sum 2,3 13\nheed1 brins product 2,3 36\nheed1 brim sum 2,3 7\nheed1 brim product 2,3 12\n"
+  let lessons = load_lessons(text)
+  let woke = awake_lessons([], {"lists": []}, lessons)
+  let lib = woke[0]
+  let active = woke[1]["lists"]
+  let pl = pools()
+  let pre = prelude()
+  let sq = 0
+  let ad = 1
+  if show(expand(call_w(0, ["v", "x"]), lib)) == "map(e -> (e + 1), x)" {
+    let sq = 1
+    let ad = 0
+  }
+  let chain = call_w(sq, call_w(ad, ["v", "x"]))
+  let body = call_w(sq, call_w(ad, ["p", 0]))
+  let slot = rt_sw_ssd_alloc(256)
+  let other = rt_sw_ssd_alloc(8)
+  let pm = rt_sw_pg()
+  let probe = rt_sw_ssd_gets(slot)
+  let missed = rt_sw_pg() - pm
+  let searches = 0
+  let wrote = false
+  let found = 0
+  let gain = 0
+  let c_fail = false
+  let trees_ok = false
+  let name_ok = false
+  let record = ""
+  if len(probe) == 0 {
+    let searches = 1
+    let c0 = run_task(chain_deep, lib, active, pl, pre)
+    let c_fail = c0[0] == null
+    let want = [
+      ["sum", chain_sum], ["head", chain_head], ["last", chain_last],
+      ["maxl", chain_max], ["minl", chain_min], ["sort", chain_sort]
+    ]
+    let sols = []
+    let oks = 0
+    for w in want {
+      let r = run_task(w[1], lib, active, pl, pre)
+      if r[0] != null { let found = found + 1 }
+      if ser(r[0]) == ser(["op", w[0], [chain]]) { let oks = oks + 1 }
+      let sols = append(sols, r[0])
+    }
+    let trees_ok = oks == 6
+    if found == 6 {
+      let real = [true, true, true, true, true, true]
+      let learned = learn_g(lib, sols, 1, real, 2, 4)
+      let gain = learned[2][0][1]
+      let named = learned[0][len(lib)]
+      let name_ok = named[0] == body
+      let lines = [named[1] ++ " " ++ named[2] ++ " " ++ ser(named[0])]
+      for s in sols { let lines = append(lines, ser(s)) }
+      let record = join(lines, "\n")
+      let pw = rt_sw_pg()
+      do rt_sw_ssd_puts(slot, record)
+      let wrote = rt_sw_pg() == pw
+    }
+  }
+  do rt_sw_ssd_puts(other, "y")
+  let p2 = rt_sw_pg()
+  let recalled = rt_sw_ssd_gets(slot)
+  let p3 = rt_sw_pg()
+  let held = rt_sw_ssd_gets(slot)
+  let lines = split(recalled, "\n")
+  let word = load_lib(lines[0])[0]
+  let lib2 = append(lib, word)
+  let active2 = append(active, true)
+  let fs = [chain_sum, chain_head, chain_last, chain_max, chain_min, chain_sort]
+  let ran = 0
+  for i in range(0, 6) {
+    let t = parse_at(split(lines[i + 1], " "), 0, lib2)[0]
+    if agrees(t, fs[i], lib2) { let ran = ran + 1 }
+  }
+  let later = 0
+  let c1 = run_task(chain_deep, lib2, active2, pl, pre)
+  let later = 1
+  let nw = len(lib)
+  let twice = call_w(nw, call_w(nw, ["v", "x"]))
+  print(len(lessons) == 2)
+  print(show(expand(chain, lib)) == "map(e -> (e * e), map(e -> (e + 1), x))")
+  print(len(probe) == 0)
+  print(missed == 1024)
+  print(searches == 1)
+  print(c_fail)
+  print(found == 6)
+  print(trees_ok)
+  print(name_ok)
+  print(gain == 6)
+  print(wrote)
+  print(p2 - pm == 2048)
+  print(p3 - p2 == 1024)
+  print(rt_sw_pg() == p3)
+  print(held == recalled)
+  print(len(lines) == 7)
+  print(show(expand(word[0], lib2)) == "map(e -> (e * e), map(e -> (e + 1), a))")
+  print(ran == 6)
+  print(later == 1)
+  print(c1[0] != null)
+  print(ser(c1[0]) == ser(twice))
+  print(show(expand(c1[0], lib2)) == "map(e -> (e * e), map(e -> (e + 1), map(e -> (e * e), map(e -> (e + 1), x))))")
+  let xs = held_inputs("lists")[0]
+  print(sev(c1[0], null, xs, null, lib2) == chain_deep(xs))
+  return 0
+}

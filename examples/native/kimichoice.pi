@@ -1,0 +1,78 @@
+# Meaning is a choice. Given a word and three candidates, pick the nearest row.
+# A cutoff cannot do this: black/white is 0.36, and road/roads is 0.36, so an
+# opposite and a plural sit in the same band. The mate still beats the other two.
+# young/old beats boy by 0.0005. That is inside the noise of this decoder, so it is not claimed.
+# cat/cats is the pair the nearness rule already knew. The other ten were not that test.
+skill bf16(u) -> Any {
+  let expb = (u // 128) % 256
+  let mant = u % 128
+  if expb == 0 { return 0.0 }
+  let mag = (128.0 + mant) / 128.0 * exp((expb - 127) * 0.6931471805599453)
+  if u >= 32768 { return 0.0 - mag }
+  return mag
+}
+skill take(line) -> Any {
+  let parts = split(line, " ")
+  let a = arr(7168)
+  for i in range(0, 7168) { do aset(a, i, num(parts[i + 1])) }
+  return [parts[0], a]
+}
+skill cosine(a, b) -> Any {
+  let dot = 0.0
+  let na = 0.0
+  let nb = 0.0
+  for i in range(0, 7168) {
+    let x = bf16(aget(a, i))
+    let y = bf16(aget(b, i))
+    let dot = dot + x * y
+    let na = na + x * x
+    let nb = nb + y * y
+  }
+  return dot / (exp(0.5 * log(na)) * exp(0.5 * log(nb)))
+}
+skill choose(rows, q, names) -> Any {
+  let best = names[0]
+  let bc = cosine(rows[q], rows[names[0]])
+  for n in names {
+    let c = cosine(rows[q], rows[n])
+    if c > bc {
+      let bc = c
+      let best = n
+    }
+  }
+  return best
+}
+
+skill main() -> Any {
+  let rows = {}
+  for line in split(trim(read_file("examples/native/kimi_choice.txt")), "\n") {
+    let got = take(line)
+    let rows = put(rows, got[0], got[1])
+  }
+  let hit = 0
+  if choose(rows, "cat", ["cats", "Paris", "hello"]) == "cats" { let hit = hit + 1 }
+  if choose(rows, "road", ["roads", "sun", "boy"]) == "roads" { let hit = hit + 1 }
+  if choose(rows, "call", ["calling", "sun", "boy"]) == "calling" { let hit = hit + 1 }
+  if choose(rows, "black", ["white", "road", "sun"]) == "white" { let hit = hit + 1 }
+  if choose(rows, "boy", ["girl", "road", "sun"]) == "girl" { let hit = hit + 1 }
+  if choose(rows, "hot", ["cold", "black", "road"]) == "cold" { let hit = hit + 1 }
+  if choose(rows, "day", ["night", "boy", "sun"]) == "night" { let hit = hit + 1 }
+  if choose(rows, "good", ["bad", "road", "sun"]) == "bad" { let hit = hit + 1 }
+  if choose(rows, "up", ["down", "boy", "road"]) == "down" { let hit = hit + 1 }
+  if choose(rows, "fire", ["water", "boy", "road"]) == "water" { let hit = hit + 1 }
+  if choose(rows, "left", ["right", "road", "sun"]) == "right" { let hit = hit + 1 }
+  if choose(rows, "open", ["close", "boy", "sun"]) == "close" { let hit = hit + 1 }
+  let text = "choose the nearest\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(len(rows) == 27)
+  print(hit == 12)
+  print(read == 1024)
+  print(got == text)
+  return 0
+}

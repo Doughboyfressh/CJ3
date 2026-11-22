@@ -82,7 +82,7 @@ example. Answer with `teach` and rerun `review` to see how the correction transf
 |---|---|
 | `examples/pic.pi` | the compiler (compiles itself) |
 | `examples/native/` | the live code: runtime, GPU engine, brain, tools, path tracer, autograd, neural models |
-| `softwell/` | the software chip: bus, TMEM, a 4×4 tile, one wave. No physical GPU |
+| `softwell/` | the software machine: one clock, CPU, 64 KB RAM, SSD, and the GPU. No physical chip |
 | `seed/pic.exe`, `seed/pic` | the bootstrap compilers for Windows and Linux (self-reproducing fixpoints) |
 | `build.cmd`, `test.cmd` | build and test on Windows |
 | `build.sh`, `test.sh` | build and test on Linux |

@@ -3291,6 +3291,12 @@ skill rt_gpu_alloc(nt) -> Any {
   return rt_tag(base + used)
 }
 
+# the bump goes back to the start of the 64 KB. The previous addresses are no longer RAM.
+skill rt_sw_rewind() -> Any {
+  do poke(gaddr(21), 0)
+  return rt_tag(0)
+}
+
 # GPU memory back (a snapshot, a thought) -> 0 when it worked
 skill rt_gpu_free(dt) -> Any {
   return rt_tag(0)
@@ -5425,6 +5431,301 @@ skill rt_sw_rmsn(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# silu as a real, so a launch can be checked against the same series
+skill rt_sw_silu(v) -> Any { return rt_mkreal(rt_sw_silu64(rt_realbits(v))) }
+
+# butterfly add.rn.f64. The pairs of one step are disjoint, so both lanes take the sum in place.
+skill rt_sw_bfly64(buf) -> Any {
+  let k = 16
+  while k >= 1 {
+    let i = 0
+    while i < 32 {
+      let j = bxor(i, k)
+      if i < j {
+        let s = fadd(peek(buf + 8 * i), peek(buf + 8 * j))
+        do poke(buf + 8 * i, s)
+        do poke(buf + 8 * j, s)
+      }
+      let i = i + 1
+    }
+    let k = k // 2
+  }
+  return peek(buf)
+}
+
+# both lanes keep the larger value, and on a tie the smaller index
+skill rt_sw_keep(buf, ibuf, i, j) -> Any {
+  let ov = peek(buf + 8 * i)
+  let bv = peek(buf + 8 * j)
+  let oi = rt_peek32(ibuf + 4 * i)
+  let bi = rt_peek32(ibuf + 4 * j)
+  let wv = bv
+  let wi = bi
+  if flt(bv, ov) {
+    let wv = ov
+    let wi = oi
+  }
+  if flt(ov, bv) == 0 and flt(bv, ov) == 0 {
+    if oi < bi {
+      let wv = ov
+      let wi = oi
+    }
+  }
+  do poke(buf + 8 * i, wv)
+  do poke(buf + 8 * j, wv)
+  do rt_poke32(ibuf + 4 * i, wi)
+  do rt_poke32(ibuf + 4 * j, wi)
+  return 0
+}
+
+skill rt_sw_bargmax(buf, ibuf) -> Any {
+  let k = 16
+  while k >= 1 {
+    let i = 0
+    while i < 32 {
+      let j = bxor(i, k)
+      if i < j { do rt_sw_keep(buf, ibuf, i, j) }
+      let i = i + 1
+    }
+    let k = k // 2
+  }
+  return peek(buf)
+}
+
+# gnorm: one block is one head of 128. The squares add across 4 warps, the scale divides by 128,
+# and FIN becomes rmsnorm(FIN) x W x silu(Z). W is 128 float32s, reused by every head.
+skill rt_sw_gnorm(gx, bx, ps) -> Any {
+  let Z = rt_sw_arg(ps, 0)
+  let W = rt_sw_arg(ps, 1)
+  let FIN = rt_sw_arg(ps, 2)
+  let blocks = rt_untag(gx)
+  let threads = rt_untag(bx)
+  let use = threads
+  if use > 128 { let use = 128 }
+  if blocks < 0 { let blocks = 0 }
+  do rt_sw_note(blocks * use * 28)
+  let buf = rt_alloc(256)
+  let red = rt_alloc(32)
+  let b = 0
+  while b < blocks {
+    let base = b * 128
+    let w = 0
+    while w < 4 {
+      let lane = 0
+      while lane < 32 {
+        do poke(buf + 8 * lane, i2f(0))
+        let tid = w * 32 + lane
+        if tid < use {
+          let x = peek(FIN + 8 * (base + tid))
+          do poke(buf + 8 * lane, fmul(x, x))
+        }
+        let lane = lane + 1
+      }
+      do poke(red + 8 * w, rt_sw_bfly64(buf))
+      let w = w + 1
+    }
+    let sum = peek(red)
+    let w = 1
+    while w < 4 {
+      let sum = fadd(sum, peek(red + 8 * w))
+      let w = w + 1
+    }
+    let scale = fdiv(i2f(1), fsqrt(fadd(fdiv(sum, 4638707616191610880), 4517329193108106637)))
+    let t = 0
+    while t < use {
+      let x = peek(FIN + 8 * (base + t))
+      let wf = rt_sw_f64_of(rt_peek32(W + 4 * t))
+      let y = fmul(fmul(fmul(x, scale), wf), rt_sw_silu64(peek(Z + 8 * (base + t))))
+      do poke(FIN + 8 * (base + t), y)
+      let t = t + 1
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
+# amax: one block of 1024 threads, stride 1024. The largest value, and the first index if several match.
+# A thread that owns nothing keeps -inf, so it cannot win.
+skill rt_sw_amax(gx, bx, ps) -> Any {
+  let L = rt_sw_arg(ps, 0)
+  let OUT = rt_sw_arg(ps, 1)
+  let n = rt_sw_arg(ps, 2)
+  let blocks = rt_untag(gx)
+  let threads = rt_untag(bx)
+  let lanes = threads
+  if lanes > 1024 { let lanes = 1024 }
+  let full = 0
+  let rem = 0
+  if n > 0 {
+    let full = n // 1024
+    let rem = n % 1024
+  }
+  let tail = rem
+  if tail > lanes { let tail = lanes }
+  let per = full * lanes + tail
+  if blocks < 0 { let blocks = 0 }
+  do rt_sw_note(blocks * (per * 8 + 16))
+  let buf = rt_alloc(256)
+  let ibuf = rt_alloc(128)
+  let red = rt_alloc(256)
+  let ired = rt_alloc(128)
+  let ninf = 0 - 4503599627370496
+  let b = 0
+  while b < blocks {
+    let w = 0
+    while w < 32 {
+      let lane = 0
+      while lane < 32 {
+        let tid = w * 32 + lane
+        do poke(buf + 8 * lane, ninf)
+        do rt_poke32(ibuf + 4 * lane, tid)
+        if tid < threads {
+          let i = tid
+          let best = ninf
+          let bi = tid
+          while i < n {
+            let v = peek(L + 8 * i)
+            if flt(best, v) {
+              let best = v
+              let bi = i
+            }
+            let i = i + 1024
+          }
+          do poke(buf + 8 * lane, best)
+          do rt_poke32(ibuf + 4 * lane, bi)
+        }
+        let lane = lane + 1
+      }
+      do rt_sw_bargmax(buf, ibuf)
+      do poke(red + 8 * w, peek(buf))
+      do rt_poke32(ired + 4 * w, rt_peek32(ibuf))
+      let w = w + 1
+    }
+    let best = peek(red)
+    let bi = rt_peek32(ired)
+    let w = 1
+    while w < 32 {
+      let ov = peek(red + 8 * w)
+      let oi = rt_peek32(ired + 4 * w)
+      if flt(best, ov) {
+        let best = ov
+        let bi = oi
+      }
+      if flt(ov, best) == 0 and flt(best, ov) == 0 {
+        if oi < bi {
+          let best = ov
+          let bi = oi
+        }
+      }
+      let w = w + 1
+    }
+    do poke(OUT, best)
+    do poke(OUT + 8, i2f(bi))
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
+# ablate: one block per token of 2048. X loses its part along D, scale in percent. 100 removes that part.
+skill rt_sw_ablate(gx, bx, ps) -> Any {
+  let X = rt_sw_arg(ps, 0)
+  let H = rt_sw_arg(ps, 1)
+  let D = rt_sw_arg(ps, 2)
+  let scale = rt_sw_arg(ps, 4)
+  let blocks = rt_untag(gx)
+  let threads = rt_untag(bx)
+  let lanes = threads
+  if lanes > 256 { let lanes = 256 }
+  if blocks < 0 { let blocks = 0 }
+  do rt_sw_note(blocks * (8 * lanes) * 48)
+  let buf = rt_alloc(256)
+  let red = rt_alloc(64)
+  let b = 0
+  while b < blocks {
+    let base = b * 2048
+    let w = 0
+    while w < 8 {
+      let lane = 0
+      while lane < 32 {
+        do poke(buf + 8 * lane, i2f(0))
+        let tid = w * 32 + lane
+        if tid < lanes {
+          let acc = i2f(0)
+          let i = tid
+          while i < 2048 {
+            let dlt = fsub(peek(X + 8 * (base + i)), peek(H + 8 * (base + i)))
+            let acc = fadd(fmul(dlt, peek(D + 8 * i)), acc)
+            let i = i + 256
+          }
+          do poke(buf + 8 * lane, acc)
+        }
+        let lane = lane + 1
+      }
+      do poke(red + 8 * w, rt_sw_bfly64(buf))
+      let w = w + 1
+    }
+    let dot = peek(red)
+    let w = 1
+    while w < 8 {
+      let dot = fadd(dot, peek(red + 8 * w))
+      let w = w + 1
+    }
+    let dot = fdiv(fmul(dot, i2f(scale)), 4636737291354636288)
+    let t = 0
+    while t < lanes {
+      let i = t
+      while i < 2048 {
+        let x = peek(X + 8 * (base + i))
+        do poke(X + 8 * (base + i), fsub(x, fmul(peek(D + 8 * i), dot)))
+        let i = i + 256
+      }
+      let t = t + 1
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
+# capd: a token whose index is a multiple of the stride. CAP gets X - H as float32.
+skill rt_sw_capd(gx, bx, ps) -> Any {
+  let X = rt_sw_arg(ps, 0)
+  let H = rt_sw_arg(ps, 1)
+  let CAP = rt_sw_arg(ps, 2)
+  let stride = rt_sw_arg(ps, 4)
+  let blocks = rt_untag(gx)
+  let threads = rt_untag(bx)
+  let lanes = threads
+  if lanes > 256 { let lanes = 256 }
+  if blocks < 0 { let blocks = 0 }
+  let active = 0
+  let b = 0
+  while b < blocks {
+    if stride > 0 and b % stride == 0 { let active = active + 1 }
+    let b = b + 1
+  }
+  do rt_sw_note(active * (8 * lanes) * 20)
+  let b = 0
+  while b < blocks {
+    if stride > 0 and b % stride == 0 {
+      let row = b // stride
+      let base = b * 2048
+      let capb = row * 2048
+      let t = 0
+      while t < lanes {
+        let i = t
+        while i < 2048 {
+          let dlt = fsub(peek(X + 8 * (base + i)), peek(H + 8 * (base + i)))
+          do rt_poke32(CAP + 4 * (capb + i), rt_sw_f32_of(dlt))
+          let i = i + 256
+        }
+        let t = t + 1
+      }
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -5461,6 +5762,10 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "vadd") { return rt_sw_finish(rt_sw_vadd(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "silumul") { return rt_sw_finish(rt_sw_silumul(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "rmsn") { return rt_sw_finish(rt_sw_rmsn(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "gnorm") { return rt_sw_finish(rt_sw_gnorm(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "amax") { return rt_sw_finish(rt_sw_amax(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "ablate") { return rt_sw_finish(rt_sw_ablate(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "capd") { return rt_sw_finish(rt_sw_capd(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

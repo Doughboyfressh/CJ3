@@ -3728,10 +3728,128 @@ skill rt_gpu_fn(mt, name) -> Any {
   return rt_tag(peek(f))
 }
 
+skill rt_sw_text_is(t, s) -> Any {
+  let n = peek(t + 8)
+  if n != peek(s + 8) { return 0 }
+  let i = 0
+  while i < n {
+    if peekb(t + 16 + i) != peekb(s + 16 + i) { return 0 }
+    let i = i + 1
+  }
+  return 1
+}
+
+# a double's bits, rounded to f32 the way fma.rn.f32 rounds. Every f32 value is an exact double, so a
+# product of two of them added in double and rounded once is that f32 fma.
+skill rt_sw_f32_of(dbits) -> Any {
+  let sign = shr(dbits, 63)
+  let exp = band(shr(dbits, 52), 2047)
+  let man = band(dbits, 4503599627370495)
+  if exp == 2047 {
+    if man == 0 { return bor(shl(sign, 31), 2139095040) }
+    return bor(shl(sign, 31), 2143289344)
+  }
+  if exp == 0 { return shl(sign, 31) }
+  let fexp = exp - 1023 + 127
+  if fexp >= 255 { return bor(shl(sign, 31), 2139095040) }
+  if fexp <= 0 { return shl(sign, 31) }
+  let top = shr(man, 29)
+  let roundb = band(shr(man, 28), 1)
+  let sticky = band(man, 268435455)
+  if roundb == 1 {
+    if sticky != 0 { let top = top + 1 } else {
+      if band(top, 1) == 1 { let top = top + 1 }
+    }
+  }
+  if top >= 8388608 {
+    let top = 0
+    let fexp = fexp + 1
+    if fexp >= 255 { return bor(shl(sign, 31), 2139095040) }
+  }
+  return bor(shl(sign, 31), bor(shl(fexp, 23), top))
+}
+
+skill rt_sw_f64_of(u) -> Any {
+  let u = band(u, 4294967295)
+  let sign = shr(u, 31)
+  let exp = band(shr(u, 23), 255)
+  let man = band(u, 8388607)
+  if exp == 255 { return bor(shl(sign, 63), bor(shl(2047, 52), shl(man, 29))) }
+  if exp == 0 {
+    if man == 0 { return shl(sign, 63) }
+    let s = 0
+    while man < 8388608 {
+      let man = shl(man, 1)
+      let s = s + 1
+    }
+    let man = band(man, 8388607)
+    return bor(shl(sign, 63), bor(shl(897 - s, 52), shl(man, 29)))
+  }
+  return bor(shl(sign, 63), bor(shl(exp - 127 + 1023, 52), shl(man, 29)))
+}
+
+skill rt_sw_fma32(a, b, c) -> Any {
+  return rt_sw_f64_of(rt_sw_f32_of(fadd(fmul(a, b), c)))
+}
+
+skill rt_sw_f32tag(real) -> Any { return rt_tag(rt_sw_f32_of(rt_realbits(real))) }
+
+skill rt_sw_stf(pt, it, real) -> Any {
+  do rt_poke32(rt_untag(pt) + 4 * rt_untag(it), rt_sw_f32_of(rt_realbits(real)))
+  return rt_tag(0)
+}
+
+skill rt_sw_ldf(pt, it) -> Any {
+  return rt_mkreal(rt_sw_f64_of(rt_peek32(rt_untag(pt) + 4 * rt_untag(it))))
+}
+
+# pi_conv: sample start+t is the f32 dot of the impulse with the dry samples at that point and before it.
+# Left and right are separate. A thread past n writes nothing.
+skill rt_sw_conv(gx, bx, ps) -> Any {
+  let dry = rt_untag(peek(ps + 16))
+  let irp = rt_untag(peek(ps + 24))
+  let out = rt_untag(peek(ps + 32))
+  let m = rt_untag(peek(ps + 40))
+  let start = rt_untag(peek(ps + 48))
+  let n = rt_untag(peek(ps + 56))
+  let bs = rt_untag(bx)
+  let blocks = rt_untag(gx)
+  let t = 0
+  let lim = blocks * bs
+  while t < lim {
+    if t < n {
+      let idx = start + t
+      let count = m
+      if idx + 1 < count { let count = idx + 1 }
+      let accL = rt_sw_f64_of(0)
+      let accR = rt_sw_f64_of(0)
+      let i = 0
+      while i < count {
+        let irL = rt_sw_f64_of(rt_peek32(irp + 8 * i))
+        let irR = rt_sw_f64_of(rt_peek32(irp + 8 * i + 4))
+        let dL = rt_sw_f64_of(rt_peek32(dry + 8 * (idx - i)))
+        let dR = rt_sw_f64_of(rt_peek32(dry + 8 * (idx - i) + 4))
+        let accL = rt_sw_fma32(irL, dL, accL)
+        let accR = rt_sw_fma32(irR, dR, accR)
+        let i = i + 1
+      }
+      do rt_poke32(out + 8 * idx, rt_sw_f32_of(accL))
+      do rt_poke32(out + 8 * idx + 4, rt_sw_f32_of(accR))
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
-  if ostarget() != 0 { return rt_tag(0 - 400) }
+  if ostarget() != 0 {
+    let rec = rt_untag(ft)
+    if rec <= 0 { return rt_tag(0 - 400) }
+    if rt_sw_text_is(peek(rec + 8), "pi_conv") { return rt_sw_conv(gxt, bxt, ps) }
+    return rt_tag(0 - 400)
+  }
   let n = peek(ps + 8)
   let cells = rt_alloc(8 * n + 8)
   let ptrs = rt_alloc(8 * n + 8)

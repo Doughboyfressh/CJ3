@@ -1,0 +1,79 @@
+# Pi. gpu for is the GPU word. pi_mma is the tile word.
+# A is large, then small. B is small, then large along K.
+# One thread owns a 4 by 4 tile and issues it once.
+
+skill col(m, j) -> Any {
+  let r = []
+  for row in m { let r = append(r, row[j]) }
+  return r
+}
+
+skill row(i, seed) -> Any {
+  let r = []
+  for j in range(0, 16) {
+    let v = 1.2 + (i % 3) * 0.4 + seed * 0.05
+    if j >= 8 { let v = v * 0.03 }
+    let r = append(r, v)
+  }
+  return r
+}
+
+skill mat(rows, seed) -> Any {
+  let m = []
+  for i in range(0, rows) { let m = append(m, row(i, seed)) }
+  return m
+}
+
+skill brow(i, seed) -> Any {
+  let r = []
+  for j in range(0, 8) {
+    let v = 1.1 + (j % 3) * 0.35 + seed * 0.04
+    if i < 8 { let v = v * 0.03 }
+    let r = append(r, v)
+  }
+  return r
+}
+
+skill bmat(seed) -> Any {
+  let m = []
+  for i in range(0, 16) { let m = append(m, brow(i, seed)) }
+  return m
+}
+
+skill gemm(a, b) -> Any {
+  let n = len(b[0])
+  let tc = (n + 3) // 4
+  let tr = (len(a) + 3) // 4
+  gpu for t in range(0, tr * tc) -> tiles {
+    let ti = t // tc
+    let tj = t % tc
+    let rows = slice(a, ti * 4, ti * 4 + 4)
+    let cols = []
+    let j = 0
+    while j < 4 {
+      let jj = tj * 4 + j
+      if jj < n { let cols = append(cols, col(b, jj)) }
+      let j = j + 1
+    }
+    let tiles = pi_mma(rows, cols)
+  }
+  let out = []
+  let i = 0
+  while i < len(a) {
+    let row = []
+    let j = 0
+    while j < n {
+      let tile = tiles[(i // 4) * tc + (j // 4)]
+      let row = append(row, tile[i % 4][j % 4])
+      let j = j + 1
+    }
+    let out = append(out, row)
+    let i = i + 1
+  }
+  return out
+}
+
+skill main() -> Any {
+  print("pi gemm committed")
+  return gemm(mat(8, 3), bmat(7))
+}

@@ -1,0 +1,22 @@
+# A spike every 16 values. pi_dot blocks by 8.
+# A block of 16 spends its scale on the spike.
+
+skill ones(n) -> Any {
+  let r = []
+  for i in range(0, n) { let r = append(r, 1) }
+  return r
+}
+
+skill main() -> Any {
+  let v = []
+  for i in range(0, 48) {
+    let x = 0.05
+    if i % 16 == 0 { let x = 6 }
+    let v = append(v, x * 0.1)
+  }
+  print(len(v))
+  gpu for t in [0] -> s {
+    let s = pi_dot(v, ones(len(v)))
+  }
+  return s
+}

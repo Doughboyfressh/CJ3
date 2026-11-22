@@ -1,0 +1,66 @@
+# Q is large then small. K is small then large.
+# The dots are pi_dot. Softmax is ordinary Pi.
+
+skill col(m, j) -> Any {
+  let r = []
+  for row in m { let r = append(r, row[j]) }
+  return r
+}
+
+skill seq(n, seed, flip) -> Any {
+  let r = []
+  for j in range(0, n) {
+    let v = 0.8 + (seed % 4) * 0.25
+    if flip == 0 and j >= 8 { let v = v * 0.03 }
+    if flip == 1 and j < 8 { let v = v * 0.03 }
+    let r = append(r, v)
+  }
+  return r
+}
+
+skill mat(rows, cols, seed, flip) -> Any {
+  let m = []
+  for i in range(0, rows) { let m = append(m, seq(cols, seed + i, flip)) }
+  return m
+}
+
+skill softmax(row) -> Any {
+  let m = row[0]
+  for x in row { if x > m { let m = x } }
+  let ex = []
+  let s = 0
+  for x in row {
+    let e = exp(x - m)
+    let ex = append(ex, e)
+    let s = s + e
+  }
+  let p = []
+  for e in ex { let p = append(p, e / s) }
+  return p
+}
+
+skill attn(q, k, v) -> Any {
+  let scale = 1 / sqrt(len(q[0]))
+  let probs = []
+  for qrow in q {
+    gpu for krow in k -> scores {
+      let scores = pi_dot(qrow, krow) * scale
+    }
+    let probs = append(probs, softmax(scores))
+  }
+  let n = len(v[0])
+  let out = []
+  let i = 0
+  while i < len(probs) {
+    gpu for j in range(0, n) -> row {
+      let row = pi_dot(probs[i], col(v, j))
+    }
+    let out = append(out, row)
+    let i = i + 1
+  }
+  return out
+}
+
+skill main() -> Any {
+  return attn(mat(4, 16, 1, 0), mat(4, 16, 2, 1), mat(4, 16, 3, 0))
+}

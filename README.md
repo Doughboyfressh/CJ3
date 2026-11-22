@@ -14,6 +14,7 @@ brain. No Rust, no interpreter, no CUDA toolkit, no third-party libraries — Pi
 - **Its own GPU.** Pi emits PTX and loads it straight through `nvcuda.dll` — no CUDA toolkit. On top of that
   sits a GPU path tracer, a from-scratch autograd engine (`grad.pi`), and neural reconstruction that overfits a
   network to a single real photo, recording or scene (`nimage.pi`, `naudio.pi`, `nerf.pi`, `nimage_hr.pi`).
+  `softwell/` is that GPU with no module in the loop: the program is the chip.
 - **A brain.** A language model runs on Pi's own GPU engine and acts *through* Pi: it writes and runs programs
   (`run_pi`), uses a real shell and the web, and keeps a memory across conversations. The language even improves
   itself — `langgrow.pi` learns new grammar rules from the brain's own compile failures, and only reseeds the
@@ -81,6 +82,7 @@ example. Answer with `teach` and rerun `review` to see how the correction transf
 |---|---|
 | `examples/pic.pi` | the compiler (compiles itself) |
 | `examples/native/` | the live code: runtime, GPU engine, brain, tools, path tracer, autograd, neural models |
+| `softwell/` | the software chip: bus, TMEM, a 4×4 tile, one wave. No physical GPU |
 | `seed/pic.exe`, `seed/pic` | the bootstrap compilers for Windows and Linux (self-reproducing fixpoints) |
 | `build.cmd`, `test.cmd` | build and test on Windows |
 | `build.sh`, `test.sh` | build and test on Linux |

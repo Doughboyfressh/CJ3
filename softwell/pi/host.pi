@@ -1,0 +1,16 @@
+# No gpu for. This is ordinary Pi.
+# The chip is the program, and nothing is scheduled.
+
+skill fact(n) -> Any {
+  if n <= 1 { return 1 }
+  return n * fact(n - 1)
+}
+
+skill main() -> Any {
+  let total = 0
+  for x in [1, 2, 3, 4, 5] {
+    let total = total + fact(x)
+  }
+  print(total)
+  return total
+}

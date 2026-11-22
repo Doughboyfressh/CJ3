@@ -1,0 +1,57 @@
+# The 494,592 packed tensors are one product, not 494,592 names.
+# File layers 1..92 (layer 0 has no experts) x experts 0..895 x {w1,w2,w3} x {packed,scale}.
+# Compared with every key in the checkpoint index: the two sets are equal, 494,592 both ways,
+# nothing left over. That comparison is the whole index, not a sample.
+# On layer 1, all 896 experts, the shape is a function of the matrix alone:
+#   w1 and w3: packed [3072, 1792], scale [3072, 112]. 3584 codes, two per byte, one scale per 32.
+#   w2:        packed [3584, 1536], scale [3584, 96].  3072 codes.
+# Layer 3 expert 0 w2 has that same packed shape. Other layers' shapes were not opened.
+# The bytes are not this word. Rows already failed the held-out half. A scale row uses 120..122,
+# which is a bound, not the byte. The product is what can be kept for all 494,592.
+skill main() -> Any {
+  let layers = 92
+  let experts = 896
+  let mats = 3
+  let kinds = 2
+  let n = layers * experts * mats * kinds
+  let latent = 3584
+  let hidden = 3072
+  let group = 32
+  let w1_packed_cols = latent // 2
+  let w1_scale_cols = latent // group
+  let w2_packed_cols = hidden // 2
+  let w2_scale_cols = hidden // group
+  let w1_row = w1_packed_cols + w1_scale_cols
+  let w2_row = w2_packed_cols + w2_scale_cols
+  let b1 = (w1_row + 31) // 32
+  let p1 = (w1_row + 3) // 4
+  let b2 = (w2_row + 31) // 32
+  let p2 = (w2_row + 3) // 4
+  let text = "product 92x896x3x2\nshape of M\npayload not a word\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(n == 494592)
+  print(layers * experts == 82432)
+  print(82432 * 6 == 494592)
+  print(w1_packed_cols == 1792)
+  print(w1_scale_cols == 112)
+  print(w2_packed_cols == 1536)
+  print(w2_scale_cols == 96)
+  print(896 * 6 == 5376)
+  print(w1_row == 1904)
+  print(b1 == 60)
+  print(p1 == 476)
+  print(8 * b1 - p1 == 4)
+  print(w2_row == 1632)
+  print(b2 == 51)
+  print(p2 == 408)
+  print(p2 == 8 * b2)
+  print(read == 1024)
+  print(got == text)
+  return 0
+}

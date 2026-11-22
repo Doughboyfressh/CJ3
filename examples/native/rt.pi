@@ -6646,6 +6646,7 @@ skill rt_sw_acomb(gx, bx, ps) -> Any {
 
 # conv: one thread per channel. History is three doubles at a stride of 8,192, so one channel spans
 # 192 KB and lives on the SSD. The four taps are float32, oldest first. y = silu(h0*a+h1*b+h2*c+x*d).
+# All 8,192 channels of one zero token are 655,360 bytes, 20,480 bus cycles, and 73,728 pages.
 skill rt_sw_kconv(gx, bx, ps) -> Any {
   let M = rt_sw_arg(ps, 0)
   let H = rt_sw_arg(ps, 1)
@@ -6689,6 +6690,7 @@ skill rt_sw_kconv(gx, bx, ps) -> Any {
 
 # combine: X = H + sum of eight expert weights times their rows + sigmoid(shared gate) * shared expert.
 # A row is 2,048 doubles, so the eight rows are 128 KB on the SSD. One element does not bring them all in.
+# All 2,048 elements of one zero token are 327,680 bytes, 10,240 bus cycles, and 40,960 pages.
 skill rt_sw_combine(gx, bx, ps) -> Any {
   let H = rt_sw_arg(ps, 0)
   let D = rt_sw_arg(ps, 1)
@@ -6757,7 +6759,7 @@ skill rt_sw_psum(buf) -> Any {
 # dnet4: one warp is 8 columns of one value head, four parts of 32 rows. The head's state is 128 by 128
 # doubles, 128 KB, on the SSD. q and k of a zero vector normalise to 0, so a zero state stays 0 and the
 # output is 0. One warp of one zero token touches 35,904 bytes, 1,122 bus cycles, and 929 pages.
-# All 32 heads are 4 MB. This SSD is 8 MB, so the state fits beside the history and the expert rows.
+# All 32 heads are 512 warps, 18,382,848 bytes, 574,464 bus cycles, and 475,648 pages. The state is 4 MB.
 skill rt_sw_dnet4(gx, bx, ps) -> Any {
   let S = rt_sw_arg(ps, 0)
   let CV = rt_sw_arg(ps, 1)

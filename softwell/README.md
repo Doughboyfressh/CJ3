@@ -14,7 +14,7 @@ Each operand is written on a 32-byte bus once, then kept in 4 KB of TMEM. A shar
 
 The opcode is `pi.mma.block8.f32`. It is this chip's instruction, not NVIDIA's. The block is 8. The same products scored as NVFP4 blocks of 16 are the B300 column. The residual is the triangle bound, and the block of 8 still beats it on these programs.
 
-This is not a physical bus, not a GHz, and not nvcc-clean PTX. There is no physical GPU, CPU, SSD, or RAM behind it. `examples/native/gpuengine.pi` still names `dnet`; that launch returns `-400`. `mvf32`, `mvq8`, `mvq4`, `mvq6`, `mxf32`, `mxq8`, `mxq4`, `mxq6`, `vadd`, `silumul`, `rmsn`, `gnorm`, `amax`, `ablate`, `capd`, `qkprep`, `attn`, `tokin`, `tokinT`, `route`, `attn2`, `acomb`, `conv`, `combine`, and `dnet4` run. `dnet` is not run: the name is the old launch. `dnet4` keeps all 32 value heads, 4 MB, on the SSD. The convolution history and the expert rows sit beside that state.
+This is not a physical bus, not a GHz, and not nvcc-clean PTX. There is no physical GPU, CPU, SSD, or RAM behind it. `examples/native/gpuengine.pi` still names `dnet`; that launch returns `-400`. `mvf32`, `mvq8`, `mvq4`, `mvq6`, `mxf32`, `mxq8`, `mxq4`, `mxq6`, `vadd`, `silumul`, `rmsn`, `gnorm`, `amax`, `ablate`, `capd`, `qkprep`, `attn`, `tokin`, `tokinT`, `route`, `attn2`, `acomb`, `conv`, `combine`, and `dnet4` run. `dnet` is not run: the name is the old launch. `dnet4` keeps all 32 value heads, 4 MB, on the SSD. One zero token runs all 8,192 convolution channels (20,480 bus cycles), all 32 heads (574,464 bus cycles), the router, and all 2,048 expert elements (10,240 bus cycles). A zero stays zero. The router of 256 zero logits keeps lanes 0 through 7 at weight 1/8.
 
 | Path | What |
 |---|---|

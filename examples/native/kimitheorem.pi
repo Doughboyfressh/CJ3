@@ -1,0 +1,77 @@
+# Write-Read Theorem. For the KDA step
+#   S' = (I - kk^T) (a .* S) + k v
+# with k^T k = 1, the read of that same key is v.
+# The old state does not appear in the answer. The decay does not appear either.
+# If a query q is orthogonal to k and the decay is 1, q still reads its old value.
+# A key that is not unit fails this. (1, 1) written with 2 reads back as -7.
+# Checked in integers on the unit key (3, 4) / 5, which was not an axis.
+# Held-out states: (1, -2) with value 4, and (8, 1) with value 0.
+skill step(sx, sy, sd, kx, ky, v) -> Any {
+  let numer = v * 5 * sd - (kx * sx + ky * sy)
+  let nx = 25 * sx + kx * numer
+  let ny = 25 * sy + ky * numer
+  return [nx, ny, 25 * sd]
+}
+skill kread(s, kx, ky) -> Any {
+  return [kx * s[0] + ky * s[1], 5 * s[2]]
+}
+skill same(s, t) -> Any {
+  if s[0] * t[2] != t[0] * s[2] { return 0 }
+  if s[1] * t[2] != t[1] * s[2] { return 0 }
+  return 1
+}
+
+skill main() -> Any {
+  let w = step(2, 7, 1, 3, 4, 5)
+  let r = kread(w, 3, 4)
+  let q0 = [0 - 4 * 2 + 3 * 7, 5]
+  let q1 = kread(w, 0 - 4, 3)
+  let h = step(1, 0 - 2, 1, 3, 4, 4)
+  let hr = kread(h, 3, 4)
+  let z = step(8, 1, 1, 3, 4, 0)
+  let zr = kread(z, 3, 4)
+  let m1 = step(0, 0, 1, 3, 4, 5)
+  let m1 = step(m1[0], m1[1], m1[2], 0 - 4, 3, 2)
+  let a = kread(m1, 3, 4)
+  let b = kread(m1, 0 - 4, 3)
+  let m2 = step(m1[0], m1[1], m1[2], 3, 4, 9)
+  let a2 = kread(m2, 3, 4)
+  let b2 = kread(m2, 0 - 4, 3)
+  let n1 = step(0, 0, 1, 0 - 4, 3, 2)
+  let n1 = step(n1[0], n1[1], n1[2], 3, 4, 5)
+  let d = step(2 * 2, 0 * 7, 1, 3, 4, 5)
+  let dr = kread(d, 3, 4)
+  let dq = kread(d, 0 - 4, 3)
+  let bad = attend_axis()
+  let text = "a full write recalls\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - p
+  print(r[0] == 5 * r[1])
+  print(q1[0] * q0[1] == q0[0] * q1[1])
+  print(hr[0] == 4 * hr[1])
+  print(zr[0] == 0)
+  print(a[0] == 5 * a[1])
+  print(b[0] == 2 * b[1])
+  print(a2[0] == 9 * a2[1])
+  print(b2[0] == 2 * b2[1])
+  print(same(m1, n1) == 1)
+  print(bad == 0 - 7)
+  print(dr[0] == 5 * dr[1])
+  print(dq[0] * q0[1] != q0[0] * dq[1])
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}
+skill attend_axis() -> Any {
+  let s0 = 3
+  let s1 = 8
+  let proj = 1 * s0 + 1 * s1
+  let y0 = s0 - proj + 2
+  let y1 = s1 - proj + 2
+  return 1 * y0 + 1 * y1
+}

@@ -5726,6 +5726,260 @@ skill rt_sw_capd(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# max.f64 across a warp. -inf loses to any number.
+skill rt_sw_bflymax(buf) -> Any {
+  let k = 16
+  while k >= 1 {
+    let i = 0
+    while i < 32 {
+      let j = bxor(i, k)
+      if i < j {
+        let a = peek(buf + 8 * i)
+        let b = peek(buf + 8 * j)
+        let m = a
+        if flt(a, b) { let m = b }
+        do poke(buf + 8 * i, m)
+        do poke(buf + 8 * j, m)
+      }
+      let i = i + 1
+    }
+    let k = k // 2
+  }
+  return peek(buf)
+}
+
+# 1 / (1 + exp(-x)). The listing's reciprocal of that sum, which is this division when the sum is exact.
+skill rt_sw_sigm64(x) -> Any {
+  return fdiv(i2f(1), fadd(rt_sw_exp64(fsub(i2f(0), x)), i2f(1)))
+}
+
+# qkprep: one block is (token, head). Heads 0..15 are queries. The 256 squares are one reciprocal
+# square root over 256, the weight is float32, and dimensions 0..63 are rotated by the rope pair.
+# Heads 16 and 17 write the key and the value into the cache as float32. The position is the
+# double at POS, which is what the listing loads over the integer parameter.
+skill rt_sw_qkprep(gx, bx, ps) -> Any {
+  let QF = rt_sw_arg(ps, 0)
+  let KF = rt_sw_arg(ps, 1)
+  let VF = rt_sw_arg(ps, 2)
+  let QN = rt_sw_arg(ps, 3)
+  let KN = rt_sw_arg(ps, 4)
+  let ROPE = rt_sw_arg(ps, 5)
+  let Q = rt_sw_arg(ps, 6)
+  let KC = rt_sw_arg(ps, 7)
+  let VC = rt_sw_arg(ps, 8)
+  let POS = rt_sw_arg(ps, 9)
+  let pos = f2i(peek(POS))
+  if pos < 0 { let pos = 0 }
+  let blocks = rt_untag(gx)
+  let threads = rt_untag(bx)
+  let use = threads
+  if use > 256 { let use = 256 }
+  if blocks < 0 { let blocks = 0 }
+  let queries = 0
+  let b = 0
+  while b < blocks {
+    if b % 18 < 16 { let queries = queries + 1 }
+    let b = b + 1
+  }
+  let keys = blocks - queries
+  do rt_sw_note(queries * use * 36 + keys * use * 44)
+  let buf = rt_alloc(256)
+  let red = rt_alloc(64)
+  let sbuf = rt_alloc(2048)
+  let kept = rt_alloc(2048)
+  let wkept = rt_alloc(2048)
+  let b = 0
+  while b < blocks {
+    let token = b // 18
+    let head = b % 18
+    let query = 0
+    if head < 16 { let query = 1 }
+    let wbase = QN
+    if query == 0 { let wbase = KN }
+    let src = QF
+    let idx0 = token * 8192 + head * 512
+    if query == 0 {
+      let src = KF
+      let idx0 = token * 512 + (head - 16) * 256
+    }
+    let w = 0
+    while w < 8 {
+      let lane = 0
+      while lane < 32 {
+        do poke(buf + 8 * lane, i2f(0))
+        let tid = w * 32 + lane
+        if tid < use {
+          let x = peek(src + 8 * (idx0 + tid))
+          do poke(kept + 8 * tid, x)
+          do poke(wkept + 8 * tid, rt_sw_f64_of(rt_peek32(wbase + 4 * tid)))
+          do poke(buf + 8 * lane, fmul(x, x))
+        }
+        let lane = lane + 1
+      }
+      do poke(red + 8 * w, rt_sw_bfly64(buf))
+      let w = w + 1
+    }
+    let sum = peek(red)
+    let w = 1
+    while w < 8 {
+      let sum = fadd(sum, peek(red + 8 * w))
+      let w = w + 1
+    }
+    let scale = fdiv(i2f(1), fsqrt(fadd(fdiv(sum, 4643211215818981376), 4517329193108106637)))
+    let t = 0
+    while t < use {
+      let x = peek(kept + 8 * t)
+      let wf = peek(wkept + 8 * t)
+      do poke(sbuf + 8 * t, fmul(fmul(x, scale), wf))
+      let t = t + 1
+    }
+    let t = 0
+    while t < use {
+      let lane = band(t, 31)
+      let a = peek(sbuf + 8 * lane)
+      let bp = peek(sbuf + 8 * (lane + 32))
+      let pair = (token * 32 + lane) * 2
+      let cs = peek(ROPE + 8 * pair)
+      let sn = peek(ROPE + 8 * pair + 8)
+      let y = fsub(fmul(a, cs), fmul(bp, sn))
+      if t >= 32 { let y = fadd(fmul(bp, cs), fmul(a, sn)) }
+      if t >= 64 { let y = peek(sbuf + 8 * t) }
+      if query == 1 {
+        do poke(Q + 8 * (token * 4096 + head * 256 + t), y)
+      } else {
+        let at = (pos + token) * 512 + (head - 16) * 256 + t
+        do rt_poke32(KC + 4 * at, rt_sw_f32_of(y))
+        let v = peek(VF + 8 * (idx0 + t))
+        do rt_poke32(VC + 4 * at, rt_sw_f32_of(v))
+      }
+      let t = t + 1
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
+# attn: one block is (token, query head). Each thread scores the positions it owns, the block
+# takes the max and the sum of exp(score - max), then thread i gathers value dimension i.
+# The gate is the second half of the head, and sigmoid is the listing's series. The position
+# count is POS[0] + token + 1.
+skill rt_sw_attn(gx, bx, ps) -> Any {
+  let Q = rt_sw_arg(ps, 0)
+  let QF = rt_sw_arg(ps, 1)
+  let KC = rt_sw_arg(ps, 2)
+  let VC = rt_sw_arg(ps, 3)
+  let SCR = rt_sw_arg(ps, 4)
+  let ATT = rt_sw_arg(ps, 5)
+  let POS = rt_sw_arg(ps, 6)
+  let maxpos = rt_sw_arg(ps, 8)
+  let pos = f2i(peek(POS))
+  if pos < 0 { let pos = 0 }
+  let blocks = rt_untag(gx)
+  let threads = rt_untag(bx)
+  let use = threads
+  if use > 256 { let use = 256 }
+  if blocks < 0 { let blocks = 0 }
+  let buf = rt_alloc(256)
+  let red = rt_alloc(64)
+  let ninf = 0 - 4503599627370496
+  let bytes = 0
+  let b = 0
+  while b < blocks {
+    let token = shr(b, 4)
+    let head = band(b, 15)
+    let kh = shr(head, 3)
+    let npos = pos + token + 1
+    let qbase = token * 4096 + head * 256
+    let sbase = b * maxpos
+    let w = 0
+    while w < 8 {
+      let lane = 0
+      while lane < 32 {
+        do poke(buf + 8 * lane, ninf)
+        let tid = w * 32 + lane
+        if tid < use {
+          let best = ninf
+          let p = tid
+          while p < npos {
+            let dot = i2f(0)
+            let d = 0
+            let kbase = p * 512 + kh * 256
+            while d < 256 {
+              let dot = fadd(dot, fmul(peek(Q + 8 * (qbase + d)), peek(KC + 8 * (kbase + d))))
+              let d = d + 1
+            }
+            let dot = fdiv(dot, 4625196817309499392)
+            do poke(SCR + 8 * (sbase + p), dot)
+            if flt(best, dot) { let best = dot }
+            let bytes = bytes + 4096 + 8
+            let p = p + 256
+          }
+          do poke(buf + 8 * lane, best)
+        }
+        let lane = lane + 1
+      }
+      do poke(red + 8 * w, rt_sw_bflymax(buf))
+      let w = w + 1
+    }
+    let mx = peek(red)
+    let w = 1
+    while w < 8 {
+      let other = peek(red + 8 * w)
+      if flt(mx, other) { let mx = other }
+      let w = w + 1
+    }
+    let w = 0
+    while w < 8 {
+      let lane = 0
+      while lane < 32 {
+        do poke(buf + 8 * lane, i2f(0))
+        let tid = w * 32 + lane
+        if tid < use {
+          let acc = i2f(0)
+          let p = tid
+          while p < npos {
+            let e = rt_sw_exp64(fsub(peek(SCR + 8 * (sbase + p)), mx))
+            do poke(SCR + 8 * (sbase + p), e)
+            let acc = fadd(acc, e)
+            let bytes = bytes + 16
+            let p = p + 256
+          }
+          do poke(buf + 8 * lane, acc)
+        }
+        let lane = lane + 1
+      }
+      do poke(red + 8 * w, rt_sw_bfly64(buf))
+      let w = w + 1
+    }
+    let sm = peek(red)
+    let w = 1
+    while w < 8 {
+      let sm = fadd(sm, peek(red + 8 * w))
+      let w = w + 1
+    }
+    let t = 0
+    while t < use {
+      let acc = i2f(0)
+      let p = 0
+      let vdim = kh * 256 + t
+      while p < npos {
+        let wt = fdiv(peek(SCR + 8 * (sbase + p)), sm)
+        let acc = fadd(acc, fmul(wt, peek(VC + 8 * (p * 512 + vdim))))
+        let bytes = bytes + 16
+        let p = p + 1
+      }
+      let gate = peek(QF + 8 * (token * 8192 + head * 512 + 256 + t))
+      let acc = fmul(acc, rt_sw_sigm64(gate))
+      do poke(ATT + 8 * (qbase + t), acc)
+      let bytes = bytes + 16
+      let t = t + 1
+    }
+    let b = b + 1
+  }
+  do rt_sw_note(bytes)
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -5766,6 +6020,8 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "amax") { return rt_sw_finish(rt_sw_amax(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "ablate") { return rt_sw_finish(rt_sw_ablate(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "capd") { return rt_sw_finish(rt_sw_capd(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "qkprep") { return rt_sw_finish(rt_sw_qkprep(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "attn") { return rt_sw_finish(rt_sw_attn(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

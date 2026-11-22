@@ -3933,6 +3933,40 @@ skill rt_sw_mix(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+skill rt_sw_u32(pt) -> Any { return rt_tag(rt_peek32(rt_untag(pt))) }
+
+# pi_peak: the louder of the two channels, times 100000, truncated. The word at ppk keeps the greatest.
+skill rt_sw_peak(gx, bx, ps) -> Any {
+  let buf = rt_untag(peek(ps + 16))
+  let pk = rt_untag(peek(ps + 24))
+  let n = rt_untag(peek(ps + 32))
+  let pbs = rt_untag(peek(ps + 40))
+  let blocks = rt_untag(gx)
+  let tx = rt_untag(bx)
+  let scale = rt_sw_f64_of(1203982336)
+  let best = rt_peek32(pk)
+  let b = 0
+  while b < blocks {
+    let th = 0
+    while th < tx {
+      let t = b * pbs + th
+      if t < n {
+        let L = band(rt_sw_f64_of(rt_peek32(buf + 8 * t)), 9223372036854775807)
+        let R = band(rt_sw_f64_of(rt_peek32(buf + 8 * t + 4)), 9223372036854775807)
+        let m = L
+        if flt(m, R) { let m = R }
+        let u = f2i(rt_sw_mul32(m, scale))
+        if u < 0 { let u = 0 }
+        if best < u { let best = u }
+      }
+      let th = th + 1
+    }
+    let b = b + 1
+  }
+  do rt_poke32(pk, best)
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -3941,6 +3975,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
     if rec <= 0 { return rt_tag(0 - 400) }
     if rt_sw_text_is(peek(rec + 8), "pi_conv") { return rt_sw_conv(gxt, bxt, ps) }
     if rt_sw_text_is(peek(rec + 8), "pi_mix") { return rt_sw_mix(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "pi_peak") { return rt_sw_peak(gxt, bxt, ps) }
     return rt_tag(0 - 400)
   }
   let n = peek(ps + 8)

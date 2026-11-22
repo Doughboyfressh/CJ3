@@ -1,0 +1,142 @@
+# The intelligence of one write, and why the rest of the vector is not it.
+# Ornith's hidden width is 2048. One such write, packed Q4_K, is 8 blocks of 144 bytes = 1,152 bytes.
+# Bus B = ceil(1152/32) = 36. Page-in P = ceil(1152/4) = 288. And 8*36 = 288, so P = 8B.
+# The copy is already on the ceiling of the bus theorem. A cleverer copy cannot be cheaper.
+# Distillation wins only by not copying the vector.
+# The probes in this test use two coordinates. The other 2,046 are a null complement: their dot with
+# every probe is 0, so they cannot change which probe wins. They are not the intelligence.
+# On positive probes the raw coordinate and the square coordinate pick the same winner.
+# A negative held-out probe splits them. The weights pick the square. Remembering the training
+# winner does not. The square is one SSD record. A cold read of it is one page, 1,024 cycles.
+# Eight packed writes are 9,216 bytes, three pages, 3,072 cycles. The file of the 35B model is not
+# on this machine, so this is the theorem those neurons would have to pass, not a claim that they did.
+skill WIDTH() -> Any { return 2048 }
+skill PACKED() -> Any { return (2048 // 256) * 144 }
+
+skill probe(x) -> Any {
+  let u = arr(2048)
+  do aset(u, 0, x)
+  do aset(u, 1, x * x)
+  return u
+}
+
+skill neuron(junk) -> Any {
+  let w = arr(2048)
+  do aset(w, 1, 1)
+  do aset(w, 100, junk)
+  do aset(w, 2000, 0 - junk)
+  return w
+}
+
+skill dot(w, u) -> Any {
+  let s = 0
+  for i in range(0, 2048) { let s = s + aget(w, i) * aget(u, i) }
+  return s
+}
+
+skill null_dot(w, u) -> Any {
+  let s = 0
+  for i in range(2, 2048) { let s = s + aget(w, i) * aget(u, i) }
+  return s
+}
+
+skill top_coord(xs, c) -> Any {
+  let bi = 0
+  let best = 0
+  for i in range(0, len(xs)) {
+    let x = xs[i]
+    let s = x
+    if c == 1 { let s = x * x }
+    if i == 0 or s > best {
+      let best = s
+      let bi = i
+    }
+  }
+  return bi
+}
+
+skill top_w(w, xs) -> Any {
+  let bi = 0
+  let best = 0
+  for i in range(0, len(xs)) {
+    let s = dot(w, probe(xs[i]))
+    if i == 0 or s > best {
+      let best = s
+      let bi = i
+    }
+  }
+  return bi
+}
+
+skill blob(n) -> Any {
+  let chunk = "0123456789abcdef"
+  let s = ""
+  while len(s) + 16 <= n { let s = s ++ chunk }
+  return s
+}
+
+skill main() -> Any {
+  let train = [1, 2, 3]
+  let held = [1, 2, 3, 0 - 4]
+  let w = neuron(9)
+  let bare = neuron(0)
+  let nulls = 0
+  let same = 0
+  for x in held {
+    if null_dot(w, probe(x)) == 0 { let nulls = nulls + 1 }
+    if dot(w, probe(x)) == dot(bare, probe(x)) { let same = same + 1 }
+  }
+  let shared = 0
+  for j in range(0, 8) {
+    if top_w(neuron(j + 1), held) == top_coord(held, 1) { let shared = shared + 1 }
+  }
+  let n = PACKED()
+  let kn = 8 * n
+  let text = "u[1]"
+  let weights = blob(kn)
+  let slot = rt_sw_ssd_alloc(kn)
+  let p0 = rt_sw_pg()
+  do rt_sw_ssd_puts(slot, weights)
+  let wrote_w = rt_sw_pg() - p0
+  let prog = rt_sw_ssd_alloc(32)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(other, "x")
+  let p1 = rt_sw_pg()
+  let back = rt_sw_ssd_gets(slot)
+  let read_w = rt_sw_pg() - p1
+  let pw = rt_sw_pg()
+  do rt_sw_ssd_puts(prog, text)
+  let wrote_p = rt_sw_pg() - pw
+  do rt_sw_ssd_puts(other, "y")
+  let p2 = rt_sw_pg()
+  let got = rt_sw_ssd_gets(prog)
+  let read_p = rt_sw_pg() - p2
+  let p3 = rt_sw_pg()
+  let again = rt_sw_ssd_gets(prog)
+  print(n == 1152)
+  print((n + 31) // 32 == 36)
+  print((n + 3) // 4 == 288)
+  print(8 * 36 == 288)
+  print(nulls == 4)
+  print(same == 4)
+  print(top_w(w, train) == top_coord(train, 0))
+  print(top_w(w, train) == top_coord(train, 1))
+  print(top_coord(held, 0) == 2)
+  print(top_w(w, held) == 3)
+  print(top_w(w, held) == top_coord(held, 1))
+  print(top_w(w, held) != top_coord(held, 0))
+  print(shared == 8)
+  print(kn == 9216)
+  print((kn + 31) // 32 == 288)
+  print((kn + 3) // 4 == 2304)
+  print(8 * 288 == 2304)
+  print(wrote_w == 3072)
+  print(read_w == 3072)
+  print(back == weights)
+  print(wrote_p == 1024)
+  print(read_p == 1024)
+  print(rt_sw_pg() == p3)
+  print(again == got)
+  print(got == "u[1]")
+  return 0
+}

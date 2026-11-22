@@ -4726,6 +4726,23 @@ skill rt_sw_addnoise(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# This chip's reduction. The sum of n floats is one word in TMEM, not a second buffer.
+skill rt_sw_tred(gx, bx, ps) -> Any {
+  let buf = rt_sw_arg(ps, 0)
+  let n = rt_sw_arg(ps, 1)
+  do rt_sw_note(4 * n + 4)
+  let base = rt_untag(rt_sw_tmem())
+  let acc = rt_sw_f64_of(0)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let t = 0
+  while t < lim {
+    if t < n { let acc = rt_sw_add32(acc, rt_sw_ld32(buf + 4 * t)) }
+    let t = t + 1
+  }
+  do rt_sw_st32(base, acc)
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -4750,6 +4767,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
     if rt_sw_text_is(peek(rec + 8), "vrw") { return rt_sw_finish(rt_sw_vrw(gxt, bxt, ps)) }
     if rt_sw_text_is(peek(rec + 8), "posenc") { return rt_sw_finish(rt_sw_posenc(gxt, bxt, ps)) }
     if rt_sw_text_is(peek(rec + 8), "addnoise") { return rt_sw_finish(rt_sw_addnoise(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "tred") { return rt_sw_finish(rt_sw_tred(gxt, bxt, ps)) }
     return rt_tag(0 - 400)
   }
   let n = peek(ps + 8)

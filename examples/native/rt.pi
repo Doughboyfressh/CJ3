@@ -4707,6 +4707,104 @@ skill rt_sw_mvq8(gx, bx, ps) -> Any {
   }
   return rt_tag(0)
 }
+
+# 6-bit Q4_K scale (which = 0) or min (which = 1), index j in 0..7.
+# j < 4 is the low 6 bits of one byte. j >= 4 is a nibble plus the top 2 bits of an earlier byte.
+skill rt_sw_q4sm(blk, j, which) -> Any {
+  if j < 4 { return band(peekb(blk + 4 + j + which * 4), 63) }
+  let b = peekb(blk + 12 + j - 4)
+  let lo = band(b, 15)
+  if which == 1 { let lo = band(shr(b, 4), 15) }
+  let hb = peekb(blk + 4 + j - 4 + which * 4)
+  return bor(lo, shl(band(shr(hb, 6), 3), 4))
+}
+
+# Q4_K. A block is 144 bytes of 256 weights: binary16 d and dmin, 12 bytes of 6-bit scales and mins,
+# then 128 bytes of nibbles. Chunk c: low nibbles are weights 64c.., high nibbles are 64c+32..,
+# scales 2c and 2c+1. Each group of 32 sums q*x and x in float32, then
+# acc += (d*scale)*sum_q + (-dmin*min)*sum_x. That is the PTX total when the products fit the
+# float32 mantissa, so splitting the group across a warp does not change it. n is a multiple of 256.
+# The vector is the same shared row as mvf32. A longer one is not kept.
+skill rt_sw_mvq4(gx, bx, ps) -> Any {
+  let W = rt_sw_arg(ps, 0)
+  let X = rt_sw_arg(ps, 1)
+  let Y = rt_sw_arg(ps, 2)
+  let n = rt_sw_arg(ps, 3)
+  let k = rt_sw_arg(ps, 4)
+  let nv = rt_sw_arg(ps, 5)
+  let rb = rt_sw_arg(ps, 6)
+  let warps = rt_untag(bx) // 32
+  if warps < 1 { let warps = 1 }
+  let rows = rt_untag(gx) * warps
+  if rows > k { let rows = k }
+  let fits = 0
+  if n > 0 and n <= 1024 { let fits = 1 }
+  let nb = n // 256
+  let bytes = 0
+  if rows > 0 and nv > 0 {
+    let wbytes = rows * nb * 144
+    if fits == 1 { let bytes = wbytes + nv * n * 8 + rows * nv * 8 }
+    if fits == 0 { let bytes = wbytes + rows * nv * n * 8 + rows * nv * 8 }
+  }
+  do rt_sw_note(bytes)
+  let base = rt_untag(rt_sw_tmem())
+  let v = 0
+  while v < nv {
+    if fits == 1 {
+      let j = 0
+      while j < n {
+        do rt_poke32(base + 4 * j, rt_sw_f32_of(peek(X + 8 * (v * n + j))))
+        let j = j + 1
+      }
+    }
+    let row = 0
+    while row < rows {
+      let acc = rt_sw_f64_of(0)
+      let b = 0
+      while b < nb {
+        let blk = W + row * rb + b * 144
+        let d = rt_sw_f64_of(rt_sw_f16(blk))
+        let dmin = rt_sw_f64_of(rt_sw_f16(blk + 2))
+        let c = 0
+        while c < 4 {
+          let h = 0
+          while h < 2 {
+            let sumq = rt_sw_f64_of(0)
+            let sumx = rt_sw_f64_of(0)
+            let i = 0
+            while i < 32 {
+              let byte = peekb(blk + 16 + 32 * c + i)
+              let q = band(byte, 15)
+              if h == 1 { let q = band(shr(byte, 4), 15) }
+              let xi = b * 256 + 64 * c + h * 32 + i
+              let xv = rt_sw_f64_of(0)
+              if fits == 1 { let xv = rt_sw_ld32(base + 4 * xi) }
+              if fits == 0 { let xv = rt_sw_f64_of(rt_sw_f32_of(peek(X + 8 * (v * n + xi)))) }
+              let qf = rt_sw_f64_of(rt_sw_f32_of(i2f(q)))
+              let sumq = rt_sw_fma32(qf, xv, sumq)
+              let sumx = rt_sw_add32(xv, sumx)
+              let i = i + 1
+            }
+            let sc = rt_sw_f64_of(rt_sw_f32_of(i2f(rt_sw_q4sm(blk, 2 * c + h, 0))))
+            let mn = rt_sw_f64_of(rt_sw_f32_of(i2f(rt_sw_q4sm(blk, 2 * c + h, 1))))
+            let acc = rt_sw_fma32(rt_sw_mul32(d, sc), sumq, acc)
+            let dm = rt_sw_mul32(dmin, mn)
+            let dm = rt_sw_f64_of(rt_sw_f32_of(fsub(i2f(0), dm)))
+            let acc = rt_sw_fma32(dm, sumx, acc)
+            let h = h + 1
+          }
+          let c = c + 1
+        }
+        let b = b + 1
+      }
+      do poke(Y + 8 * (v * k + row), acc)
+      let row = row + 1
+    }
+    let v = v + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -4734,6 +4832,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "srow") { return rt_sw_finish(rt_sw_srow(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "mvf32") { return rt_sw_finish(rt_sw_mvf32(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "mvq8") { return rt_sw_finish(rt_sw_mvq8(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "mvq4") { return rt_sw_finish(rt_sw_mvq4(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

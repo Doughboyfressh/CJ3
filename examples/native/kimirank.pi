@@ -1,0 +1,53 @@
+# Sixteen layer-1 w2 rows, one from each of sixteen experts, do not share a direction.
+# After centering, fifteen singular values split the energy. The first holds 75 thousandths.
+# Cosine with expert 0, in thousandths, stays inside 49. The same is true down one expert's rows.
+# The only word in the sample is the scale. Each group is 120, 121, or 122, which is
+# 2^-7, 2^-6, or 2^-5. Expert 0 was in the first sixteen. Experts 10, 333, 777, and 123 were not.
+# 121 is the most common byte in every one of those rows. The codes themselves are not this word.
+skill main() -> Any {
+  let lines = split(trim(read_file("examples/native/kimi_scale.txt")), "\n")
+  let ok = 0
+  let maj = 0
+  for line in lines {
+    let p = split(line, " ")
+    let n120 = 0
+    let n121 = 0
+    let n122 = 0
+    let bad = 0
+    for i in range(1, 97) {
+      let v = num(p[i])
+      if v == 120 { let n120 = n120 + 1 }
+      if v == 121 { let n121 = n121 + 1 }
+      if v == 122 { let n122 = n122 + 1 }
+      if v < 120 { let bad = bad + 1 }
+      if v > 122 { let bad = bad + 1 }
+    }
+    if bad == 0 { let ok = ok + 1 }
+    if n121 > n120 {
+      if n121 > n122 { let maj = maj + 1 }
+    }
+  }
+  let cs = [0, 0 - 4, 2, 0 - 12, 5, 0 - 15, 0 - 17, 49, 0 - 4, 17, 5, 0 - 18, 5, 0 - 49, 7]
+  let mx = 0
+  for c in cs {
+    let a = c
+    if a < 0 { let a = 0 - a }
+    if a > mx { let mx = a }
+  }
+  let text = "experts do not share a direction\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(len(lines) == 5)
+  print(ok == 5)
+  print(maj == 5)
+  print(mx == 49)
+  print(75 < 100)
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

@@ -1,0 +1,136 @@
+# Subtraction is in the search, and so is one condition.
+# 2,116 arithmetic programs, built from 0, 1, 2, the input, and + - * /.
+# 18,496 conditionals: if the input is below 0, 1, 2, or 3, use one short
+# program, otherwise the other. The wide layer is not stored.
+# 0, 1, 2, 3 mapping to 1, 0, -1, -2 was not labeled. 26 survivors force -3 and -9.
+# 0, 1, 2, 3, 4 mapping to 0, 1, 2, 6, 8 fits no arithmetic program.
+# 21 conditionals force 10 and 14. The falling line with only three points
+# does not agree once a condition is allowed.
+skill ev(e, x) -> Any {
+  let k = e[0]
+  if k == 0 { return [1, e[1]] }
+  if k == 1 { return [1, x] }
+  if k == 6 {
+    if x < e[1] { return ev(e[2], x) }
+    return ev(e[3], x)
+  }
+  let L = ev(e[1], x)
+  let R = ev(e[2], x)
+  if L[0] == 0 { return [0, 0] }
+  if R[0] == 0 { return [0, 0] }
+  if k == 2 { return [1, L[1] + R[1]] }
+  if k == 3 { return [1, L[1] - R[1]] }
+  if k == 4 { return [1, L[1] * R[1]] }
+  if R[1] == 0 { return [0, 0] }
+  if L[1] % R[1] != 0 { return [0, 0] }
+  return [1, L[1] // R[1]]
+}
+skill fit_fall(e) -> Any {
+  if ev(e, 0) != [1, 1] { return 0 }
+  if ev(e, 1) != [1, 0] { return 0 }
+  if ev(e, 2) != [1, 0 - 1] { return 0 }
+  if ev(e, 3) != [1, 0 - 2] { return 0 }
+  return 1
+}
+skill fit_pow(e) -> Any {
+  if ev(e, 0) != [1, 1] { return 0 }
+  if ev(e, 1) != [1, 2] { return 0 }
+  if ev(e, 2) != [1, 4] { return 0 }
+  if ev(e, 3) != [1, 8] { return 0 }
+  return 1
+}
+skill fit_piece(e) -> Any {
+  if ev(e, 0) != [1, 0] { return 0 }
+  if ev(e, 1) != [1, 1] { return 0 }
+  if ev(e, 2) != [1, 2] { return 0 }
+  if ev(e, 3) != [1, 6] { return 0 }
+  if ev(e, 4) != [1, 8] { return 0 }
+  return 1
+}
+skill fit_thin(e) -> Any {
+  if ev(e, 0) != [1, 1] { return 0 }
+  if ev(e, 1) != [1, 0] { return 0 }
+  if ev(e, 2) != [1, 0 - 1] { return 0 }
+  return 1
+}
+skill forced(ss, x) -> Any {
+  if len(ss) == 0 { return [0, 0] }
+  let v = ev(ss[0], x)
+  if v[0] == 0 { return [0, 0] }
+  for e in ss {
+    if ev(e, x) != v { return [0, 0] }
+  }
+  return [1, v[1]]
+}
+
+skill main() -> Any {
+  let atoms = [[0, 0], [0, 1], [0, 2], [1]]
+  let ops = [2, 3, 4, 5]
+  let mid = []
+  for op in ops {
+    for a in atoms {
+      for b in atoms {
+        let mid = append(mid, [op, a, b])
+      }
+    }
+  }
+  let progs = atoms
+  for e in mid { let progs = append(progs, e) }
+  for op in ops {
+    for a in atoms {
+      for b in mid {
+        let progs = append(progs, [op, a, b])
+        let progs = append(progs, [op, b, a])
+      }
+    }
+  }
+  let fall = []
+  let pow = []
+  let piece_arith = 0
+  for e in progs {
+    if fit_fall(e) == 1 { let fall = append(fall, e) }
+    if fit_pow(e) == 1 { let pow = append(pow, e) }
+    if fit_piece(e) == 1 { let piece_arith = piece_arith + 1 }
+  }
+  let shorts = atoms
+  for e in mid { let shorts = append(shorts, e) }
+  let piece = []
+  let thin = []
+  let ncond = 0
+  for c in [0, 1, 2, 3] {
+    for a in shorts {
+      for b in shorts {
+        let e = [6, c, a, b]
+        let ncond = ncond + 1
+        if fit_piece(e) == 1 { let piece = append(piece, e) }
+        if fit_thin(e) == 1 { let thin = append(thin, e) }
+      }
+    }
+  }
+  let text = "a condition is a program\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(len(progs) == 2116)
+  print(ncond == 18496)
+  print(len(fall) == 26)
+  print(len(pow) == 0)
+  print(piece_arith == 0)
+  print(len(piece) == 21)
+  print(len(thin) == 150)
+  print(forced(fall, 4) == [1, 0 - 3])
+  print(forced(fall, 10) == [1, 0 - 9])
+  print(forced(fall, 0 - 2) == [1, 3])
+  print(forced(fall, 0 - 5) == [1, 6])
+  print(forced(pow, 4) == [0, 0])
+  print(forced(piece, 5) == [1, 10])
+  print(forced(piece, 7) == [1, 14])
+  print(forced(thin, 5) == [0, 0])
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

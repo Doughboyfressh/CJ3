@@ -6728,6 +6728,186 @@ skill rt_sw_combine(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+
+# log(1 + exp(x)). At 0 this is ln 2. The listing's series, then the same ln2 it reduces by.
+skill rt_sw_softplus(x) -> Any {
+  return fmul(rt_sw_log2(fadd(rt_sw_exp64(x), i2f(1))), 4604418534313441775)
+}
+
+# the two shuffles that join a column's four parts. Each lane adds the partner it is shown.
+skill rt_sw_psum(buf) -> Any {
+  let k = 8
+  while k <= 16 {
+    let i = 0
+    while i < 32 {
+      let j = bxor(i, k)
+      if i < j {
+        let a = peek(buf + 8 * i)
+        let b = peek(buf + 8 * j)
+        do poke(buf + 8 * i, fadd(a, b))
+        do poke(buf + 8 * j, fadd(b, a))
+      }
+      let i = i + 1
+    }
+    let k = k * 2
+  }
+  return 0
+}
+
+# dnet4: one warp is 8 columns of one value head, four parts of 32 rows. The head's state is 128 by 128
+# doubles, 128 KB, on the SSD. q and k of a zero vector normalise to 0, so a zero state stays 0 and the
+# output is 0. One warp of one zero token touches 35,904 bytes, 1,122 bus cycles, and 929 pages.
+# All 32 heads are 4 MB, and this SSD is 1 MB, so a launch past head 7 has nothing to keep.
+skill rt_sw_dnet4(gx, bx, ps) -> Any {
+  let S = rt_sw_arg(ps, 0)
+  let CV = rt_sw_arg(ps, 1)
+  let B = rt_sw_arg(ps, 2)
+  let A = rt_sw_arg(ps, 3)
+  let DTB = rt_sw_arg(ps, 4)
+  let SA = rt_sw_arg(ps, 5)
+  let FIN = rt_sw_arg(ps, 6)
+  let T = rt_sw_arg(ps, 7)
+  let blocks = rt_untag(gx)
+  let lanes = rt_untag(bx)
+  if lanes > 32 { let lanes = 32 }
+  if lanes < 0 { let lanes = 0 }
+  if blocks < 0 { let blocks = 0 }
+  if T < 0 { let T = 0 }
+  let p0 = lanes
+  if p0 > 8 { let p0 = 8 }
+  do rt_sw_note(blocks * lanes * (8 + T * 1112) + blocks * p0 * T * 8)
+  let mem = rt_untag(rt_sw_tmem())
+  let qreg = rt_alloc(1024)
+  let kreg = rt_alloc(1024)
+  let sq = rt_alloc(256)
+  let sks = rt_alloc(256)
+  let vs = rt_alloc(256)
+  let betas = rt_alloc(256)
+  let os = rt_alloc(256)
+  let b = 0
+  while b < blocks {
+    let j = b // 16
+    let colg = b % 16
+    let dtb = i2f(0)
+    let sav = i2f(0)
+    let lane = 0
+    while lane < lanes {
+      let dtb = rt_sw_f64_of(rt_sw_ssd_ld32(DTB, 4 * j))
+      let sav = rt_sw_f64_of(rt_sw_ssd_ld32(SA, 4 * j))
+      let lane = lane + 1
+    }
+    let t = 0
+    while t < T {
+      let lane = 0
+      while lane < 32 {
+        do poke(sq + 8 * lane, i2f(0))
+        do poke(sks + 8 * lane, i2f(0))
+        let lane = lane + 1
+      }
+      let lane = 0
+      while lane < lanes {
+        let keyh = j % 16
+        let base = t * 8192 + keyh * 128 + lane
+        let qs = i2f(0)
+        let ks = i2f(0)
+        let i = 0
+        while i < 4 {
+          let q = rt_sw_ssd_ld(CV, 8 * (base + 32 * i))
+          let k = rt_sw_ssd_ld(CV, 8 * (base + 32 * i) + 16384)
+          do poke(qreg + 8 * (lane * 4 + i), q)
+          do poke(kreg + 8 * (lane * 4 + i), k)
+          let qs = fadd(qs, fmul(q, q))
+          let ks = fadd(ks, fmul(k, k))
+          let i = i + 1
+        }
+        do poke(sq + 8 * lane, qs)
+        do poke(sks + 8 * lane, ks)
+        let lane = lane + 1
+      }
+      do rt_sw_bfly64(sq)
+      do rt_sw_bfly64(sks)
+      let rq = fdiv(i2f(1), fsqrt(fadd(peek(sq), 4517329193108106637)))
+      let rk = fdiv(i2f(1), fsqrt(fadd(peek(sks), 4517329193108106637)))
+      let lane = 0
+      while lane < lanes {
+        let i = 0
+        while i < 4 {
+          let dim = lane + 32 * i
+          do poke(mem + 8 * dim, fmul(peek(qreg + 8 * (lane * 4 + i)), rq))
+          do poke(mem + 1024 + 8 * dim, fmul(peek(kreg + 8 * (lane * 4 + i)), rk))
+          let i = i + 1
+        }
+        let lane = lane + 1
+      }
+      let lane = 0
+      while lane < lanes {
+        let column = colg * 8 + (lane % 8)
+        let part = lane // 8
+        let v = rt_sw_ssd_ld(CV, 8 * (t * 8192 + j * 128 + column + 4096))
+        let beta = rt_sw_sigm64(rt_sw_ssd_ld(B, 8 * (t * 32 + j)))
+        let decay = rt_sw_exp64(fmul(rt_sw_softplus(fadd(rt_sw_ssd_ld(A, 8 * (t * 32 + j)), dtb)), sav))
+        do poke(vs + 8 * lane, v)
+        do poke(betas + 8 * lane, beta)
+        let acc = i2f(0)
+        let row = 0
+        while row < 32 {
+          let el = j * 16384 + part * 4096 + column + row * 128
+          let sv = fmul(rt_sw_ssd_ld(S, 8 * el), decay)
+          do rt_sw_ssd_st(S, 8 * el, sv)
+          let kv = peek(mem + 1024 + 8 * (part * 32 + row))
+          let acc = fadd(acc, fmul(sv, kv))
+          let row = row + 1
+        }
+        do poke(sks + 8 * lane, acc)
+        let lane = lane + 1
+      }
+      let lane = lanes
+      while lane < 32 {
+        do poke(sks + 8 * lane, i2f(0))
+        let lane = lane + 1
+      }
+      do rt_sw_psum(sks)
+      let lane = 0
+      while lane < lanes {
+        let column = colg * 8 + (lane % 8)
+        let part = lane // 8
+        let delta = fmul(fsub(peek(vs + 8 * lane), peek(sks + 8 * lane)), peek(betas + 8 * lane))
+        let acc = i2f(0)
+        let row = 0
+        while row < 32 {
+          let el = j * 16384 + part * 4096 + column + row * 128
+          let kv = peek(mem + 1024 + 8 * (part * 32 + row))
+          let sv = fadd(rt_sw_ssd_ld(S, 8 * el), fmul(kv, delta))
+          do rt_sw_ssd_st(S, 8 * el, sv)
+          let qv = peek(mem + 8 * (part * 32 + row))
+          let acc = fadd(acc, fmul(sv, qv))
+          let row = row + 1
+        }
+        do poke(os + 8 * lane, acc)
+        let lane = lane + 1
+      }
+      let lane = lanes
+      while lane < 32 {
+        do poke(os + 8 * lane, i2f(0))
+        let lane = lane + 1
+      }
+      do rt_sw_psum(os)
+      let lane = 0
+      while lane < lanes {
+        if lane // 8 == 0 {
+          let column = colg * 8 + (lane % 8)
+          let o = fdiv(peek(os + 8 * lane), fsqrt(i2f(128)))
+          do rt_sw_ssd_st(FIN, 8 * (t * 4096 + j * 128 + column), o)
+        }
+        let lane = lane + 1
+      }
+      let t = t + 1
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -6777,6 +6957,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "acomb") { return rt_sw_finish(rt_sw_acomb(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "conv") { return rt_sw_finish(rt_sw_kconv(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "combine") { return rt_sw_finish(rt_sw_combine(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "dnet4") { return rt_sw_finish(rt_sw_dnet4(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

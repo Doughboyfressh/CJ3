@@ -14,7 +14,7 @@ Each operand is written on a 32-byte bus once, then kept in 4 KB of TMEM. A shar
 
 The opcode is `pi.mma.block8.f32`. It is this chip's instruction, not NVIDIA's. The block is 8. The same products scored as NVFP4 blocks of 16 are the B300 column. The residual is the triangle bound, and the block of 8 still beats it on these programs.
 
-This is not a physical bus, not a GHz, and not nvcc-clean PTX. There is no physical GPU, CPU, SSD, or RAM behind it. `examples/native/gpuengine.pi` still names `dnet`; that launch returns `-400`. `mvf32`, `mvq8`, `mvq4`, `mvq6`, `mxf32`, `mxq8`, `mxq4`, `mxq6`, `vadd`, `silumul`, `rmsn`, `gnorm`, `amax`, `ablate`, `capd`, `qkprep`, `attn`, `tokin`, `tokinT`, `route`, `attn2`, `acomb`, `conv`, and `combine` run. `dnet` is not run: its state is 32 by 128 by 128 doubles, 4 MB, and this SSD is 1 MB.
+This is not a physical bus, not a GHz, and not nvcc-clean PTX. There is no physical GPU, CPU, SSD, or RAM behind it. `examples/native/gpuengine.pi` still names `dnet`; that launch returns `-400`. `mvf32`, `mvq8`, `mvq4`, `mvq6`, `mxf32`, `mxq8`, `mxq4`, `mxq6`, `vadd`, `silumul`, `rmsn`, `gnorm`, `amax`, `ablate`, `capd`, `qkprep`, `attn`, `tokin`, `tokinT`, `route`, `attn2`, `acomb`, `conv`, `combine`, and `dnet4` run. `dnet` is not run: the name is the old launch. `dnet4` keeps one value head, 128 KB, on the SSD. All 32 heads are 4 MB, and this SSD is 1 MB.
 
 | Path | What |
 |---|---|

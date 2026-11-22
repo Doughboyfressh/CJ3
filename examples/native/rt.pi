@@ -4621,6 +4621,92 @@ skill rt_sw_mvf32(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# IEEE binary16 at p, as f32 bits. Not an SFU approximation.
+skill rt_sw_f16(p) -> Any {
+  let h = peekb(p) + shl(peekb(p + 1), 8)
+  let sign = shr(h, 15)
+  let exp = band(shr(h, 10), 31)
+  let man = band(h, 1023)
+  if exp == 31 {
+    if man == 0 { return bor(shl(sign, 31), 2139095040) }
+    return bor(shl(sign, 31), 2143289344)
+  }
+  if exp == 0 {
+    if man == 0 { return shl(sign, 31) }
+    let e = 1
+    while band(man, 1024) == 0 {
+      let man = shl(man, 1)
+      let e = e - 1
+    }
+    let man = band(man, 1023)
+    return bor(shl(sign, 31), bor(shl(e + 112, 23), shl(man, 13)))
+  }
+  return bor(shl(sign, 31), bor(shl(exp + 112, 23), shl(man, 13)))
+}
+
+# Q8_0. A block is 34 bytes: one binary16 scale, then 32 signed bytes. weight = scale * q, once per block.
+# The vector is the same shared row as mvf32.
+skill rt_sw_mvq8(gx, bx, ps) -> Any {
+  let W = rt_sw_arg(ps, 0)
+  let X = rt_sw_arg(ps, 1)
+  let Y = rt_sw_arg(ps, 2)
+  let n = rt_sw_arg(ps, 3)
+  let k = rt_sw_arg(ps, 4)
+  let nv = rt_sw_arg(ps, 5)
+  let rb = rt_sw_arg(ps, 6)
+  let warps = rt_untag(bx) // 32
+  if warps < 1 { let warps = 1 }
+  let rows = rt_untag(gx) * warps
+  if rows > k { let rows = k }
+  let fits = 0
+  if n > 0 and n <= 1024 { let fits = 1 }
+  let nb = n // 32
+  let bytes = 0
+  if rows > 0 and nv > 0 {
+    let wbytes = rows * nb * 34
+    if fits == 1 { let bytes = wbytes + nv * n * 8 + rows * nv * 8 }
+    if fits == 0 { let bytes = wbytes + rows * nv * n * 8 + rows * nv * 8 }
+  }
+  do rt_sw_note(bytes)
+  let base = rt_untag(rt_sw_tmem())
+  let v = 0
+  while v < nv {
+    if fits == 1 {
+      let j = 0
+      while j < n {
+        do rt_poke32(base + 4 * j, rt_sw_f32_of(peek(X + 8 * (v * n + j))))
+        let j = j + 1
+      }
+    }
+    let row = 0
+    while row < rows {
+      let acc = rt_sw_f64_of(0)
+      let b = 0
+      while b < nb {
+        let blk = W + row * rb + b * 34
+        let d = rt_sw_f64_of(rt_sw_f16(blk))
+        let sum = rt_sw_f64_of(0)
+        let j = 0
+        while j < 32 {
+          let q = peekb(blk + 2 + j)
+          if q >= 128 { let q = q - 256 }
+          let qf = rt_sw_f64_of(rt_sw_f32_of(i2f(q)))
+          let xv = rt_sw_f64_of(0)
+          if fits == 1 { let xv = rt_sw_ld32(base + 4 * (b * 32 + j)) }
+          if fits == 0 { let xv = rt_sw_f64_of(rt_sw_f32_of(peek(X + 8 * (v * n + b * 32 + j)))) }
+          let sum = rt_sw_fma32(qf, xv, sum)
+          let j = j + 1
+        }
+        let acc = rt_sw_fma32(d, sum, acc)
+        let b = b + 1
+      }
+      do poke(Y + 8 * (v * k + row), acc)
+      let row = row + 1
+    }
+    let v = v + 1
+  }
+  return rt_tag(0)
+}
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -4647,6 +4733,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "tred") { return rt_sw_finish(rt_sw_tred(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "srow") { return rt_sw_finish(rt_sw_srow(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "mvf32") { return rt_sw_finish(rt_sw_mvf32(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "mvq8") { return rt_sw_finish(rt_sw_mvq8(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

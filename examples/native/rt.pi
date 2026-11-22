@@ -4967,6 +4967,87 @@ skill rt_sw_mxf32(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# mxq8: the expert table of mxf32, and the Q8_0 dot of mvq8. Same shared row.
+skill rt_sw_mxq8(gx, bx, ps) -> Any {
+  let W = rt_sw_arg(ps, 0)
+  let X = rt_sw_arg(ps, 1)
+  let Y = rt_sw_arg(ps, 2)
+  let n = rt_sw_arg(ps, 3)
+  let k = rt_sw_arg(ps, 4)
+  let rpe = rt_sw_arg(ps, 5)
+  let rb = rt_sw_arg(ps, 6)
+  let E = rt_sw_arg(ps, 7)
+  let xd = rt_sw_arg(ps, 8)
+  let warps = rt_untag(bx) // 32
+  if warps < 1 { let warps = 1 }
+  let rows = rt_untag(gx) * warps
+  if rows > k { let rows = k }
+  let fits = 0
+  if n > 0 and n <= 1024 { let fits = 1 }
+  let nb = n // 32
+  let loads = 0
+  if fits == 1 and rows > 0 {
+    let prev = 0 - 1
+    let r = 0
+    while r < rows {
+      let vi = (r // rpe) // xd
+      if vi != prev {
+        let loads = loads + 1
+        let prev = vi
+      }
+      let r = r + 1
+    }
+  }
+  let bytes = 0
+  if rows > 0 {
+    let wbytes = rows * nb * 34
+    if fits == 1 { let bytes = wbytes + loads * n * 8 + rows * 8 }
+    if fits == 0 { let bytes = wbytes + rows * n * 8 + rows * 8 }
+  }
+  do rt_sw_note(bytes)
+  let base = rt_untag(rt_sw_tmem())
+  let held = 0 - 1
+  let r = 0
+  while r < rows {
+    let s = r // rpe
+    let j = r - s * rpe
+    let vi = s // xd
+    let expert = f2i(peek(E + 8 * s))
+    if fits == 1 and vi != held {
+      let t = 0
+      while t < n {
+        do rt_poke32(base + 4 * t, rt_sw_f32_of(peek(X + 8 * (vi * n + t))))
+        let t = t + 1
+      }
+      let held = vi
+    }
+    let acc = rt_sw_f64_of(0)
+    let wr = W + (expert * rpe + j) * rb
+    let b = 0
+    while b < nb {
+      let blk = wr + b * 34
+      let d = rt_sw_f64_of(rt_sw_f16(blk))
+      let sum = rt_sw_f64_of(0)
+      let i = 0
+      while i < 32 {
+        let q = peekb(blk + 2 + i)
+        if q >= 128 { let q = q - 256 }
+        let qf = rt_sw_f64_of(rt_sw_f32_of(i2f(q)))
+        let xv = rt_sw_f64_of(0)
+        if fits == 1 { let xv = rt_sw_ld32(base + 4 * (b * 32 + i)) }
+        if fits == 0 { let xv = rt_sw_f64_of(rt_sw_f32_of(peek(X + 8 * (vi * n + b * 32 + i)))) }
+        let sum = rt_sw_fma32(qf, xv, sum)
+        let i = i + 1
+      }
+      let acc = rt_sw_fma32(d, sum, acc)
+      let b = b + 1
+    }
+    do poke(Y + 8 * r, acc)
+    let r = r + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -4997,6 +5078,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "mvq4") { return rt_sw_finish(rt_sw_mvq4(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "mvq6") { return rt_sw_finish(rt_sw_mvq6(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "mxf32") { return rt_sw_finish(rt_sw_mxf32(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "mxq8") { return rt_sw_finish(rt_sw_mxq8(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

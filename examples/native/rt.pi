@@ -5330,6 +5330,101 @@ skill rt_sw_silumul(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# butterfly add.f32 across 32 lanes. The two halves are written together, then the buffers swap.
+skill rt_sw_bfly32(buf) -> Any {
+  let src = buf
+  let dst = buf + 128
+  let k = 16
+  while k >= 1 {
+    let i = 0
+    while i < 32 {
+      let a = rt_sw_f64_of(rt_peek32(src + 4 * i))
+      let b = rt_sw_f64_of(rt_peek32(src + 4 * bxor(i, k)))
+      do rt_poke32(dst + 4 * i, rt_sw_f32_of(rt_sw_add32(a, b)))
+      let i = i + 1
+    }
+    let hold = src
+    let src = dst
+    let dst = hold
+    let k = k // 2
+  }
+  return rt_sw_f64_of(rt_peek32(src))
+}
+
+# rmsn: one block per vector, 8 warps, stride 256, as the listing. Squares are float32, one fma per
+# element, then a warp butterfly. Lane 0 writes that warp sum as f64. Warp 0 adds the 8 sums, then
+# Y = X * rcp(sqrt(sum/n + 1e-6)) * W, and W is float32 indexed inside the vector. The 8 sums and
+# the scale are 72 bytes. A thread that does not exist adds a zero lane.
+skill rt_sw_rmsn(gx, bx, ps) -> Any {
+  let X = rt_sw_arg(ps, 0)
+  let W = rt_sw_arg(ps, 1)
+  let Y = rt_sw_arg(ps, 2)
+  let n = rt_sw_arg(ps, 3)
+  let blocks = rt_untag(gx)
+  let threads = rt_untag(bx)
+  let lanes = threads
+  if lanes > 256 { let lanes = 256 }
+  let full = 0
+  let rem = 0
+  if n > 0 {
+    let full = n // 256
+    let rem = n % 256
+  }
+  let tail = rem
+  if tail > lanes { let tail = lanes }
+  let per = full * lanes + tail
+  if blocks < 0 { let blocks = 0 }
+  if per < 0 { let per = 0 }
+  do rt_sw_note(blocks * per * 28)
+  let red = rt_alloc(64)
+  let buf = rt_alloc(256)
+  let b = 0
+  while b < blocks {
+    let base = b * n
+    let w = 0
+    while w < 8 {
+      let lane = 0
+      while lane < 32 {
+        do rt_poke32(buf + 4 * lane, 0)
+        let tid = w * 32 + lane
+        if tid < threads {
+          let acc = i2f(0)
+          let i = tid
+          while i < n {
+            let xf = rt_sw_f64_of(rt_sw_f32_of(peek(X + 8 * (base + i))))
+            let acc = rt_sw_fma32(xf, xf, acc)
+            let i = i + 256
+          }
+          do rt_poke32(buf + 4 * lane, rt_sw_f32_of(acc))
+        }
+        let lane = lane + 1
+      }
+      do poke(red + 8 * w, rt_sw_bfly32(buf))
+      let w = w + 1
+    }
+    let sum = peek(red)
+    let w = 1
+    while w < 8 {
+      let sum = fadd(sum, peek(red + 8 * w))
+      let w = w + 1
+    }
+    let scale = fdiv(i2f(1), fsqrt(fadd(fdiv(sum, i2f(n)), 4517329193108106637)))
+    let t = 0
+    while t < threads {
+      let i = t
+      while i < n {
+        let x = peek(X + 8 * (base + i))
+        let wf = rt_sw_f64_of(rt_peek32(W + 4 * i))
+        do poke(Y + 8 * (base + i), fmul(fmul(x, scale), wf))
+        let i = i + 256
+      }
+      let t = t + 1
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -5365,6 +5460,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "mxq6") { return rt_sw_finish(rt_sw_mxq6(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "vadd") { return rt_sw_finish(rt_sw_vadd(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "silumul") { return rt_sw_finish(rt_sw_silumul(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "rmsn") { return rt_sw_finish(rt_sw_rmsn(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

@@ -4524,6 +4524,51 @@ skill rt_sw_tred(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# y[row] = dot(A[row], x). x is one shared row in the 4 KB, or it is not.
+# A row of at most 1024 floats is copied into TMEM once, and every row reads it there.
+# A longer row does not fit, so it is not kept, and every row reads it from the bus.
+skill rt_sw_srow(gx, bx, ps) -> Any {
+  let A = rt_sw_arg(ps, 0)
+  let X = rt_sw_arg(ps, 1)
+  let Y = rt_sw_arg(ps, 2)
+  let M = rt_sw_arg(ps, 3)
+  let K = rt_sw_arg(ps, 4)
+  let fits = 0
+  if K > 0 and K <= 1024 { let fits = 1 }
+  let bytes = 0
+  if M > 0 {
+    if fits == 1 { let bytes = 4 * (M * K + K + M) }
+    if fits == 0 { let bytes = 4 * (2 * M * K + M) }
+  }
+  do rt_sw_note(bytes)
+  let base = rt_untag(rt_sw_tmem())
+  if fits == 1 {
+    let k = 0
+    while k < K {
+      do rt_sw_st32(base + 4 * k, rt_sw_ld32(X + 4 * k))
+      let k = k + 1
+    }
+  }
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let t = 0
+  while t < lim {
+    if t < M {
+      let acc = rt_sw_f64_of(0)
+      let k = 0
+      while k < K {
+        let xv = rt_sw_f64_of(0)
+        if fits == 1 { let xv = rt_sw_ld32(base + 4 * k) }
+        if fits == 0 { let xv = rt_sw_ld32(X + 4 * k) }
+        let acc = rt_sw_fma32(rt_sw_ld32(A + 4 * (t * K + k)), xv, acc)
+        let k = k + 1
+      }
+      do rt_sw_st32(Y + 4 * t, acc)
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -4548,6 +4593,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "posenc") { return rt_sw_finish(rt_sw_posenc(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "addnoise") { return rt_sw_finish(rt_sw_addnoise(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "tred") { return rt_sw_finish(rt_sw_tred(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "srow") { return rt_sw_finish(rt_sw_srow(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

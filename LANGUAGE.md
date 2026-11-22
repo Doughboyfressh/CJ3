@@ -37,8 +37,7 @@ and `./test.sh`; programs are `out/prog`, and the seed is `seed/pic`.
   - `listdir` gives names in the same order on both (as Windows sorts them).
   - `rt_now()` is local time on both; Linux reads the zone from `/etc/localtime`.
   - `spawn` starts a program by its path; a bare name (`"python3 x.py"`) goes to `/bin/sh` on Linux.
-  - Not on Linux yet: the GPU words, `http`, `screen`, `mouse`, `key`, `play`, `render`, `fgwin`, `focus`. Using
-    one stops the program with `PiRuntimeError: <name> is a Windows facility that Pi does not have on Linux yet`.
+  - On Linux, `gpu for`, `gpu_mm`, `gpu_seq`, and `rt_gpu_seqw` run on the software chip. `gpu_seq` is the `seqk` kernel and `rt_gpu_seqw` is `seqw`: the smallest program id that fits, including words, unaries, and the kernel's leaf-order pruning. `screen` is a 64 by 64 software display, `mouse` paints it, `render` draws its own bitmap, `key`, `fgwin`, and `focus("Pi")` talk to that display, `play` accepts a wav file, and `http` fetches `http://` through the same sockets as `tcp`. `https` is not implemented. The rest of the CUDA engine still asks for `nvcuda.dll` and stops. There is no Mac binary.
 
 ## Syntax
 

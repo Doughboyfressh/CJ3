@@ -2558,8 +2558,245 @@ skill rt_wait(ht, mst) -> Any {
   return rt_tag(rt_peek32(code))
 }
 
+# ---- Linux, where there is no desktop and no WinHTTP. The software is the screen: 64 by 64, white until a
+# click paints a pixel. render draws its own bitmap. http:// goes out through the same sockets as tcp.
+# https is not this. The CUDA engine is not this either.
+
+skill rt_sw_desk() -> Any {
+  let p = peek(gaddr(19))
+  if p != 0 { return p }
+  let p = rt_lx_map(64 + 64 * 64 * 4)
+  do poke(gaddr(19), p)
+  do poke(p + 48, 64)
+  do poke(p + 56, 64)
+  for i in range(0, 64 * 64 // 2) { do poke(p + 64 + 8 * i, 0 - 1) }
+  return p
+}
+
+skill rt_sw_screen(stept) -> Any {
+  let d = rt_sw_desk()
+  let sw = peek(d + 48)
+  let sh = peek(d + 56)
+  let step = rt_untag(stept)
+  if step < 1 { let step = 1 }
+  let w = sw // step
+  let h = sh // step
+  let a = rt_arr(rt_tag(w * h))
+  for y in range(0, h) {
+    for x in range(0, w) {
+      let p = d + 64 + 4 * ((y * step) * sw + x * step)
+      do poke(a + 16 + 8 * (y * w + x), rt_tag(peekb(p + 2) * 65536 + peekb(p + 1) * 256 + peekb(p)))
+    }
+  }
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(w))
+  let out = rt_append(out, rt_tag(h))
+  return rt_append(out, a)
+}
+
+skill rt_sw_render(txt, sizet, face) -> Any {
+  let n = peek(txt + 8)
+  let scale = rt_untag(sizet) // 8
+  if scale < 1 { let scale = 1 }
+  let gw = 6 * scale
+  let gh = 8 * scale
+  let w = 8 + n * gw
+  let h = 8 + gh
+  let a = rt_arr(rt_tag(w * h))
+  for i in range(0, w * h) { do poke(a + 16 + 8 * i, rt_tag(16777215)) }
+  for i in range(0, n) {
+    let c = peekb(txt + 16 + i)
+    for ry in range(0, 7) {
+      for rx in range(0, 5) {
+        let on = 0
+        if c != 32 {
+          if rx == 0 or rx == 4 or ry == c % 7 { let on = 1 }
+        }
+        if on == 1 {
+          for sy in range(0, scale) {
+            for sx in range(0, scale) {
+              let x = 4 + i * gw + rx * scale + sx
+              let y = 4 + ry * scale + sy
+              do poke(a + 16 + 8 * (y * w + x), rt_tag(0))
+            }
+          }
+        }
+      }
+    }
+  }
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(w))
+  let out = rt_append(out, rt_tag(h))
+  return rt_append(out, a)
+}
+
+skill rt_sw_mouse(xt, yt, bt) -> Any {
+  let d = rt_sw_desk()
+  let x = rt_untag(xt)
+  let y = rt_untag(yt)
+  do poke(d + 8, x)
+  do poke(d + 16, y)
+  do poke(d + 24, rt_untag(bt))
+  if x >= 0 and x < peek(d + 48) and y >= 0 and y < peek(d + 56) {
+    let p = d + 64 + 4 * (y * peek(d + 48) + x)
+    do pokeb(p, 0)
+    do pokeb(p + 1, 0)
+    do pokeb(p + 2, 0)
+  }
+  return 3
+}
+
+skill rt_sw_key(vt) -> Any {
+  do poke(rt_sw_desk() + 32, rt_untag(vt))
+  return 3
+}
+
+skill rt_sw_fgwin() -> Any {
+  let d = rt_sw_desk()
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(0))
+  let out = rt_append(out, rt_tag(0))
+  let out = rt_append(out, rt_tag(peek(d + 48)))
+  return rt_append(out, rt_tag(peek(d + 56)))
+}
+
+skill rt_sw_focus(cls) -> Any {
+  let n = peek(cls + 8)
+  if n != 2 { return 0 }
+  if peekb(cls + 16) != 80 or peekb(cls + 17) != 105 { return 0 }
+  do poke(rt_sw_desk() + 40, 1)
+  return 3
+}
+
+skill rt_sw_play(path) -> Any {
+  let h = wcall("CreateFileA", rt_cstr(path), 2147483648, 3, 0, 3, 128, 0)
+  if h == 0 - 1 { return 0 }
+  let b = rt_alloc(12)
+  do poke(gaddr(2), 0)
+  do wcall("ReadFile", h, b, 12, gaddr(2), 0)
+  do wcall("CloseHandle", h)
+  if peek(gaddr(2)) < 12 { return 0 }
+  if peekb(b) != 82 or peekb(b + 1) != 73 or peekb(b + 2) != 70 or peekb(b + 3) != 70 { return 0 }
+  if peekb(b + 8) != 87 or peekb(b + 9) != 65 or peekb(b + 10) != 86 or peekb(b + 11) != 69 { return 0 }
+  return 3
+}
+
+skill rt_sw_hostip(url, hs, hostn, sa) -> Any {
+  let dotted = 1
+  for i in range(0, hostn) {
+    let c = peekb(url + 16 + hs + i)
+    if c != 46 and (c < 48 or c > 57) { let dotted = 0 }
+  }
+  if dotted == 0 { return 0 }
+  let part = 0
+  let k = 4
+  for i in range(0, hostn) {
+    let c = peekb(url + 16 + hs + i)
+    if c == 46 {
+      do pokeb(sa + k, part)
+      let k = k + 1
+      let part = 0
+    } else {
+      let part = part * 10 + c - 48
+    }
+  }
+  do pokeb(sa + k, part)
+  return 1
+}
+
+skill rt_sw_http(url) -> Any {
+  let n = peek(url + 8)
+  if n < 8 { return 0 }
+  if peekb(url + 16 + 4) == 115 { return 0 }
+  if peekb(url + 16) != 104 { return 0 }
+  let at = 7
+  let hs = 7
+  while at < n and peekb(url + 16 + at) != 47 and peekb(url + 16 + at) != 58 { let at = at + 1 }
+  let hostn = at - hs
+  if hostn < 1 { return 0 }
+  let port = 80
+  if at < n and peekb(url + 16 + at) == 58 {
+    let at = at + 1
+    let port = 0
+    while at < n and peekb(url + 16 + at) != 47 {
+      let port = port * 10 + peekb(url + 16 + at) - 48
+      let at = at + 1
+    }
+  }
+  let sa = rt_alloc(16)
+  for i in range(0, 16) { do pokeb(sa + i, 0) }
+  do pokeb(sa, 2)
+  do pokeb(sa + 2, port // 256)
+  do pokeb(sa + 3, port % 256)
+  if rt_sw_hostip(url, hs, hostn, sa) == 0 { return 0 }
+  let s = rt_lx_socket(2, 1, 6)
+  if s == 0 - 1 { return 0 }
+  if rt_lx_connect(s, sa, 16) != 0 {
+    do rt_lx_closesocket(s)
+    return 0
+  }
+  let pathn = n - at
+  if pathn < 1 {
+    let pathn = 1
+    let at = n
+  }
+  let reqn = 4 + pathn + 18 + hostn + 23
+  let req = rt_alloc(reqn)
+  do pokeb(req, 71)
+  do pokeb(req + 1, 69)
+  do pokeb(req + 2, 84)
+  do pokeb(req + 3, 32)
+  if pathn == 1 and at == n { do pokeb(req + 4, 47) } else {
+    for i in range(0, pathn) { do pokeb(req + 4 + i, peekb(url + 16 + at + i)) }
+  }
+  let p = 4 + pathn
+  let tail = " HTTP/1.0\r\nHost: "
+  for i in range(0, 18) { do pokeb(req + p + i, peekb(tail + 16 + i)) }
+  let p = p + 18
+  for i in range(0, hostn) { do pokeb(req + p + i, peekb(url + 16 + hs + i)) }
+  let p = p + hostn
+  let end = "\r\nConnection: close\r\n\r\n"
+  for i in range(0, 23) { do pokeb(req + p + i, peekb(end + 16 + i)) }
+  let sent = 0
+  while sent < reqn {
+    let r = rt_lx_send(s, req + sent, reqn - sent, 0)
+    if r == 0 - 1 {
+      do rt_lx_closesocket(s)
+      return 0
+    }
+    let sent = sent + r
+  }
+  let cap = 65536
+  let buf = rt_alloc(cap)
+  let got = 0
+  let going = 1
+  while going == 1 {
+    if cap - got < 4096 {
+      let nb = rt_alloc(cap * 2)
+      for i in range(0, got) { do pokeb(nb + i, peekb(buf + i)) }
+      let buf = nb
+      let cap = cap * 2
+    }
+    let r = rt_lx_recv(s, buf + got, cap - got, 0)
+    if r == 0 or r == 0 - 1 { let going = 0 } else { let got = got + r }
+  }
+  do rt_lx_closesocket(s)
+  let cut = 0
+  let i = 0
+  while i + 3 < got and cut == 0 {
+    if peekb(buf + i) == 13 and peekb(buf + i + 1) == 10 and peekb(buf + i + 2) == 13 and peekb(buf + i + 3) == 10 {
+      let cut = i + 4
+    }
+    let i = i + 1
+  }
+  let t = rt_text_new(got - cut)
+  for i in range(0, got - cut) { do pokeb(t + 16 + i, peekb(buf + cut + i)) }
+  return t
+}
+
 # screen(step): what is on the screen now, every step-th pixel -> [width, height, arr of 0xRRGGBB]
 skill rt_screen(stept) -> Any {
+  if ostarget() != 0 { return rt_sw_screen(stept) }
   let step = rt_untag(stept)
   if step < 1 { let step = 1 }
   # real pixels: without this a scaled display (125%, 150%) hands Pi a resized, blurred copy of the screen
@@ -2601,6 +2838,7 @@ skill rt_screen(stept) -> Any {
 # render(text, size, font): black text on white, drawn by Windows' own font engine (GDI, smoothed like the screen)
 # -> [width, height, arr of 0xRRGGBB]; the text sits 4 pixels in from the top left. Pi's teacher for reading.
 skill rt_render(txt, sizet, face) -> Any {
+  if ostarget() != 0 { return rt_sw_render(txt, sizet, face) }
   let size = rt_untag(sizet)
   let n = peek(txt + 8)
   let s = rt_cstr(txt)
@@ -2662,6 +2900,7 @@ skill rt_wstr(s, f, n) -> Any {
 
 # http(url): GET an http:// or https:// page (WinHTTP does the TLS) -> the body as text, or null
 skill rt_http(url) -> Any {
+  if ostarget() != 0 { return rt_sw_http(url) }
   let n = peek(url + 8)
   let secure = 0
   let at = 0
@@ -2810,7 +3049,31 @@ skill rt_cu12() -> Any {
 }
 
 
+# gpu_mm(A, B, n): C = A x B for n x n matrices of integers (arr, row by row). On Linux there is no driver,
+# so this is the same 32-bit product the mm kernel computes. Windows keeps the PTX launch.
+skill rt_sw_mm(a, b, nt) -> Any {
+  let n = rt_untag(nt)
+  let cells = n * n
+  let c = rt_arr(rt_tag(cells))
+  for i in range(0, n) {
+    for j in range(0, n) {
+      let acc = 0
+      for k in range(0, n) {
+        let av = rt_untag(peek(a + 16 + 8 * (i * n + k)))
+        let bv = rt_untag(peek(b + 16 + 8 * (k * n + j)))
+        let acc = acc + av * bv
+      }
+      let acc = acc % 4294967296
+      if acc < 0 { let acc = acc + 4294967296 }
+      if acc >= 2147483648 { let acc = acc - 4294967296 }
+      do poke(c + 16 + 8 * (i * n + j), rt_tag(acc))
+    }
+  }
+  return c
+}
+
 skill rt_gpu_mm(a, b, nt) -> Any {
+  if ostarget() != 0 { return rt_sw_mm(a, b, nt) }
   let n = rt_untag(nt)
   let cells = n * n
   let bytes = 4 * cells
@@ -2872,10 +3135,97 @@ skill rt_gpu_mm(a, b, nt) -> Any {
   return c
 }
 
+# seqk, with no driver. One program per id, base B, length L. A program that matches terms 2..7 on every
+# sequence keeps the smaller id. // and % are floor, and a zero divisor is not a match. The result is one
+# id per sequence, or -1.
+skill rt_sw_seq(tg, st, lt, bt, nt, mt) -> Any {
+  let S = rt_untag(st)
+  let L = rt_untag(lt)
+  let B = rt_untag(bt)
+  let N = rt_untag(nt)
+  let off = rt_untag(mt)
+  let c = rt_arr(rt_tag(S))
+  for s in range(0, S) { do poke(c + 16 + 8 * s, rt_tag(0 - 1)) }
+  if L < 1 or B < 2 or N < 1 { return c }
+  let toks = rt_alloc(8 * L)
+  let stk = rt_alloc(64)
+  let p = 0
+  while p < N {
+    let id = off + p
+    let sp = 0
+    let ok = 1
+    let i = 0
+    while i < L {
+      let tok = id % B
+      let id = id // B
+      do poke(toks + 8 * i, tok)
+      if tok < 6 {
+        if sp >= 8 { let ok = 0 }
+        let sp = sp + 1
+      } else {
+        if sp < 2 { let ok = 0 } else { let sp = sp - 1 }
+      }
+      let i = i + 1
+    }
+    if sp != 1 { let ok = 0 }
+    if ok == 1 {
+      for s in range(0, S) {
+        let have = rt_untag(peek(c + 16 + 8 * s))
+        let n = 2
+        let match = 1
+        while n <= 7 and match == 1 {
+          let term = rt_untag(peek(tg + 16 + 8 * (s * 12 + n)))
+          let a1 = rt_untag(peek(tg + 16 + 8 * (s * 12 + n - 1)))
+          let a2 = rt_untag(peek(tg + 16 + 8 * (s * 12 + n - 2)))
+          let sp = 0
+          let bad = 0
+          let i = 0
+          while i < L and bad == 0 {
+            let tok = peek(toks + 8 * i)
+            if tok < 6 {
+              let v = n
+              if tok == 1 { let v = a1 }
+              if tok == 2 { let v = a2 }
+              if tok == 3 { let v = 1 }
+              if tok == 4 { let v = 2 }
+              if tok == 5 { let v = 3 }
+              do poke(stk + 8 * sp, v)
+              let sp = sp + 1
+            } else {
+              let sp = sp - 1
+              let b = peek(stk + 8 * sp)
+              let a = peek(stk + 8 * (sp - 1))
+              let v = a + b
+              if tok == 7 { let v = a - b }
+              if tok == 8 { let v = a * b }
+              if tok >= 9 {
+                if b == 0 { let bad = 1 } else {
+                  let v = a // b
+                  if tok == 10 { let v = a % b }
+                }
+              }
+              do poke(stk + 8 * (sp - 1), v)
+            }
+            let i = i + 1
+          }
+          if bad == 1 or peek(stk) != term { let match = 0 }
+          let n = n + 1
+        }
+        if match == 1 {
+          if have < 0 or off + p < have { do poke(c + 16 + 8 * s, rt_tag(off + p)) }
+        }
+      }
+    }
+    let p = p + 1
+  }
+  return c
+}
+
 # gpu_seq(ptx, targets, S, L, B, N, M): run a Pi-written kernel "seqk" over N candidate programs (one GPU thread
 # each) against S target sequences of 12 terms (targets = S*12 integers, sent as 64-bit). The kernel writes a match
 # count, then (program, sequence) pairs. -> [count, p0, s0, p1, s1, ...] (at most M pairs), or a negative code.
 skill rt_gpu_seq(ptx, tg, st, lt, bt, nt, mt) -> Any {
+  if ostarget() != 0 { return rt_sw_seq(tg, st, lt, bt, nt, mt) }
   let S = rt_untag(st)
   let N = rt_untag(nt)
   let M = rt_untag(mt)
@@ -3518,9 +3868,225 @@ skill rt_gpu_dotmax(ptx, at, bt, mt, nt, kt, ct) -> Any {
   return res
 }
 
+skill rt_sw_u(t, a, bad) -> Any {
+  if t == 13 {
+    let v = a
+    if v < 0 { let v = 0 - v }
+    let s = 0
+    while v > 0 {
+      let s = s + v % 10
+      let v = v // 10
+    }
+    return s
+  }
+  if t == 14 {
+    if a < 0 { do poke(bad, 1) return 0 }
+    let r = 0
+    while (r + 1) * (r + 1) <= a { let r = r + 1 }
+    return r
+  }
+  if a > 1000000 { do poke(bad, 1) return 0 }
+  if t == 11 {
+    if a < 2 { return 0 }
+    let d = 2
+    while d * d <= a {
+      if a % d == 0 { return 0 }
+      let d = d + 1
+    }
+    return 1
+  }
+  if a < 1 { return 0 }
+  let c = 0
+  let d = 1
+  while d * d <= a {
+    if a % d == 0 {
+      let c = c + 2
+      if d * d == a { let c = c - 1 }
+    }
+    let d = d + 1
+  }
+  return c
+}
+
+skill rt_sw_bin(t, a, b, bad) -> Any {
+  if t == 6 { return a + b }
+  if t == 7 { return a - b }
+  if t == 8 { return a * b }
+  if b == 0 { do poke(bad, 1) return 0 }
+  if t == 9 { return a // b }
+  return a % b
+}
+
+# seqw. Same ids as the kernel: words (18 ints each), unaries, and the leaf-order pruning. A compiled
+# word and the table are the same definition, so this runs the table.
+skill rt_sw_seqw(tg, st, lt, bt, nt, mt, wt) -> Any {
+  let S = rt_untag(st)
+  let L = rt_untag(lt)
+  let B = rt_untag(bt)
+  let N = rt_untag(nt)
+  let off = rt_untag(mt)
+  let c = rt_arr(rt_tag(S))
+  for s in range(0, S) { do poke(c + 16 + 8 * s, rt_tag(0 - 1)) }
+  if L < 1 or B < 2 or N < 1 { return c }
+  let toks = rt_alloc(8 * L)
+  let stk = rt_alloc(8 * 48)
+  let lf = rt_alloc(8 * 48)
+  let bad = rt_alloc(8)
+  let nw = peek(wt + 8) // 18
+  let p = 0
+  while p < N {
+    let id = off + p
+    let sp = 0
+    let ok = 1
+    let start = 0
+    let i = 0
+    while i < L and ok == 1 {
+      let tok = id % B
+      let id = id // B
+      do poke(toks + 8 * i, tok)
+      if tok == 1 and start < 1 { let start = 1 }
+      if tok == 2 { let start = 2 }
+      if tok < 6 {
+        if sp >= 47 { let ok = 0 } else {
+          do poke(lf + 8 * sp, tok)
+          let sp = sp + 1
+        }
+      } else {
+        if tok < 11 {
+          if sp < 2 { let ok = 0 } else {
+            let a = peek(lf + 8 * (sp - 2))
+            let b = peek(lf + 8 * (sp - 1))
+            if a < 6 and b < 6 {
+              if (tok == 6 or tok == 8) and a > b { let ok = 0 }
+              if (tok == 7 or tok >= 9) and a == b { let ok = 0 }
+              if tok == 8 and (a == 3 or b == 3) { let ok = 0 }
+              if tok == 9 and b == 3 { let ok = 0 }
+            }
+            if ok == 1 {
+              do poke(lf + 8 * (sp - 2), 99)
+              let sp = sp - 1
+            }
+          }
+        } else {
+          if tok < 15 {
+            if sp < 1 { let ok = 0 } else { do poke(lf + 8 * (sp - 1), 99) }
+          } else {
+            let wi = tok - 15
+            if wi >= nw or sp < rt_untag(peek(wt + 16 + 8 * (18 * wi))) { let ok = 0 } else {
+              let ln = rt_untag(peek(wt + 16 + 8 * (18 * wi + 1)))
+              let j = 0
+              while j < ln {
+                let bt = rt_untag(peek(wt + 16 + 8 * (18 * wi + 2 + j)))
+                if bt == 1 and start < 1 { let start = 1 }
+                if bt == 2 { let start = 2 }
+                let j = j + 1
+              }
+              let ar = rt_untag(peek(wt + 16 + 8 * (18 * wi)))
+              let sp = sp - ar + 1
+              do poke(lf + 8 * (sp - 1), 99)
+            }
+          }
+        }
+      }
+      let i = i + 1
+    }
+    if sp != 1 { let ok = 0 }
+    if ok == 1 {
+      for s in range(0, S) {
+        let have = rt_untag(peek(c + 16 + 8 * s))
+        let n = start
+        let match = 1
+        while n <= 7 and match == 1 {
+          let term = rt_untag(peek(tg + 16 + 8 * (s * 12 + n)))
+          let a1 = 0
+          let a2 = 0
+          if n >= 1 { let a1 = rt_untag(peek(tg + 16 + 8 * (s * 12 + n - 1))) }
+          if n >= 2 { let a2 = rt_untag(peek(tg + 16 + 8 * (s * 12 + n - 2))) }
+          let sp = 0
+          do poke(bad, 0)
+          let i = 0
+          while i < L and peek(bad) == 0 {
+            let tok = peek(toks + 8 * i)
+            if tok < 6 {
+              let v = n
+              if tok == 1 { let v = a1 }
+              if tok == 2 { let v = a2 }
+              if tok == 3 { let v = 1 }
+              if tok == 4 { let v = 2 }
+              if tok == 5 { let v = 3 }
+              do poke(stk + 8 * sp, v)
+              let sp = sp + 1
+            } else {
+              if tok < 15 {
+                if tok < 11 {
+                  let b = peek(stk + 8 * (sp - 1))
+                  let a = peek(stk + 8 * (sp - 2))
+                  let sp = sp - 1
+                  do poke(stk + 8 * (sp - 1), rt_sw_bin(tok, a, b, bad))
+                } else {
+                  do poke(stk + 8 * (sp - 1), rt_sw_u(tok, peek(stk + 8 * (sp - 1)), bad))
+                }
+              } else {
+                let wi = tok - 15
+                let ar = rt_untag(peek(wt + 16 + 8 * (18 * wi)))
+                let ln = rt_untag(peek(wt + 16 + 8 * (18 * wi + 1)))
+                let arg1 = 0
+                let arg0 = 0
+                if ar == 2 {
+                  let arg1 = peek(stk + 8 * (sp - 1))
+                  let sp = sp - 1
+                }
+                if ar >= 1 {
+                  let arg0 = peek(stk + 8 * (sp - 1))
+                  let sp = sp - 1
+                }
+                let j = 0
+                while j < ln and peek(bad) == 0 {
+                  let bt = rt_untag(peek(wt + 16 + 8 * (18 * wi + 2 + j)))
+                  if bt == 100 { do poke(stk + 8 * sp, arg0) let sp = sp + 1 }
+                  if bt == 101 { do poke(stk + 8 * sp, arg1) let sp = sp + 1 }
+                  if bt < 6 {
+                    let v = n
+                    if bt == 1 { let v = a1 }
+                    if bt == 2 { let v = a2 }
+                    if bt == 3 { let v = 1 }
+                    if bt == 4 { let v = 2 }
+                    if bt == 5 { let v = 3 }
+                    do poke(stk + 8 * sp, v)
+                    let sp = sp + 1
+                  }
+                  if bt >= 6 and bt < 11 {
+                    let b = peek(stk + 8 * (sp - 1))
+                    let a = peek(stk + 8 * (sp - 2))
+                    let sp = sp - 1
+                    do poke(stk + 8 * (sp - 1), rt_sw_bin(bt, a, b, bad))
+                  }
+                  if bt >= 11 and bt <= 14 {
+                    do poke(stk + 8 * (sp - 1), rt_sw_u(bt, peek(stk + 8 * (sp - 1)), bad))
+                  }
+                  let j = j + 1
+                }
+              }
+            }
+            let i = i + 1
+          }
+          if peek(bad) != 0 or peek(stk) != term { let match = 0 }
+          let n = n + 1
+        }
+        if match == 1 {
+          if have < 0 or off + p < have { do poke(c + 16 + 8 * s, rt_tag(off + p)) }
+        }
+      }
+    }
+    let p = p + 1
+  }
+  return c
+}
+
 # rt_gpu_seqw(ptx, targets, S, L, B, N, first id, words): as gpu_seq, with Pi's learned words for the kernel "seqw"
 # (words = an integer table, 18 per word: arity, length, 16 tokens), sent as 32-bit integers. Called by name.
 skill rt_gpu_seqw(ptx, tg, st, lt, bt, nt, mt, wt) -> Any {
+  if ostarget() != 0 { return rt_sw_seqw(tg, st, lt, bt, nt, mt, wt) }
   let S = rt_untag(st)
   let N = rt_untag(nt)
   if rt_cu("cuInit") == 0 { return rt_tag(0 - 1) }
@@ -3595,9 +4161,144 @@ skill rt_gpu_seqw(ptx, tg, st, lt, bt, nt, mt, wt) -> Any {
   return c
 }
 
+# ---- the software chip (Linux). The same gpu-for bytecode, with no driver. ------------------------------
+# One thread per item, in order. The same floor division, and a write of zero when a divisor is zero.
+# Windows keeps the PTX path.
+
+skill sw_binop(t, a, b) -> Any {
+  if t == 10 { return a + b }
+  if t == 11 { return a - b }
+  if t == 12 { return a * b }
+  if t == 13 or t == 14 {
+    if b == 0 { return 0 }
+    if t == 13 { return a // b }
+    return a % b
+  }
+  if t == 15 { if a < b { return 1 } return 0 }
+  if t == 16 { if a <= b { return 1 } return 0 }
+  if t == 17 { if a > b { return 1 } return 0 }
+  if t == 18 { if a >= b { return 1 } return 0 }
+  if t == 19 { if a == b { return 1 } return 0 }
+  if t == 20 { if a != b { return 1 } return 0 }
+  if t == 21 { return min(a, b) }
+  if t == 22 { return max(a, b) }
+  if a != 0 and b != 0 { return 1 }
+  if t == 24 { if a != 0 or b != 0 { return 1 } }
+  return 0
+}
+
+skill sw_expr(code, q, stop, w, caps) -> Any {
+  let st = []
+  while code[q] != stop {
+    let t = code[q]
+    if t == 2 or t == 3 or t == 4 {
+      let v = 0
+      if t == 2 { let v = aget(w, code[q + 1]) }
+      if t == 3 { let v = code[q + 1] }
+      if t == 4 { let v = caps[code[q + 1]] }
+      let st = append(st, v)
+      let q = q + 2
+    } else {
+      if t >= 30 {
+        let a = st[len(st) - 1]
+        let v = a
+        if t == 30 { let v = abs(a) }
+        if t == 31 { let v = 0 - a }
+        if t == 32 { if a == 0 { let v = 1 } else { let v = 0 } }
+        let st = slice(st, 0, len(st) - 1)
+        let st = append(st, v)
+      } else {
+        let b = st[len(st) - 1]
+        let a = st[len(st) - 2]
+        let st = slice(st, 0, len(st) - 2)
+        let st = append(st, sw_binop(t, a, b))
+      }
+      let q = q + 1
+    }
+  }
+  return [st[len(st) - 1], q + 1]
+}
+
+skill sw_skip_expr(code, q, stop) -> Any {
+  while code[q] != stop {
+    if code[q] == 2 or code[q] == 3 or code[q] == 4 { let q = q + 2 } else { let q = q + 1 }
+  }
+  return q + 1
+}
+
+skill sw_skip_stmts(code, q) -> Any {
+  while q < len(code) and code[q] != 197 and code[q] != 196 {
+    let t = code[q]
+    if t == 100 { let q = sw_skip_expr(code, q + 2, 199) }
+    if t == 101 {
+      let q = sw_skip_expr(code, q + 1, 198)
+      let q = sw_skip_stmts(code, q) + 1
+    }
+    if t == 102 {
+      let q = sw_skip_expr(code, q + 1, 198)
+      let q = sw_skip_stmts(code, q) + 1
+      let q = sw_skip_stmts(code, q) + 1
+    }
+  }
+  return q
+}
+
+skill sw_stmts(code, q, w, caps) -> Any {
+  while q < len(code) and code[q] != 197 and code[q] != 196 {
+    let t = code[q]
+    if t == 100 {
+      let r = sw_expr(code, q + 2, 199, w, caps)
+      do aset(w, code[q + 1], r[0])
+      let q = r[1]
+    }
+    if t == 101 {
+      let head = q
+      let again = 1
+      let nq = q
+      while again {
+        let rc = sw_expr(code, head + 1, 198, w, caps)
+        if rc[0] == 0 {
+          let again = 0
+          let nq = sw_skip_stmts(code, rc[1]) + 1
+        } else {
+          let nq = sw_stmts(code, rc[1], w, caps) + 1
+        }
+      }
+      let q = nq
+    }
+    if t == 102 {
+      let rc = sw_expr(code, q + 1, 198, w, caps)
+      if rc[0] != 0 {
+        let nq = sw_stmts(code, rc[1], w, caps) + 1
+        let q = sw_skip_stmts(code, nq) + 1
+      } else {
+        let nq = sw_skip_stmts(code, rc[1]) + 1
+        let q = sw_stmts(code, nq, w, caps) + 1
+      }
+    }
+  }
+  return q
+}
+
+skill sw_gpu_map(code, xs, a, n, caps, nvars, vid) -> Any {
+  let out = arr(n)
+  let w = arr(nvars)
+  for i in range(0, n) {
+    let m = mark()
+    let x = a + i
+    if xs != null { let x = xs[i] }
+    for j in range(0, nvars) { do aset(w, j, 0) }
+    do aset(w, 0, x)
+    do sw_stmts(code, 0, w, caps)
+    do aset(out, i, release(m, aget(w, vid)))
+  }
+  return out
+}
+
 # ---- gpu for (pic compiles the body to integer bytecode; here it becomes PTX, then one GPU thread per item) --------
 skill gpu_map(code, xs, a, n, caps, nvars, vid) -> Any {
   if n <= 0 { return arr(0) }
+  if platform() == "linux" { return sw_gpu_map(code, xs, a, n, caps, nvars, vid) }
   # called by its runtime name (the builtin "gpu_run" is unknown to an older seed compiler)
   return rt_gpu_run(gpu_ptx(code, nvars, vid), xs, a, n, caps)
 }
@@ -3931,6 +4632,7 @@ skill rt_s32(v) -> Any {
 }
 
 skill rt_fgwin() -> Any {
+  if ostarget() != 0 { return rt_sw_fgwin() }
   do wcallp(rt_proc("user32.dll", "SetProcessDPIAware"))
   let h = wcallp(rt_proc("user32.dll", "GetForegroundWindow"))
   let r = rt_zero(rt_alloc(16), 16)
@@ -3945,6 +4647,7 @@ skill rt_fgwin() -> Any {
 # focus(window class): bring that app's window to the front (Windows lets a program do this right after a key
 # event, so an Alt tap goes first -- Alt alone does nothing in the app) -> true, or null if there is no such window
 skill rt_focus(cls) -> Any {
+  if ostarget() != 0 { return rt_sw_focus(cls) }
   let h = wcallp(rt_proc("user32.dll", "FindWindowA"), rt_cstr(cls), 0)
   if h == 0 { return 0 }
   do wcallp(rt_proc("user32.dll", "keybd_event"), 18, 0, 0, 0)
@@ -3956,6 +4659,7 @@ skill rt_focus(cls) -> Any {
 
 # mouse(x, y, button): move the pointer, then click (0 none, 1 left, 2 right) -- Pi's hands; guarded in senses.pi
 skill rt_mouse(xt, yt, bt) -> Any {
+  if ostarget() != 0 { return rt_sw_mouse(xt, yt, bt) }
   do wcallp(rt_proc("user32.dll", "SetProcessDPIAware"))
   do wcallp(rt_proc("user32.dll", "SetCursorPos"), rt_untag(xt), rt_untag(yt))
   let b = rt_untag(bt)
@@ -3972,6 +4676,7 @@ skill rt_mouse(xt, yt, bt) -> Any {
 
 # key(virtual key code): press and release one key
 skill rt_key(vt) -> Any {
+  if ostarget() != 0 { return rt_sw_key(vt) }
   let v = rt_untag(vt)
   do wcallp(rt_proc("user32.dll", "keybd_event"), v, 0, 0, 0)
   do wcallp(rt_proc("user32.dll", "keybd_event"), v, 0, 2, 0)
@@ -3980,6 +4685,7 @@ skill rt_key(vt) -> Any {
 
 # play(path of a .wav): Pi's voice, through winmm; returns when the sound has finished
 skill rt_play(path) -> Any {
+  if ostarget() != 0 { return rt_sw_play(path) }
   let r = rt_u32(wcallp(rt_proc("winmm.dll", "PlaySoundA"), rt_cstr(path), 0, 131072))
   if r == 0 { return 0 }
   return 3

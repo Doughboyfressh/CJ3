@@ -4,11 +4,12 @@
 #      the last two must be the same file, byte for byte.
 #   2. The two systems agree: the Linux compiler cross-compiles the Windows compiler, and it must be seed/pic.exe.
 #   3. Every program with a golden file is compiled, run, and its output compared byte for byte -- the same golden
-#      files Windows is held to. Programs that need a Windows-only facility are listed in WINDOWS_ONLY and skipped.
+#      files Windows is held to. gpu for runs on the software chip, so it is not skipped. Programs that still
+#      need a Windows-only facility are listed in WINDOWS_ONLY and skipped.
 #   4. The agent remembers across runs.
 cd "$(dirname "$0")" || exit 1
 mkdir -p out
-WINDOWS_ONLY="gpuforms"
+WINDOWS_ONLY=""
 fail=0
 n=0
 rm -f out/t_g0 out/t_g1 out/t_g2

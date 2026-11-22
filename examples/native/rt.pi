@@ -6164,6 +6164,137 @@ skill rt_sw_tokinT(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+
+# order-preserving key of a double. Negatives are complemented. The rest get the sign bit set,
+# so an unsigned compare matches the float order, and a tie keeps the smaller index.
+skill rt_sw_okey(bits) -> Any {
+  let mask = bor(9223372036854775807, shl(1, 63))
+  if shr(bits, 63) != 0 { return bxor(bits, mask) }
+  return bor(bits, shl(1, 63))
+}
+
+# unsigned greater-than. The two sides are keys, so the high bit is set on every non-negative float.
+skill rt_sw_gtu(a, b) -> Any {
+  let as = shr(a, 63)
+  let bs = shr(b, 63)
+  if as != bs { return as }
+  if a > b { return 1 }
+  return 0
+}
+
+# route: one block per token, one thread per expert, at most 256. Softmax, then the eight largest
+# keys. A tie keeps the smaller index. Keys sit in TMEM (2,048 bytes) with the eight chosen
+# weights (64), one warp of the reduction (256), and the eight warp sums (64). 2,432 of the 4 KB.
+# The bus is one double in per expert and two doubles out per chosen expert.
+skill rt_sw_route(gx, bx, ps) -> Any {
+  let LG = rt_sw_arg(ps, 0)
+  let E = rt_sw_arg(ps, 1)
+  let W = rt_sw_arg(ps, 2)
+  let blocks = rt_untag(gx)
+  let lanes = rt_untag(bx)
+  if lanes > 256 { let lanes = 256 }
+  if lanes < 0 { let lanes = 0 }
+  if blocks < 0 { let blocks = 0 }
+  let chosen = lanes
+  if chosen > 8 { let chosen = 8 }
+  do rt_sw_note(blocks * (lanes * 8 + chosen * 16))
+  let mem = rt_untag(rt_sw_tmem())
+  let logits = rt_alloc(2048)
+  let probs = rt_alloc(2048)
+  let aheads = rt_alloc(2048)
+  let scratch = mem + 2112
+  let red = mem + 2368
+  let b = 0
+  while b < blocks {
+    if lanes > 0 {
+      let t = 0
+      while t < lanes {
+        let bits = peek(LG + 8 * (b * 256 + t))
+        do poke(logits + 8 * t, bits)
+        do poke(mem + 8 * t, rt_sw_okey(bits))
+        let t = t + 1
+      }
+      let warps = (lanes + 31) // 32
+      let w = 0
+      while w < warps {
+        let lane = 0
+        while lane < 32 {
+          let tid = w * 32 + lane
+          let v = peek(logits)
+          if tid < lanes { let v = peek(logits + 8 * tid) }
+          do poke(scratch + 8 * lane, v)
+          let lane = lane + 1
+        }
+        do poke(red + 8 * w, rt_sw_bflymax(scratch))
+        let w = w + 1
+      }
+      let mx = peek(red)
+      let w = 1
+      while w < warps {
+        let a = peek(red + 8 * w)
+        if flt(mx, a) { let mx = a }
+        let w = w + 1
+      }
+      let w = 0
+      while w < warps {
+        let lane = 0
+        while lane < 32 {
+          let tid = w * 32 + lane
+          let v = i2f(0)
+          if tid < lanes { let v = rt_sw_exp64(fsub(peek(logits + 8 * tid), mx)) }
+          do poke(scratch + 8 * lane, v)
+          let lane = lane + 1
+        }
+        do poke(red + 8 * w, rt_sw_bfly64(scratch))
+        let w = w + 1
+      }
+      let sum = peek(red)
+      let w = 1
+      while w < warps {
+        let sum = fadd(sum, peek(red + 8 * w))
+        let w = w + 1
+      }
+      let t = 0
+      while t < lanes {
+        let e = rt_sw_exp64(fsub(peek(logits + 8 * t), mx))
+        do poke(probs + 8 * t, fdiv(e, sum))
+        let mine = peek(mem + 8 * t)
+        let ahead = 0
+        let j = 0
+        while j < lanes {
+          let other = peek(mem + 8 * j)
+          let win = rt_sw_gtu(other, mine)
+          if other == mine {
+            if t > j { let win = 1 }
+          }
+          if win == 1 { let ahead = ahead + 1 }
+          let j = j + 1
+        }
+        do poke(aheads + 8 * t, ahead)
+        if ahead < 8 { do poke(mem + 2048 + 8 * ahead, peek(probs + 8 * t)) }
+        let t = t + 1
+      }
+      let acc = i2f(0)
+      let k = 0
+      while k < chosen {
+        let acc = fadd(acc, peek(mem + 2048 + 8 * k))
+        let k = k + 1
+      }
+      let t = 0
+      while t < lanes {
+        let ahead = peek(aheads + 8 * t)
+        if ahead < 8 {
+          do poke(E + 8 * (b * 8 + ahead), i2f(t))
+          do poke(W + 8 * (b * 8 + ahead), fdiv(peek(probs + 8 * t), acc))
+        }
+        let t = t + 1
+      }
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -6208,6 +6339,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "attn") { return rt_sw_finish(rt_sw_attn(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "tokin") { return rt_sw_finish(rt_sw_tokin(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "tokinT") { return rt_sw_finish(rt_sw_tokinT(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "route") { return rt_sw_finish(rt_sw_route(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

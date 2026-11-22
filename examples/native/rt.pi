@@ -3297,7 +3297,54 @@ skill rt_gpu_seq(ptx, tg, st, lt, bt, nt, mt) -> Any {
 
 # ---- the GPU engine's runtime (called by name): one context for the whole process, GPU memory as integer handles,
 # files copied straight to the GPU, Pi-written kernels loaded and launched. Reals cross as doubles (their bits). -----
+# Linux: the bytes live in this process. 64 MB. A launch of a kernel this chip does not run returns -400.
+skill rt_sw_copy(d, s, n) -> Any {
+  let i = 0
+  while i + 8 <= n {
+    do poke(d + i, peek(s + i))
+    let i = i + 8
+  }
+  while i < n {
+    do pokeb(d + i, peekb(s + i))
+    let i = i + 1
+  }
+  return 0
+}
+
+skill rt_sw_zero(d, n) -> Any {
+  let i = 0
+  while i + 8 <= n {
+    do poke(d + i, 0)
+    let i = i + 8
+  }
+  while i < n {
+    do pokeb(d + i, 0)
+    let i = i + 1
+  }
+  return 0
+}
+
+skill rt_sw_entry(ptx, name) -> Any {
+  let n = peek(ptx + 8)
+  let m = peek(name + 8)
+  let i = 0
+  while i + 7 + m <= n {
+    if peekb(ptx + 16 + i) == 46 and peekb(ptx + 17 + i) == 101 and peekb(ptx + 18 + i) == 110 and peekb(ptx + 19 + i) == 116 and peekb(ptx + 20 + i) == 114 and peekb(ptx + 21 + i) == 121 and peekb(ptx + 22 + i) == 32 {
+      let ok = 1
+      let j = 0
+      while j < m and ok == 1 {
+        if peekb(ptx + 23 + i + j) != peekb(name + 16 + j) { let ok = 0 }
+        let j = j + 1
+      }
+      if ok == 1 { return 1 }
+    }
+    let i = i + 1
+  }
+  return 0
+}
+
 skill rt_gpu_open() -> Any {
+  if ostarget() != 0 { return rt_tag(1) }
   if rt_cu("cuInit") == 0 { return rt_tag(0 - 1) }
   let r = rt_u32(wcallp(rt_cu("cuInit"), 0))
   if r != 0 { return rt_tag(0 - 100 - r) }
@@ -3310,6 +3357,13 @@ skill rt_gpu_open() -> Any {
 }
 
 skill rt_gpu_alloc(nt) -> Any {
+  if ostarget() != 0 {
+    let n = rt_untag(nt)
+    if n < 1 { let n = 1 }
+    let p = rt_lx_map(n)
+    do poke(gaddr(21), peek(gaddr(21)) + n)
+    return rt_tag(p)
+  }
   let d = rt_zero(rt_alloc(8), 8)
   let r = rt_u32(wcallp(rt_cu("cuMemAlloc_v2"), d, rt_untag(nt)))
   if r != 0 { return rt_tag(0 - 700 - r) }
@@ -3317,7 +3371,10 @@ skill rt_gpu_alloc(nt) -> Any {
 }
 
 # GPU memory back (a snapshot, a thought) -> 0 when it worked
-skill rt_gpu_free(dt) -> Any { return rt_tag(rt_u32(wcallp(rt_cu("cuMemFree_v2"), rt_untag(dt)))) }
+skill rt_gpu_free(dt) -> Any {
+  if ostarget() != 0 { return rt_tag(0) }
+  return rt_tag(rt_u32(wcallp(rt_cu("cuMemFree_v2"), rt_untag(dt))))
+}
 
 # bytes [off, off+n) of a file -> GPU memory at d, through one 64 MB host buffer
 skill rt_gpu_file(dt, path, offt, nt) -> Any {
@@ -3410,6 +3467,7 @@ skill rt_read_batch(ht, reqt, hbt) -> Any {
 
 # n bytes of page-locked host memory (fast copies to the GPU) -> its address, or -1
 skill rt_host_alloc(nt) -> Any {
+  if ostarget() != 0 { return rt_tag(rt_lx_map(rt_untag(nt))) }
   let p = rt_zero(rt_alloc(8), 8)
   let r = rt_u32(wcallp(rt_cu("cuMemAllocHost_v2"), p, rt_untag(nt)))
   if r != 0 { return rt_tag(0 - 1) }
@@ -3458,8 +3516,17 @@ skill rt_gpu_put_u64_async(dt, xs, ht, st) -> Any {
 # host <-> GPU copies of n bytes, a page-locked buffer's free, and a host buffer to / from a file (the brain keeps its
 # state snapshots in host memory: the VRAM they took is the experts' cache)
 skill rt_gpu_to_host(ht, dt, nt) -> Any { return rt_tag(rt_u32(wcallp(rt_cu12(), rt_untag(ht), rt_untag(dt), rt_untag(nt)))) }
-skill rt_host_to_gpu(dt, ht, nt) -> Any { return rt_tag(rt_u32(wcallp(rt_cu11(), rt_untag(dt), rt_untag(ht), rt_untag(nt)))) }
-skill rt_host_free(ht) -> Any { return rt_tag(rt_u32(wcallp(rt_cu("cuMemFreeHost"), rt_untag(ht)))) }
+skill rt_host_to_gpu(dt, ht, nt) -> Any {
+  if ostarget() != 0 {
+    do rt_sw_copy(rt_untag(dt), rt_untag(ht), rt_untag(nt))
+    return rt_tag(0)
+  }
+  return rt_tag(rt_u32(wcallp(rt_cu11(), rt_untag(dt), rt_untag(ht), rt_untag(nt))))
+}
+skill rt_host_free(ht) -> Any {
+  if ostarget() != 0 { return rt_tag(0) }
+  return rt_tag(rt_u32(wcallp(rt_cu("cuMemFreeHost"), rt_untag(ht))))
+}
 
 skill rt_host_dump(ht, nt, path) -> Any {
   let h = wcall("CreateFileA", rt_cstr(path), 1073741824, 0, 0, 2, 128, 0)
@@ -3523,6 +3590,11 @@ skill rt_gpu_fread(dt, ht, offt, nt, hbt, capt) -> Any {
 
 # n bytes of GPU memory from s to d (on the GPU, no host copy)
 skill rt_gpu_copy(dt, st, nt) -> Any {
+  if ostarget() != 0 {
+    if rt_untag(nt) <= 0 { return rt_tag(0) }
+    do rt_sw_copy(rt_untag(dt), rt_untag(st), rt_untag(nt))
+    return rt_tag(0)
+  }
   if rt_untag(nt) <= 0 { return rt_tag(0) }
   let r = rt_u32(wcallp(rt_cu("cuMemcpyDtoD_v2"), rt_untag(dt), rt_untag(st), rt_untag(nt)))
   if r != 0 { return rt_tag(0 - 1400 - r) }
@@ -3531,6 +3603,10 @@ skill rt_gpu_copy(dt, st, nt) -> Any {
 
 # n bytes of GPU memory at d set to zero
 skill rt_gpu_zero(dt, nt) -> Any {
+  if ostarget() != 0 {
+    do rt_sw_zero(rt_untag(dt), rt_untag(nt))
+    return rt_tag(0)
+  }
   let r = rt_u32(wcallp(rt_cu("cuMemsetD8_v2"), rt_untag(dt), 0, rt_untag(nt)))
   if r != 0 { return rt_tag(0 - 800 - r) }
   return rt_tag(0)
@@ -3562,6 +3638,10 @@ skill rt_gpu_dump(dt, nt, path) -> Any {
 # a list of numbers -> doubles in GPU memory at d
 skill rt_gpu_put(dt, xs) -> Any {
   let n = peek(xs + 8)
+  if ostarget() != 0 {
+    for i in range(0, n) { do poke(rt_untag(dt) + 8 * i, rt_realbits(peek(xs + 16 + 8 * i))) }
+    return rt_tag(n)
+  }
   let hb = rt_alloc(8 * n + 8)
   for i in range(0, n) { do poke(hb + 8 * i, rt_realbits(peek(xs + 16 + 8 * i))) }
   do wcallp(rt_cu11(), rt_untag(dt), hb, 8 * n)
@@ -3571,6 +3651,10 @@ skill rt_gpu_put(dt, xs) -> Any {
 # a list of integers -> raw 8-byte words in GPU memory at d (addresses, indices: not converted to doubles)
 skill rt_gpu_put_u64(dt, xs) -> Any {
   let n = peek(xs + 8)
+  if ostarget() != 0 {
+    for i in range(0, n) { do poke(rt_untag(dt) + 8 * i, rt_untag(peek(xs + 16 + 8 * i))) }
+    return rt_tag(n)
+  }
   let hb = rt_alloc(8 * n + 8)
   for i in range(0, n) { do poke(hb + 8 * i, rt_untag(peek(xs + 16 + 8 * i))) }
   do wcallp(rt_cu11(), rt_untag(dt), hb, 8 * n)
@@ -3605,6 +3689,11 @@ skill rt_gather_put(dt, bt, offs, nbt) -> Any {
 # n doubles from GPU memory at d -> a list of reals
 skill rt_gpu_get(dt, nt) -> Any {
   let n = rt_untag(nt)
+  if ostarget() != 0 {
+    let l = rt_list_new(n)
+    for i in range(0, n) { do poke(l + 16 + 8 * i, rt_mkreal(peek(rt_untag(dt) + 8 * i))) }
+    return l
+  }
   let hb = rt_alloc(8 * n + 8)
   do wcallp(rt_cu12(), hb, rt_untag(dt), 8 * n)
   let l = rt_list_new(n)
@@ -3613,6 +3702,11 @@ skill rt_gpu_get(dt, nt) -> Any {
 }
 
 skill rt_gpu_module(ptx) -> Any {
+  if ostarget() != 0 {
+    let p = rt_alloc(8)
+    do poke(p, ptx)
+    return rt_tag(p)
+  }
   let mod = rt_zero(rt_alloc(8), 8)
   let r = rt_u32(wcallp(rt_cu("cuModuleLoadData"), mod, rt_cstr(ptx)))
   if r != 0 { return rt_tag(0 - 300 - r) }
@@ -3620,6 +3714,14 @@ skill rt_gpu_module(ptx) -> Any {
 }
 
 skill rt_gpu_fn(mt, name) -> Any {
+  if ostarget() != 0 {
+    let ptx = peek(rt_untag(mt))
+    if rt_sw_entry(ptx, name) == 0 { return rt_tag(0 - 400) }
+    let f = rt_alloc(16)
+    do poke(f, ptx)
+    do poke(f + 8, name)
+    return rt_tag(f)
+  }
   let f = rt_zero(rt_alloc(8), 8)
   let r = rt_u32(wcallp(rt_cu("cuModuleGetFunction"), f, rt_untag(mt), rt_cstr(name)))
   if r != 0 { return rt_tag(0 - 400 - r) }
@@ -3629,6 +3731,7 @@ skill rt_gpu_fn(mt, name) -> Any {
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
+  if ostarget() != 0 { return rt_tag(0 - 400) }
   let n = peek(ps + 8)
   let cells = rt_alloc(8 * n + 8)
   let ptrs = rt_alloc(8 * n + 8)
@@ -3733,6 +3836,13 @@ skill rt_pid(ht) -> Any { return rt_tag(rt_u32(wcallp(rt_proc("kernel32.dll", "G
 
 # the GPU's memory -> [free bytes, total bytes]
 skill rt_gpu_meminfo() -> Any {
+  if ostarget() != 0 {
+    let total = 67108864
+    let used = peek(gaddr(21))
+    let out = rt_list_new(0)
+    let out = rt_append(out, rt_tag(total - used))
+    return rt_append(out, rt_tag(total))
+  }
   let f = rt_zero(rt_alloc(8), 8)
   let t = rt_zero(rt_alloc(8), 8)
   do wcallp(rt_cu("cuMemGetInfo_v2"), f, t)
@@ -3792,15 +3902,61 @@ skill rt_gpu_graph_go(et, st) -> Any {
 }
 
 skill rt_gpu_sync() -> Any {
+  if ostarget() != 0 { return rt_tag(0) }
   let r = rt_u32(wcallp(rt_cu10()))
   if r != 0 { return rt_tag(0 - 600 - r) }
   return rt_tag(0)
+}
+
+# dotmax, with no driver. Integers that fit in the f32 mantissa, so the sum is the same number the
+# kernel rounds. A tie keeps the earlier row. A chunk with no rows is not this.
+skill rt_sw_dotmax(at, bt, mt, nt, kt, ct) -> Any {
+  let m = rt_untag(mt)
+  let n = rt_untag(nt)
+  let k = rt_untag(kt)
+  let c = rt_untag(ct)
+  let res = rt_arr(rt_tag(2 * m * c))
+  if c < 1 or m < 1 { return res }
+  let chunk = (n + c - 1) // c
+  let t = 0
+  while t < m * c {
+    let i = t // c
+    let ch = t % c
+    let j0 = ch * chunk
+    let j1 = j0 + chunk
+    if j1 > n { let j1 = n }
+    let best = 0
+    let idx = 0
+    let have = 0
+    let j = j0
+    while j < j1 {
+      let s = 0
+      let q = 0
+      while q < k {
+        let av = rt_untag(peek(at + 16 + 8 * (i * k + q)))
+        let bv = rt_untag(peek(bt + 16 + 8 * (j * k + q)))
+        let s = s + av * bv
+        let q = q + 1
+      }
+      if have == 0 or s > best {
+        let best = s
+        let idx = j
+        let have = 1
+      }
+      let j = j + 1
+    }
+    do poke(res + 16 + 8 * (2 * t), rt_tag(best))
+    do poke(res + 16 + 8 * (2 * t + 1), rt_tag(idx))
+    let t = t + 1
+  }
+  return res
 }
 
 # rt_gpu_dotmax(ptx, A, B, m, n, k, chunks): rows of A (m x k) against rows of B (n x k), integers sent as 32-bit and
 # multiplied as floats on the GPU (kernel "dotmax", Pi-written); for every row of A and every chunk of B's rows, the
 # best dot product and which row of B gave it -> an array of m * chunks * 2 integers [best, index]. Called by name.
 skill rt_gpu_dotmax(ptx, at, bt, mt, nt, kt, ct) -> Any {
+  if ostarget() != 0 { return rt_sw_dotmax(at, bt, mt, nt, kt, ct) }
   let m = rt_untag(mt)
   let n = rt_untag(nt)
   let k = rt_untag(kt)

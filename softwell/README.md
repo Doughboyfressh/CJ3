@@ -8,7 +8,7 @@ The CPU retires one Pi statement per cycle. The kernel body is not the CPU. The 
 
 `gpu for` is one kernel. `%tid.x` picks the thread. `pi_dot` is one product. `pi_mma` is a 4×4 tile, issued once. Tiles that fit on the 256 SMs are one wave, so the pipe runs once. A second wave pays the pipe again.
 
-On Linux, Softwell is that machine. RAM is 64 KB. The SSD is 1 MB, in pages of 4 KB. An allocation past the end of RAM returns `-700`. The audio, picture, training, and volume kernels run. A shade call and shared memory return `-400`.
+On Linux, Softwell is that machine. RAM is 64 KB. The SSD is 1 MB, in pages of 4 KB, copied in at 4 bytes a cycle. `rt_sw_page` of 1,684 bytes is 421 cycles, and `rt_sw_clock` is that plus the statements `rt_sw_retire` counted. A launch does not add a beat. An allocation past the end of RAM returns `-700`. A program past the end of the SSD returns `-800`. The audio, picture, training, and volume kernels run. A shade call and shared memory return `-400`.
 
 Each operand is written on a 32-byte bus once, then kept in 4 KB of TMEM. A shared row is not read from the bus again. A line that does not fit is dropped, oldest first, and the next use reads the bus.
 

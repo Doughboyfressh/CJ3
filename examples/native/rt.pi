@@ -3360,15 +3360,61 @@ skill rt_gpu_open() -> Any {
   return rt_tag(1)
 }
 
+skill rt_sw_ram() -> Any {
+  if peek(gaddr(22)) == 0 { do poke(gaddr(22), rt_lx_map(65536)) }
+  return peek(gaddr(22))
+}
+
+skill rt_sw_host(p) -> Any { return rt_tag(p) }
+
+skill rt_sw_prog() -> Any { return rt_tag(rt_sw_ram()) }
+
+# Copy n bytes of program text into RAM. 4 bytes a cycle. Returns the first free address.
+# The program is replaced. An allocation already made is no longer in the count.
+skill rt_sw_page(src, nt) -> Any {
+  let n = rt_untag(nt)
+  if n < 0 or n > 1048576 { return rt_tag(0 - 800) }
+  let heap = 0
+  if n > 0 { let heap = ((n + 7) // 8) * 8 }
+  if heap > 65536 { return rt_tag(0 - 700) }
+  let base = rt_sw_ram()
+  if base == 0 { return rt_tag(0 - 700) }
+  let s = rt_untag(src)
+  let i = 0
+  while i < n {
+    do pokeb(base + i, peekb(s + i))
+    let i = i + 1
+  }
+  do poke(gaddr(21), heap)
+  let cyc = 0
+  if n > 0 { let cyc = (n + 3) // 4 }
+  do poke(gaddr(24), cyc)
+  let pages = 0
+  if n > 0 { let pages = (n + 4095) // 4096 }
+  do poke(gaddr(26), pages)
+  return rt_tag(base + heap)
+}
+
+skill rt_sw_retire(nt) -> Any {
+  let n = rt_untag(nt)
+  if n < 0 { let n = 0 }
+  do poke(gaddr(25), peek(gaddr(25)) + n)
+  return rt_tag(peek(gaddr(25)))
+}
+
+# The page-in plus the statements retired. A launch does not add a beat here.
+skill rt_sw_clock() -> Any { return rt_tag(peek(gaddr(24)) + peek(gaddr(25))) }
+
 skill rt_gpu_alloc(nt) -> Any {
   if ostarget() != 0 {
     let n = rt_untag(nt)
     if n < 1 { let n = 1 }
     let used = peek(gaddr(21))
     if used + n > 65536 { return rt_tag(0 - 700) }
-    let p = rt_lx_map(n)
+    let base = rt_sw_ram()
+    if base == 0 { return rt_tag(0 - 700) }
     do poke(gaddr(21), used + n)
-    return rt_tag(p)
+    return rt_tag(base + used)
   }
   let d = rt_zero(rt_alloc(8), 8)
   let r = rt_u32(wcallp(rt_cu("cuMemAlloc_v2"), d, rt_untag(nt)))

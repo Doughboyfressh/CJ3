@@ -1,0 +1,132 @@
+# The checkpoint's own layer numbers, not the config's.
+# config id t is file layer t-1. File layers are 0..92.
+# A file layer is DSA exactly when L == 92 or (L >= 3 and L % 4 == 3).
+# That matches the indexer tensor on all 93 layers: 24 DSA, 69 KDA. Layer 0 is the
+# only dense MLP, and it is one of the 69.
+# Refused, whole tensor or whole row, because the training half does not name the rest:
+#   layer-1 dt_bias, 12,288 values, every one negative, 12,281 distinct, held-out mode hits 0.
+#   layer-1 routed-expert norm, 3,584 values, 142 distinct, the mode hits 22 of 1,792.
+#   layer 3 (a DSA layer), expert 0, w2 row 0: mode 1 hits 188 of 1,536, halves differ in 1,418.
+# q, k and v convolutions were compared outside this program: 0 of 49,152 taps match, 0 are negations.
+# Those three tensors are not stored. Unread packed tensors stay unread.
+skill file_dsa(L) -> Any {
+  if L == 92 { return 1 }
+  if L >= 3 {
+    if L % 4 == 3 { return 1 }
+  }
+  return 0
+}
+skill load(path, n) -> Any {
+  let parts = split(trim(read_file(path)), " ")
+  let a = arr(n)
+  for i in range(0, n) { do aset(a, i, num(parts[i])) }
+  return a
+}
+skill score_arr(xs, n) -> Any {
+  let h = n // 2
+  let best = 0
+  let maj = aget(xs, 0)
+  for i in range(0, h) {
+    let c = 0
+    for j in range(0, h) {
+      if aget(xs, j) == aget(xs, i) { let c = c + 1 }
+    }
+    if c > best {
+      let best = c
+      let maj = aget(xs, i)
+    }
+  }
+  let heldm = 0
+  let diffs = 0
+  for i in range(0, h) {
+    if aget(xs, h + i) == maj { let heldm = heldm + 1 }
+    if aget(xs, i) != aget(xs, h + i) { let diffs = diffs + 1 }
+  }
+  let kinds = 0
+  for i in range(0, n) {
+    let earlier = 0
+    for j in range(0, i) {
+      if aget(xs, j) == aget(xs, i) { let earlier = 1 }
+    }
+    if earlier == 0 { let kinds = kinds + 1 }
+  }
+  return [kinds, best, heldm, diffs]
+}
+skill score_codes(codes) -> Any {
+  let hist = arr(16)
+  for i in range(0, 1536) {
+    let c = aget(codes, i)
+    do aset(hist, c, aget(hist, c) + 1)
+  }
+  let maj = 0
+  let best = 0
+  for c in range(0, 16) {
+    if aget(hist, c) > best {
+      let best = aget(hist, c)
+      let maj = c
+    }
+  }
+  let heldm = 0
+  let diffs = 0
+  for i in range(0, 1536) {
+    if aget(codes, 1536 + i) == maj { let heldm = heldm + 1 }
+    if aget(codes, i) != aget(codes, 1536 + i) { let diffs = diffs + 1 }
+  }
+  let seen = arr(16)
+  for i in range(0, 3072) { do aset(seen, aget(codes, i), 1) }
+  let kinds = 0
+  for c in range(0, 16) {
+    if aget(seen, c) == 1 { let kinds = kinds + 1 }
+  }
+  return [maj, best, heldm, diffs, kinds]
+}
+
+skill main() -> Any {
+  let s = trim(read_file("examples/native/kimi_layers.txt"))
+  let bad = 0
+  let nd = 0
+  for i in range(0, 93) {
+    let bit = num(slice(s, i, i + 1))
+    if bit != file_dsa(i) { let bad = bad + 1 }
+    if bit == 1 { let nd = nd + 1 }
+  }
+  let dt = load("examples/native/kimi_dt.txt", 12288)
+  let neg = 0
+  for i in range(0, 12288) {
+    if aget(dt, i) >= 2147483648 { let neg = neg + 1 }
+  }
+  let norm = load("examples/native/kimi_rnorm.txt", 3584)
+  let bs = load("examples/native/kimi_l3.txt", 1536)
+  let codes = arr(3072)
+  for i in range(0, 1536) {
+    let b = aget(bs, i)
+    do aset(codes, i * 2, b % 16)
+    do aset(codes, i * 2 + 1, b // 16)
+  }
+  let text = "file dsa L%4==3 or 92\nrefused dt\nrefused rnorm\nrefused L3 row\n"
+  let slot = rt_sw_ssd_alloc(128)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  let again = rt_sw_ssd_gets(slot)
+  print(len(s) == 93)
+  print(bad == 0)
+  print(nd == 24)
+  print(93 - nd == 69)
+  print(file_dsa(0) == 0)
+  print(file_dsa(3) == 1)
+  print(file_dsa(4) == 0)
+  print(file_dsa(92) == 1)
+  print(96 * 128 == 12288)
+  print(neg == 12288)
+  print(score_arr(dt, 12288) == [12281, 2, 0, 6144])
+  print(score_arr(norm, 3584) == [142, 36, 22, 1770])
+  print(score_codes(codes) == [1, 171, 188, 1418, 16])
+  print(read == 1024)
+  print(again == got)
+  print(got == text)
+  return 0
+}

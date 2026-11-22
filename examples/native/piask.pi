@@ -1,0 +1,206 @@
+# One search, five questions. The pairs are data. No question has its own formula.
+# The language is arithmetic, a long single cut, and two cuts. A program that fails
+# is not stored. An answer is forced only when every survivor agrees.
+# Six points of the falling line force the next values. Four points do not.
+# Powers of two have no survivor. Below zero, the two-cut sample is not forced.
+skill ev(e, x) -> Any {
+  let k = e[0]
+  if k == 0 { return e[1] }
+  if k == 1 { return x }
+  let L = ev(e[1], x)
+  let R = ev(e[2], x)
+  if L == 1000000000 { return 1000000000 }
+  if R == 1000000000 { return 1000000000 }
+  if k == 2 { return L + R }
+  if k == 3 { return L - R }
+  if k == 4 { return L * R }
+  if R == 0 { return 1000000000 }
+  if L % R != 0 { return 1000000000 }
+  return L // R
+}
+skill ev3(c1, c2, a, b, d, x) -> Any {
+  if x < c1 { return ev(a, x) }
+  if x < c2 { return ev(b, x) }
+  return ev(d, x)
+}
+skill ev1(c, t, e, x) -> Any {
+  if x < c { return ev(t, x) }
+  return ev(e, x)
+}
+skill holds(got, pairs) -> Any {
+  let i = 0
+  for p in pairs {
+    if got[i] != p[1] { return 0 }
+    let i = i + 1
+  }
+  return 1
+}
+skill observe(seen, val, bad, i, w) -> Any {
+  if aget(bad, i) == 1 { return 0 }
+  if aget(seen, i) == 0 {
+    do aset(seen, i, 1)
+    do aset(val, i, w)
+    return 0
+  }
+  if aget(val, i) != w { do aset(bad, i, 1) }
+  return 0
+}
+skill ask(atoms, mid, deep, shorts, cuts, pairs, queries) -> Any {
+  let nq = len(queries)
+  let seen = arr(nq)
+  let val = arr(nq)
+  let bad = arr(nq)
+  let cnt = 0
+  let np = len(pairs)
+  for e in atoms {
+    let got = []
+    for p in pairs { let got = append(got, ev(e, p[0])) }
+    if holds(got, pairs) == 1 {
+      let cnt = cnt + 1
+      let i = 0
+      for q in queries {
+        do observe(seen, val, bad, i, ev(e, q))
+        let i = i + 1
+      }
+    }
+  }
+  for e in mid {
+    let got = []
+    for p in pairs { let got = append(got, ev(e, p[0])) }
+    if holds(got, pairs) == 1 {
+      let cnt = cnt + 1
+      let i = 0
+      for q in queries {
+        do observe(seen, val, bad, i, ev(e, q))
+        let i = i + 1
+      }
+    }
+  }
+  for e in deep {
+    let got = []
+    for p in pairs { let got = append(got, ev(e, p[0])) }
+    if holds(got, pairs) == 1 {
+      let cnt = cnt + 1
+      let i = 0
+      for q in queries {
+        do observe(seen, val, bad, i, ev(e, q))
+        let i = i + 1
+      }
+    }
+  }
+  let m = len(shorts)
+  for cut in cuts {
+    for i in range(0, m) {
+      for j in range(0, m) {
+        for k in range(0, m) {
+          let ok = 1
+          for p in pairs {
+            if ev3(cut[0], cut[1], shorts[i], shorts[j], shorts[k], p[0]) != p[1] {
+              let ok = 0
+            }
+          }
+          if ok == 1 {
+            let cnt = cnt + 1
+            let qi = 0
+            for q in queries {
+              do observe(seen, val, bad, qi, ev3(cut[0], cut[1], shorts[i], shorts[j], shorts[k], q))
+              let qi = qi + 1
+            }
+          }
+        }
+      }
+    }
+  }
+  for c in [0, 1, 2, 3, 4] {
+    for ai in range(0, 4) {
+      for di in range(0, len(deep)) {
+        let ok = 1
+        for p in pairs {
+          if ev1(c, atoms[ai], deep[di], p[0]) != p[1] { let ok = 0 }
+        }
+        if ok == 1 {
+          let cnt = cnt + 1
+          let qi = 0
+          for q in queries {
+            do observe(seen, val, bad, qi, ev1(c, atoms[ai], deep[di], q))
+            let qi = qi + 1
+          }
+        }
+        let ok = 1
+        for p in pairs {
+          if ev1(c, deep[di], atoms[ai], p[0]) != p[1] { let ok = 0 }
+        }
+        if ok == 1 {
+          let cnt = cnt + 1
+          let qi = 0
+          for q in queries {
+            do observe(seen, val, bad, qi, ev1(c, deep[di], atoms[ai], q))
+            let qi = qi + 1
+          }
+        }
+      }
+    }
+  }
+  let out = [cnt]
+  for i in range(0, nq) {
+    if aget(seen, i) == 0 { let out = append(out, [0, 0]) }
+    if aget(seen, i) == 1 {
+      if aget(bad, i) == 1 { let out = append(out, [0, 0]) }
+      if aget(bad, i) == 0 { let out = append(out, [1, aget(val, i)]) }
+    }
+  }
+  return out
+}
+
+skill main() -> Any {
+  let atoms = [[0, 0], [0, 1], [0, 2], [1]]
+  let ops = [2, 3, 4, 5]
+  let mid = []
+  for op in ops {
+    for a in atoms {
+      for b in atoms {
+        let mid = append(mid, [op, a, b])
+      }
+    }
+  }
+  let deep = []
+  for op in ops {
+    for a in atoms {
+      for b in mid {
+        let deep = append(deep, [op, a, b])
+        let deep = append(deep, [op, b, a])
+      }
+    }
+  }
+  let shorts = atoms
+  for e in mid { let shorts = append(shorts, e) }
+  let cuts = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]]
+  let line = []
+  for x in range(0, 6) { let line = append(line, [x, 1 - x]) }
+  let few = []
+  for x in range(0, 4) { let few = append(few, [x, 1 - x]) }
+  let piece = [[0, 0], [1, 1], [2, 4], [3, 6], [4, 16], [5, 25]]
+  let longp = [[0, 0], [1, 1], [2, 2], [3, 6], [4, 12]]
+  let pow = [[0, 1], [1, 2], [2, 4], [3, 8]]
+  let a = ask(atoms, mid, deep, shorts, cuts, line, [6, 8, 0 - 1])
+  let b = ask(atoms, mid, deep, shorts, cuts, few, [4])
+  let c = ask(atoms, mid, deep, shorts, cuts, piece, [6, 8, 0 - 1])
+  let d = ask(atoms, mid, deep, shorts, cuts, longp, [5, 7, 0 - 1])
+  let e = ask(atoms, mid, deep, shorts, cuts, pow, [4])
+  let text = "the pairs are the question\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(a == [1330, [1, 0 - 5], [1, 0 - 7], [0, 0]])
+  print(b == [7006, [0, 0]])
+  print(c == [27, [1, 36], [1, 64], [0, 0]])
+  print(d == [6, [1, 20], [1, 42], [1, 0 - 1]])
+  print(e == [0, [0, 0]])
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

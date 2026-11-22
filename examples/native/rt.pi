@@ -3841,6 +3841,98 @@ skill rt_sw_conv(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+skill rt_sw_mul32(a, b) -> Any { return rt_sw_f64_of(rt_sw_f32_of(fmul(a, b))) }
+
+skill rt_sw_add32(a, b) -> Any { return rt_sw_f64_of(rt_sw_f32_of(fadd(a, b))) }
+
+skill rt_sw_div32(a, b) -> Any { return rt_sw_f64_of(rt_sw_f32_of(fdiv(a, b))) }
+
+skill rt_sw_sqrt32(a) -> Any { return rt_sw_f64_of(rt_sw_f32_of(fsqrt(a))) }
+
+# nearest integer, ties to even, from a double's bits
+skill rt_sw_rni(dbits) -> Any {
+  let t = f2i(dbits)
+  let whole = i2f(t)
+  let ad = dbits
+  let aw = whole
+  if flt(dbits, i2f(0)) {
+    let ad = fsub(i2f(0), dbits)
+    let aw = fsub(i2f(0), whole)
+  }
+  let diff = fsub(ad, aw)
+  let half = fdiv(i2f(1), i2f(2))
+  let away = 0
+  if flt(half, diff) { let away = 1 }
+  if flt(diff, half) == 0 and flt(half, diff) == 0 {
+    if band(t, 1) == 1 { let away = 1 }
+  }
+  if away == 0 { return t }
+  if flt(dbits, i2f(0)) { return t - 1 }
+  return t + 1
+}
+
+skill rt_sw_byte(pt, it) -> Any { return rt_tag(peekb(rt_untag(pt) + rt_untag(it))) }
+
+# pi_mix: dry and wet scaled, then x / (1 + x^4)^(1/4), then the 24-bit sample.
+skill rt_sw_mix(gx, bx, ps) -> Any {
+  let dry = rt_untag(peek(ps + 16))
+  let wet = rt_untag(peek(ps + 24))
+  let pcm = rt_untag(peek(ps + 32))
+  let start = rt_untag(peek(ps + 40))
+  let n = rt_untag(peek(ps + 48))
+  let dryg = rt_untag(peek(ps + 56))
+  let wetg = rt_untag(peek(ps + 64))
+  let pbs = rt_untag(peek(ps + 72))
+  let blocks = rt_untag(gx)
+  let tx = rt_untag(bx)
+  let scale = rt_sw_f64_of(1258291198)
+  let unit = rt_sw_f64_of(1065353216)
+  let g0 = rt_sw_mul32(rt_sw_f64_of(rt_sw_f32_of(i2f(dryg))), rt_sw_f64_of(897988541))
+  let g1 = rt_sw_mul32(rt_sw_f64_of(rt_sw_f32_of(i2f(wetg))), rt_sw_f64_of(897988541))
+  let b = 0
+  while b < blocks {
+    let th = 0
+    while th < tx {
+      let t = b * pbs + th
+      if t < n {
+        let idx = start + t
+        let dL = rt_sw_f64_of(rt_peek32(dry + 8 * idx))
+        let dR = rt_sw_f64_of(rt_peek32(dry + 8 * idx + 4))
+        let wL = rt_sw_f64_of(rt_peek32(wet + 8 * idx))
+        let wR = rt_sw_f64_of(rt_peek32(wet + 8 * idx + 4))
+        let L = rt_sw_fma32(wL, g1, rt_sw_mul32(dL, g0))
+        let R = rt_sw_fma32(wR, g1, rt_sw_mul32(dR, g0))
+        let aL = band(L, 9223372036854775807)
+        let pL = rt_sw_mul32(aL, aL)
+        let pL = rt_sw_mul32(pL, pL)
+        let pL = rt_sw_add32(pL, unit)
+        let pL = rt_sw_sqrt32(pL)
+        let pL = rt_sw_sqrt32(pL)
+        let L = rt_sw_mul32(rt_sw_div32(L, pL), scale)
+        let aR = band(R, 9223372036854775807)
+        let pR = rt_sw_mul32(aR, aR)
+        let pR = rt_sw_mul32(pR, pR)
+        let pR = rt_sw_add32(pR, unit)
+        let pR = rt_sw_sqrt32(pR)
+        let pR = rt_sw_sqrt32(pR)
+        let R = rt_sw_mul32(rt_sw_div32(R, pR), scale)
+        let iL = rt_sw_rni(L)
+        let iR = rt_sw_rni(R)
+        let p = pcm + 6 * idx
+        do pokeb(p, band(iL, 255))
+        do pokeb(p + 1, band(shr(iL, 8), 255))
+        do pokeb(p + 2, band(shr(iL, 16), 255))
+        do pokeb(p + 3, band(iR, 255))
+        do pokeb(p + 4, band(shr(iR, 8), 255))
+        do pokeb(p + 5, band(shr(iR, 16), 255))
+      }
+      let th = th + 1
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -3848,6 +3940,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
     let rec = rt_untag(ft)
     if rec <= 0 { return rt_tag(0 - 400) }
     if rt_sw_text_is(peek(rec + 8), "pi_conv") { return rt_sw_conv(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "pi_mix") { return rt_sw_mix(gxt, bxt, ps) }
     return rt_tag(0 - 400)
   }
   let n = peek(ps + 8)

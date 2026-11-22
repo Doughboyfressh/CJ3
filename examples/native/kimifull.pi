@@ -1,0 +1,208 @@
+# What of Kimi K3.1 Pro is a function, and what was read and refused.
+# The checkpoint has 497,340 tensors and 1,561,217,377,280 bytes. It is not on this machine.
+# Kept, because each one predicts a held-out case:
+#   SiTU, betas 4 and 25, from config.json.
+#   The delta rule: a full write replaces the state, a zero write keeps it, a zero gate forgets it.
+#   Top-k selection, which is what the router (16 of 896) and DSA (2048) do.
+#   The layer schedule: DSA is every 4th layer from 4 through 92, plus layer 93. The other 69 are KDA.
+# Read and refused, because the training half does not name the held-out half:
+#   w2 row 0 of layer-1 experts 0, 100, 400, 800 and 895.
+#   layer-1 A_log (128), o_norm (128) and the router bias (896), the whole vector, as raw bits.
+# Unread, so not distilled: the other 494,592 packed expert tensors, and the other 2,745 tensors
+# that are not those three. A cold read of this verdict is one page. The weights are not stored.
+skill sigmoid(x) -> Any { return 1.0 / (1.0 + exp(0.0 - x)) }
+skill tanh(x) -> Any {
+  let e = exp(x + x)
+  return (e - 1.0) / (e + 1.0)
+}
+skill silu(x) -> Any { return x * sigmoid(x) }
+skill situ_gate(x) -> Any { return 4.0 * tanh(x / 4.0) * sigmoid(x) }
+skill situ_up(y) -> Any { return 25.0 * tanh(y / 25.0) }
+skill situ(x, y) -> Any { return situ_gate(x) * situ_up(y) }
+skill abs(x) -> Any {
+  if x < 0.0 { return 0.0 - x }
+  return x
+}
+skill delta(s, beta, k, alpha, v) -> Any {
+  return (1 - beta * k * k) * alpha * s + beta * k * v
+}
+skill topk(xs, k) -> Any {
+  let used = arr(len(xs))
+  let out = []
+  for n in range(0, k) {
+    let bi = 0
+    let best = 0
+    let seen = 0
+    for i in range(0, len(xs)) {
+      if aget(used, i) == 0 {
+        if seen == 0 {
+          let best = xs[i]
+          let bi = i
+          let seen = 1
+        }
+        if xs[i] > best {
+          let best = xs[i]
+          let bi = i
+        }
+      }
+    }
+    do aset(used, bi, 1)
+    let out = append(out, bi)
+  }
+  return out
+}
+skill is_dsa(t) -> Any {
+  if t == 93 { return 1 }
+  if t >= 4 {
+    if t % 4 == 0 { return 1 }
+  }
+  return 0
+}
+skill score_codes(codes) -> Any {
+  let hist = arr(16)
+  for i in range(0, 1536) {
+    let c = aget(codes, i)
+    do aset(hist, c, aget(hist, c) + 1)
+  }
+  let maj = 0
+  let best = 0
+  for c in range(0, 16) {
+    if aget(hist, c) > best {
+      let best = aget(hist, c)
+      let maj = c
+    }
+  }
+  let heldm = 0
+  let diffs = 0
+  for i in range(0, 1536) {
+    if aget(codes, 1536 + i) == maj { let heldm = heldm + 1 }
+    if aget(codes, i) != aget(codes, 1536 + i) { let diffs = diffs + 1 }
+  }
+  let seen = arr(16)
+  for i in range(0, 3072) { do aset(seen, aget(codes, i), 1) }
+  let kinds = 0
+  for c in range(0, 16) {
+    if aget(seen, c) == 1 { let kinds = kinds + 1 }
+  }
+  return [maj, best, heldm, diffs, kinds]
+}
+skill score_bits(xs) -> Any {
+  let n = len(xs)
+  let h = n // 2
+  let best = 0
+  let maj = xs[0]
+  for i in range(0, h) {
+    let c = 0
+    for j in range(0, h) {
+      if xs[j] == xs[i] { let c = c + 1 }
+    }
+    if c > best {
+      let best = c
+      let maj = xs[i]
+    }
+  }
+  let heldm = 0
+  let diffs = 0
+  for i in range(0, h) {
+    if xs[h + i] == maj { let heldm = heldm + 1 }
+    if xs[i] != xs[h + i] { let diffs = diffs + 1 }
+  }
+  let kinds = 0
+  for i in range(0, n) {
+    let earlier = 0
+    for j in range(0, i) {
+      if xs[j] == xs[i] { let earlier = 1 }
+    }
+    if earlier == 0 { let kinds = kinds + 1 }
+  }
+  return [kinds, best, heldm, diffs]
+}
+skill nums(line) -> Any {
+  let out = []
+  for p in split(line, " ") { let out = append(out, num(p)) }
+  return out
+}
+
+skill main() -> Any {
+  let xs = [1.0, 2.0, 3.0, 0.0 - 4.0, 8.0, 6.0]
+  let gates = 0
+  let ups = 0
+  let both = 0
+  for x in xs {
+    if abs(situ_gate(x)) < abs(silu(x)) { if abs(situ_gate(x)) < 4.0 { let gates = gates + 1 } }
+    if abs(situ_up(x)) < abs(x) { if abs(situ_up(x)) < 25.0 { let ups = ups + 1 } }
+    if abs(situ(x, x)) < abs(silu(x) * x) { if abs(situ(x, x)) < 100.0 { let both = both + 1 } }
+  }
+  let scores = [1, 5, 3, 9, 2, 8, 4, 7]
+  let picked = topk(scores, 3)
+  let dsa = 0
+  let kda = 0
+  for t in range(1, 94) {
+    if is_dsa(t) == 1 { let dsa = dsa + 1 }
+    if is_dsa(t) == 0 { let kda = kda + 1 }
+  }
+  let lines = split(trim(read_file("examples/native/kimi_rows.txt")), "\n")
+  let want = [[9, 164, 162, 1416, 16], [9, 184, 153, 1428, 16], [1, 179, 177, 1420, 16], [1, 168, 172, 1414, 16], [9, 182, 165, 1413, 16]]
+  let rowbad = 0
+  let rowlens = 0
+  for r in range(0, 5) {
+    let bs = nums(lines[r])
+    if len(bs) == 1536 { let rowlens = rowlens + 1 }
+    let codes = arr(3072)
+    for i in range(0, 1536) {
+      let b = bs[i]
+      do aset(codes, i * 2, b % 16)
+      do aset(codes, i * 2 + 1, b // 16)
+    }
+    let g = score_codes(codes)
+    for f in range(0, 5) {
+      if g[f] != want[r][f] { let rowbad = rowbad + 1 }
+    }
+  }
+  let al = score_bits(nums(trim(read_file("examples/native/kimi_A_log.txt"))))
+  let on = score_bits(nums(trim(read_file("examples/native/kimi_o_norm.txt"))))
+  let bias = score_bits(nums(trim(read_file("examples/native/kimi_bias.txt"))))
+  let packed = 82432 * 6
+  let text = "kept situ\nkept delta\nkept topk\nkept schedule\nrefused 5 rows\nrefused 3 vectors\nunread 494592\n"
+  let slot = rt_sw_ssd_alloc(128)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  let again = rt_sw_ssd_gets(slot)
+  print(exp(0.0) == 1.0)
+  print(situ(0.0, 5.0) == 0.0)
+  print(situ(5.0, 0.0) == 0.0)
+  print(gates == 6)
+  print(ups == 6)
+  print(both == 6)
+  print(delta(3, 1, 1, 1, 7) == 7)
+  print(delta(9, 1, 1, 1, 7) == 7)
+  print(delta(3, 0, 1, 1, 7) == 3)
+  print(delta(9, 0, 1, 1, 7) == 9)
+  print(delta(3, 0, 1, 0, 7) == 0)
+  print(delta(9, 0, 1, 0, 7) == 0)
+  print(picked == [3, 5, 7])
+  print(picked != [0, 1, 2])
+  print(dsa == 24)
+  print(kda == 69)
+  print(dsa + kda == 93)
+  print(len(lines) == 5)
+  print(rowlens == 5)
+  print(rowbad == 0)
+  print(al == [97, 1, 0, 64])
+  print(on == [128, 1, 0, 64])
+  print(bias == [896, 1, 0, 448])
+  print(packed == 494592)
+  print(packed + 2748 == 497340)
+  print(1536 + 96 == 1632)
+  print((1632 + 31) // 32 == 51)
+  print((1632 + 3) // 4 == 408)
+  print(408 == 8 * 51)
+  print(read == 1024)
+  print(again == got)
+  print(got == text)
+  return 0
+}

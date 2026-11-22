@@ -1,0 +1,66 @@
+# Instant learning: the label is a program, so the dataset is not stored.
+# 82,340 printable tokens are already on the disk. A form-label is the token plus
+# "s" or "ing" when that string is also a token. That closure is 8,401 plus 1,798
+# pairs. Writing them out would be a new table. This program adds none.
+# green, hand, light, river, stone, chair, paper, and train were not in the
+# embedding tests. hot labels "hots" because that token exists. king and cloud
+# have neither form, so the label is empty rather than an English guess.
+skill load() -> Any {
+  let m = {}
+  for line in split(trim(read_file("examples/native/kimi_vocab.txt")), "\n") {
+    let cs = chars(line)
+    let i = 0
+    let rank = 0
+    while ord(cs[i]) != 32 {
+      let rank = rank * 10 + (ord(cs[i]) - 48)
+      let i = i + 1
+    }
+    let m = put(m, slice(line, i + 1, len(line)), rank)
+  }
+  return m
+}
+skill present(m, s) -> Any {
+  if get(m, s, 0 - 1) >= 0 { return 1 }
+  return 0
+}
+skill label(m, w) -> Any {
+  if present(m, w ++ "s") == 1 { return w ++ "s" }
+  if present(m, w ++ "ing") == 1 { return w ++ "ing" }
+  return ""
+}
+
+skill main() -> Any {
+  let m = load()
+  let ns = 0
+  let ni = 0
+  for w in keys(m) {
+    if present(m, w ++ "s") == 1 { let ns = ns + 1 }
+    if present(m, w ++ "ing") == 1 { let ni = ni + 1 }
+  }
+  let text = "the label is the program\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - p
+  print(len(m) == 82340)
+  print(ns == 8401)
+  print(ni == 1798)
+  print(ns + ni == 10199)
+  print(label(m, "green") == "greens")
+  print(label(m, "hand") == "hands")
+  print(label(m, "light") == "lights")
+  print(label(m, "river") == "rivers")
+  print(label(m, "stone") == "stones")
+  print(label(m, "chair") == "chairs")
+  print(label(m, "paper") == "papers")
+  print(label(m, "train") == "training")
+  print(label(m, "king") == "")
+  print(label(m, "hot") == "hots")
+  print(label(m, "cloud") == "")
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

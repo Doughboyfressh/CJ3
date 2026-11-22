@@ -1,0 +1,44 @@
+# Capacity. A KDA head has dimension 128, so it holds at most 128 orthogonal unit keys.
+# In dimension 2 the same fact is exact: two unit keys with determinant 25 span the plane,
+# and the only vector orthogonal to both is 0.
+# A third unit key, (1, 0), written with value 0, changes both stored reads.
+# 96 heads of width 128 are 12,288 slots. A 129th key inside one head does not fit.
+skill step(sx, sy, sd, kx, ky, v) -> Any {
+  let numer = v * 5 * sd - (kx * sx + ky * sy)
+  let nx = 25 * sx + kx * numer
+  let ny = 25 * sy + ky * numer
+  return [nx, ny, 25 * sd]
+}
+skill readn(s, kx, ky) -> Any { return kx * s[0] + ky * s[1] }
+
+skill main() -> Any {
+  let s = step(0, 0, 1, 3, 4, 5)
+  let s = step(s[0], s[1], s[2], 0 - 4, 3, 2)
+  let den = 5 * s[2]
+  let r1 = readn(s, 3, 4)
+  let r2 = readn(s, 0 - 4, 3)
+  let t = step(s[0], s[1], s[2], 5, 0, 0)
+  let tden = 5 * t[2]
+  let q1 = readn(t, 3, 4)
+  let q2 = readn(t, 0 - 4, 3)
+  let det = 3 * 3 - 4 * (0 - 4)
+  let text = "two keys fill the state\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - p
+  print(r1 == 5 * den)
+  print(r2 == 2 * den)
+  print(det == 25)
+  print(q1 != 5 * tden)
+  print(q2 != 2 * tden)
+  print(q1 * 25 == 104 * tden)
+  print(q2 * 25 == 78 * tden)
+  print(96 * 128 == 12288)
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

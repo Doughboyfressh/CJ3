@@ -6910,6 +6910,27 @@ skill rt_sw_dnet4(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# lsum: each of n raw integers, combined, then added. op 0 multiplies by k. op 1 squares.
+# The list is read and the sum is written. n of them are n * 8 bytes, and the sum is 8 more.
+skill rt_sw_lsum(gx, bx, ps) -> Any {
+  let src = rt_sw_arg(ps, 0)
+  let n = rt_sw_arg(ps, 1)
+  let k = rt_sw_arg(ps, 2)
+  let dst = rt_sw_arg(ps, 3)
+  let op = rt_sw_arg(ps, 4)
+  if n < 0 { let n = 0 }
+  do rt_sw_note(n * 8 + 8)
+  let s = 0
+  let i = 0
+  while i < n {
+    let v = peek(src + 8 * i)
+    if op == 1 { let s = s + v * v } else { let s = s + v * k }
+    let i = i + 1
+  }
+  do poke(dst, i2f(s))
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -6960,6 +6981,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "conv") { return rt_sw_finish(rt_sw_kconv(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "combine") { return rt_sw_finish(rt_sw_combine(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "dnet4") { return rt_sw_finish(rt_sw_dnet4(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "lsum") { return rt_sw_finish(rt_sw_lsum(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

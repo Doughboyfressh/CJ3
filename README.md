@@ -64,7 +64,7 @@ out/heed memory out/lessons.txt use "product of ravels" 3,5,7
 
 On Windows, build with `build.cmd examples\native\heed.pi` and run `out\heed.exe`.
 The lesson file stores observations. Repeating the same word, operation, and input with a new
-answer corrects that observation. The learner tries small shifts and scales first. If all of
+answer corrects that observation. The same file is a Mind lesson: a word with one meaning becomes a building block the search can use, and Softwell runs a program made from it. The learner tries small shifts and scales first. If all of
 them fail, it tries a bounded search for a scalar expression and checks it against every saved
 example for the word. Supported operations are sum, product, count, largest, and smallest on
 nonempty lists of integers.

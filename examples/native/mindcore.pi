@@ -2,6 +2,7 @@
 # downscaling, replay), number and colour sense, dreaming. Programs that use it: mind.pi (the core loop), arcmind.pi.
 import "interp.pi"
 import "json.pi"
+import "heedmemory.pi"
 
 # ---- the language ----------------------------------------------------------------------------------------------
 skill optable() -> Any {
@@ -2589,10 +2590,16 @@ skill attempt_task_g(task, domain, lib, active, pl, pre, g) -> Any {
 #   rewrite <task name> := <tree>          another way to say a memory Pi already has (accepted only if it computes
 #                                          the same as the task on every training, held-out and extra input)
 #   task <domain> <task name> := <tree>    a stepping-stone task: the tree only MAKES the examples; Pi must solve it
+#   heed1 <word> <reducer> <inputs> <y>    a Heed observation. One resolved word becomes a building block.
 #   # comment
 skill load_lessons(text) -> Any {
   let out = []
   if text == null { return out }
+  let heed = false
+  for line in split(text, "\n") {
+    if slice(trim(line), 0, 6) == "heed1 " { let heed = true }
+  }
+  if heed { let out = hm_lessons(text) }
   for line in split(text, "\n") {
     let line = trim(line)
     if line != "" and slice(line, 0, 1) != "#" and contains(line, " := ") {
@@ -2621,6 +2628,22 @@ skill find_task(ts, name) -> Any {
     if t[0] == name { return t }
   }
   return null
+}
+
+# A lesson that names a word is awake in every domain. The same word Heed learned is a form the search can use.
+skill awake_lessons(lib, active, lessons) -> Any {
+  let notes = []
+  if lessons == null { return [lib, active, notes] }
+  for ls in lessons {
+    if ls[0] == "word" {
+      let lib = append(lib, ls[2])
+      for dd in keys(active) {
+        let active = put(active, dd, append(active[dd], true))
+      }
+      let notes = append(notes, ls[1])
+    }
+  }
+  return [lib, active, notes]
 }
 
 skill live(g, mem, tasks) -> Any {
@@ -2656,6 +2679,10 @@ skill live(g, mem, tasks) -> Any {
   # lessons: stepping-stone tasks join their domain's practice (tagged "taught: "); rewrites wait for their memory
   let lessons = g["__lessons"]
   if lessons == null { let lessons = [] }
+  let woke = awake_lessons(lib, active, lessons)
+  let lib = woke[0]
+  let active = woke[1]
+  for nm in woke[2] { let out = out ++ "  lesson: word " ++ nm ++ "\n" }
   let rewrites = []
   for ls in lessons {
     if ls[0] == "task" {

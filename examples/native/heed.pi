@@ -38,30 +38,7 @@ skill hd_uses(t) -> Any {
   return false
 }
 
-# the hole in a step (its own mark: ["p", 0] is already the running value inside a fold)
-skill hd_hole() -> Any { return ["v", "_"] }
-
-skill hd_holed(t) -> Any {
-  if t[0] == "v" {
-    if isinput(t[1]) { return hd_hole() }
-    return t
-  }
-  if t[0] == "q" or t[0] == "p" { return t }
-  let out = []
-  for a in t[2] { let out = append(out, hd_holed(a)) }
-  return [t[0], t[1], out]
-}
-
-skill hd_plug(t, v) -> Any {
-  if t[0] == "v" {
-    if t[1] == "_" { return v }
-    return t
-  }
-  if t[0] == "q" or t[0] == "p" { return t }
-  let out = []
-  for a in t[2] { let out = append(out, hd_plug(a, v)) }
-  return [t[0], t[1], out]
-}
+# the hole in a step lives in heedmemory.pi
 
 # a program as a chain of steps, outermost first; each step a tree with a hole where the rest goes
 skill hd_chain(t) -> Any {
@@ -199,6 +176,76 @@ skill hd_read_tree(rules, fam, steps, phrase, domain) -> Any {
   let toks = tg_understand(rules, fam, hd_words(phrase))
   if toks == null { return null }
   return hd_program(toks, steps, hd_input(domain))
+}
+
+skill hm_phrase(phrase) -> Any {
+  if phrase == null { return null }
+  let ws = hd_words(phrase)
+  if len(ws) == 3 and ws[1] == "of" { ws = [ws[0], ws[2]] }
+  if len(ws) != 2 { return null }
+  if not contains(hm_reducers(), ws[0]) or not hm_word(ws[1]) { return null }
+  return ws
+}
+
+# Export each resolved meaning into the same grammar/step vocabulary that ordinary Heed reads.
+skill hm_grammar(word, law, rules, steps) -> Any {
+  let step = if law[1] { O("map", [law[0], hd_hole()]) } else { subst_e(law[0], hd_hole()) }
+  let key = hd_token(step)
+  let meaning = if law[1] { ["$1", key] } else { [key, "$1"] }
+  let lexical = []
+  steps = put(steps, key, step)
+  for name in hm_reducers() {
+    let tree = hm_reduce(name, hd_hole())
+    let token = hd_token(tree)
+    lexical = append(lexical, [[name], [token]])
+    steps = put(steps, token, tree)
+  }
+  let word_rules = [[["$1", "of", word], meaning], [["$1", word], meaning]]
+  return [word_rules ++ lexical ++ rules, steps]
+}
+
+skill hm_read(word, law, phrase, xs) -> Any {
+  let fitted = hm_grammar(word, law, [], {})
+  let tree = hd_read_tree(fitted[0], null, fitted[1], phrase, "lists")
+  if tree == null { return null }
+  return sev(tree, null, xs, null, [])
+}
+
+skill hm_command(path, command, phrase, csv, answer) -> Any {
+  let ws = hm_phrase(phrase)
+  let xs = hm_numbers(csv)
+  let extra = arg(7) != null or (command == "use" and answer != null)
+  if ws == null or xs == null or path == null or not contains(["teach", "use"], command) or extra {
+    return "Usage: heed memory FILE teach|use \"sum of WORD\" 2,3 [answer]"
+  }
+  let book = hm_load(path)
+  if book == null { return "Unreadable or incomplete lesson file." }
+  let word = ws[1]
+  if command == "teach" {
+    let y = hm_number(answer)
+    if y == null { return "Give a whole-number observation." }
+    let record = hm_line(word, [ws[0], xs, y])
+    if not rt_append_file(path, record) { return "Could not save the observation." }
+    book = hm_load(path)
+    if book == null { return "Could not read the saved observation." }
+  }
+  let obs = book[word]
+  if obs == null { return "Teach an example for " ++ word ++ " first." }
+  let laws = hm_laws(obs)
+  if len(laws) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
+  if len(laws) == 1 {
+    if command == "teach" { return "Learned " ++ word ++ ": " ++ show(laws[0][0]) ++ if laws[0][1] { " before reduction." } else { " after reduction." } }
+    let y = hm_read(word, laws[0], phrase, xs)
+    if y == null { return "Meaning undefined for this input." }
+    return str(y)
+  }
+  if command == "use" {
+    let y = hm_read(word, laws[0], phrase, xs)
+    let agree = y != null
+    for law in laws { if hm_read(word, law, phrase, xs) != y { agree = false } }
+    if agree { return str(y) }
+  }
+  return hm_ask(word, laws)
 }
 
 # Read learned corrections before less specific grammar rules, only in the taught domain.

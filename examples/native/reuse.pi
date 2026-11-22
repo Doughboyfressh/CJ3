@@ -1,0 +1,54 @@
+# One idea, taught once. Heed's lesson file is also a Mind lesson. The word is a building block.
+# Sum of squares does not fit in the budget as map-then-sum. Sum of the taught word does.
+# Softwell squares the list and adds it.
+import "mindcore.pi"
+
+skill squared(xs) -> Any {
+  let s = 0
+  for v in xs { let s = s + v * v }
+  return s
+}
+
+skill shape_of(t, lib) -> Any {
+  let mul = expand(t, lib)[2][0][2][0]
+  if mul[2][1][0] == "v" { return [1, 0] }
+  return [0, mul[2][1][1]]
+}
+
+skill main() -> Any {
+  let text = "heed1 brins sum 2,3 13\nheed1 brins product 2,3 36\n"
+  let lessons = load_lessons(text)
+  let woke = awake_lessons([], {"lists": []}, lessons)
+  let lib = woke[0]
+  let word = lessons[0][2]
+  let tr = examples_of(squared, train_inputs("lists"))
+  let hl = examples_of(squared, held_inputs("lists"))
+  let pl = pools()
+  let pre = prelude()
+  let bare = solve(tr, hl, [], [], pl, pre, 4, 20000)
+  let got = solve(tr, hl, lib, woke[1]["lists"], pl, pre, 4, 20000)
+  let tree = got[0]
+  print(len(lessons) == 1)
+  print(lessons[0][1] == "brins")
+  print(show(word[0]) == "map(e -> (e * e), a)")
+  print(len(woke[2]) == 1)
+  print(bare[0] == null)
+  print(tree != null)
+  print(show(tree) == "sum(w0(x))")
+  print(show(expand(tree, lib)) == "sum(map(e -> (e * e), x))")
+  let xs = held_inputs("lists")[0]
+  print(sev(tree, null, xs, null, lib) == squared(xs))
+  let how = shape_of(tree, lib)
+  let buf = rt_gpu_alloc(8 * len(xs))
+  let dst = rt_gpu_alloc(8)
+  do rt_gpu_put_u64(buf, xs)
+  let m = rt_gpu_module(".visible .entry lsum()\n")
+  let f = rt_gpu_fn(m, "lsum")
+  let b0 = rt_sw_gpu()
+  let r = rt_gpu_launch(f, 1, 1, [buf, len(xs), how[1], dst, how[0]])
+  let seen = rt_gpu_get(dst, 1)
+  print(r)
+  print(rt_sw_gpu() - b0 == 2)
+  print(seen[0] == squared(xs) * 1.0)
+  return 0
+}

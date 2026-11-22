@@ -1,0 +1,11 @@
+<|open|>message role="user"<|sep|>hello<|close|>message<|sep|><|end_of_msg|><|open|>message role="assistant"<|sep|><|open|>think<|sep|>
+---
+<|open|>message role="user"<|sep|>The capital of France is Paris<|close|>message<|sep|><|end_of_msg|><|open|>message role="assistant"<|sep|><|open|>think<|sep|>
+---
+<|open|>message role="user"<|sep|>hello<|close|>message<|sep|><|end_of_msg|><|open|>message role="assistant"<|sep|><|open|>response<|sep|>
+---
+<|open|>message role="user"<|sep|>go<|close|>message<|sep|><|end_of_msg|><|open|>message role="system" type="tool-choice"<|sep|>The system is invoked with `tool_choice=none`.
+You MUST NOT call any tools in the next message.<|close|>message<|sep|><|end_of_msg|>
+---
+<|open|>message role="user"<|sep|>go<|close|>message<|sep|><|end_of_msg|><|open|>message role="system" type="tool-choice"<|sep|>The system is invoked with `tool_choice=required`.
+You MUST call tools in the next message.<|close|>message<|sep|><|end_of_msg|>

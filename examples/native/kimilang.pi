@@ -1,0 +1,60 @@
+# Language, facts, and choices from Kimi's own encoder, not from the weights.
+# encoding_k3.py wraps a user message and does not rewrite the text inside it.
+# generation_config.json stops at 163586, which is <|end_of_msg|>.
+# tokenizer_config.json puts [EOS] at 163585. Those are different tokens.
+# The sentence about France is copied through. It was not read out of a weight.
+# The oracle file was rendered by that Python module. This program rebuilds it.
+skill q() -> Any { return chr(34) }
+skill user_turn(text, thinking) -> Any {
+  let quote = q()
+  let s = "<|open|>message role=" ++ quote ++ "user" ++ quote ++ "<|sep|>"
+  let s = s ++ text
+  let s = s ++ "<|close|>message<|sep|><|end_of_msg|>"
+  let s = s ++ "<|open|>message role=" ++ quote ++ "assistant" ++ quote ++ "<|sep|>"
+  if thinking == 1 { let s = s ++ "<|open|>think<|sep|>" }
+  if thinking == 0 { let s = s ++ "<|open|>response<|sep|>" }
+  return s
+}
+skill choice_turn(which) -> Any {
+  let quote = q()
+  let s = "<|open|>message role=" ++ quote ++ "user" ++ quote ++ "<|sep|>go"
+  let s = s ++ "<|close|>message<|sep|><|end_of_msg|>"
+  let s = s ++ "<|open|>message role=" ++ quote ++ "system" ++ quote
+  let s = s ++ " type=" ++ quote ++ "tool-choice" ++ quote ++ "<|sep|>"
+  if which == 0 {
+    let s = s ++ "The system is invoked with `tool_choice=none`.\nYou MUST NOT call any tools in the next message."
+  }
+  if which == 1 {
+    let s = s ++ "The system is invoked with `tool_choice=required`.\nYou MUST call tools in the next message."
+  }
+  let s = s ++ "<|close|>message<|sep|><|end_of_msg|>"
+  return s
+}
+
+skill main() -> Any {
+  let recs = split(read_file("examples/native/kimi_lang.txt"), "\n---\n")
+  let fact = "The capital of France is Paris"
+  let held = user_turn(fact, 1)
+  let stop = 163586
+  let eos = 163585
+  let text = "lang copies\nchoice stop 163586\nfact not in the weights\n"
+  let slot = rt_sw_ssd_alloc(128)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(len(recs) == 5)
+  print(user_turn("hello", 1) == recs[0])
+  print(held == recs[1])
+  print(user_turn("hello", 0) == recs[2])
+  print(choice_turn(0) == recs[3])
+  print(choice_turn(1) == recs[4])
+  print(len(held) == len(user_turn("", 1)) + len(fact))
+  print(stop != eos)
+  print(stop == 163586)
+  print(read == 1024)
+  print(got == text)
+  return 0
+}

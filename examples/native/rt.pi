@@ -6945,8 +6945,10 @@ skill rt_sw_dnet4(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
-# lsum: each of n raw integers, combined, then added. op 0 multiplies by k. op 1 squares.
-# The list is read and the sum is written. n of them are n * 8 bytes, and the sum is 8 more.
+# lsum: each of n raw integers, combined, then added.
+# op 0 multiplies by k. op 1 squares. op 2 adds k, then squares.
+# An elementwise chain still reads the list once and writes the sum once.
+# n of them are n * 8 bytes, and the sum is 8 more. The bus is not charged once per step.
 skill rt_sw_lsum(gx, bx, ps) -> Any {
   let src = rt_sw_arg(ps, 0)
   let n = rt_sw_arg(ps, 1)
@@ -6959,7 +6961,12 @@ skill rt_sw_lsum(gx, bx, ps) -> Any {
   let i = 0
   while i < n {
     let v = peek(src + 8 * i)
-    if op == 1 { let s = s + v * v } else { let s = s + v * k }
+    if op == 1 { let s = s + v * v } else {
+      if op == 2 {
+        let t = v + k
+        let s = s + t * t
+      } else { let s = s + v * k }
+    }
     let i = i + 1
   }
   do poke(dst, i2f(s))

@@ -1,23 +1,32 @@
-# One idea, taught once. The lesson text lives on the SSD, not in a host file.
-# Reading it through the one 4 KB window costs 1,024 cycles, and the same page again costs nothing.
-# Sum of squares does not fit in the budget as map-then-sum. Sum of the taught word does.
-# Softwell squares the list and adds it.
+# Composition. Under a uniform cost u, a form costs u and a leaf costs u.
+# A list word applied to the input costs 2u. A second word around it costs 3u.
+# sum of that costs 4u, so it fits in maxsize 4.
+# map of a size-3 element function costs 5u, and sum of that costs 6u, so it does not.
+# Two taught words therefore solve what the same budget cannot solve from the primitives,
+# and what either word alone cannot solve.
+# Fusion. The chain is elementwise, then a reduction. The chip reads each input once
+# and writes the sum once, so the bus stays ceil((8n+8)/32). It is not charged per word.
+# The lesson text is one SSD page. Bringing it in, evicting it, and reading it back is 3,072 cycles.
 import "mindcore.pi"
 
-skill squared(xs) -> Any {
+skill grew(xs) -> Any {
   let s = 0
-  for v in xs { let s = s + v * v }
+  for v in xs { let s = s + (v + 1) * (v + 1) }
   return s
 }
 
+# sum(map(e * e, map(e + k, x))) is op 2 with shift k. The square's own body is e * e either way.
 skill shape_of(t, lib) -> Any {
-  let mul = expand(t, lib)[2][0][2][0]
-  if mul[2][1][0] == "v" { return [1, 0] }
-  return [0, mul[2][1][1]]
+  let m = expand(t, lib)[2][0]
+  let arg = m[2][1]
+  if arg[0] == "op" {
+    if arg[1] == "map" { return [2, arg[2][0][2][1][1]] }
+  }
+  return [1, 0]
 }
 
 skill main() -> Any {
-  let text = "heed1 brins sum 2,3 13\nheed1 brins product 2,3 36\n"
+  let text = "heed1 brins sum 2,3 13\nheed1 brins product 2,3 36\nheed1 brim sum 2,3 7\nheed1 brim product 2,3 12\n"
   let slot = rt_sw_ssd_alloc(8 + len(text))
   let p0 = rt_sw_pg()
   do rt_sw_ssd_puts(slot, text)
@@ -29,12 +38,13 @@ skill main() -> Any {
   let lessons = load_lessons(back)
   let woke = awake_lessons([], {"lists": []}, lessons)
   let lib = woke[0]
-  let word = lessons[0][2]
-  let tr = examples_of(squared, train_inputs("lists"))
-  let hl = examples_of(squared, held_inputs("lists"))
+  let tr = examples_of(grew, train_inputs("lists"))
+  let hl = examples_of(grew, held_inputs("lists"))
   let pl = pools()
   let pre = prelude()
   let bare = solve(tr, hl, [], [], pl, pre, 4, 20000)
+  let only0 = solve(tr, hl, [lib[0]], [true], pl, pre, 4, 20000)
+  let only1 = solve(tr, hl, [lib[1]], [true], pl, pre, 4, 20000)
   let got = solve(tr, hl, lib, woke[1]["lists"], pl, pre, 4, 20000)
   let tree = got[0]
   print(slot >= 0)
@@ -42,16 +52,14 @@ skill main() -> Any {
   print(p1 - p0 == 3072)
   print(rt_sw_pg() == p1)
   print(again == text)
-  print(len(lessons) == 1)
-  print(lessons[0][1] == "brins")
-  print(show(word[0]) == "map(e -> (e * e), a)")
-  print(len(woke[2]) == 1)
+  print(len(lessons) == 2)
   print(bare[0] == null)
+  print(only0[0] == null)
+  print(only1[0] == null)
   print(tree != null)
-  print(show(tree) == "sum(w0(x))")
-  print(show(expand(tree, lib)) == "sum(map(e -> (e * e), x))")
+  print(show(expand(tree, lib)) == "sum(map(e -> (e * e), map(e -> (e + 1), x)))")
   let xs = held_inputs("lists")[0]
-  print(sev(tree, null, xs, null, lib) == squared(xs))
+  print(sev(tree, null, xs, null, lib) == grew(xs))
   let how = shape_of(tree, lib)
   let buf = rt_gpu_alloc(8 * len(xs))
   let dst = rt_gpu_alloc(8)
@@ -61,8 +69,10 @@ skill main() -> Any {
   let b0 = rt_sw_gpu()
   let r = rt_gpu_launch(f, 1, 1, [buf, len(xs), how[1], dst, how[0]])
   let seen = rt_gpu_get(dst, 1)
+  print(how[0] == 2)
+  print(how[1] == 1)
   print(r)
   print(rt_sw_gpu() - b0 == 2)
-  print(seen[0] == squared(xs) * 1.0)
+  print(seen[0] == grew(xs) * 1.0)
   return 0
 }

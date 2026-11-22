@@ -1,0 +1,82 @@
+# Kimi K3.1 Pro, the part that is a function.
+# Read from the published config and from the safetensors header of
+# model-00002, layer 1, expert 0. The weight shards are 1,561,217,377,280
+# bytes. They are not on this machine. Softwell's SSD is 8 MB.
+# SiTU-GLU uses the config's own betas, 4 and 25:
+#   gate(x) = 4 * tanh(x/4) * sigmoid(x)
+#   up(y)   = 25 * tanh(y/25)
+#   situ(x, y) = gate(x) * up(y)
+# For x != 0, |tanh(x/4)| < |x/4|, so |gate(x)| < |x * sigmoid(x)|.
+# For y != 0, |up(y)| < |y|. So both branches sit strictly inside a SiLU-GLU,
+# and |gate| < 4, |up| < 25, |situ| < 100. SiLU-GLU has no such bound.
+# One expert row, from the header, not from a guess:
+#   w1 and w3: 1,792 packed bytes + 112 scales = 1,904. Bus 60, page-in 476, ceiling 480.
+#   w2:        1,536 packed bytes +  96 scales = 1,632. Bus 51, page-in 408, ceiling 408.
+# w2 is already on the bus ceiling. w1 is four cycles under it.
+# The kept record is the function and that fact. A cold read is one page.
+skill sigmoid(x) -> Any { return 1.0 / (1.0 + exp(0.0 - x)) }
+skill tanh(x) -> Any {
+  let e = exp(x + x)
+  return (e - 1.0) / (e + 1.0)
+}
+skill silu(x) -> Any { return x * sigmoid(x) }
+skill situ_gate(x) -> Any { return 4.0 * tanh(x / 4.0) * sigmoid(x) }
+skill situ_up(y) -> Any { return 25.0 * tanh(y / 25.0) }
+skill situ(x, y) -> Any { return situ_gate(x) * situ_up(y) }
+skill abs(x) -> Any {
+  if x < 0.0 { return 0.0 - x }
+  return x
+}
+
+skill main() -> Any {
+  let xs = [1.0, 2.0, 3.0, 0.0 - 4.0, 8.0, 6.0]
+  let gates = 0
+  let ups = 0
+  let both = 0
+  for x in xs {
+    if abs(situ_gate(x)) < abs(silu(x)) and abs(situ_gate(x)) < 4.0 { let gates = gates + 1 }
+    if abs(situ_up(x)) < abs(x) and abs(situ_up(x)) < 25.0 { let ups = ups + 1 }
+    if abs(situ(x, x)) < abs(silu(x) * x) and abs(situ(x, x)) < 100.0 { let both = both + 1 }
+  }
+  let w1 = 1792 + 112
+  let w2 = 1536 + 96
+  let b1 = (w1 + 31) // 32
+  let p1 = (w1 + 3) // 4
+  let b2 = (w2 + 31) // 32
+  let p2 = (w2 + 3) // 4
+  let text = "situ 4 25\nw2 1632 51 408\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  let held = rt_sw_ssd_gets(slot)
+  print(exp(0.0) == 1.0)
+  print(tanh(0.0) == 0.0)
+  print(situ(0.0, 5.0) == 0.0)
+  print(situ(5.0, 0.0) == 0.0)
+  print(gates == 6)
+  print(ups == 6)
+  print(both == 6)
+  print(92 * 896 == 82432)
+  print(93 - 24 == 69)
+  print(w1 == 1904)
+  print(b1 == 60)
+  print(p1 == 476)
+  print(8 * b1 == 480)
+  print(8 * b1 - p1 == 4)
+  print(b1 <= p1)
+  print(p1 <= 8 * b1)
+  print(w2 == 1632)
+  print(b2 == 51)
+  print(p2 == 408)
+  print(8 * b2 == 408)
+  print(p2 == 8 * b2)
+  print(read == 1024)
+  print(rt_sw_pg() == p + read)
+  print(held == got)
+  print(got == text)
+  return 0
+}

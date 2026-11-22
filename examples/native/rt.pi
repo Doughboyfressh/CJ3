@@ -3944,6 +3944,18 @@ skill rt_sw_st32(p, bits) -> Any {
   return 0
 }
 
+# n float32 ones at a raw or tagged address. The harness's own 1.0 is a tagged real, and this is not.
+skill rt_sw_onef(pt, nt) -> Any {
+  let p = rt_untag(pt)
+  let n = rt_untag(nt)
+  let i = 0
+  while i < n {
+    do rt_sw_st32(p + 4 * i, i2f(1))
+    let i = i + 1
+  }
+  return rt_tag(0)
+}
+
 # C[M,N] = A[M,K] . B[K,N]
 skill rt_sw_gemm(gx, bx, ps) -> Any {
   let A = rt_sw_arg(ps, 0)
@@ -6295,6 +6307,255 @@ skill rt_sw_route(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+
+# 2^x for a float32, flushed toward zero. The series is the float64 exp of x*ln2, then rounded
+# back to float32. ex2(0) is 1. This is not the special-function unit.
+skill rt_sw_ex2(u) -> Any {
+  let u = band(u, 4294967295)
+  let exp = band(shr(u, 23), 255)
+  let man = band(u, 8388607)
+  if exp == 0 { let u = shl(shr(u, 31), 31) }
+  if exp == 255 {
+    if man != 0 { return bor(shl(shr(u, 31), 31), 2143289344) }
+    if shr(u, 31) != 0 { return 0 }
+    return 2139095040
+  }
+  let y = rt_sw_exp64(fmul(rt_sw_f64_of(u), 4604418534313441775))
+  return rt_sw_f32_of(y)
+}
+
+# float32 warp butterfly. op 0 adds, op 1 keeps the larger. Lane 0 holds the result.
+skill rt_sw_bflyf(buf, op) -> Any {
+  let k = 16
+  while k >= 1 {
+    let i = 0
+    while i < 32 {
+      let j = bxor(i, k)
+      if i < j {
+        let a = rt_sw_ld32(buf + 4 * i)
+        let b = rt_sw_ld32(buf + 4 * j)
+        let s = rt_sw_add32(a, b)
+        if op == 1 {
+          let s = a
+          if flt(a, b) { let s = b }
+        }
+        do rt_sw_st32(buf + 4 * i, s)
+        do rt_sw_st32(buf + 4 * j, s)
+      }
+      let i = i + 1
+    }
+    let k = k // 2
+  }
+  return rt_sw_ld32(buf)
+}
+
+# attn2: one block is (token, head, split). The query head is 256 floats in TMEM. This split's
+# scores, at most 512, sit beside it. A key of zeros scores 0, and ex2(0) is 1.
+skill rt_sw_attn2(gx, bx, ps) -> Any {
+  let Q = rt_sw_arg(ps, 0)
+  let KC = rt_sw_arg(ps, 1)
+  let VC = rt_sw_arg(ps, 2)
+  let POS = rt_sw_arg(ps, 3)
+  let PM = rt_sw_arg(ps, 4)
+  let PL = rt_sw_arg(ps, 5)
+  let PO = rt_sw_arg(ps, 6)
+  let S = rt_sw_arg(ps, 7)
+  if S < 1 { return rt_tag(0 - 400) }
+  let blocks = rt_untag(gx)
+  let lanes = rt_untag(bx)
+  if lanes > 256 { let lanes = 256 }
+  if lanes < 0 { let lanes = 0 }
+  if blocks < 0 { let blocks = 0 }
+  let mem = rt_untag(rt_sw_tmem())
+  let scores = mem + 1024
+  let scratch = mem + 3104
+  let bytes = 0
+  let b = 0
+  while b < blocks {
+    let span = S * 16
+    let token = b // span
+    let rem = b % span
+    let head = rem // S
+    let split = rem % S
+    let kv = head // 8
+    let npos = f2i(peek(POS)) + token + 1
+    let chunks = (npos + S - 1) // S
+    let begin = split * chunks
+    let endp = begin + chunks
+    if endp > npos { let endp = npos }
+    if endp < begin { let endp = begin }
+    let count = endp - begin
+    if count > 512 { return rt_tag(0 - 400) }
+    let bytes = bytes + lanes * 16
+    let bytes = bytes + count * 1024
+    let bytes = bytes + lanes * count * 4
+    let bytes = bytes + lanes * 4
+    if lanes > 0 { let bytes = bytes + 8 }
+    let t = 0
+    while t < lanes {
+      let qv = peek(Q + 8 * (token * 4096 + head * 256 + t))
+      do rt_sw_st32(mem + 4 * t, qv)
+      let t = t + 1
+    }
+    let warps = (lanes + 31) // 32
+    let w = 0
+    while w < warps {
+      let p = w
+      while p < count {
+        let lane = 0
+        while lane < 32 {
+          let acc = i2f(0)
+          let tid = w * 32 + lane
+          if tid < lanes {
+            let j = 0
+            while j < 8 {
+              let dim = lane + 32 * j
+              let key = rt_sw_ld32(KC + 4 * ((begin + p) * 512 + kv * 256 + dim))
+              let qv = rt_sw_ld32(mem + 4 * dim)
+              let acc = rt_sw_fma32(key, qv, acc)
+              let j = j + 1
+            }
+          }
+          do rt_sw_st32(scratch + 4 * lane, acc)
+          let lane = lane + 1
+        }
+        let dot = rt_sw_bflyf(scratch, 0)
+        do rt_sw_st32(scores + 4 * p, rt_sw_mul32(dot, rt_sw_f64_of(1031798784)))
+        let p = p + 8
+      }
+      let w = w + 1
+    }
+    let ninf = rt_sw_f64_of(4286578688)
+    let t = 0
+    while t < lanes {
+      let a = ninf
+      let c = ninf
+      if t < count { let a = rt_sw_ld32(scores + 4 * t) }
+      if t + 256 < count { let c = rt_sw_ld32(scores + 4 * (t + 256)) }
+      let m = a
+      if flt(a, c) { let m = c }
+      do rt_sw_st32(scratch + 4 * (t % 32), m)
+      if t % 32 == 31 or t + 1 == lanes {
+        let wid = t // 32
+        do rt_sw_st32(mem + 3072 + 4 * wid, rt_sw_bflyf(scratch, 1))
+      }
+      let t = t + 1
+    }
+    let mx = ninf
+    if warps > 0 { let mx = rt_sw_ld32(mem + 3072) }
+    let w = 1
+    while w < warps {
+      let a = rt_sw_ld32(mem + 3072 + 4 * w)
+      if flt(mx, a) { let mx = a }
+      let w = w + 1
+    }
+    let t = 0
+    while t < lanes {
+      let e0 = i2f(0)
+      let e1 = i2f(0)
+      if t < count {
+        let d = rt_sw_sub_score(rt_sw_ld32(scores + 4 * t), mx)
+        let e0 = rt_sw_f64_of(rt_sw_ex2(rt_sw_f32_of(d)))
+        do rt_sw_st32(scores + 4 * t, e0)
+      }
+      if t + 256 < count {
+        let d = rt_sw_sub_score(rt_sw_ld32(scores + 4 * (t + 256)), mx)
+        let e1 = rt_sw_f64_of(rt_sw_ex2(rt_sw_f32_of(d)))
+        do rt_sw_st32(scores + 4 * (t + 256), e1)
+      }
+      do rt_sw_st32(scratch + 4 * (t % 32), rt_sw_add32(e0, e1))
+      if t % 32 == 31 or t + 1 == lanes {
+        let wid = t // 32
+        do rt_sw_st32(mem + 3072 + 4 * wid, rt_sw_bflyf(scratch, 0))
+      }
+      let t = t + 1
+    }
+    let sm = i2f(0)
+    if warps > 0 { let sm = rt_sw_ld32(mem + 3072) }
+    let w = 1
+    while w < warps {
+      let sm = rt_sw_add32(sm, rt_sw_ld32(mem + 3072 + 4 * w))
+      let w = w + 1
+    }
+    let t = 0
+    while t < lanes {
+      let acc = i2f(0)
+      let p = 0
+      while p < count {
+        let wt = rt_sw_ld32(scores + 4 * p)
+        let vv = rt_sw_ld32(VC + 4 * ((begin + p) * 512 + kv * 256 + t))
+        let acc = rt_sw_fma32(wt, vv, acc)
+        let p = p + 1
+      }
+      do rt_sw_st32(PO + 4 * (b * 256 + t), acc)
+      let t = t + 1
+    }
+    if lanes > 0 {
+      do rt_sw_st32(PM + 4 * b, mx)
+      do rt_sw_st32(PL + 4 * b, sm)
+    }
+    let b = b + 1
+  }
+  do rt_sw_note(bytes)
+  return rt_tag(0)
+}
+
+# (score - max) * log2(e), in float32
+skill rt_sw_sub_score(s, mx) -> Any {
+  return rt_sw_mul32(rt_sw_add32(s, rt_sw_f64_of(rt_sw_f32_of(fsub(i2f(0), mx)))), rt_sw_f64_of(1069066811))
+}
+
+# acomb: one block is (token, head). The split pieces merge by the largest max, then the sigmoid of the gate.
+skill rt_sw_acomb(gx, bx, ps) -> Any {
+  let PM = rt_sw_arg(ps, 0)
+  let PL = rt_sw_arg(ps, 1)
+  let PO = rt_sw_arg(ps, 2)
+  let QF = rt_sw_arg(ps, 3)
+  let ATT = rt_sw_arg(ps, 4)
+  let S = rt_sw_arg(ps, 5)
+  if S < 1 { return rt_tag(0 - 400) }
+  let blocks = rt_untag(gx)
+  let lanes = rt_untag(bx)
+  if lanes > 256 { let lanes = 256 }
+  if lanes < 0 { let lanes = 0 }
+  if blocks < 0 { let blocks = 0 }
+  do rt_sw_note(blocks * lanes * (S * 12 + 16))
+  let b = 0
+  while b < blocks {
+    let token = b // 16
+    let head = b % 16
+    let ninf = rt_sw_f64_of(4286578688)
+    let mx = ninf
+    let s = 0
+    while s < S {
+      let a = rt_sw_ld32(PM + 4 * (b * S + s))
+      if flt(mx, a) { let mx = a }
+      let s = s + 1
+    }
+    let t = 0
+    while t < lanes {
+      let den = i2f(0)
+      let num = i2f(0)
+      let s = 0
+      while s < S {
+        let d = rt_sw_sub_score(rt_sw_ld32(PM + 4 * (b * S + s)), mx)
+        let e = rt_sw_f64_of(rt_sw_ex2(rt_sw_f32_of(d)))
+        let den = rt_sw_fma32(e, rt_sw_ld32(PL + 4 * (b * S + s)), den)
+        let num = rt_sw_fma32(e, rt_sw_ld32(PO + 4 * ((b * S + s) * 256 + t)), num)
+        let s = s + 1
+      }
+      let out = rt_sw_div32(num, den)
+      let gate = peek(QF + 8 * (token * 8192 + head * 512 + 256 + t))
+      let z = rt_sw_mul32(gate, rt_sw_f64_of(3216550459))
+      let sig = rt_sw_div32(i2f(1), rt_sw_add32(rt_sw_f64_of(rt_sw_ex2(rt_sw_f32_of(z))), i2f(1)))
+      do poke(ATT + 8 * (token * 4096 + head * 256 + t), rt_sw_f64_of(rt_sw_f32_of(rt_sw_mul32(out, sig))))
+      let t = t + 1
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -6340,6 +6601,8 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "tokin") { return rt_sw_finish(rt_sw_tokin(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "tokinT") { return rt_sw_finish(rt_sw_tokinT(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "route") { return rt_sw_finish(rt_sw_route(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "attn2") { return rt_sw_finish(rt_sw_attn2(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "acomb") { return rt_sw_finish(rt_sw_acomb(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

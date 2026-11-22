@@ -4189,19 +4189,137 @@ skill rt_sw_biasgrad(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
-# relu only. sin.approx is the GPU's approximation, and this chip does not invent one.
+skill rt_sw_exp2tag(real) -> Any { return rt_tag(rt_sw_f32_of(rt_sw_exp2(rt_realbits(real)))) }
+
+skill rt_sw_log2tag(real) -> Any { return rt_tag(rt_sw_f32_of(rt_sw_log2(rt_realbits(real)))) }
+
+skill rt_sw_neg32(a) -> Any { return rt_sw_f64_of(bxor(rt_sw_f32_of(a), shl(1, 31))) }
+
+skill rt_sw_scale2(bits, n) -> Any {
+  if bits == 0 { return shl(shr(bits, 63), 63) }
+  let sign = shr(bits, 63)
+  let exp = band(shr(bits, 52), 2047)
+  let man = band(bits, 4503599627370495)
+  if exp == 2047 { return bits }
+  if exp == 0 { return shl(sign, 63) }
+  let exp = exp + n
+  if exp >= 2047 { return bor(shl(sign, 63), shl(2047, 52)) }
+  if exp <= 0 { return shl(sign, 63) }
+  return bor(shl(sign, 63), bor(shl(exp, 52), man))
+}
+
+# 2^x, rounded back to f32. The GPU instruction is an approximation; this is the rounded value.
+skill rt_sw_exp2(x) -> Any {
+  let x = rt_sw_f64_of(rt_sw_f32_of(x))
+  let n = rt_sw_rni(x)
+  let f = fsub(x, i2f(n))
+  let y = fmul(f, 4604418534313441775)
+  let sum = i2f(1)
+  let term = i2f(1)
+  let i = 1
+  while i < 16 {
+    let term = fdiv(fmul(term, y), i2f(i))
+    let sum = fadd(sum, term)
+    let i = i + 1
+  }
+  return rt_sw_f64_of(rt_sw_f32_of(rt_sw_scale2(sum, n)))
+}
+
+skill rt_sw_log2(x) -> Any {
+  let exp = band(shr(x, 52), 2047)
+  let man = band(x, 4503599627370495)
+  if exp == 0 or exp == 2047 { return rt_sw_f64_of(4286578688) }
+  let e = exp - 1023
+  let m = bor(shl(1023, 52), man)
+  let one = i2f(1)
+  let z = fdiv(fsub(m, one), fadd(m, one))
+  let z2 = fmul(z, z)
+  let sum = z
+  let term = z
+  let i = 1
+  while i < 14 {
+    let term = fmul(term, z2)
+    let sum = fadd(sum, fdiv(term, i2f(2 * i + 1)))
+    let i = i + 1
+  }
+  let ln = fmul(sum, i2f(2))
+  return rt_sw_f64_of(rt_sw_f32_of(fadd(i2f(e), fdiv(ln, 4604418534313441775))))
+}
+
+skill rt_sw_sin(x) -> Any {
+  let x = rt_sw_f64_of(rt_sw_f32_of(x))
+  let x2 = fmul(x, x)
+  let term = x
+  let sum = x
+  let i = 1
+  while i < 12 {
+    let term = fsub(i2f(0), fdiv(fmul(term, x2), i2f((2 * i) * (2 * i + 1))))
+    let sum = fadd(sum, term)
+    let i = i + 1
+  }
+  return rt_sw_f64_of(rt_sw_f32_of(sum))
+}
+
+skill rt_sw_cos(x) -> Any {
+  let x = rt_sw_f64_of(rt_sw_f32_of(x))
+  let x2 = fmul(x, x)
+  let term = i2f(1)
+  let sum = i2f(1)
+  let i = 1
+  while i < 12 {
+    let term = fsub(i2f(0), fdiv(fmul(term, x2), i2f((2 * i - 1) * (2 * i))))
+    let sum = fadd(sum, term)
+    let i = i + 1
+  }
+  return rt_sw_f64_of(rt_sw_f32_of(sum))
+}
+
+skill rt_sw_rcp32(a) -> Any { return rt_sw_f64_of(rt_sw_f32_of(fdiv(i2f(1), a))) }
+
+skill rt_sw_relu32(a) -> Any {
+  if flt(rt_sw_f64_of(0), a) { return a }
+  return rt_sw_f64_of(0)
+}
+
+# the kernel's own range reduction, then the rounded sine
+skill rt_sw_fsin(x) -> Any {
+  let n = rt_sw_f64_of(rt_sw_f32_of(i2f(rt_sw_rni(rt_sw_mul32(x, rt_sw_f64_of(1042479491))))))
+  let x = rt_sw_add32(x, rt_sw_neg32(rt_sw_mul32(n, rt_sw_f64_of(1086918619))))
+  return rt_sw_sin(x)
+}
+
+skill rt_sw_fcos(x) -> Any {
+  let n = rt_sw_f64_of(rt_sw_f32_of(i2f(rt_sw_rni(rt_sw_mul32(x, rt_sw_f64_of(1042479491))))))
+  let x = rt_sw_add32(x, rt_sw_neg32(rt_sw_mul32(n, rt_sw_f64_of(1086918619))))
+  return rt_sw_cos(x)
+}
+
+skill rt_sw_sig(c) -> Any {
+  let e = rt_sw_exp2(rt_sw_mul32(rt_sw_neg32(c), rt_sw_f64_of(1069066811)))
+  return rt_sw_rcp32(rt_sw_add32(e, rt_sw_f64_of(1065353216)))
+}
+
+skill rt_sw_expm(dens, delta) -> Any {
+  let a = rt_sw_mul32(rt_sw_relu32(dens), delta)
+  return rt_sw_exp2(rt_sw_mul32(rt_sw_neg32(a), rt_sw_f64_of(1069066811)))
+}
+
+# relu only. sin.approx is the GPU's approximation; here the sine is the rounded value.
 skill rt_sw_act(gx, bx, ps) -> Any {
-  if rt_sw_arg(ps, 3) != 0 { return rt_tag(0 - 400) }
   let X = rt_sw_arg(ps, 0)
   let Y = rt_sw_arg(ps, 1)
   let n = rt_sw_arg(ps, 2)
+  let mode = rt_sw_arg(ps, 3)
+  let a = rt_sw_f64_of(rt_sw_arg(ps, 4))
   let lim = rt_untag(gx) * rt_untag(bx)
   let z = rt_sw_f64_of(0)
   let t = 0
   while t < lim {
     if t < n {
       let x = rt_sw_ld32(X + 4 * t)
-      if flt(z, x) == 0 { let x = z }
+      if mode == 0 {
+        if flt(z, x) == 0 { let x = z }
+      } else { let x = rt_sw_fsin(rt_sw_mul32(x, a)) }
       do rt_sw_st32(Y + 4 * t, x)
     }
     let t = t + 1
@@ -4210,18 +4328,24 @@ skill rt_sw_act(gx, bx, ps) -> Any {
 }
 
 skill rt_sw_actb(gx, bx, ps) -> Any {
-  if rt_sw_arg(ps, 4) != 0 { return rt_tag(0 - 400) }
   let X = rt_sw_arg(ps, 0)
   let DY = rt_sw_arg(ps, 1)
   let DX = rt_sw_arg(ps, 2)
   let n = rt_sw_arg(ps, 3)
+  let mode = rt_sw_arg(ps, 4)
+  let a = rt_sw_f64_of(rt_sw_arg(ps, 5))
   let lim = rt_untag(gx) * rt_untag(bx)
   let z = rt_sw_f64_of(0)
   let t = 0
   while t < lim {
     if t < n {
       let g = z
-      if flt(z, rt_sw_ld32(X + 4 * t)) { let g = rt_sw_ld32(DY + 4 * t) }
+      if mode == 0 {
+        if flt(z, rt_sw_ld32(X + 4 * t)) { let g = rt_sw_ld32(DY + 4 * t) }
+      } else {
+        let y = rt_sw_fcos(rt_sw_mul32(rt_sw_ld32(X + 4 * t), a))
+        let g = rt_sw_mul32(rt_sw_mul32(y, a), rt_sw_ld32(DY + 4 * t))
+      }
       do rt_sw_st32(DX + 4 * t, g)
     }
     let t = t + 1
@@ -4286,6 +4410,219 @@ skill rt_sw_adam(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+skill rt_sw_vrfwd(gx, bx, ps) -> Any {
+  let raw = rt_sw_arg(ps, 0)
+  let out = rt_sw_arg(ps, 1)
+  let tr = rt_sw_arg(ps, 2)
+  let nr = rt_sw_arg(ps, 3)
+  let m = rt_sw_arg(ps, 4)
+  let delta = rt_sw_arg(ps, 5)
+  let bg = rt_sw_f64_of(rt_sw_arg(ps, 6))
+  let one = rt_sw_f64_of(1065353216)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let ray = 0
+  while ray < lim {
+    if ray < nr {
+      let d = rt_sw_ld32(delta + 4 * ray)
+      let T = one
+      let r = rt_sw_f64_of(0)
+      let g = rt_sw_f64_of(0)
+      let b = rt_sw_f64_of(0)
+      let s = 0
+      while s < m {
+        let p = raw + 16 * (ray * m + s)
+        let e = rt_sw_expm(rt_sw_ld32(p), d)
+        let alpha = rt_sw_add32(one, rt_sw_neg32(e))
+        let c0 = rt_sw_sig(rt_sw_ld32(p + 4))
+        let c1 = rt_sw_sig(rt_sw_ld32(p + 8))
+        let c2 = rt_sw_sig(rt_sw_ld32(p + 12))
+        let w = rt_sw_mul32(T, alpha)
+        let r = rt_sw_fma32(w, c0, r)
+        let g = rt_sw_fma32(w, c1, g)
+        let b = rt_sw_fma32(w, c2, b)
+        do rt_sw_st32(tr + 4 * (ray * m + s), T)
+        let T = rt_sw_add32(T, rt_sw_neg32(w))
+        let s = s + 1
+      }
+      let r = rt_sw_fma32(T, bg, r)
+      let g = rt_sw_fma32(T, bg, g)
+      let b = rt_sw_fma32(T, bg, b)
+      do rt_sw_st32(out + 12 * ray, r)
+      do rt_sw_st32(out + 12 * ray + 4, g)
+      do rt_sw_st32(out + 12 * ray + 8, b)
+    }
+    let ray = ray + 1
+  }
+  return rt_tag(0)
+}
+
+skill rt_sw_vrw(gx, bx, ps) -> Any {
+  let raw = rt_sw_arg(ps, 0)
+  let wts = rt_sw_arg(ps, 1)
+  let delta = rt_sw_arg(ps, 2)
+  let nr = rt_sw_arg(ps, 3)
+  let m = rt_sw_arg(ps, 4)
+  let one = rt_sw_f64_of(1065353216)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let ray = 0
+  while ray < lim {
+    if ray < nr {
+      let d = rt_sw_ld32(delta + 4 * ray)
+      let T = one
+      let s = 0
+      while s < m {
+        let e = rt_sw_expm(rt_sw_ld32(raw + 16 * (ray * m + s)), d)
+        let w = rt_sw_mul32(T, rt_sw_add32(one, rt_sw_neg32(e)))
+        do rt_sw_st32(wts + 4 * (ray * m + s), w)
+        let T = rt_sw_add32(T, rt_sw_neg32(w))
+        let s = s + 1
+      }
+    }
+    let ray = ray + 1
+  }
+  return rt_tag(0)
+}
+
+skill rt_sw_vrbwd(gx, bx, ps) -> Any {
+  let raw = rt_sw_arg(ps, 0)
+  let tr = rt_sw_arg(ps, 1)
+  let dc = rt_sw_arg(ps, 2)
+  let draw = rt_sw_arg(ps, 3)
+  let nr = rt_sw_arg(ps, 4)
+  let m = rt_sw_arg(ps, 5)
+  let delta = rt_sw_arg(ps, 6)
+  let bg = rt_sw_f64_of(rt_sw_arg(ps, 7))
+  let one = rt_sw_f64_of(1065353216)
+  let z = rt_sw_f64_of(0)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let ray = 0
+  while ray < lim {
+    if ray < nr {
+      let dlt = rt_sw_ld32(delta + 4 * ray)
+      let c0 = rt_sw_ld32(dc + 12 * ray)
+      let c1 = rt_sw_ld32(dc + 12 * ray + 4)
+      let c2 = rt_sw_ld32(dc + 12 * ray + 8)
+      let sum = rt_sw_add32(rt_sw_add32(c0, c1), c2)
+      let last = ray * m + m - 1
+      let eL = rt_sw_expm(rt_sw_ld32(raw + 16 * last), dlt)
+      let TL = rt_sw_ld32(tr + 4 * last)
+      let tail = rt_sw_mul32(rt_sw_mul32(rt_sw_mul32(dlt, rt_sw_mul32(TL, eL)), bg), sum)
+      let a0 = z
+      let a1 = z
+      let a2 = z
+      let s = m - 1
+      while s >= 0 {
+        let idx = ray * m + s
+        let p = raw + 16 * idx
+        let dens = rt_sw_ld32(p)
+        let gate = z
+        if flt(z, dens) { let gate = one }
+        let e = rt_sw_expm(dens, dlt)
+        let alpha = rt_sw_add32(one, rt_sw_neg32(e))
+        let T = rt_sw_ld32(tr + 4 * idx)
+        let w = rt_sw_mul32(T, alpha)
+        let rest = rt_sw_add32(T, rt_sw_neg32(w))
+        let s0 = rt_sw_sig(rt_sw_ld32(p + 4))
+        let s1 = rt_sw_sig(rt_sw_ld32(p + 8))
+        let s2 = rt_sw_sig(rt_sw_ld32(p + 12))
+        let dot = rt_sw_fma32(c2, s2, rt_sw_fma32(c1, s1, rt_sw_mul32(c0, s0)))
+        let acc = rt_sw_fma32(c2, a2, rt_sw_fma32(c1, a1, rt_sw_mul32(c0, a0)))
+        let g = rt_sw_add32(rt_sw_mul32(rt_sw_add32(rt_sw_mul32(rest, dot), rt_sw_neg32(acc)), dlt), rt_sw_neg32(tail))
+        do rt_sw_st32(draw + 16 * idx, rt_sw_mul32(g, gate))
+        let q0 = rt_sw_mul32(s0, rt_sw_add32(one, rt_sw_neg32(s0)))
+        let q1 = rt_sw_mul32(s1, rt_sw_add32(one, rt_sw_neg32(s1)))
+        let q2 = rt_sw_mul32(s2, rt_sw_add32(one, rt_sw_neg32(s2)))
+        do rt_sw_st32(draw + 16 * idx + 4, rt_sw_mul32(rt_sw_mul32(w, c0), q0))
+        do rt_sw_st32(draw + 16 * idx + 8, rt_sw_mul32(rt_sw_mul32(w, c1), q1))
+        do rt_sw_st32(draw + 16 * idx + 12, rt_sw_mul32(rt_sw_mul32(w, c2), q2))
+        let a0 = rt_sw_fma32(w, s0, a0)
+        let a1 = rt_sw_fma32(w, s1, a1)
+        let a2 = rt_sw_fma32(w, s2, a2)
+        if s == 0 { let s = 0 - 1 } else { let s = s - 1 }
+      }
+    }
+    let ray = ray + 1
+  }
+  return rt_tag(0)
+}
+
+skill rt_sw_posenc(gx, bx, ps) -> Any {
+  let pts = rt_sw_arg(ps, 0)
+  let feat = rt_sw_arg(ps, 1)
+  let n = rt_sw_arg(ps, 2)
+  let L = rt_sw_arg(ps, 3)
+  let alpha = rt_sw_f64_of(rt_sw_arg(ps, 4))
+  let one = rt_sw_f64_of(1065353216)
+  let z = rt_sw_f64_of(0)
+  let pi = rt_sw_f64_of(1078530011)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let t = 0
+  while t < lim {
+    if t < n {
+      let stride = L * 6 + 3
+      let o = feat + 4 * (t * stride)
+      let x = rt_sw_ld32(pts + 12 * t)
+      let y = rt_sw_ld32(pts + 12 * t + 4)
+      let zz = rt_sw_ld32(pts + 12 * t + 8)
+      do rt_sw_st32(o, x)
+      do rt_sw_st32(o + 4, y)
+      do rt_sw_st32(o + 8, zz)
+      let o = o + 12
+      let freq = pi
+      let lv = 0
+      while lv < L {
+        let w = rt_sw_add32(alpha, rt_sw_neg32(rt_sw_f64_of(rt_sw_f32_of(i2f(lv)))))
+        if flt(w, z) { let w = z }
+        if flt(one, w) { let w = one }
+        do rt_sw_st32(o, rt_sw_mul32(rt_sw_fsin(rt_sw_mul32(freq, x)), w))
+        do rt_sw_st32(o + 4, rt_sw_mul32(rt_sw_fcos(rt_sw_mul32(freq, x)), w))
+        do rt_sw_st32(o + 8, rt_sw_mul32(rt_sw_fsin(rt_sw_mul32(freq, y)), w))
+        do rt_sw_st32(o + 12, rt_sw_mul32(rt_sw_fcos(rt_sw_mul32(freq, y)), w))
+        do rt_sw_st32(o + 16, rt_sw_mul32(rt_sw_fsin(rt_sw_mul32(freq, zz)), w))
+        do rt_sw_st32(o + 20, rt_sw_mul32(rt_sw_fcos(rt_sw_mul32(freq, zz)), w))
+        let o = o + 24
+        let freq = rt_sw_mul32(freq, rt_sw_f64_of(1073741824))
+        let lv = lv + 1
+      }
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+skill rt_sw_u32m(a, b) -> Any { return band(a * b, 4294967295) }
+
+skill rt_sw_u32a(a, b) -> Any { return band(a + b, 4294967295) }
+
+skill rt_sw_addnoise(gx, bx, ps) -> Any {
+  let raw = rt_sw_arg(ps, 0)
+  let n = rt_sw_arg(ps, 1)
+  let scale = rt_sw_f64_of(rt_sw_arg(ps, 2))
+  let seed = rt_sw_arg(ps, 3)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let tiny = rt_sw_f64_of(872415232)
+  let neg = rt_sw_f64_of(3216077336)
+  let twopi = rt_sw_f64_of(1086918619)
+  let t = 0
+  while t < lim {
+    if t < n {
+      let u = rt_sw_u32a(rt_sw_u32m(rt_sw_u32a(t, seed), 747796405), 2891336453)
+      let s = bxor(rt_sw_u32m(u, u), u)
+      let f1 = rt_sw_add32(rt_sw_f64_of(bor(shr(s, 9), 1065353216)), rt_sw_neg32(rt_sw_f64_of(1065353216)))
+      if flt(f1, tiny) { let f1 = tiny }
+      let u2 = rt_sw_u32a(rt_sw_u32m(s, 747796405), 2891336453)
+      let s2 = bxor(rt_sw_u32m(u2, u2), u2)
+      let f2 = rt_sw_add32(rt_sw_f64_of(bor(shr(s2, 9), 1065353216)), rt_sw_neg32(rt_sw_f64_of(1065353216)))
+      let mag = rt_sw_sqrt32(rt_sw_mul32(rt_sw_log2(f1), neg))
+      let noise = rt_sw_mul32(rt_sw_mul32(mag, rt_sw_cos(rt_sw_mul32(f2, twopi))), scale)
+      let p = raw + 16 * t
+      do rt_sw_st32(p, rt_sw_add32(rt_sw_ld32(p), noise))
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -4305,6 +4642,11 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
     if rt_sw_text_is(peek(rec + 8), "actb") { return rt_sw_actb(gxt, bxt, ps) }
     if rt_sw_text_is(peek(rec + 8), "mseg") { return rt_sw_mseg(gxt, bxt, ps) }
     if rt_sw_text_is(peek(rec + 8), "adam") { return rt_sw_adam(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "vrfwd") { return rt_sw_vrfwd(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "vrbwd") { return rt_sw_vrbwd(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "vrw") { return rt_sw_vrw(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "posenc") { return rt_sw_posenc(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "addnoise") { return rt_sw_addnoise(gxt, bxt, ps) }
     return rt_tag(0 - 400)
   }
   let n = peek(ps + 8)

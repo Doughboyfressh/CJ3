@@ -1,8 +1,8 @@
-# Number sequences on the GPU: every small program at once. Each GPU thread is one candidate program (postfix, up to
+# Number sequences on the chip: every small program at once. Each thread is one candidate program (postfix, up to
 # 7 tokens over n, a(n-1), a(n-2), 1, 2, 3, + - * // %), checked against every target sequence on terms 2..7 (with the
-# sequence's own earlier terms, so recurrences are included). The kernel is PTX that Pi writes (no toolkit); Pi's
-# runtime launches it through nvcuda.dll (gpu_seq). The CPU then checks each sequence's SHORTEST fitting program --
-# chosen without looking at held-out terms -- on terms 9-12 (solved) and 13-20 (holds), as oeis.pi does.
+# sequence's own earlier terms, so recurrences are included). gpu_seq runs that check on Softwell. The CPU then checks
+# each sequence's SHORTEST fitting program -- chosen without looking at held-out terms -- on terms 9-12 (solved) and
+# 13-20 (holds), as oeis.pi does.
 # Test set: the same 300 OEIS sequences as oeis.pi (usable sequences, every 5th, never practised).
 #   out\gpuseq.exe [test sequences] [max length]
 import "inflate.pi"

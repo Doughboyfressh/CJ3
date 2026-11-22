@@ -1395,30 +1395,9 @@ skill sh_compile_sound(src) -> Any {
 
 # ---- GPU code in, with what the driver said when it refuses it ---------------------------------------------------------
 skill rt_sh_module(ptx, logpath) -> Any {
-  if ostarget() != 0 {
-    let p = rt_alloc(8)
-    do poke(p, ptx)
-    return rt_tag(p)
-  }
-  let n = 65536
-  let log = rt_zero(rt_alloc(n), n)
-  let opts = rt_zero(rt_alloc(16), 16)
-  do rt_poke32(opts, 5)
-  do rt_poke32(opts + 4, 6)
-  let vals = rt_alloc(16)
-  do poke(vals, log)
-  do poke(vals + 8, n)
-  let mod = rt_zero(rt_alloc(8), 8)
-  let r = rt_u32(wcallp(rt_cu("cuModuleLoadDataEx"), mod, rt_cstr(ptx), 2, opts, vals))
-  if r != 0 {
-    let k = 0
-    while k < n - 1 and peekb(log + k) != 0 { let k = k + 1 }
-    let t = rt_text_new(k)
-    for i in range(0, k) { do pokeb(t + 16 + i, peekb(log + i)) }
-    do rt_write_file(logpath, t)
-    return rt_tag(0 - 300 - r)
-  }
-  return rt_tag(peek(mod))
+  let p = rt_alloc(8)
+  do poke(p, ptx)
+  return rt_tag(p)
 }
 
 # ---- PNG ------------------------------------------------------------------------------------------------------------

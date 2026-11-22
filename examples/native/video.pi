@@ -1,5 +1,4 @@
-# video: Pi's frames as a real video file, with nothing between Pi and the graphics card. The driver's hardware encoder
-# (NVENC, part of the same driver as CUDA) is called directly, as CUDA is; the MP4 file around its output is written here.
+# video: frames as a file. There is no physical encoder. vid_open stops, and names the refusal.
 #   vid_open(path, w, h, fps, quality)  vid_frame(V, S)  vid_close(V)
 # S is what shade.pi's sh_open returned: its bytes buffer is the frame. quality: 1 (best) .. 51 (smallest); 18 is
 # already hard to tell from the original.
@@ -35,111 +34,11 @@ skill rt_nv_guid(p, a, b, c, hi, lo) -> Any {
   return p
 }
 
-# -> the encoder's handle block, or a negative number saying which step refused
+# -> the encoder's handle block, or a negative number saying which step refused.
+# There is no hardware encoder on this machine.
 skill rt_nv_open(wt, ht, fpst, cqt, pitcht, devt) -> Any {
-  let w = rt_untag(wt)
-  let h = rt_untag(ht)
-  let pmax = rt_zero(rt_alloc(8), 8)
-  let f0 = rt_proc("nvEncodeAPI64.dll", "NvEncodeAPIGetMaxSupportedVersion")
-  if f0 == 0 { return rt_tag(0 - 1) }
-  let r = rt_u32(wcallp(f0, pmax))
-  if r != 0 { return rt_tag(0 - 1000 - r) }
-  let mx = rt_peek32(pmax)
-  let major = shr(mx, 4)
-  let minor = band(mx, 15)
-  if major < 13 { return rt_tag(0 - 2) }
-  if major > 13 or minor > 1 {
-    let major = 13
-    let minor = 1
-  }
-  let api = bor(major, shl(minor, 24))
-  let nv = rt_zero(rt_alloc(256), 256)
-  do poke(nv + 16, api)
-  let fl = rt_zero(rt_alloc(2552), 2552)
-  do rt_poke32(fl, rt_nv_sv(api, 2))
-  let r = rt_u32(wcallp(rt_proc("nvEncodeAPI64.dll", "NvEncodeAPICreateInstance"), fl))
-  if r != 0 { return rt_tag(0 - 2000 - r) }
-  do poke(nv, fl)
-  # a session on the GPU context this program already has
-  let ctx = rt_zero(rt_alloc(8), 8)
-  do wcallp(rt_cu("cuCtxGetCurrent"), ctx)
-  let op = rt_zero(rt_alloc(1552), 1552)
-  do rt_poke32(op, rt_nv_sv(api, 1))
-  do rt_poke32(op + 4, 1)
-  do poke(op + 8, peek(ctx))
-  do rt_poke32(op + 24, api)
-  let ep = rt_zero(rt_alloc(8), 8)
-  let r = rt_u32(wcallp(rt_nv_fn(nv, 29), op, ep))
-  if r != 0 { return rt_tag(0 - 3000 - r) }
-  let enc = peek(ep)
-  do poke(nv + 8, enc)
-  # H.264, the slowest and best preset, tuned for quality; it fills in the settings and only a few are changed
-  let gc = rt_nv_guid(rt_alloc(16), 1808279394, 20067, 19620, 2860850768, 4079089343)
-  let gp = rt_nv_guid(rt_alloc(16), 2223279122, 28529, 19475, 2468041698, 2213902708)
-  let pc = rt_zero(rt_alloc(16384), 16384)
-  do rt_poke32(pc, bor(rt_nv_sv(api, 5), shl(1, 31)))
-  do rt_poke32(pc + 8, bor(rt_nv_sv(api, 9), shl(1, 31)))
-  let r = rt_u32(wcallp(rt_nv_fn(nv, 39), enc, gc, gp, 1, pc))
-  if r != 0 { return rt_tag(0 - 4000 - r) }
-  let cfg = pc + 8
-  # no B-frames: each frame comes out as it goes in; forced keyframes rather than a fixed length
-  do rt_poke32(cfg + 20, 4294967295)
-  do rt_poke32(cfg + 24, 1)
-  # a constant quality, not a bitrate: variable rate with the target quality set and the average left open
-  do rt_poke32(cfg + 44, 1)
-  do rt_poke32(cfg + 60, 0)
-  do rt_poke32(cfg + 64, 240000000)
-  # adaptive quantisation on, look-ahead off (it would hold frames back)
-  let bits = rt_peek32(cfg + 76)
-  let bits = bor(bits, 8)
-  let bits = bor(bits, 256)
-  let bits = band(bits, 4294967263)
-  do rt_poke32(cfg + 76, bits)
-  do pokeb(cfg + 128, rt_untag(cqt))
-  do pokeb(cfg + 129, 0)
-  do pokeb(cfg + 130, 0)
-  do pokeb(cfg + 131, 0)
-  let ip = rt_zero(rt_alloc(1800), 1800)
-  do rt_poke32(ip, bor(rt_nv_sv(api, 7), shl(1, 31)))
-  do rt_vid_copy(ip + 4, gc, 16)
-  do rt_vid_copy(ip + 20, gp, 16)
-  do rt_poke32(ip + 36, w)
-  do rt_poke32(ip + 40, h)
-  do rt_poke32(ip + 44, w)
-  do rt_poke32(ip + 48, h)
-  do rt_poke32(ip + 52, rt_untag(fpst))
-  do rt_poke32(ip + 56, 1)
-  do rt_poke32(ip + 64, 1)
-  do poke(ip + 88, cfg)
-  do rt_poke32(ip + 96, w)
-  do rt_poke32(ip + 100, h)
-  do rt_poke32(ip + 136, 1)
-  let r = rt_u32(wcallp(rt_nv_fn(nv, 11), enc, ip))
-  if r != 0 { return rt_tag(0 - 5000 - r) }
-  # where the compressed frames land
-  let bb = rt_zero(rt_alloc(776), 776)
-  do rt_poke32(bb, rt_nv_sv(api, 1))
-  let r = rt_u32(wcallp(rt_nv_fn(nv, 14), enc, bb))
-  if r != 0 { return rt_tag(0 - 6000 - r) }
-  do poke(nv + 24, peek(bb + 16))
-  # the frames come from GPU memory, NV12
-  let rg = rt_zero(rt_alloc(1536), 1536)
-  do rt_poke32(rg, rt_nv_sv(api, 5))
-  do rt_poke32(rg + 4, 1)
-  do rt_poke32(rg + 8, w)
-  do rt_poke32(rg + 12, h)
-  do rt_poke32(rg + 16, rt_untag(pitcht))
-  do poke(rg + 24, rt_untag(devt))
-  do rt_poke32(rg + 40, 1)
-  let r = rt_u32(wcallp(rt_nv_fn(nv, 30), enc, rg))
-  if r != 0 { return rt_tag(0 - 7000 - r) }
-  do poke(nv + 32, peek(rg + 32))
-  do poke(nv + 40, w)
-  do poke(nv + 48, h)
-  do poke(nv + 56, rt_untag(pitcht))
-  return rt_tag(nv)
+  return rt_tag(0 - 1)
 }
-
 # the file a film is written to, straight through
 skill rt_vf_open(patht) -> Any {
   let h = wcall("CreateFileA", rt_cstr(patht), 1073741824, 0, 0, 2, 128, 0)

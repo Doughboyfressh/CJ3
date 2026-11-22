@@ -11,7 +11,7 @@ brain. No Rust, no interpreter, no CUDA toolkit, no third-party libraries — Pi
   other exactly. The Rust interpreter that first bootstrapped Pi has been retired.
 - **Its own runtime.** `examples/native/rt.pi` provides memory, text, lists, maps, exact big integers, files
   and printing. There is no garbage collector; memory is reclaimed in regions (`mark()` / `release()`).
-- **Its own machine.** Softwell is the only GPU, CPU, SSD, and RAM Pi needs: 64 KB of RAM, a 1 MB SSD, and the chip. No CUDA toolkit, and no physical module. On Windows, Pi can still emit PTX through `nvcuda.dll`. It does not have to.
+- **Its own machine.** Softwell is the only GPU, CPU, SSD, and RAM Pi needs: 64 KB of RAM, a 1 MB SSD, and the chip. No CUDA toolkit, no driver, and no physical module.
 - **A brain.** A language model runs on Pi's own GPU engine and acts *through* Pi: it writes and runs programs
   (`run_pi`), uses a real shell and the web, and keeps a memory across conversations. The language even improves
   itself — `langgrow.pi` learns new grammar rules from the brain's own compile failures, and only reseeds the
@@ -101,6 +101,6 @@ and the compiler — but not the brain's local data, which stays on the machine.
 A personal research project. Windows x64 and Linux x64.
 
 On Linux the language, the runtime, files, folders, child processes (`spawn`, `par for`), sockets and the clock
-all work, and the whole test suite passes against the same golden files as Windows. What is still Windows-only:
-the GPU engine (it loads NVIDIA's Windows driver), `http()` (WinHTTP), and the screen, mouse, keyboard and sound
-words. A program that reaches for one of those on Linux stops with a message naming it.
+all work, and the whole test suite passes against the same golden files as Windows. Softwell is the machine on
+both hosts. There is no NVIDIA driver to load. What is still Windows-only: `http()` (WinHTTP), and the screen,
+mouse, keyboard and sound words. A program that reaches for one of those on Linux stops with a message naming it.

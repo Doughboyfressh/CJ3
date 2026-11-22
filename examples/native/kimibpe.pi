@@ -1,0 +1,90 @@
+# Kimi's language, the part that fits.
+# The merge table has 163,584 pieces. 82,340 of them are printable ASCII, 1,106,544 bytes.
+# The disk is 8,388,608, so this piece fits. The gate and the expert payloads do not.
+# encode merges the pair with the lowest rank until none is in the table.
+# hello, world, a, and the are the training words. Paris, distill, Pi, Kimi, and soft are held out.
+# Their ids were produced by Kimi's tiktoken file, and this program recomputes them.
+# A word that is not one piece stays split: distill is 22,769 then 534. Kimi is 42 then 30,223.
+skill load_vocab() -> Any {
+  let m = {}
+  let n = 0
+  for line in split(trim(read_file("examples/native/kimi_vocab.txt")), "\n") {
+    let cs = chars(line)
+    let i = 0
+    let rank = 0
+    while ord(cs[i]) != 32 {
+      let rank = rank * 10 + (ord(cs[i]) - 48)
+      let i = i + 1
+    }
+    let m = put(m, slice(line, i + 1, len(line)), rank)
+    let n = n + 1
+  }
+  return [m, n]
+}
+skill encode(m, text) -> Any {
+  let parts = chars(text)
+  let n = len(parts)
+  let going = 1
+  while going == 1 {
+    if n < 2 { let going = 0 }
+    if going == 1 {
+      let best = 0 - 1
+      let br = 0
+      for i in range(0, n - 1) {
+        let r = get(m, parts[i] ++ parts[i + 1], 0 - 1)
+        if r >= 0 {
+          if best < 0 {
+            let best = i
+            let br = r
+          }
+          if r < br {
+            let best = i
+            let br = r
+          }
+        }
+      }
+      if best < 0 { let going = 0 }
+      if best >= 0 {
+        let nxt = []
+        for i in range(0, n) {
+          if i == best { let nxt = append(nxt, parts[i] ++ parts[i + 1]) }
+          if i != best {
+            if i != best + 1 { let nxt = append(nxt, parts[i]) }
+          }
+        }
+        let parts = nxt
+        let n = len(parts)
+      }
+    }
+  }
+  let ids = []
+  for p in parts { let ids = append(ids, get(m, p, 0 - 1)) }
+  return ids
+}
+
+skill main() -> Any {
+  let loaded = load_vocab()
+  let m = loaded[0]
+  let text = "bpe ascii fits\npayload does not\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(loaded[1] == 82340)
+  print(1106544 < 8388608)
+  print(encode(m, "hello") == [22931])
+  print(encode(m, "world") == [23617])
+  print(encode(m, "a") == [64])
+  print(encode(m, "the") == [2108])
+  print(encode(m, "Paris") == [113476])
+  print(encode(m, "distill") == [22769, 534])
+  print(encode(m, "Pi") == [41809])
+  print(encode(m, "Kimi") == [42, 30223])
+  print(encode(m, "soft") == [5302])
+  print(read == 1024)
+  print(got == text)
+  return 0
+}

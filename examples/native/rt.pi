@@ -4569,6 +4569,58 @@ skill rt_sw_srow(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# mvf32: k float rows times nv double vectors. A vector that fits is one shared row in TMEM.
+# Eight threads of a warp share a row; the launch's row count is gx blocks of bx/32 warps.
+# The sum is float32, then widened. A vector longer than 1024 floats is not kept.
+skill rt_sw_mvf32(gx, bx, ps) -> Any {
+  let W = rt_sw_arg(ps, 0)
+  let X = rt_sw_arg(ps, 1)
+  let Y = rt_sw_arg(ps, 2)
+  let n = rt_sw_arg(ps, 3)
+  let k = rt_sw_arg(ps, 4)
+  let nv = rt_sw_arg(ps, 5)
+  let rb = rt_sw_arg(ps, 6)
+  let warps = rt_untag(bx) // 32
+  if warps < 1 { let warps = 1 }
+  let rows = rt_untag(gx) * warps
+  if rows > k { let rows = k }
+  let fits = 0
+  if n > 0 and n <= 1024 { let fits = 1 }
+  let bytes = 0
+  if rows > 0 and nv > 0 {
+    if fits == 1 { let bytes = rows * n * 4 + nv * n * 8 + rows * nv * 8 }
+    if fits == 0 { let bytes = rows * n * 4 + rows * nv * n * 8 + rows * nv * 8 }
+  }
+  do rt_sw_note(bytes)
+  let base = rt_untag(rt_sw_tmem())
+  let v = 0
+  while v < nv {
+    if fits == 1 {
+      let j = 0
+      while j < n {
+        do rt_poke32(base + 4 * j, rt_sw_f32_of(peek(X + 8 * (v * n + j))))
+        let j = j + 1
+      }
+    }
+    let row = 0
+    while row < rows {
+      let acc = rt_sw_f64_of(0)
+      let j = 0
+      while j < n {
+        let xv = rt_sw_f64_of(0)
+        if fits == 1 { let xv = rt_sw_ld32(base + 4 * j) }
+        if fits == 0 { let xv = rt_sw_f64_of(rt_sw_f32_of(peek(X + 8 * (v * n + j)))) }
+        let acc = rt_sw_fma32(rt_sw_ld32(W + row * rb + 4 * j), xv, acc)
+        let j = j + 1
+      }
+      do poke(Y + 8 * (v * k + row), acc)
+      let row = row + 1
+    }
+    let v = v + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -4594,6 +4646,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "addnoise") { return rt_sw_finish(rt_sw_addnoise(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "tred") { return rt_sw_finish(rt_sw_tred(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "srow") { return rt_sw_finish(rt_sw_srow(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "mvf32") { return rt_sw_finish(rt_sw_mvf32(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

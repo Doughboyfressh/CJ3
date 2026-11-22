@@ -1,4 +1,5 @@
-# One idea, taught once. Heed's lesson file is also a Mind lesson. The word is a building block.
+# One idea, taught once. The lesson text lives on the SSD, not in a host file.
+# Reading it through the one 4 KB window costs 1,024 cycles, and the same page again costs nothing.
 # Sum of squares does not fit in the budget as map-then-sum. Sum of the taught word does.
 # Softwell squares the list and adds it.
 import "mindcore.pi"
@@ -17,7 +18,15 @@ skill shape_of(t, lib) -> Any {
 
 skill main() -> Any {
   let text = "heed1 brins sum 2,3 13\nheed1 brins product 2,3 36\n"
-  let lessons = load_lessons(text)
+  let slot = rt_sw_ssd_alloc(8 + len(text))
+  let p0 = rt_sw_pg()
+  do rt_sw_ssd_puts(slot, text)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(other, "x")
+  let back = rt_sw_ssd_gets(slot)
+  let p1 = rt_sw_pg()
+  let again = rt_sw_ssd_gets(slot)
+  let lessons = load_lessons(back)
   let woke = awake_lessons([], {"lists": []}, lessons)
   let lib = woke[0]
   let word = lessons[0][2]
@@ -28,6 +37,11 @@ skill main() -> Any {
   let bare = solve(tr, hl, [], [], pl, pre, 4, 20000)
   let got = solve(tr, hl, lib, woke[1]["lists"], pl, pre, 4, 20000)
   let tree = got[0]
+  print(slot >= 0)
+  print(back == text)
+  print(p1 - p0 == 3072)
+  print(rt_sw_pg() == p1)
+  print(again == text)
   print(len(lessons) == 1)
   print(lessons[0][1] == "brins")
   print(show(word[0]) == "map(e -> (e * e), a)")

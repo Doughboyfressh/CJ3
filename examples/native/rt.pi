@@ -3378,6 +3378,41 @@ skill rt_sw_ssd_real(bt, ot) -> Any {
   return rt_mkreal(rt_sw_ssd_ld(rt_untag(bt), rt_untag(ot)))
 }
 
+# A text record on the SSD: one raw length, then that many bytes. Both go through the one
+# 4 KB window. The first byte of a page costs 1,024 cycles. The rest of that page does not.
+skill rt_sw_ssd_puts(bt, text) -> Any {
+  let base = rt_untag(bt)
+  let n = peek(text + 8)
+  do rt_sw_ssd_st(base, 0, n)
+  let i = 0
+  while i < n {
+    let p = rt_sw_page_at(base + 8 + i)
+    if p != 0 {
+      let c = peekb(text + 16 + i)
+      do pokeb(p, c)
+      do pokeb(rt_sw_ssd() + base + 8 + i, c)
+    }
+    let i = i + 1
+  }
+  return rt_tag(n)
+}
+
+skill rt_sw_ssd_gets(bt) -> Any {
+  let base = rt_untag(bt)
+  let n = rt_sw_ssd_ld(base, 0)
+  if n < 0 or n > 8388608 { return 0 }
+  let s = rt_text_new(n)
+  let i = 0
+  while i < n {
+    let p = rt_sw_page_at(base + 8 + i)
+    let c = 0
+    if p != 0 { let c = peekb(p) }
+    do pokeb(s + 16 + i, c)
+    let i = i + 1
+  }
+  return s
+}
+
 # the bump goes back to the start of the 64 KB. The previous addresses are no longer RAM.
 skill rt_sw_rewind() -> Any {
   do poke(gaddr(21), 0)

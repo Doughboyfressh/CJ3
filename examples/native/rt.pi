@@ -5980,6 +5980,190 @@ skill rt_sw_attn(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# cos and sin of a double, the listing's reduction and series. A product is two roundings;
+# at a zero angle every product is zero, so both are exact.
+skill rt_sw_sincos(x, dst) -> Any {
+  let n = rt_sw_rni(fmul(x, 4594902181429758083))
+  let r = fadd(fmul(fsub(i2f(0), i2f(n)), 4618760256179416344), x)
+  let r = fadd(fmul(fsub(i2f(0), i2f(n)), 4373459396149402631), r)
+  let u = fsub(i2f(0), fmul(r, r))
+  let sn = 4099459641245955516
+  let sn = fadd(fmul(sn, u), 4143973535452453037)
+  let sn = fadd(fmul(sn, u), 4187532579305213603)
+  let sn = fadd(fmul(sn, u), 4229992536239136681)
+  let sn = fadd(fmul(sn, u), 4271490197626435610)
+  let sn = fadd(fmul(sn, u), 4311945469071521138)
+  let sn = fadd(fmul(sn, u), 4351309137733304663)
+  let sn = fadd(fmul(sn, u), 4389130328383466826)
+  let sn = fadd(fmul(sn, u), 4425604618586929183)
+  let sn = fadd(fmul(sn, u), 4460272573143870729)
+  let sn = fadd(fmul(sn, u), 4493156764026750180)
+  let sn = fadd(fmul(sn, u), 4523617214285662004)
+  let sn = fadd(fmul(sn, u), 4551452160554016794)
+  let sn = fadd(fmul(sn, u), 4575957461383581969)
+  let sn = fadd(fmul(sn, u), 4595172819793696085)
+  let sn = fadd(fmul(sn, u), 4607182418800017408)
+  let cs = 4121799902508865037
+  let cs = fadd(fmul(cs, u), 4166007270036277341)
+  let cs = fadd(fmul(cs, u), 4208770557894348378)
+  let cs = fadd(fmul(cs, u), 4251165982991775096)
+  let cs = fadd(fmul(cs, u), 4292157190933313619)
+  let cs = fadd(fmul(cs, u), 4331992437988917797)
+  let cs = fadd(fmul(cs, u), 4370323941990432151)
+  let cs = fadd(fmul(cs, u), 4407590220077447199)
+  let cs = fadd(fmul(cs, u), 4443145680587881629)
+  let cs = fadd(fmul(cs, u), 4477122120089393304)
+  let cs = fadd(fmul(cs, u), 4508805057796939612)
+  let cs = fadd(fmul(cs, u), 4537941361671905306)
+  let cs = fadd(fmul(cs, u), 4564047942368979991)
+  let cs = fadd(fmul(cs, u), 4586165620538955093)
+  let cs = fadd(fmul(cs, u), 4602678819172646912)
+  let cs = fadd(fmul(cs, u), 4607182418800017408)
+  do poke(dst, cs)
+  do poke(dst + 8, fmul(sn, r))
+  return 0
+}
+
+# one Q4_K weight. d and dmin are binary16 widened through float32. The 6-bit scale and min
+# and the nibble are the same bytes mvq4 reads. The products stay float64, as this listing does.
+skill rt_sw_q4w(blk, within) -> Any {
+  let c = shr(within, 6)
+  let half = band(shr(within, 5), 1)
+  let l = band(within, 31)
+  let j = c * 2 + half
+  let d = rt_sw_f64_of(rt_sw_f16(blk))
+  let dmin = rt_sw_f64_of(rt_sw_f16(blk + 2))
+  let sc = i2f(rt_sw_q4sm(blk, j, 0))
+  let mn = i2f(rt_sw_q4sm(blk, j, 1))
+  let nb = peekb(blk + 16 + 32 * c + l)
+  let q = band(nb, 15)
+  if half == 1 { let q = band(shr(nb, 4), 15) }
+  return fsub(fmul(fmul(d, sc), i2f(q)), fmul(dmin, mn))
+}
+
+# one Q6_K weight. The nibble, the two high bits, and the signed scale are mvq6's. q is that
+# 6-bit value minus 32. d is the binary16 at offset 208, widened through float32.
+skill rt_sw_q6w(blk, within) -> Any {
+  let h = shr(within, 7)
+  let lo = band(within, 127)
+  let g = shr(lo, 5)
+  let l = band(lo, 31)
+  let ql = peekb(blk + 64 * h + l)
+  if band(g, 1) == 1 { let ql = peekb(blk + 64 * h + 32 + l) }
+  let nib = band(ql, 15)
+  if g >= 2 { let nib = band(shr(ql, 4), 15) }
+  let top = band(shr(peekb(blk + 128 + 32 * h + l), 2 * g), 3)
+  let q = bor(nib, shl(top, 4)) - 32
+  let sc = peekb(blk + 192 + 8 * h + 2 * g + shr(l, 4))
+  if sc >= 128 { let sc = sc - 256 }
+  let d = rt_sw_f64_of(rt_sw_f16(blk + 208))
+  return fmul(fmul(d, i2f(sc)), i2f(q))
+}
+
+# rope pairs for threads 0..31. th = pos * exp(-(2 i / 64) * ln(1e7)).
+skill rt_sw_tokrope(dst, pos, lanes) -> Any {
+  let n = lanes
+  if n > 32 { let n = 32 }
+  if n < 0 { let n = 0 }
+  let t = 0
+  while t < n {
+    let ang = fdiv(i2f(t + t), 4634204016564240384)
+    let ang = fmul(ang, 4625230058280102515)
+    let th = fmul(i2f(pos), rt_sw_exp64(fsub(i2f(0), ang)))
+    do rt_sw_sincos(th, dst + 16 * t)
+    let t = t + 1
+  }
+  return n * 16
+}
+
+# 2048 embedding weights, stride 256, then the rope pairs. Q6_K when typ is 14, otherwise Q4_K.
+skill rt_sw_tokbody(row, X, ROPE, pos, typ, lanes) -> Any {
+  let bytes = 0
+  let t = 0
+  while t < lanes {
+    let i = t
+    while i < 2048 {
+      let blk = shr(i, 8)
+      let within = band(i, 255)
+      if typ == 14 {
+        do poke(X + 8 * i, rt_sw_q6w(row + blk * 210, within))
+        let bytes = bytes + 13
+      } else {
+        do poke(X + 8 * i, rt_sw_q4w(row + blk * 144, within))
+        let bytes = bytes + 15
+        if within >= 128 { let bytes = bytes + 1 }
+      }
+      let i = i + 256
+    }
+    let t = t + 1
+  }
+  return bytes + rt_sw_tokrope(ROPE, pos, lanes)
+}
+
+# tokin: thread 0 records the position and the chosen token, then every thread decodes that row.
+# The token is AMAX[1] and the position is POS[1], both doubles taken toward zero.
+skill rt_sw_tokin(gx, bx, ps) -> Any {
+  let AM = rt_sw_arg(ps, 0)
+  let POS = rt_sw_arg(ps, 1)
+  let TOKS = rt_sw_arg(ps, 2)
+  let EMB = rt_sw_arg(ps, 3)
+  let X = rt_sw_arg(ps, 4)
+  let ROPE = rt_sw_arg(ps, 5)
+  let rb = rt_sw_arg(ps, 6)
+  let typ = rt_sw_arg(ps, 7)
+  let blocks = rt_untag(gx)
+  let lanes = rt_untag(bx)
+  if lanes > 256 { let lanes = 256 }
+  if lanes < 0 { let lanes = 0 }
+  if blocks < 0 { let blocks = 0 }
+  let bytes = 0
+  let b = 0
+  while b < blocks {
+    let id = f2i(peek(AM + 8))
+    let pos = f2i(peek(POS + 8))
+    if lanes > 0 {
+      do poke(POS, i2f(pos))
+      do poke(POS + 8, i2f(pos + 1))
+      do poke(TOKS + 8 * pos, peek(AM + 8))
+      let bytes = bytes + 24
+    }
+    let bytes = bytes + lanes * 16
+    let bytes = bytes + rt_sw_tokbody(EMB + id * rb, X, ROPE, pos, typ, lanes)
+    let b = b + 1
+  }
+  do rt_sw_note(bytes)
+  return rt_tag(0)
+}
+
+# tokinT: one block per token of a prefill. The token id is TOKS[POS[0] + block]. No bookkeeping.
+# Row t of X is 2048 doubles past the previous one, and its rope is 64 doubles past.
+skill rt_sw_tokinT(gx, bx, ps) -> Any {
+  let POS = rt_sw_arg(ps, 1)
+  let TOKS = rt_sw_arg(ps, 2)
+  let EMB = rt_sw_arg(ps, 3)
+  let X = rt_sw_arg(ps, 4)
+  let ROPE = rt_sw_arg(ps, 5)
+  let rb = rt_sw_arg(ps, 6)
+  let typ = rt_sw_arg(ps, 7)
+  let blocks = rt_untag(gx)
+  let lanes = rt_untag(bx)
+  if lanes > 256 { let lanes = 256 }
+  if lanes < 0 { let lanes = 0 }
+  if blocks < 0 { let blocks = 0 }
+  let pos0 = f2i(peek(POS))
+  let bytes = 0
+  let b = 0
+  while b < blocks {
+    let pos = pos0 + b
+    let id = f2i(peek(TOKS + 8 * pos))
+    let bytes = bytes + lanes * 16
+    let bytes = bytes + rt_sw_tokbody(EMB + id * rb, X + b * 16384, ROPE + b * 512, pos, typ, lanes)
+    let b = b + 1
+  }
+  do rt_sw_note(bytes)
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -6022,6 +6206,8 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "capd") { return rt_sw_finish(rt_sw_capd(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "qkprep") { return rt_sw_finish(rt_sw_qkprep(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "attn") { return rt_sw_finish(rt_sw_attn(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "tokin") { return rt_sw_finish(rt_sw_tokin(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "tokinT") { return rt_sw_finish(rt_sw_tokinT(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

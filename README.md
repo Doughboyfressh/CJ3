@@ -73,6 +73,19 @@ Run `out/heed review out/lessons.txt` to use that memory in the ordinary Heed cu
 When practice examples support multiple readings, Heed can save them and ask for a distinguishing
 example. Answer with `teach` and rerun `review` to see how the correction transfers.
 
+When a `use` request has several possible answers, Heed tries questions on other small
+lists. It chooses a question that minimizes how many different answers to your original
+request could remain after the reply. Teach the reply and repeat the original request.
+Different meanings can agree on that request and still disagree on a later one.
+
+For example, teach that the product of “vems” on `0` is `0`, then ask for the product
+on `4,5,6`. Heed asks for the product on `3,5,7`. If you teach `-105`, it can answer
+`-120` on the original list while it still needs another observation for `7,8`.
+
+Run `./build.sh examples/native/inquiry.pi` and `out/inquiry compare` to compare
+the two question policies. It prints the number of ambiguous requests, the number
+of request/rule pairs, and how many each policy resolves with one reply.
+
 ## Layout
 
 | Path | What |

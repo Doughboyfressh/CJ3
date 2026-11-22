@@ -244,6 +244,8 @@ skill hm_command(path, command, phrase, csv, answer) -> Any {
     let agree = y != null
     for law in laws { if hm_read(word, law, phrase, xs) != y { agree = false } }
     if agree { return str(y) }
+    let probe = hm_target_question(laws,[ws[0],xs])
+    if probe != null { return hm_prompt(word,probe) }
   }
   return hm_ask(word, laws)
 }

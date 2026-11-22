@@ -1,0 +1,69 @@
+# An answer to a different question settles this product while leaving the word ambiguous.
+import "mindcore.pi"
+
+skill decided(laws,target,probe) -> Any {
+  let wins = 0
+  for truth in laws {
+    let reply = hm_predict(truth,probe)
+    let expected = hm_predict(truth,target)
+    let ok = true
+    for law in laws {
+      if hm_predict(law,probe) == reply and hm_predict(law,target) != expected { let ok = false }
+    }
+    if ok { let wins = wins + 1 }
+  }
+  return wins
+}
+skill compare_questions() -> Any {
+  let total = 0
+  let old = 0
+  let fresh = 0
+  let jobs = 0
+  for obs in [["product",[0],0],["sum",[2,3],10],["count",[2,3],2],["largest",[2],4]] {
+    let laws = hm_laws([obs])
+    for reducer in hm_reducers() {
+      for xs in [[4,5,6],[7,8],[0-5,3,4]] {
+        let query = [reducer,xs]
+        let vals = {}
+        for law in laws { let vals = put(vals,str(hm_predict(law,query)),true) }
+        if len(keys(vals)) > 1 {
+          let base = hm_question(laws)
+          let probe = hm_target_question(laws,query)
+          if probe == null { let probe = base }
+          let jobs = jobs + 1
+          let total = total + len(laws)
+          let old = old + decided(laws,query,base)
+          let fresh = fresh + decided(laws,query,probe)
+        }
+      }
+    }
+  }
+  return [jobs,total,old,fresh]
+}
+
+# Pass "compare" to count one-reply resolutions across the fixed comparison cases.
+skill main() -> Any {
+  if arg(1) == "compare" { return compare_questions() }
+  let obs = [["product",[0],0]]
+  let laws = hm_laws(obs)
+  let target = ["product",[4,5,6]]
+  let probe = hm_target_question(laws,target)
+  if probe == null { return "missing probe" }
+  let replies = {}
+  for law in laws {
+    let key = str(hm_predict(law,probe))
+    let answer = hm_predict(law,target)
+    if get(replies,key,answer) != answer { return "ambiguous probe reply" }
+    let replies = put(replies,key,answer)
+  }
+  let survivors = hm_laws(append(obs,[probe[0],probe[1],0-105]))
+  print(probe != target and len(survivors) == 2 and replies["-105"] == 0-120)
+  print(hm_predict(survivors[0],["product",[7,8]]) != hm_predict(survivors[1],["product",[7,8]]))
+
+  let lessons = load_lessons("heed1 glims sum 2,3 7\nheed1 glims product 2,3 12\n")
+  let first = awake_lessons([],{"lists":[]},lessons)
+  let restored = load_lib(save_lib(first[0]))
+  let again = awake_lessons(restored,{"lists":[false]},lessons)
+  print(restored == again[0] and again[1]["lists"] == [true])
+  return 0
+}

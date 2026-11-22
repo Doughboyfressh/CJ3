@@ -2636,9 +2636,12 @@ skill awake_lessons(lib, active, lessons) -> Any {
   if lessons == null { return [lib, active, notes] }
   for ls in lessons {
     if ls[0] == "word" {
-      let lib = append(lib, ls[2])
+      let id = 0
+      while id < len(lib) and lib[id] != ls[2] { let id = id + 1 }
+      if id == len(lib) { let lib = append(lib, ls[2]) }
       for dd in keys(active) {
-        let active = put(active, dd, append(active[dd], true))
+        let flags = active[dd]
+        let active = put(active, dd, slice(flags,0,id) ++ [true] ++ slice(flags,id+1,len(flags)))
       }
       let notes = append(notes, ls[1])
     }

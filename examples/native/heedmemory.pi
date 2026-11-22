@@ -146,6 +146,42 @@ skill hm_question(laws) -> Any {
   return best
 }
 
+# For a pending prediction, minimize the number of different target answers left
+# in the worst reply bucket. Equivalent laws may stay unresolved.
+skill hm_target_question(laws, target) -> Any {
+  let predictions = []
+  let outcomes = {}
+  for law in laws {
+    let answer = str(hm_predict(law,target))
+    let predictions = append(predictions,answer)
+    let outcomes = put(outcomes,answer,true)
+  }
+  let best = null
+  let bound = len(keys(outcomes))
+  for xs in [[0],[1],[2],[0-1],[2,3],[1,1],[0-2,4],[0,1,3],[3,5,7]] {
+    if xs != target[1] {
+      for reducer in hm_reducers() {
+        let buckets = {}
+        let worst = 0
+        for i in range(0,len(laws)) {
+          let reply = hm_predict(laws[i],[reducer,xs])
+          if reply == null { let worst = bound }
+          let key = str(reply)
+          let answers = put(get(buckets,key,{}),predictions[i],true)
+          let buckets = put(buckets,key,answers)
+          let worst = max(worst,len(keys(answers)))
+        }
+        if worst < bound {
+          let best = [reducer,xs]
+          let bound = worst
+          if bound == 1 { return best }
+        }
+      }
+    }
+  }
+  return best
+}
+
 skill hm_word(s) -> Any {
   if s == null or s == "" { return false }
   for c in chars(s) { if not contains("abcdefghijklmnopqrstuvwxyz", c) { return false } }
@@ -214,7 +250,10 @@ skill hm_line(word, ex) -> Any {
 }
 
 skill hm_ask(word,laws) -> Any {
-  let q = hm_question(laws)
+  return hm_prompt(word,hm_question(laws))
+}
+
+skill hm_prompt(word,q) -> Any {
   if q == null { return "Still ambiguous. Supply a different example." }
   return "What is " ++ q[0] ++ " of " ++ word ++ " on " ++ hm_csv(q[1]) ++ "?"
 }

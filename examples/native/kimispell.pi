@@ -1,0 +1,43 @@
+# The inflected form is the spelling, so the embedding row is not required.
+# A candidate is the form when it is the word plus "s" or the word plus "ing".
+# That pick matched the nearest row for plant, mark, press, star, listen, and point,
+# none of which were in the earlier row tests. sun and boy were the other candidates.
+# It does not fire for an opposite: hot does not choose cold. That one still needs the row.
+# KDA layers have k_proj and no k_norm, so a key is not assumed to be unit.
+skill mate(q, c) -> Any {
+  if c == q ++ "s" { return 1 }
+  if c == q ++ "ing" { return 1 }
+  return 0
+}
+skill choose(q, cs) -> Any {
+  for c in cs {
+    if mate(q, c) == 1 { return c }
+  }
+  return ""
+}
+
+skill main() -> Any {
+  let lines = split(trim(read_file("examples/native/kimi_spell.txt")), "\n")
+  let hit = 0
+  for line in lines {
+    let p = split(line, " ")
+    if choose(p[0], [p[1], "sun", "boy"]) == p[1] { let hit = hit + 1 }
+  }
+  let text = "the form is the spelling\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(len(lines) == 6)
+  print(hit == 6)
+  print(choose("cat", ["cats", "sun", "boy"]) == "cats")
+  print(choose("call", ["calling", "sun", "boy"]) == "calling")
+  print(choose("hot", ["cold", "sun", "boy"]) == "")
+  print(choose("turn", ["sun", "boy"]) == "")
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

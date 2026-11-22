@@ -1,0 +1,67 @@
+# The layer-1 gate, applied to the token embedding, not to a hidden state.
+# A sentence still does not pick experts. This is the choice for that vector only.
+# Shared experts of a spelling pair: 2 through 7. Shared experts of an unrelated
+# pair: 0 through 3. The ranges cross, so no cutoff agrees with the spelling.
+# cat/cats share 2. phone/hello share 3. The form shares fewer than the unrelated pair.
+skill overlap(xs, ys) -> Any {
+  let n = 0
+  for x in xs {
+    for y in ys {
+      if x == y { let n = n + 1 }
+    }
+  }
+  return n
+}
+
+skill main() -> Any {
+  let lines = split(trim(read_file("examples/native/kimi_experts.txt")), "\n")
+  let form_min = 16
+  let far_max = 0
+  let forms = 0
+  let fars = 0
+  let cat = 0 - 1
+  let phone = 0 - 1
+  for line in lines {
+    let p = split(line, " ")
+    let a = []
+    let b = []
+    for i in range(0, 16) {
+      let a = append(a, num(p[3 + i]))
+      let b = append(b, num(p[19 + i]))
+    }
+    let o = overlap(a, b)
+    if p[0] == "F" {
+      let forms = forms + 1
+      if o < form_min { let form_min = o }
+    }
+    if p[0] == "U" {
+      let fars = fars + 1
+      if o > far_max { let far_max = o }
+    }
+    if p[1] == "cat" {
+      if p[2] == "cats" { let cat = o }
+    }
+    if p[1] == "phone" {
+      if p[2] == "hello" { let phone = o }
+    }
+  }
+  let text = "spelling does not choose the expert\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(len(lines) == 22)
+  print(forms == 12)
+  print(fars == 10)
+  print(form_min == 2)
+  print(far_max == 3)
+  print(cat == 2)
+  print(phone == 3)
+  print(cat < phone)
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

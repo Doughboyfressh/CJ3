@@ -1395,6 +1395,11 @@ skill sh_compile_sound(src) -> Any {
 
 # ---- GPU code in, with what the driver said when it refuses it ---------------------------------------------------------
 skill rt_sh_module(ptx, logpath) -> Any {
+  if ostarget() != 0 {
+    let p = rt_alloc(8)
+    do poke(p, ptx)
+    return rt_tag(p)
+  }
   let n = 65536
   let log = rt_zero(rt_alloc(n), n)
   let opts = rt_zero(rt_alloc(16), 16)

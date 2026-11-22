@@ -3336,7 +3336,10 @@ skill rt_sw_entry(ptx, name) -> Any {
         if peekb(ptx + 23 + i + j) != peekb(name + 16 + j) { let ok = 0 }
         let j = j + 1
       }
-      if ok == 1 { return 1 }
+      if ok == 1 {
+        let c = peekb(ptx + 23 + i + m)
+        if c == 32 or c == 40 { return 1 }
+      }
     }
     let i = i + 1
   }
@@ -4053,6 +4056,236 @@ skill rt_sw_nv12(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+skill rt_sw_arg(ps, i) -> Any { return rt_untag(peek(ps + 16 + 8 * i)) }
+
+skill rt_sw_ld32(p) -> Any { return rt_sw_f64_of(rt_peek32(p)) }
+
+skill rt_sw_st32(p, bits) -> Any {
+  do rt_poke32(p, rt_sw_f32_of(bits))
+  return 0
+}
+
+# C[M,N] = A[M,K] . B[K,N]
+skill rt_sw_gemm(gx, bx, ps) -> Any {
+  let A = rt_sw_arg(ps, 0)
+  let B = rt_sw_arg(ps, 1)
+  let C = rt_sw_arg(ps, 2)
+  let M = rt_sw_arg(ps, 3)
+  let K = rt_sw_arg(ps, 4)
+  let N = rt_sw_arg(ps, 5)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let count = M * N
+  let t = 0
+  while t < lim {
+    if t < count {
+      let row = t // N
+      let col = t % N
+      let acc = rt_sw_f64_of(0)
+      let k = 0
+      while k < K {
+        let acc = rt_sw_fma32(rt_sw_ld32(A + 4 * (row * K + k)), rt_sw_ld32(B + 4 * (k * N + col)), acc)
+        let k = k + 1
+      }
+      do rt_sw_st32(C + 4 * t, acc)
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+# C[K,N] = A[M,K]^T . B[M,N]
+skill rt_sw_atb(gx, bx, ps) -> Any {
+  let A = rt_sw_arg(ps, 0)
+  let B = rt_sw_arg(ps, 1)
+  let C = rt_sw_arg(ps, 2)
+  let M = rt_sw_arg(ps, 3)
+  let K = rt_sw_arg(ps, 4)
+  let N = rt_sw_arg(ps, 5)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let count = K * N
+  let t = 0
+  while t < lim {
+    if t < count {
+      let row = t // N
+      let col = t % N
+      let acc = rt_sw_f64_of(0)
+      let m = 0
+      while m < M {
+        let acc = rt_sw_fma32(rt_sw_ld32(A + 4 * (m * K + row)), rt_sw_ld32(B + 4 * (m * N + col)), acc)
+        let m = m + 1
+      }
+      do rt_sw_st32(C + 4 * t, acc)
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+# C[M,K] = A[M,N] . B[K,N]^T
+skill rt_sw_abt(gx, bx, ps) -> Any {
+  let A = rt_sw_arg(ps, 0)
+  let B = rt_sw_arg(ps, 1)
+  let C = rt_sw_arg(ps, 2)
+  let M = rt_sw_arg(ps, 3)
+  let K = rt_sw_arg(ps, 4)
+  let N = rt_sw_arg(ps, 5)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let count = M * K
+  let t = 0
+  while t < lim {
+    if t < count {
+      let row = t // K
+      let col = t % K
+      let acc = rt_sw_f64_of(0)
+      let n = 0
+      while n < N {
+        let acc = rt_sw_fma32(rt_sw_ld32(A + 4 * (row * N + n)), rt_sw_ld32(B + 4 * (col * N + n)), acc)
+        let n = n + 1
+      }
+      do rt_sw_st32(C + 4 * t, acc)
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+skill rt_sw_addbias(gx, bx, ps) -> Any {
+  let Z = rt_sw_arg(ps, 0)
+  let B = rt_sw_arg(ps, 1)
+  let M = rt_sw_arg(ps, 2)
+  let N = rt_sw_arg(ps, 3)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let count = M * N
+  let t = 0
+  while t < lim {
+    if t < count {
+      let col = t % N
+      do rt_sw_st32(Z + 4 * t, rt_sw_add32(rt_sw_ld32(Z + 4 * t), rt_sw_ld32(B + 4 * col)))
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+skill rt_sw_biasgrad(gx, bx, ps) -> Any {
+  let Z = rt_sw_arg(ps, 0)
+  let B = rt_sw_arg(ps, 1)
+  let M = rt_sw_arg(ps, 2)
+  let N = rt_sw_arg(ps, 3)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let t = 0
+  while t < lim {
+    if t < N {
+      let acc = rt_sw_f64_of(0)
+      let r = 0
+      while r < M {
+        let acc = rt_sw_add32(acc, rt_sw_ld32(Z + 4 * (r * N + t)))
+        let r = r + 1
+      }
+      do rt_sw_st32(B + 4 * t, acc)
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+# relu only. sin.approx is the GPU's approximation, and this chip does not invent one.
+skill rt_sw_act(gx, bx, ps) -> Any {
+  if rt_sw_arg(ps, 3) != 0 { return rt_tag(0 - 400) }
+  let X = rt_sw_arg(ps, 0)
+  let Y = rt_sw_arg(ps, 1)
+  let n = rt_sw_arg(ps, 2)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let z = rt_sw_f64_of(0)
+  let t = 0
+  while t < lim {
+    if t < n {
+      let x = rt_sw_ld32(X + 4 * t)
+      if flt(z, x) == 0 { let x = z }
+      do rt_sw_st32(Y + 4 * t, x)
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+skill rt_sw_actb(gx, bx, ps) -> Any {
+  if rt_sw_arg(ps, 4) != 0 { return rt_tag(0 - 400) }
+  let X = rt_sw_arg(ps, 0)
+  let DY = rt_sw_arg(ps, 1)
+  let DX = rt_sw_arg(ps, 2)
+  let n = rt_sw_arg(ps, 3)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let z = rt_sw_f64_of(0)
+  let t = 0
+  while t < lim {
+    if t < n {
+      let g = z
+      if flt(z, rt_sw_ld32(X + 4 * t)) { let g = rt_sw_ld32(DY + 4 * t) }
+      do rt_sw_st32(DX + 4 * t, g)
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+# squared error, added in thread order. The GPU's atomic add does not promise an order.
+skill rt_sw_mseg(gx, bx, ps) -> Any {
+  let P = rt_sw_arg(ps, 0)
+  let T = rt_sw_arg(ps, 1)
+  let D = rt_sw_arg(ps, 2)
+  let L = rt_sw_arg(ps, 3)
+  let n = rt_sw_arg(ps, 4)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let nf = rt_sw_f64_of(rt_sw_f32_of(i2f(n)))
+  let two = rt_sw_f64_of(rt_sw_f32_of(i2f(2)))
+  let t = 0
+  while t < lim {
+    if t < n {
+      let e = rt_sw_add32(rt_sw_ld32(P + 4 * t), rt_sw_f64_of(bxor(rt_sw_f32_of(rt_sw_ld32(T + 4 * t)), shl(1, 31))))
+      let sq = rt_sw_mul32(e, e)
+      let loss = rt_sw_add32(rt_sw_ld32(L), rt_sw_div32(sq, nf))
+      do rt_sw_st32(L, loss)
+      do rt_sw_st32(D + 4 * t, rt_sw_div32(rt_sw_mul32(two, e), nf))
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+skill rt_sw_adam(gx, bx, ps) -> Any {
+  let P = rt_sw_arg(ps, 0)
+  let G = rt_sw_arg(ps, 1)
+  let M = rt_sw_arg(ps, 2)
+  let V = rt_sw_arg(ps, 3)
+  let n = rt_sw_arg(ps, 4)
+  let lr = rt_sw_f64_of(rt_sw_arg(ps, 5))
+  let b1 = rt_sw_f64_of(rt_sw_arg(ps, 6))
+  let b2 = rt_sw_f64_of(rt_sw_arg(ps, 7))
+  let eps = rt_sw_f64_of(rt_sw_arg(ps, 8))
+  let mc = rt_sw_f64_of(rt_sw_arg(ps, 9))
+  let vc = rt_sw_f64_of(rt_sw_arg(ps, 10))
+  let one = rt_sw_f64_of(1065353216)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let t = 0
+  while t < lim {
+    if t < n {
+      let p = rt_sw_ld32(P + 4 * t)
+      let g = rt_sw_ld32(G + 4 * t)
+      let m = rt_sw_fma32(g, rt_sw_add32(one, rt_sw_f64_of(bxor(rt_sw_f32_of(b1), shl(1, 31)))), rt_sw_mul32(rt_sw_ld32(M + 4 * t), b1))
+      let g2 = rt_sw_mul32(g, g)
+      let v = rt_sw_fma32(g2, rt_sw_add32(one, rt_sw_f64_of(bxor(rt_sw_f32_of(b2), shl(1, 31)))), rt_sw_mul32(rt_sw_ld32(V + 4 * t), b2))
+      do rt_sw_st32(M + 4 * t, m)
+      do rt_sw_st32(V + 4 * t, v)
+      let den = rt_sw_add32(rt_sw_sqrt32(rt_sw_div32(v, vc)), eps)
+      let step = rt_sw_mul32(rt_sw_div32(rt_sw_div32(m, mc), den), lr)
+      do rt_sw_st32(P + 4 * t, rt_sw_add32(p, rt_sw_f64_of(bxor(rt_sw_f32_of(step), shl(1, 31)))))
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -4063,6 +4296,15 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
     if rt_sw_text_is(peek(rec + 8), "pi_mix") { return rt_sw_mix(gxt, bxt, ps) }
     if rt_sw_text_is(peek(rec + 8), "pi_peak") { return rt_sw_peak(gxt, bxt, ps) }
     if rt_sw_text_is(peek(rec + 8), "pi_nv12") { return rt_sw_nv12(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "mm") { return rt_sw_gemm(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "mm_atb") { return rt_sw_atb(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "mm_abt") { return rt_sw_abt(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "addbias") { return rt_sw_addbias(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "biasgrad") { return rt_sw_biasgrad(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "act") { return rt_sw_act(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "actb") { return rt_sw_actb(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "mseg") { return rt_sw_mseg(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "adam") { return rt_sw_adam(gxt, bxt, ps) }
     return rt_tag(0 - 400)
   }
   let n = peek(ps + 8)
@@ -4081,6 +4323,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
 
 # the same launch without waiting for it: kernels queue up in order on the GPU; rt_gpu_get (or rt_gpu_sync) waits
 skill rt_gpu_go(ft, gxt, bxt, ps) -> Any {
+  if ostarget() != 0 { return rt_gpu_launch(ft, gxt, bxt, ps) }
   let n = peek(ps + 8)
   let cells = rt_alloc(8 * n + 8)
   let ptrs = rt_alloc(8 * n + 8)
@@ -4095,6 +4338,7 @@ skill rt_gpu_go(ft, gxt, bxt, ps) -> Any {
 
 # the same on a given stream (0 = the default one)
 skill rt_gpu_gos(ft, gxt, bxt, ps, st) -> Any {
+  if ostarget() != 0 { return rt_gpu_launch(ft, gxt, bxt, ps) }
   let n = peek(ps + 8)
   let cells = rt_alloc(8 * n + 8)
   let ptrs = rt_alloc(8 * n + 8)
@@ -4109,6 +4353,7 @@ skill rt_gpu_gos(ft, gxt, bxt, ps, st) -> Any {
 
 # the same with sm bytes of dynamic shared memory (a kernel's .extern .shared array, sized per launch)
 skill rt_gpu_gosm(ft, gxt, bxt, ps, st, smt) -> Any {
+  if ostarget() != 0 { return rt_gpu_launch(ft, gxt, bxt, ps) }
   let n = peek(ps + 8)
   let cells = rt_alloc(8 * n + 8)
   let ptrs = rt_alloc(8 * n + 8)

@@ -1,0 +1,63 @@
+# A KDA value is a vector. The state is the sum of k v^T over orthogonal unit keys.
+# Recall of a key is that whole vector. The other key is not touched.
+# Key (3, 4) / 5 stores (5, 7). The orthogonal key (-4, 3) / 5 stores (1, -3).
+# Replacing the first vector with (8, 2) leaves (1, -3) in place.
+# The two writes commute. None of these vectors is an axis key.
+skill step(sx, sy, sd, kx, ky, v) -> Any {
+  let numer = v * 5 * sd - (kx * sx + ky * sy)
+  let nx = 25 * sx + kx * numer
+  let ny = 25 * sy + ky * numer
+  return [nx, ny, 25 * sd]
+}
+skill is_v(num, den, v) -> Any {
+  if num == v * den { return 1 }
+  return 0
+}
+skill recall(s, kx, ky) -> Any {
+  return kx * s[0] + ky * s[1]
+}
+skill write(c0, c1, kx, ky, v0, v1) -> Any {
+  let a = step(c0[0], c0[1], c0[2], kx, ky, v0)
+  let b = step(c1[0], c1[1], c1[2], kx, ky, v1)
+  return [a, b]
+}
+skill eq(p, q) -> Any {
+  if p[0][0] != q[0][0] { return 0 }
+  if p[0][1] != q[0][1] { return 0 }
+  if p[0][2] != q[0][2] { return 0 }
+  if p[1][0] != q[1][0] { return 0 }
+  if p[1][1] != q[1][1] { return 0 }
+  if p[1][2] != q[1][2] { return 0 }
+  return 1
+}
+
+skill main() -> Any {
+  let z = [[0, 0, 1], [0, 0, 1]]
+  let m = write(z[0], z[1], 3, 4, 5, 7)
+  let m = write(m[0], m[1], 0 - 4, 3, 1, 0 - 3)
+  let n = write(z[0], z[1], 0 - 4, 3, 1, 0 - 3)
+  let n = write(n[0], n[1], 3, 4, 5, 7)
+  let r = write(m[0], m[1], 3, 4, 8, 2)
+  let den = 5 * m[0][2]
+  let rden = 5 * r[0][2]
+  let text = "recall is the vector\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - p
+  print(is_v(recall(m[0], 3, 4), den, 5) == 1)
+  print(is_v(recall(m[1], 3, 4), den, 7) == 1)
+  print(is_v(recall(m[0], 0 - 4, 3), den, 1) == 1)
+  print(is_v(recall(m[1], 0 - 4, 3), den, 0 - 3) == 1)
+  print(eq(m, n) == 1)
+  print(is_v(recall(r[0], 3, 4), rden, 8) == 1)
+  print(is_v(recall(r[1], 3, 4), rden, 2) == 1)
+  print(is_v(recall(r[0], 0 - 4, 3), rden, 1) == 1)
+  print(is_v(recall(r[1], 0 - 4, 3), rden, 0 - 3) == 1)
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

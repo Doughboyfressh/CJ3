@@ -3402,8 +3402,44 @@ skill rt_sw_retire(nt) -> Any {
   return rt_tag(peek(gaddr(25)))
 }
 
-# The page-in plus the statements retired. A launch does not add a beat here.
-skill rt_sw_clock() -> Any { return rt_tag(peek(gaddr(24)) + peek(gaddr(25))) }
+# The page-in, the statements retired, and the bus. One bus cycle moves 32 bytes.
+skill rt_sw_clock() -> Any { return rt_tag(peek(gaddr(24)) + peek(gaddr(25)) + peek(gaddr(27))) }
+
+# ceil(n / 32). For every n > 0, this B and the page-in P = ceil(n / 4) satisfy B ≤ P ≤ 8B.
+skill rt_sw_bus(nt) -> Any {
+  let n = rt_untag(nt)
+  if n < 1 { return rt_tag(0) }
+  return rt_tag((n + 31) // 32)
+}
+
+skill rt_sw_bound(nt) -> Any {
+  let n = rt_untag(nt)
+  if n < 1 { return rt_tag(0) }
+  let p = (n + 3) // 4
+  let b = (n + 31) // 32
+  if b <= p and p <= 8 * b { return rt_tag(1) }
+  return rt_tag(0)
+}
+
+skill rt_sw_note(n) -> Any {
+  do poke(gaddr(28), n)
+  return 0
+}
+
+skill rt_sw_finish(r) -> Any {
+  if r == 1 {
+    let n = peek(gaddr(28))
+    if n > 0 { do poke(gaddr(27), peek(gaddr(27)) + (n + 31) // 32) }
+  }
+  do poke(gaddr(28), 0)
+  return r
+}
+
+# 4 KB beside RAM. A shared row lives here, not in the 64 KB.
+skill rt_sw_tmem() -> Any {
+  if peek(gaddr(29)) == 0 { do poke(gaddr(29), rt_lx_map(4096)) }
+  return rt_tag(peek(gaddr(29)))
+}
 
 skill rt_gpu_alloc(nt) -> Any {
   if ostarget() != 0 {
@@ -3865,6 +3901,7 @@ skill rt_sw_conv(gx, bx, ps) -> Any {
   let start = rt_untag(peek(ps + 48))
   let n = rt_untag(peek(ps + 56))
   let bs = rt_untag(bx)
+  do rt_sw_note(16 * n + 16 * m)
   let blocks = rt_untag(gx)
   let t = 0
   let lim = blocks * bs
@@ -3933,6 +3970,7 @@ skill rt_sw_mix(gx, bx, ps) -> Any {
   let start = rt_untag(peek(ps + 40))
   let n = rt_untag(peek(ps + 48))
   let dryg = rt_untag(peek(ps + 56))
+  do rt_sw_note(22 * n)
   let wetg = rt_untag(peek(ps + 64))
   let pbs = rt_untag(peek(ps + 72))
   let blocks = rt_untag(gx)
@@ -3993,6 +4031,7 @@ skill rt_sw_peak(gx, bx, ps) -> Any {
   let pk = rt_untag(peek(ps + 24))
   let n = rt_untag(peek(ps + 32))
   let pbs = rt_untag(peek(ps + 40))
+  do rt_sw_note(8 * n + 4)
   let blocks = rt_untag(gx)
   let tx = rt_untag(bx)
   let scale = rt_sw_f64_of(1203982336)
@@ -4032,6 +4071,7 @@ skill rt_sw_nv12(gx, bx, ps) -> Any {
   let h = rt_untag(peek(ps + 40))
   let pitch = rt_untag(peek(ps + 48))
   let pbs = rt_untag(peek(ps + 56))
+  do rt_sw_note(3 * w * h + pitch * h + pitch * ((h + 1) // 2))
   let blocks = rt_untag(gx)
   let tx = rt_untag(bx)
   let yr = rt_sw_f64_of(1046066128)
@@ -4122,6 +4162,7 @@ skill rt_sw_gemm(gx, bx, ps) -> Any {
   let M = rt_sw_arg(ps, 3)
   let K = rt_sw_arg(ps, 4)
   let N = rt_sw_arg(ps, 5)
+  do rt_sw_note(4 * (M * K + K * N + M * N))
   let lim = rt_untag(gx) * rt_untag(bx)
   let count = M * N
   let t = 0
@@ -4150,6 +4191,7 @@ skill rt_sw_atb(gx, bx, ps) -> Any {
   let M = rt_sw_arg(ps, 3)
   let K = rt_sw_arg(ps, 4)
   let N = rt_sw_arg(ps, 5)
+  do rt_sw_note(4 * (M * K + M * N + K * N))
   let lim = rt_untag(gx) * rt_untag(bx)
   let count = K * N
   let t = 0
@@ -4178,6 +4220,7 @@ skill rt_sw_abt(gx, bx, ps) -> Any {
   let M = rt_sw_arg(ps, 3)
   let K = rt_sw_arg(ps, 4)
   let N = rt_sw_arg(ps, 5)
+  do rt_sw_note(4 * (M * N + K * N + M * K))
   let lim = rt_untag(gx) * rt_untag(bx)
   let count = M * K
   let t = 0
@@ -4203,6 +4246,7 @@ skill rt_sw_addbias(gx, bx, ps) -> Any {
   let B = rt_sw_arg(ps, 1)
   let M = rt_sw_arg(ps, 2)
   let N = rt_sw_arg(ps, 3)
+  do rt_sw_note(4 * (M * N + N))
   let lim = rt_untag(gx) * rt_untag(bx)
   let count = M * N
   let t = 0
@@ -4221,6 +4265,7 @@ skill rt_sw_biasgrad(gx, bx, ps) -> Any {
   let B = rt_sw_arg(ps, 1)
   let M = rt_sw_arg(ps, 2)
   let N = rt_sw_arg(ps, 3)
+  do rt_sw_note(4 * (M * N + N))
   let lim = rt_untag(gx) * rt_untag(bx)
   let t = 0
   while t < lim {
@@ -4358,6 +4403,7 @@ skill rt_sw_act(gx, bx, ps) -> Any {
   let X = rt_sw_arg(ps, 0)
   let Y = rt_sw_arg(ps, 1)
   let n = rt_sw_arg(ps, 2)
+  do rt_sw_note(8 * n)
   let mode = rt_sw_arg(ps, 3)
   let a = rt_sw_f64_of(rt_sw_arg(ps, 4))
   let lim = rt_untag(gx) * rt_untag(bx)
@@ -4381,6 +4427,7 @@ skill rt_sw_actb(gx, bx, ps) -> Any {
   let DY = rt_sw_arg(ps, 1)
   let DX = rt_sw_arg(ps, 2)
   let n = rt_sw_arg(ps, 3)
+  do rt_sw_note(12 * n)
   let mode = rt_sw_arg(ps, 4)
   let a = rt_sw_f64_of(rt_sw_arg(ps, 5))
   let lim = rt_untag(gx) * rt_untag(bx)
@@ -4409,6 +4456,7 @@ skill rt_sw_mseg(gx, bx, ps) -> Any {
   let D = rt_sw_arg(ps, 2)
   let L = rt_sw_arg(ps, 3)
   let n = rt_sw_arg(ps, 4)
+  do rt_sw_note(12 * n + 4)
   let lim = rt_untag(gx) * rt_untag(bx)
   let nf = rt_sw_f64_of(rt_sw_f32_of(i2f(n)))
   let two = rt_sw_f64_of(rt_sw_f32_of(i2f(2)))
@@ -4432,6 +4480,7 @@ skill rt_sw_adam(gx, bx, ps) -> Any {
   let M = rt_sw_arg(ps, 2)
   let V = rt_sw_arg(ps, 3)
   let n = rt_sw_arg(ps, 4)
+  do rt_sw_note(16 * n)
   let lr = rt_sw_f64_of(rt_sw_arg(ps, 5))
   let b1 = rt_sw_f64_of(rt_sw_arg(ps, 6))
   let b2 = rt_sw_f64_of(rt_sw_arg(ps, 7))
@@ -4465,6 +4514,7 @@ skill rt_sw_vrfwd(gx, bx, ps) -> Any {
   let tr = rt_sw_arg(ps, 2)
   let nr = rt_sw_arg(ps, 3)
   let m = rt_sw_arg(ps, 4)
+  do rt_sw_note(20 * nr * m + 16 * nr)
   let delta = rt_sw_arg(ps, 5)
   let bg = rt_sw_f64_of(rt_sw_arg(ps, 6))
   let one = rt_sw_f64_of(1065353216)
@@ -4511,6 +4561,7 @@ skill rt_sw_vrw(gx, bx, ps) -> Any {
   let delta = rt_sw_arg(ps, 2)
   let nr = rt_sw_arg(ps, 3)
   let m = rt_sw_arg(ps, 4)
+  do rt_sw_note(20 * nr * m + 4 * nr)
   let one = rt_sw_f64_of(1065353216)
   let lim = rt_untag(gx) * rt_untag(bx)
   let ray = 0
@@ -4539,6 +4590,7 @@ skill rt_sw_vrbwd(gx, bx, ps) -> Any {
   let draw = rt_sw_arg(ps, 3)
   let nr = rt_sw_arg(ps, 4)
   let m = rt_sw_arg(ps, 5)
+  do rt_sw_note(36 * nr * m + 16 * nr)
   let delta = rt_sw_arg(ps, 6)
   let bg = rt_sw_f64_of(rt_sw_arg(ps, 7))
   let one = rt_sw_f64_of(1065353216)
@@ -4600,6 +4652,7 @@ skill rt_sw_posenc(gx, bx, ps) -> Any {
   let feat = rt_sw_arg(ps, 1)
   let n = rt_sw_arg(ps, 2)
   let L = rt_sw_arg(ps, 3)
+  do rt_sw_note(12 * n + 4 * n * (L * 6 + 3))
   let alpha = rt_sw_f64_of(rt_sw_arg(ps, 4))
   let one = rt_sw_f64_of(1065353216)
   let z = rt_sw_f64_of(0)
@@ -4646,6 +4699,7 @@ skill rt_sw_u32a(a, b) -> Any { return band(a + b, 4294967295) }
 skill rt_sw_addnoise(gx, bx, ps) -> Any {
   let raw = rt_sw_arg(ps, 0)
   let n = rt_sw_arg(ps, 1)
+  do rt_sw_note(16 * n)
   let scale = rt_sw_f64_of(rt_sw_arg(ps, 2))
   let seed = rt_sw_arg(ps, 3)
   let lim = rt_untag(gx) * rt_untag(bx)
@@ -4678,24 +4732,24 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if ostarget() != 0 {
     let rec = rt_untag(ft)
     if rec <= 0 { return rt_tag(0 - 400) }
-    if rt_sw_text_is(peek(rec + 8), "pi_conv") { return rt_sw_conv(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "pi_mix") { return rt_sw_mix(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "pi_peak") { return rt_sw_peak(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "pi_nv12") { return rt_sw_nv12(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "mm") { return rt_sw_gemm(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "mm_atb") { return rt_sw_atb(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "mm_abt") { return rt_sw_abt(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "addbias") { return rt_sw_addbias(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "biasgrad") { return rt_sw_biasgrad(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "act") { return rt_sw_act(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "actb") { return rt_sw_actb(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "mseg") { return rt_sw_mseg(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "adam") { return rt_sw_adam(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "vrfwd") { return rt_sw_vrfwd(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "vrbwd") { return rt_sw_vrbwd(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "vrw") { return rt_sw_vrw(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "posenc") { return rt_sw_posenc(gxt, bxt, ps) }
-    if rt_sw_text_is(peek(rec + 8), "addnoise") { return rt_sw_addnoise(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "pi_conv") { return rt_sw_finish(rt_sw_conv(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "pi_mix") { return rt_sw_finish(rt_sw_mix(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "pi_peak") { return rt_sw_finish(rt_sw_peak(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "pi_nv12") { return rt_sw_finish(rt_sw_nv12(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "mm") { return rt_sw_finish(rt_sw_gemm(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "mm_atb") { return rt_sw_finish(rt_sw_atb(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "mm_abt") { return rt_sw_finish(rt_sw_abt(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "addbias") { return rt_sw_finish(rt_sw_addbias(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "biasgrad") { return rt_sw_finish(rt_sw_biasgrad(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "act") { return rt_sw_finish(rt_sw_act(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "actb") { return rt_sw_finish(rt_sw_actb(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "mseg") { return rt_sw_finish(rt_sw_mseg(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "adam") { return rt_sw_finish(rt_sw_adam(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "vrfwd") { return rt_sw_finish(rt_sw_vrfwd(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "vrbwd") { return rt_sw_finish(rt_sw_vrbwd(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "vrw") { return rt_sw_finish(rt_sw_vrw(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "posenc") { return rt_sw_finish(rt_sw_posenc(gxt, bxt, ps)) }
+    if rt_sw_text_is(peek(rec + 8), "addnoise") { return rt_sw_finish(rt_sw_addnoise(gxt, bxt, ps)) }
     return rt_tag(0 - 400)
   }
   let n = peek(ps + 8)

@@ -1,0 +1,89 @@
+# A fact that was not stored, and a choice made the way the router makes it.
+# token_name builds <|reserved_token_N|>. 163594 is not in the named list.
+# layer_kind uses the file rule. Layer 90 is KDA. Layer 91 and 92 are DSA.
+# Those three answers are not written out in this file.
+# The router adds e_score_correction_bias and keeps 16 experts.
+# When every affinity is equal, layer 1's real bias picks the 16 below.
+# Expert 826 is 17th. Raising its score puts it in and drops 592.
+# Two shared experts are always on, and they are not among the 896.
+# This is the choice at equal affinity, not the choice for an arbitrary prompt.
+# The gate matrix was not read.
+skill token_name(i) -> Any {
+  return "<|reserved_token_" ++ str(i) ++ "|>"
+}
+skill layer_kind(L) -> Any {
+  if L == 92 { return "dsa" }
+  if L >= 3 {
+    if L % 4 == 3 { return "dsa" }
+  }
+  return "kda"
+}
+skill better(s, i, best, bi) -> Any {
+  if bi < 0 { return 1 }
+  if s > best { return 1 }
+  if s == best {
+    if i < bi { return 1 }
+  }
+  return 0
+}
+skill choose(scores) -> Any {
+  let used = arr(896)
+  let out = []
+  for n in range(0, 16) {
+    let bi = 0 - 1
+    let best = 0
+    for i in range(0, 896) {
+      if aget(used, i) == 0 {
+        if better(aget(scores, i), i, best, bi) == 1 {
+          let best = aget(scores, i)
+          let bi = i
+        }
+      }
+    }
+    do aset(used, bi, 1)
+    let out = append(out, bi)
+  }
+  return out
+}
+skill load(path) -> Any {
+  let parts = split(trim(read_file(path)), " ")
+  let a = arr(len(parts))
+  for i in range(0, len(parts)) { do aset(a, i, num(parts[i])) }
+  return a
+}
+
+skill main() -> Any {
+  let bias = load("examples/native/kimi_bias_i.txt")
+  let lines = split(trim(read_file("examples/native/kimi_top16.txt")), "\n")
+  let want = load_line(lines[0])
+  let want2 = load_line(lines[1])
+  let picked = choose(bias)
+  do aset(bias, 826, aget(bias, 826) + 1000000000)
+  let moved = choose(bias)
+  let text = "fact from rule\nchoice top 16\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(token_name(163594) == "<|reserved_token_163594|>")
+  print(layer_kind(90) == "kda")
+  print(layer_kind(91) == "dsa")
+  print(layer_kind(92) == "dsa")
+  print(92 * 896 * 6 == 494592)
+  print(picked == want)
+  print(moved == want2)
+  print(len(picked) == 16)
+  print(16 + 2 == 18)
+  print(read == 1024)
+  print(got == text)
+  return 0
+}
+skill load_line(line) -> Any {
+  let parts = split(line, " ")
+  let a = []
+  for p in parts { let a = append(a, num(p)) }
+  return a
+}

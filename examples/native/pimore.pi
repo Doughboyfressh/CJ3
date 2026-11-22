@@ -1,0 +1,126 @@
+# The same search, one level deeper, and division is allowed when it divides exactly.
+# 28,852 programs. A value is forced only when every survivor agrees.
+# 1, 2, 3, 4 mapping to 1, 3, 6, 10 was not labeled. Six survivors force 15, 21, 36, 55.
+# The earlier sample 0, 2, 6, 12 now has 126 survivors, and they still agree.
+# 0, 1, 2, 3 mapping to 1, 2, 4, 8 has no survivor, so there is no answer.
+skill ev(e, x) -> Any {
+  let k = e[0]
+  if k == 0 { return [1, e[1]] }
+  if k == 1 { return [1, x] }
+  let L = ev(e[1], x)
+  let R = ev(e[2], x)
+  if L[0] == 0 { return [0, 0] }
+  if R[0] == 0 { return [0, 0] }
+  if k == 2 { return [1, L[1] + R[1]] }
+  if k == 3 { return [1, L[1] * R[1]] }
+  if R[1] == 0 { return [0, 0] }
+  if L[1] % R[1] != 0 { return [0, 0] }
+  return [1, L[1] // R[1]]
+}
+skill fit_tri(e) -> Any {
+  let a = ev(e, 1)
+  let b = ev(e, 2)
+  let c = ev(e, 3)
+  let d = ev(e, 4)
+  if a != [1, 1] { return 0 }
+  if b != [1, 3] { return 0 }
+  if c != [1, 6] { return 0 }
+  if d != [1, 10] { return 0 }
+  return 1
+}
+skill fit_old(e) -> Any {
+  let a = ev(e, 0)
+  let b = ev(e, 1)
+  let c = ev(e, 2)
+  let d = ev(e, 3)
+  if a != [1, 0] { return 0 }
+  if b != [1, 2] { return 0 }
+  if c != [1, 6] { return 0 }
+  if d != [1, 12] { return 0 }
+  return 1
+}
+skill fit_pow(e) -> Any {
+  let a = ev(e, 0)
+  let b = ev(e, 1)
+  let c = ev(e, 2)
+  let d = ev(e, 3)
+  if a != [1, 1] { return 0 }
+  if b != [1, 2] { return 0 }
+  if c != [1, 4] { return 0 }
+  if d != [1, 8] { return 0 }
+  return 1
+}
+skill forced(ss, x) -> Any {
+  if len(ss) == 0 { return [0, 0] }
+  let v = ev(ss[0], x)
+  if v[0] == 0 { return [0, 0] }
+  for e in ss {
+    let w = ev(e, x)
+    if w != v { return [0, 0] }
+  }
+  return [1, v[1]]
+}
+
+skill main() -> Any {
+  let atoms = [[0, 0], [0, 1], [0, 2], [1]]
+  let ops = [2, 3, 4]
+  let mid = []
+  for op in ops {
+    for a in atoms {
+      for b in atoms {
+        let mid = append(mid, [op, a, b])
+      }
+    }
+  }
+  let deep = []
+  for op in ops {
+    for a in atoms {
+      for b in mid {
+        let deep = append(deep, [op, a, b])
+        let deep = append(deep, [op, b, a])
+      }
+    }
+  }
+  let progs = atoms
+  for e in mid { let progs = append(progs, e) }
+  for e in deep { let progs = append(progs, e) }
+  let wider = []
+  for op in ops {
+    for a in atoms {
+      for b in deep {
+        let wider = append(wider, [op, a, b])
+        let wider = append(wider, [op, b, a])
+      }
+    }
+  }
+  for e in wider { let progs = append(progs, e) }
+  let tri = []
+  let old = []
+  let pow = []
+  for e in progs {
+    if fit_tri(e) == 1 { let tri = append(tri, e) }
+    if fit_old(e) == 1 { let old = append(old, e) }
+    if fit_pow(e) == 1 { let pow = append(pow, e) }
+  }
+  let text = "a longer law is forced\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(len(progs) == 28852)
+  print(len(tri) == 6)
+  print(len(old) == 126)
+  print(len(pow) == 0)
+  print(forced(tri, 5) == [1, 15])
+  print(forced(tri, 6) == [1, 21])
+  print(forced(tri, 8) == [1, 36])
+  print(forced(tri, 10) == [1, 55])
+  print(forced(old, 4) == [1, 20])
+  print(forced(pow, 4) == [0, 0])
+  print(readp == 1024)
+  print(got == text)
+  return 0
+}

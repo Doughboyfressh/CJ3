@@ -6,7 +6,9 @@
 # and what either word alone cannot solve.
 # Fusion. The chain is elementwise, then a reduction. The chip reads each input once
 # and writes the sum once, so the bus stays ceil((8n+8)/32). It is not charged per word.
-# The lesson text is one SSD page. Bringing it in, evicting it, and reading it back is 3,072 cycles.
+# Habit. The answer is a record on the SSD. A missing record is an empty length, and that
+# is the only time the search runs. A cold read of the record is one page, 1,024 cycles.
+# The same page again is free. A new process is a new machine: the SSD is not a host file.
 import "mindcore.pi"
 
 skill grew(xs) -> Any {
@@ -35,6 +37,7 @@ skill main() -> Any {
   let back = rt_sw_ssd_gets(slot)
   let p1 = rt_sw_pg()
   let again = rt_sw_ssd_gets(slot)
+  let held_lesson = rt_sw_pg() == p1
   let lessons = load_lessons(back)
   let woke = awake_lessons([], {"lists": []}, lessons)
   let lib = woke[0]
@@ -42,25 +45,56 @@ skill main() -> Any {
   let hl = examples_of(grew, held_inputs("lists"))
   let pl = pools()
   let pre = prelude()
-  let bare = solve(tr, hl, [], [], pl, pre, 4, 20000)
-  let only0 = solve(tr, hl, [lib[0]], [true], pl, pre, 4, 20000)
-  let only1 = solve(tr, hl, [lib[1]], [true], pl, pre, 4, 20000)
-  let got = solve(tr, hl, lib, woke[1]["lists"], pl, pre, 4, 20000)
-  let tree = got[0]
+  let ans = rt_sw_ssd_alloc(64)
+  let pm = rt_sw_pg()
+  let probe = rt_sw_ssd_gets(ans)
+  let missed = rt_sw_pg() - pm
+  let tree = null
+  let bare = [null]
+  let only0 = [null]
+  let only1 = [null]
+  let searches = 0
+  let wrote = false
+  if len(probe) == 0 {
+    let searches = 1
+    let bare = solve(tr, hl, [], [], pl, pre, 4, 20000)
+    let only0 = solve(tr, hl, [lib[0]], [true], pl, pre, 4, 20000)
+    let only1 = solve(tr, hl, [lib[1]], [true], pl, pre, 4, 20000)
+    let got = solve(tr, hl, lib, woke[1]["lists"], pl, pre, 4, 20000)
+    let tree = got[0]
+    let pw = rt_sw_pg()
+    do rt_sw_ssd_puts(ans, ser(expand(tree, lib)))
+    let wrote = rt_sw_pg() == pw
+  }
+  do rt_sw_ssd_puts(other, "y")
+  let p2 = rt_sw_pg()
+  let recalled = rt_sw_ssd_gets(ans)
+  let known = parse_at(split(recalled, " "), 0, [])[0]
+  let p3 = rt_sw_pg()
+  let held = rt_sw_ssd_gets(ans)
   print(slot >= 0)
   print(back == text)
   print(p1 - p0 == 3072)
-  print(rt_sw_pg() == p1)
+  print(held_lesson)
   print(again == text)
   print(len(lessons) == 2)
+  print(len(probe) == 0)
+  print(missed == 1024)
+  print(wrote)
+  print(searches == 1)
   print(bare[0] == null)
   print(only0[0] == null)
   print(only1[0] == null)
   print(tree != null)
   print(show(expand(tree, lib)) == "sum(map(e -> (e * e), map(e -> (e + 1), x)))")
+  print(p2 - pm == 2048)
+  print(p3 - p2 == 1024)
+  print(rt_sw_pg() == p3)
+  print(held == recalled)
+  print(show(known) == "sum(map(e -> (e * e), map(e -> (e + 1), x)))")
   let xs = held_inputs("lists")[0]
-  print(sev(tree, null, xs, null, lib) == grew(xs))
-  let how = shape_of(tree, lib)
+  print(sev(known, null, xs, null, []) == grew(xs))
+  let how = shape_of(known, [])
   let buf = rt_gpu_alloc(8 * len(xs))
   let dst = rt_gpu_alloc(8)
   do rt_gpu_put_u64(buf, xs)

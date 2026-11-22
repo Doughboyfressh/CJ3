@@ -1,0 +1,58 @@
+# Facts that the published files actually state.
+# vocab 163840, of which the last 256 are special. The first of those is 163584.
+# Sixteen are named in tokenizer_config.json. The other 240 are <|reserved_token_N|>.
+# Id 163592 is not in the named list. Neither is 163600. Both are held out.
+# A memorized sentence is not one of these facts. "Paris" does not answer a second question.
+# Nothing in the tensors we opened was a sentence, so no world fact was copied out of them.
+skill token_name(i) -> Any {
+  if i == 163584 { return "[BOS]" }
+  if i == 163585 { return "[EOS]" }
+  if i == 163586 { return "<|end_of_msg|>" }
+  if i == 163587 { return "<|open|>" }
+  if i == 163588 { return "<|close|>" }
+  if i == 163589 { return "<|sep|>" }
+  if i == 163590 { return "[start_header_id]" }
+  if i == 163591 { return "[end_header_id]" }
+  if i == 163593 { return "[EOT]" }
+  if i == 163602 { return "<|media_begin|>" }
+  if i == 163603 { return "<|media_content|>" }
+  if i == 163604 { return "<|media_end|>" }
+  if i == 163605 { return "<|media_pad|>" }
+  if i == 163649 { return "<osagent_mode>" }
+  if i == 163838 { return "[UNK]" }
+  if i == 163839 { return "[PAD]" }
+  return "<|reserved_token_" ++ str(i) ++ "|>"
+}
+
+skill main() -> Any {
+  let lines = split(trim(read_file("examples/native/kimi_facts.txt")), "\n")
+  let named = 0
+  for ln in lines {
+    let parts = split(ln, " ")
+    let i = num(parts[0])
+    let want = slice(ln, len(parts[0]) + 1, len(ln))
+    if token_name(i) == want { let named = named + 1 }
+  }
+  let base = 163840 - 256
+  let text = "token facts 256\nworld fact not kept\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(base == 163584)
+  print(base + 255 == 163839)
+  print(len(lines) == 16)
+  print(named == 16)
+  print(256 - 16 == 240)
+  print(token_name(163592) == "<|reserved_token_163592|>")
+  print(token_name(163600) == "<|reserved_token_163600|>")
+  print(token_name(163837) == "<|reserved_token_163837|>")
+  print(token_name(163586) != token_name(163585))
+  print("Paris" != "Rome")
+  print(read == 1024)
+  print(got == text)
+  return 0
+}

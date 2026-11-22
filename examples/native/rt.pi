@@ -3967,6 +3967,92 @@ skill rt_sw_peak(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+skill rt_sw_stb(pt, it, vt) -> Any {
+  do pokeb(rt_untag(pt) + rt_untag(it), rt_untag(vt))
+  return rt_tag(0)
+}
+
+# pi_nv12: one RGB byte triple becomes a limited-range BT.709 Y. Even pixels also write the block's U and V.
+skill rt_sw_nv12(gx, bx, ps) -> Any {
+  let rgb = rt_untag(peek(ps + 16))
+  let nv = rt_untag(peek(ps + 24))
+  let w = rt_untag(peek(ps + 32))
+  let h = rt_untag(peek(ps + 40))
+  let pitch = rt_untag(peek(ps + 48))
+  let pbs = rt_untag(peek(ps + 56))
+  let blocks = rt_untag(gx)
+  let tx = rt_untag(bx)
+  let yr = rt_sw_f64_of(1046066128)
+  let yg = rt_sw_f64_of(1060575065)
+  let yb = rt_sw_f64_of(1033100696)
+  let ys = rt_sw_f64_of(1062984668)
+  let yo = rt_sw_f64_of(1099169792)
+  let q = rt_sw_f64_of(1048576000)
+  let ur = rt_sw_f64_of(3186275176)
+  let ug = rt_sw_f64_of(3200602918)
+  let ub = rt_sw_f64_of(1056964608)
+  let us = rt_sw_f64_of(1063313633)
+  let uo = rt_sw_f64_of(1124106240)
+  let vr = rt_sw_f64_of(1056964608)
+  let vg = rt_sw_f64_of(3202911463)
+  let vb = rt_sw_f64_of(3174806690)
+  let b = 0
+  while b < blocks {
+    let th = 0
+    while th < tx {
+      let t = b * pbs + th
+      if t < w * h {
+        let x = t % w
+        let y = t // w
+        let p = rgb + 3 * t
+        let r = peekb(p)
+        let g = peekb(p + 1)
+        let bl = peekb(p + 2)
+        let f = rt_sw_mul32(rt_sw_f64_of(rt_sw_f32_of(i2f(r))), yr)
+        let f = rt_sw_fma32(rt_sw_f64_of(rt_sw_f32_of(i2f(g))), yg, f)
+        let f = rt_sw_fma32(rt_sw_f64_of(rt_sw_f32_of(i2f(bl))), yb, f)
+        let f = rt_sw_add32(rt_sw_mul32(f, ys), yo)
+        let Y = f2i(f)
+        if Y < 0 { let Y = 0 }
+        if Y > 235 { let Y = 235 }
+        do pokeb(nv + y * pitch + x, Y)
+        if band(x, 1) == 0 and band(y, 1) == 0 {
+          let p1 = p + 3
+          let row = w * 3
+          let p2 = p + row
+          let p3 = p2 + 3
+          let rs = r + peekb(p1) + peekb(p2) + peekb(p3)
+          let gs = g + peekb(p1 + 1) + peekb(p2 + 1) + peekb(p3 + 1)
+          let bs = bl + peekb(p1 + 2) + peekb(p2 + 2) + peekb(p3 + 2)
+          let r4 = rt_sw_mul32(rt_sw_f64_of(rt_sw_f32_of(i2f(rs))), q)
+          let g4 = rt_sw_mul32(rt_sw_f64_of(rt_sw_f32_of(i2f(gs))), q)
+          let b4 = rt_sw_mul32(rt_sw_f64_of(rt_sw_f32_of(i2f(bs))), q)
+          let U = rt_sw_mul32(r4, ur)
+          let U = rt_sw_fma32(g4, ug, U)
+          let U = rt_sw_fma32(b4, ub, U)
+          let U = rt_sw_add32(rt_sw_mul32(U, us), uo)
+          let V = rt_sw_mul32(r4, vr)
+          let V = rt_sw_fma32(g4, vg, V)
+          let V = rt_sw_fma32(b4, vb, V)
+          let V = rt_sw_add32(rt_sw_mul32(V, us), uo)
+          let Ui = f2i(U)
+          let Vi = f2i(V)
+          if Ui < 0 { let Ui = 0 }
+          if Vi < 0 { let Vi = 0 }
+          if Ui > 240 { let Ui = 240 }
+          if Vi > 240 { let Vi = 240 }
+          let c = nv + h * pitch + (y // 2) * pitch + x
+          do pokeb(c, Ui)
+          do pokeb(c + 1, Vi)
+        }
+      }
+      let th = th + 1
+    }
+    let b = b + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -3976,6 +4062,7 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
     if rt_sw_text_is(peek(rec + 8), "pi_conv") { return rt_sw_conv(gxt, bxt, ps) }
     if rt_sw_text_is(peek(rec + 8), "pi_mix") { return rt_sw_mix(gxt, bxt, ps) }
     if rt_sw_text_is(peek(rec + 8), "pi_peak") { return rt_sw_peak(gxt, bxt, ps) }
+    if rt_sw_text_is(peek(rec + 8), "pi_nv12") { return rt_sw_nv12(gxt, bxt, ps) }
     return rt_tag(0 - 400)
   }
   let n = peek(ps + 8)

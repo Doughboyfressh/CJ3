@@ -1,0 +1,74 @@
+# What an id means, past the spelling.
+# 113476 spells Paris. Its embedding row and its output row are each 7,168 bf16 values.
+# The whole table is 163,840 of those rows: 2,348,810,240 bytes. The disk is 8,388,608.
+# The two rows for Paris differ in 7,165 of 7,168 positions. The output table is not the embedding.
+# Each row fails the held-out half. Two values in the embedding tie at 11 in the
+# training half. The one that reaches 11 first hits 6 of the other half. The other hits 1.
+# Four other ids, 0, 64, 22931, and 163839, were also unequal and failed the same way.
+# They are not stored here. The letters are the meaning that fits. The vector is not a word.
+skill score_row(xs) -> Any {
+  let hist = arr(65536)
+  let best = 0
+  let maj = 0
+  for i in range(0, 3584) {
+    let v = aget(xs, i)
+    do aset(hist, v, aget(hist, v) + 1)
+    if aget(hist, v) > best {
+      let best = aget(hist, v)
+      let maj = v
+    }
+  }
+  let heldm = 0
+  let diffs = 0
+  for i in range(0, 3584) {
+    if aget(xs, 3584 + i) == maj { let heldm = heldm + 1 }
+    if aget(xs, i) != aget(xs, 3584 + i) { let diffs = diffs + 1 }
+  }
+  for i in range(0, 3584) { do aset(hist, aget(xs, i), 0) }
+  let kinds = 0
+  for i in range(0, 7168) {
+    let v = aget(xs, i)
+    if aget(hist, v) == 0 {
+      do aset(hist, v, 1)
+      let kinds = kinds + 1
+    }
+  }
+  return [kinds, best, heldm, diffs]
+}
+skill load_line(line) -> Any {
+  let parts = split(line, " ")
+  let a = arr(7168)
+  for i in range(0, 7168) { do aset(a, i, num(parts[i])) }
+  return a
+}
+
+skill main() -> Any {
+  let lines = split(trim(read_file("examples/native/kimi_paris.txt")), "\n")
+  let lm = load_line(lines[0])
+  let em = load_line(lines[1])
+  let between = 0
+  for i in range(0, 7168) {
+    if aget(lm, i) != aget(em, i) { let between = between + 1 }
+  }
+  let table = 163840 * 7168 * 2
+  let disk = 8 * 1024 * 1024
+  let text = "vector is not the spelling\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(len(lines) == 2)
+  print(score_row(lm) == [1626, 13, 4, 3583])
+  print(score_row(lm) == [1626, 13, 4, 3583])
+  print(score_row(em) == [1594, 11, 6, 3583])
+  print(between == 7165)
+  print(table == 2348810240)
+  print(table > disk)
+  print(7168 * 2 == 14336)
+  print(read == 1024)
+  print(got == text)
+  return 0
+}

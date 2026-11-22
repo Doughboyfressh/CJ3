@@ -3297,7 +3297,8 @@ skill rt_gpu_seq(ptx, tg, st, lt, bt, nt, mt) -> Any {
 
 # ---- the GPU engine's runtime (called by name): one context for the whole process, GPU memory as integer handles,
 # files copied straight to the GPU, Pi-written kernels loaded and launched. Reals cross as doubles (their bits). -----
-# Linux: the bytes live in this process. 64 MB. A launch of a kernel this chip does not run returns -400.
+# Linux: Softwell is the machine. 64 KB of RAM, a 1 MB SSD, and this chip. Nothing else is required.
+# A launch of a kernel this chip does not run returns -400. An allocation past the end of RAM returns -700.
 skill rt_sw_copy(d, s, n) -> Any {
   let i = 0
   while i + 8 <= n {
@@ -3363,8 +3364,10 @@ skill rt_gpu_alloc(nt) -> Any {
   if ostarget() != 0 {
     let n = rt_untag(nt)
     if n < 1 { let n = 1 }
+    let used = peek(gaddr(21))
+    if used + n > 65536 { return rt_tag(0 - 700) }
     let p = rt_lx_map(n)
-    do poke(gaddr(21), peek(gaddr(21)) + n)
+    do poke(gaddr(21), used + n)
     return rt_tag(p)
   }
   let d = rt_zero(rt_alloc(8), 8)
@@ -4754,10 +4757,21 @@ skill rt_now() -> Any {
 # a process handle's id
 skill rt_pid(ht) -> Any { return rt_tag(rt_u32(wcallp(rt_proc("kernel32.dll", "GetProcessId"), rt_untag(ht)))) }
 
+# Softwell, the only machine Pi needs: [RAM bytes, SSD bytes, page bytes, bus bytes, SMs].
+# The CPU retires one Pi statement per cycle. The kernel body is not the CPU.
+skill rt_softwell() -> Any {
+  let out = rt_list_new(0)
+  let out = rt_append(out, rt_tag(65536))
+  let out = rt_append(out, rt_tag(1048576))
+  let out = rt_append(out, rt_tag(4096))
+  let out = rt_append(out, rt_tag(32))
+  return rt_append(out, rt_tag(256))
+}
+
 # the GPU's memory -> [free bytes, total bytes]
 skill rt_gpu_meminfo() -> Any {
   if ostarget() != 0 {
-    let total = 67108864
+    let total = 65536
     let used = peek(gaddr(21))
     let out = rt_list_new(0)
     let out = rt_append(out, rt_tag(total - used))

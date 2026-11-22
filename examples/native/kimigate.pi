@@ -1,0 +1,78 @@
+# The layer-1 gate does not fold, and it does not fit.
+# Shape [896, 7168] bf16 is 12,845,056 bytes. The disk is 8,388,608.
+# The matrix is 4,456,448 bytes over the disk. All 896 rows were distinct.
+# A 48-by-64 projection of spread rows had no zero eigenvalue.
+# Five rows are checked here. The training half's most common value hits
+# at most 7 of the 3,584 held-out positions. The halves differ in more than 3,500.
+# Cosines between these rows were under 0.07. They are not copies and not multiples.
+# A prompt still cannot be scored on this machine. The equal-affinity choice stays.
+skill score_row(xs) -> Any {
+  let hist = arr(65536)
+  let best = 0
+  let maj = 0
+  for i in range(0, 3584) {
+    let v = aget(xs, i)
+    do aset(hist, v, aget(hist, v) + 1)
+    if aget(hist, v) > best {
+      let best = aget(hist, v)
+      let maj = v
+    }
+  }
+  let heldm = 0
+  let diffs = 0
+  for i in range(0, 3584) {
+    if aget(xs, 3584 + i) == maj { let heldm = heldm + 1 }
+    if aget(xs, i) != aget(xs, 3584 + i) { let diffs = diffs + 1 }
+  }
+  for i in range(0, 3584) { do aset(hist, aget(xs, i), 0) }
+  let kinds = 0
+  for i in range(0, 7168) {
+    let v = aget(xs, i)
+    if aget(hist, v) == 0 {
+      do aset(hist, v, 1)
+      let kinds = kinds + 1
+    }
+  }
+  return [kinds, best, heldm, diffs]
+}
+skill load_line(line) -> Any {
+  let parts = split(line, " ")
+  let a = arr(7168)
+  for i in range(0, 7168) { do aset(a, i, num(parts[i])) }
+  return a
+}
+
+skill main() -> Any {
+  let lines = split(trim(read_file("examples/native/kimi_gate_rows.txt")), "\n")
+  let want = [[1612, 12, 7, 3581], [1616, 14, 4, 3577], [1636, 12, 6, 3581], [1622, 12, 4, 3582], [1615, 12, 6, 3582]]
+  let bad = 0
+  let kinds0 = 0
+  for r in range(0, 5) {
+    let g = score_row(load_line(lines[r]))
+    if r == 0 { let kinds0 = g[0] }
+    if g[0] == kinds0 { if r != 0 { let bad = bad + 1 } }
+    for f in range(0, 4) {
+      if g[f] != want[r][f] { let bad = bad + 1 }
+    }
+  }
+  let bytes = 896 * 7168 * 2
+  let disk = 8 * 1024 * 1024
+  let text = "gate does not fold\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let p = rt_sw_pg()
+  let got = rt_sw_ssd_gets(slot)
+  let read = rt_sw_pg() - p
+  print(len(lines) == 5)
+  print(bad == 0)
+  print(bytes == 12845056)
+  print(disk == 8388608)
+  print(bytes > disk)
+  print(bytes - disk == 4456448)
+  print(7168 * 2 == 14336)
+  print(read == 1024)
+  print(got == text)
+  return 0
+}

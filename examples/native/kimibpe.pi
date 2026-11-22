@@ -4,9 +4,13 @@
 # encode merges the pair with the lowest rank until none is in the table.
 # hello, world, a, and the are the training words. Paris, distill, Pi, Kimi, and soft are held out.
 # Their ids were produced by Kimi's tiktoken file, and this program recomputes them.
-# A word that is not one piece stays split: distill is 22,769 then 534. Kimi is 42 then 30,223.
+# An id means the piece it spells. The same table read backwards.
+# 22,769 is "dist" and 534 is "ill". Together they are "distill", which was not one piece.
+# means, cat, water, and token were not in the encode checks. Their ids still spell them.
+# This is the form of the id. It is not a fact about the world. "Paris" is the letters, not a city.
 skill load_vocab() -> Any {
   let m = {}
+  let back = {}
   let n = 0
   for line in split(trim(read_file("examples/native/kimi_vocab.txt")), "\n") {
     let cs = chars(line)
@@ -16,10 +20,17 @@ skill load_vocab() -> Any {
       let rank = rank * 10 + (ord(cs[i]) - 48)
       let i = i + 1
     }
-    let m = put(m, slice(line, i + 1, len(line)), rank)
+    let tok = slice(line, i + 1, len(line))
+    let m = put(m, tok, rank)
+    let back = put(back, rank, tok)
     let n = n + 1
   }
-  return [m, n]
+  return [m, back, n]
+}
+skill spell(back, ids) -> Any {
+  let s = ""
+  for id in ids { let s = s ++ get(back, id, "") }
+  return s
 }
 skill encode(m, text) -> Any {
   let parts = chars(text)
@@ -65,7 +76,8 @@ skill encode(m, text) -> Any {
 skill main() -> Any {
   let loaded = load_vocab()
   let m = loaded[0]
-  let text = "bpe ascii fits\npayload does not\n"
+  let back = loaded[1]
+  let text = "id means the piece\n"
   let slot = rt_sw_ssd_alloc(64)
   let other = rt_sw_ssd_alloc(8)
   do rt_sw_ssd_puts(slot, text)
@@ -73,7 +85,7 @@ skill main() -> Any {
   let p = rt_sw_pg()
   let got = rt_sw_ssd_gets(slot)
   let read = rt_sw_pg() - p
-  print(loaded[1] == 82340)
+  print(loaded[2] == 82340)
   print(1106544 < 8388608)
   print(encode(m, "hello") == [22931])
   print(encode(m, "world") == [23617])
@@ -84,6 +96,15 @@ skill main() -> Any {
   print(encode(m, "Pi") == [41809])
   print(encode(m, "Kimi") == [42, 30223])
   print(encode(m, "soft") == [5302])
+  print(get(back, 113476, "") == "Paris")
+  print(get(back, 22769, "") == "dist")
+  print(get(back, 534, "") == "ill")
+  print(spell(back, encode(m, "distill")) == "distill")
+  print(spell(back, encode(m, "Kimi")) == "Kimi")
+  print(get(back, 101635, "") == "means")
+  print(spell(back, encode(m, "cat")) == "cat")
+  print(spell(back, encode(m, "water")) == "water")
+  print(spell(back, encode(m, "token")) == "token")
   print(read == 1024)
   print(got == text)
   return 0

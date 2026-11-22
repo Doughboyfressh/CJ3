@@ -1,0 +1,110 @@
+# Hugging Face deepmind/math_dataset, module arithmetic__add_or_sub.
+# The test split has 10,000 questions. 1,331 of them are integers, and the same
+# arithmetic labels every one of them. The train split of this module has 1,999,998.
+# None of those rows are stored. The label is the sum, the difference, or the distance.
+# Subtract-from was checked on all 523 of that template. They are decimals, so they are not here.
+# These 12 lines are integer questions from the test split.
+skill contains(q, n) -> Any {
+  let cs = chars(q)
+  let ns = chars(n)
+  if len(cs) < len(ns) { return 0 }
+  for i in range(0, len(cs) - len(ns) + 1) {
+    let ok = 1
+    for j in range(0, len(ns)) {
+      if cs[i + j] != ns[j] { let ok = 0 }
+    }
+    if ok == 1 { return 1 }
+  }
+  return 0
+}
+skill nums(q) -> Any {
+  let cs = chars(q)
+  let n = len(cs)
+  let out = []
+  let i = 0
+  while i < n {
+    let c = ord(cs[i])
+    let isnum = 0
+    if c >= 48 {
+      if c <= 57 { let isnum = 1 }
+    }
+    if c == 45 {
+      if i + 1 < n {
+        let d = ord(cs[i + 1])
+        if d >= 48 {
+          if d <= 57 { let isnum = 1 }
+        }
+      }
+    }
+    if isnum == 0 { let i = i + 1 }
+    if isnum == 1 {
+      let neg = 0
+      if c == 45 {
+        let neg = 1
+        let i = i + 1
+      }
+      let v = 0
+      let going = 1
+      while going == 1 {
+        if i >= n { let going = 0 }
+        if going == 1 {
+          let d = ord(cs[i])
+          if d < 48 { let going = 0 }
+          if d > 57 { let going = 0 }
+          if going == 1 {
+            let v = v * 10 + d - 48
+            let i = i + 1
+          }
+        }
+      }
+      if neg == 1 { let v = 0 - v }
+      let out = append(out, v)
+    }
+  }
+  return out
+}
+skill solve(q) -> Any {
+  let xs = nums(q)
+  let x = xs[0]
+  let y = xs[1]
+  if contains(q, "distance") == 1 {
+    if x < y { return y - x }
+    return x - y
+  }
+  if contains(q, "difference") == 1 {
+    if x < y { return y - x }
+    return x - y
+  }
+  if contains(q, "less than") == 1 { return y - x }
+  if contains(q, "Subtract") == 1 { return y - x }
+  if contains(q, "+") == 1 { return x + y }
+  if contains(q, "plus") == 1 { return x + y }
+  if contains(q, "Add") == 1 { return x + y }
+  if contains(q, "Sum") == 1 { return x + y }
+  if contains(q, "Total") == 1 { return x + y }
+  return x - y
+}
+
+skill main() -> Any {
+  let lines = split(trim(read_file("examples/native/kimi_math.txt")), "\n")
+  let hit = 0
+  for line in lines {
+    let p = split(line, "\t")
+    let got = solve(p[0])
+    let want = nums(p[1])
+    if got == want[0] { let hit = hit + 1 }
+  }
+  let text = "the answer is the arithmetic\n"
+  let slot = rt_sw_ssd_alloc(64)
+  let other = rt_sw_ssd_alloc(8)
+  do rt_sw_ssd_puts(slot, text)
+  do rt_sw_ssd_puts(other, "x")
+  let pg = rt_sw_pg()
+  let gotssd = rt_sw_ssd_gets(slot)
+  let readp = rt_sw_pg() - pg
+  print(len(lines) == 12)
+  print(hit == 12)
+  print(readp == 1024)
+  print(gotssd == text)
+  return 0
+}

@@ -117,3 +117,32 @@ On Linux the language, the runtime, files, folders, child processes (`spawn`, `p
 all work, and the whole test suite passes against the same golden files as Windows. Softwell is the machine on
 both hosts. There is no NVIDIA driver to load. What is still Windows-only: `http()` (WinHTTP), and the screen,
 mouse, keyboard and sound words. A program that reaches for one of those on Linux stops with a message naming it.
+
+## Kimi choices in Pi
+
+From the repository root, build `examples/native/kimiblend.pi` with the normal
+build script. Run `out/kimiblend hot 3 Paris 1 cold France` for a weighted
+mixture of the two normalized input embedding rows. It selects `cold`.
+Reversing the weights selects `France`. Negative integer weights subtract a
+direction. The command returns `uncertain` whenever rounding could change
+the winner. The 44 words in `examples/native/kimi_margins.txt` are the
+supported query and candidate vocabulary.
+
+The compact table stores each pair's cosine rounded to the nearest multiple
+of 1/32767. For weights a and b, each candidate's weighted score has at most
+(|a| + |b|)/2 units of rounding error on that scale. A lead larger than
+|a| + |b| keeps the same winner as the reference scores. This evaluates an
+embedding-space choice. Conversational generation requires a separate teacher.
+Run `python tools/distill_kimi_choices.py` to reproduce the margin table and
+the smaller single-query ordering from the two tracked BF16 fixtures.
+Build `examples/native/kimiselect.pi` for single-query choices.
+
+For byte-level encoding of an individual pretokenized piece, download
+`tiktoken.model` from Moonshot's Kimi-K3.1-Pro revision
+`d9e99b0792a5e93b78ea9bea62a68167e36ddd9e` and run
+`python tools/prepare_kimi_bpe.py PATH/TO/tiktoken.model out/kimi_bpe.hex`.
+The converter checks the file digest. Build `examples/native/kimipiece.pi`.
+From the repository root, `out/kimipiece encode e4b8ade69687` returns
+`[16717]`, and `out/kimipiece decode 16717` returns the original hex bytes.
+The vocabulary covers 163,584 ordinary merge ranks. Callers supply piece
+boundaries and handle special tokens and chat formatting separately.

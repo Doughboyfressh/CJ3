@@ -1,3 +1,4 @@
+import "kimimerge.pi"
 # Kimi's language, the part that fits.
 # The merge table has 163,584 pieces. 82,340 of them are printable ASCII, 1,106,544 bytes.
 # The disk is 8,388,608, so this piece fits. The gate and the expert payloads do not.
@@ -32,46 +33,7 @@ skill spell(back, ids) -> Any {
   for id in ids { let s = s ++ get(back, id, "") }
   return s
 }
-skill encode(m, text) -> Any {
-  let parts = chars(text)
-  let n = len(parts)
-  let going = 1
-  while going == 1 {
-    if n < 2 { let going = 0 }
-    if going == 1 {
-      let best = 0 - 1
-      let br = 0
-      for i in range(0, n - 1) {
-        let r = get(m, parts[i] ++ parts[i + 1], 0 - 1)
-        if r >= 0 {
-          if best < 0 {
-            let best = i
-            let br = r
-          }
-          if r < br {
-            let best = i
-            let br = r
-          }
-        }
-      }
-      if best < 0 { let going = 0 }
-      if best >= 0 {
-        let nxt = []
-        for i in range(0, n) {
-          if i == best { let nxt = append(nxt, parts[i] ++ parts[i + 1]) }
-          if i != best {
-            if i != best + 1 { let nxt = append(nxt, parts[i]) }
-          }
-        }
-        let parts = nxt
-        let n = len(parts)
-      }
-    }
-  }
-  let ids = []
-  for p in parts { let ids = append(ids, get(m, p, 0 - 1)) }
-  return ids
-}
+skill encode(m, text) -> Any { return merge_parts(m,chars(text)) }
 
 skill main() -> Any {
   let loaded = load_vocab()

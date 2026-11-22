@@ -1,0 +1,40 @@
+# Merge byte symbols in one pretokenized piece by ascending Kimi rank.
+skill merge_parts(m, parts) -> Any {
+  let n = len(parts)
+  let going = 1
+  while going == 1 {
+    if n < 2 { let going = 0 }
+    if going == 1 {
+      let best = 0 - 1
+      let br = 0
+      for i in range(0, n - 1) {
+        let r = get(m, parts[i] ++ parts[i + 1], 0 - 1)
+        if r >= 0 {
+          if best < 0 {
+            let best = i
+            let br = r
+          }
+          if r < br {
+            let best = i
+            let br = r
+          }
+        }
+      }
+      if best < 0 { let going = 0 }
+      if best >= 0 {
+        let nxt = []
+        for i in range(0, n) {
+          if i == best { let nxt = append(nxt, parts[i] ++ parts[i + 1]) }
+          if i != best {
+            if i != best + 1 { let nxt = append(nxt, parts[i]) }
+          }
+        }
+        let parts = nxt
+        let n = len(parts)
+      }
+    }
+  }
+  let ids = []
+  for p in parts { let ids = append(ids, get(m, p, 0 - 1)) }
+  return ids
+}

@@ -1,0 +1,33 @@
+# Choose the nearest candidate using the distilled ordering of Kimi embedding rows.
+# The columns follow the file's row order. Lower ranks are nearer. Ties keep the first candidate.
+skill main() -> Any {
+  if arg(1) == null or arg(2) == null { return "Usage: kimiselect QUERY CANDIDATE ..." }
+  let data = read_file("examples/native/kimi_choice_ranks.txt")
+  if data == null { return "Cannot read the distilled vocabulary." }
+  let ids = {}
+  let ranks = null
+  let i = 0
+  for line in split(trim(data),"\n") {
+    let pair = split(trim(line)," ")
+    if len(pair) != 2 { return "Invalid rank table." }
+    let ids = put(ids,pair[0],i)
+    if pair[0] == arg(1) { let ranks = pair[1] }
+    let i = i + 1
+  }
+  if ranks == null { return "Unknown query: " ++ arg(1) }
+  if len(ranks) != i { return "Invalid rank table." }
+  let winner = ""
+  let best = 127
+  let j = 2
+  while arg(j) != null {
+    let id = ids[arg(j)]
+    if id == null { return "Unknown candidate: " ++ arg(j) }
+    let rank = ord(slice(ranks,id,id+1))
+    if rank < best {
+      let best = rank
+      let winner = arg(j)
+    }
+    let j = j + 1
+  }
+  return winner
+}

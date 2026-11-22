@@ -1,0 +1,36 @@
+# An ordinary BPE piece arrives as hexadecimal bytes. This also handles invalid UTF-8 bytes.
+import "kimimerge.pi"
+
+skill main() -> Any {
+  let mode = arg(1)
+  if arg(2) == null or (mode != "encode" and mode != "decode") {
+    return "Usage: kimipiece encode HEX | decode TOKEN_ID ..."
+  }
+  let table = read_file("out/kimi_bpe.hex")
+  if table == null { return "Prepare out/kimi_bpe.hex first." }
+  let pieces = split(trim(table),"\n")
+  if len(pieces) != 163584 { return "Incomplete merge table." }
+  if mode == "decode" {
+    let bytes = []
+    let i = 2
+    while arg(i) != null {
+      let t = arg(i)
+      for c in chars(t) { if not contains("0123456789",c) { return "Invalid token id." } }
+      if len(t) == 0 or len(t) > 6 { return "Invalid token id." }
+      let id = int(t)
+      if id >= len(pieces) { return "Token outside ordinary vocabulary." }
+      let bytes = append(bytes,pieces[id])
+      let i = i + 1
+    }
+    return join(bytes,"")
+  }
+  let hex = lower(arg(2))
+  if arg(3) != null or len(hex) % 2 != 0 { return "Expected one hexadecimal byte string." }
+  for c in chars(hex) { if not contains("0123456789abcdef",c) { return "Invalid hexadecimal byte." } }
+  let m = {}
+  for i in range(0,len(pieces)) { let m = put(m,pieces[i],i) }
+  if m[hex] != null { return [m[hex]] }
+  let parts = []
+  for i in range(0,len(hex)//2) { let parts = append(parts,slice(hex,2*i,2*i+2)) }
+  return merge_parts(m,parts)
+}

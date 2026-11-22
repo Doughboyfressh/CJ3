@@ -1,0 +1,50 @@
+# Compare a weighted mixture of two normalized embeddings against candidate directions.
+# Each stored inner product has error <= 0.5 in scaled units. A difference of
+# two weighted scores therefore has error <= |a| + |b| (for the source scores).
+skill weight(s) -> Any {
+  if s == null or len(s) == 0 or len(s) > 10 { return null }
+  let start = if slice(s,0,1) == "-" { 1 } else { 0 }
+  if start == len(s) { return null }
+  for c in chars(slice(s,start,len(s))) { if not contains("0123456789",c) { return null } }
+  return int(s)
+}
+
+skill main() -> Any {
+  let a = weight(arg(2))
+  let b = weight(arg(4))
+  if a == null or b == null or arg(6) == null { return "Usage: kimiblend WORD WEIGHT WORD WEIGHT CANDIDATE CANDIDATE ..." }
+  let data = read_file("examples/native/kimi_margins.txt")
+  if data == null { return "Missing Kimi margin table." }
+  let ids = {}
+  let rows = {}
+  for line in split(trim(data),"\n") {
+    let fields = split(line," ")
+    let ids = put(ids,fields[0],len(keys(ids))+1)
+    let rows = put(rows,fields[0],fields)
+  }
+  let x = rows[arg(1)]
+  let y = rows[arg(3)]
+  if x == null or y == null { return "Unknown query word." }
+  let best = null
+  let second = null
+  let winner = ""
+  let seen = {}
+  let j = 5
+  while arg(j) != null {
+    let c = arg(j)
+    let id = ids[c]
+    if id == null { return "Unknown candidate: " ++ c }
+    if seen[c] == null {
+      let seen = put(seen,c,true)
+      let score = a * int(x[id]) + b * int(y[id])
+      if best == null or score > best {
+        let second = best
+        let best = score
+        let winner = c
+      } else { if second == null or score > second { let second = score } }
+    }
+    let j = j + 1
+  }
+  if second != null and best-second <= abs(a)+abs(b) { return "uncertain" }
+  return winner
+}

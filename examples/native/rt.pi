@@ -3241,6 +3241,9 @@ skill rt_sw_retire(nt) -> Any {
 # The page-in, the statements retired, and the bus. One bus cycle moves 32 bytes.
 skill rt_sw_clock() -> Any { return rt_tag(peek(gaddr(24)) + peek(gaddr(25)) + peek(gaddr(27))) }
 
+# GPU wait so far. The page-in and the CPU are not in this register.
+skill rt_sw_gpu() -> Any { return rt_tag(peek(gaddr(27))) }
+
 # ceil(n / 32). For every n > 0, this B and the page-in P = ceil(n / 4) satisfy B ≤ P ≤ 8B.
 skill rt_sw_bus(nt) -> Any {
   let n = rt_untag(nt)
@@ -5249,6 +5252,84 @@ skill rt_sw_mxq6(gx, bx, ps) -> Any {
   return rt_tag(0)
 }
 
+# exp(x) as the listing writes it: n = round(x log2 e), g = (x log2 e - n) ln2, e^g by the
+# degree-12 Horner, then scale by 2^n. A product here is two roundings; it matches the fma
+# when the reduced argument is zero.
+skill rt_sw_exp64(x) -> Any {
+  let y = fmul(x, 4609176140021203710)
+  let lim = 4652183230701633536
+  let neg = fsub(i2f(0), lim)
+  if flt(y, neg) { let y = neg }
+  if flt(lim, y) { let y = lim }
+  let n = rt_sw_rni(y)
+  let g = fmul(fsub(y, i2f(n)), 4604418534313441775)
+  let p = 4477122120089393304
+  let p = fadd(fmul(p, g), 4493156764026750180)
+  let p = fadd(fmul(p, g), 4508805057796939612)
+  let p = fadd(fmul(p, g), 4523617214285662003)
+  let p = fadd(fmul(p, g), 4537941361671905306)
+  let p = fadd(fmul(p, g), 4551452160554016794)
+  let p = fadd(fmul(p, g), 4564047942368979991)
+  let p = fadd(fmul(p, g), 4575957461383581969)
+  let p = fadd(fmul(p, g), 4586165620538955093)
+  let p = fadd(fmul(p, g), 4595172819793696085)
+  let p = fadd(fmul(p, g), 4602678819172646912)
+  let p = fadd(fmul(p, g), 4607182418800017408)
+  let p = fadd(fmul(p, g), 4607182418800017408)
+  let e = n + 1023
+  if e <= 0 { return i2f(0) }
+  if e >= 2047 { return shl(2047, 52) }
+  return fmul(p, shl(e, 52))
+}
+
+# silu(x) = x / (1 + exp(-x)), the listing's div, not a reciprocal multiply
+skill rt_sw_silu64(x) -> Any {
+  return fdiv(x, fadd(rt_sw_exp64(fsub(i2f(0), x)), i2f(1)))
+}
+
+# vadd: one thread owns index ctaid.x * ntid.x + tid.x. Y = A + B in f64. A thread at or past n
+# loads nothing. The bytes are the doubles that thread actually touches.
+skill rt_sw_vadd(gx, bx, ps) -> Any {
+  let A = rt_sw_arg(ps, 0)
+  let B = rt_sw_arg(ps, 1)
+  let Y = rt_sw_arg(ps, 2)
+  let n = rt_sw_arg(ps, 3)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let touched = n
+  if lim < touched { let touched = lim }
+  if touched < 0 { let touched = 0 }
+  do rt_sw_note(touched * 24)
+  let t = 0
+  while t < lim {
+    if t < n {
+      do poke(Y + 8 * t, fadd(peek(A + 8 * t), peek(B + 8 * t)))
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
+# silumul: the same index. Y = silu(G) * U. The exp is the listing's series.
+skill rt_sw_silumul(gx, bx, ps) -> Any {
+  let G = rt_sw_arg(ps, 0)
+  let U = rt_sw_arg(ps, 1)
+  let Y = rt_sw_arg(ps, 2)
+  let n = rt_sw_arg(ps, 3)
+  let lim = rt_untag(gx) * rt_untag(bx)
+  let touched = n
+  if lim < touched { let touched = lim }
+  if touched < 0 { let touched = 0 }
+  do rt_sw_note(touched * 24)
+  let t = 0
+  while t < lim {
+    if t < n {
+      do poke(Y + 8 * t, fmul(rt_sw_silu64(peek(G + 8 * t)), peek(U + 8 * t)))
+    }
+    let t = t + 1
+  }
+  return rt_tag(0)
+}
+
 # launch: grid gx blocks of bx threads; params = a list of integers (each sent as one 8-byte cell; a 32-bit kernel
 # parameter reads its low half)
 skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
@@ -5282,6 +5363,8 @@ skill rt_gpu_launch(ft, gxt, bxt, ps) -> Any {
   if rt_sw_text_is(peek(rec + 8), "mxq8") { return rt_sw_finish(rt_sw_mxq8(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "mxq4") { return rt_sw_finish(rt_sw_mxq4(gxt, bxt, ps)) }
   if rt_sw_text_is(peek(rec + 8), "mxq6") { return rt_sw_finish(rt_sw_mxq6(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "vadd") { return rt_sw_finish(rt_sw_vadd(gxt, bxt, ps)) }
+  if rt_sw_text_is(peek(rec + 8), "silumul") { return rt_sw_finish(rt_sw_silumul(gxt, bxt, ps)) }
   return rt_tag(0 - 400)
 }
 

@@ -22,7 +22,6 @@ import "mindcore.pi"
 import "tonguelib.pi"
 import "scopelearn.pi"
 import "heedmemory.pi"
-import "witnessnet.pi"
 
 # an instruction's words: lower case, a comma a word of its own
 skill hd_words(text) -> Any { return split(join(split(lower(text), ","), " , ")) }

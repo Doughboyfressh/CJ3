@@ -1,3 +1,5 @@
+import "witnessnet.pi"
+
 # the hole in a step. Mind and Heed both use it, so it lives with the lesson file.
 skill hd_hole() -> Any { return ["v", "_"] }
 
@@ -298,6 +300,15 @@ skill hm_lessons(text) -> Any {
   for word in keys(book) {
     let laws = hm_laws(book[word])
     if len(laws) == 1 { let out = append(out, ["word", word, hm_as_word(laws[0])]) }
+    if len(laws) == 0 {
+      for reducer in hm_reducers() {
+        let selectors = wn_positions(book[word],reducer)
+        if len(selectors) == 1 {
+          let typed = [xparam(selectors[0]),"L","I"]
+          out = append(out,["word",reducer ++ " of " ++ word,typed])
+        }
+      }
+    }
   }
   return out
 }

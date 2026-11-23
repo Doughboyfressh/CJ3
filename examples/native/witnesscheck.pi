@@ -1,7 +1,30 @@
 import "mindcore.pi"
-import "witnessnet.pi"
+
+# Use the same lesson reader and typed search as Mind after Heed exits.
+skill wc_transfer(text) -> Any {
+  let lessons = load_lessons(text)
+  if len(lessons) != 1 { return "expected one resolved lesson" }
+  let woke = awake_lessons([],{"lists":[]},lessons)
+  let encoded = save_lib(woke[0])
+  let slot = rt_sw_ssd_alloc(len(encoded)+8)
+  do rt_sw_ssd_puts(slot,encoded)
+  let lib = load_lib(rt_sw_ssd_gets(slot))
+  if lib != woke[0] { return "Softwell vocabulary round trip failed" }
+  let train = [[[1,9,3],10],[[6,1,8],2],[[3,0,7,2],8],[[4,6,3,1,9],4]]
+  let held = [[[11,3,0-8,2],0-7]]
+  let pl = pools()
+  let pre = prelude()
+  let bare = solve(train,held,[],[],pl,pre,4,10000)
+  let fitted = solve(train,held,lib,woke[1]["lists"],pl,pre,4,10000)
+  if bare[0] != null or fitted[0] == null { return "transfer comparison failed" }
+  return lessons[0][1] ++ " -> " ++ show(fitted[0]) ++ " -> " ++ str(sev(fitted[0],null,held[0][0],null,lib))
+}
 
 skill main() -> Any {
+  if arg(1) != null { return wc_transfer(read_file(arg(1))) }
+  let text = "heed1 zells sum 2,1,5 1\nheed1 zells sum 2,9,5 9\nheed1 zells sum 5,1,2 1\nheed1 zells sum 5,2,1 2\n"
+  do print("ambiguous exports: " ++ str(len(load_lessons(text))))
+  do print(wc_transfer(text ++ "heed1 zells sum 8,7,6,5,4 6\n"))
   let rows = [["sum",[2,5],2],["sum",[5,2],11],["sum",[0,5],0]]
   do print(wn_reply(rows,"sum",[1,1],false))
   for r in [["sum",[5,0],15],["sum",[0-3,4],0-3],["sum",[4,0-3],18],["sum",[3,3],3]] {

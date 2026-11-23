@@ -89,6 +89,12 @@ offsets from either end and a length-dependent middle (right middle for even
 lengths). Mind replays each surviving expression against every lesson. A query
 on which those expressions disagree prompts another lesson.
 
+Mind can load the same Heed lesson file to reuse a resolved positional selector.
+When exactly one selector survives for a phrase, the lesson reader gives it the
+full phrase name and a list-to-integer type. For a worked transfer example,
+`witnesscheck` stores and reloads the vocabulary on Softwell's software SSD and
+searches for a new operation that calls the learned selector.
+
 The preservation property follows from the update itself. Write an input as
 `x = [first, last]` and let the rows of the invertible matrix `P` be the two
 anchors. For a candidate neuron `z(x) = max(0, first - last - k)`, solve

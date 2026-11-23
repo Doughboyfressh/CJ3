@@ -56,7 +56,9 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
-    binary = parser.parse_args().binary.resolve()
+    parser.add_argument("--first-plan", action="store_true", help="Measure goal discovery without requiring a model")
+    args = parser.parse_args()
+    binary = args.binary.resolve()
     print("Heed sha256", sha256(binary.read_bytes()).hexdigest(), flush=True)
     models = {}
     with tempfile.TemporaryDirectory() as directory:
@@ -64,7 +66,8 @@ def main():
             log = Path(directory) / task
             oracle = [sys.executable, str(Path(__file__).resolve()), "--observe", task]
             try:
-                run = run_agent(binary, log, list(ACTIONS), None, 1, [], oracle, BUDGET, 10)
+                run = run_agent(binary, log, list(ACTIONS), None, 1, [], oracle, BUDGET, 10,
+                                finish_model=not args.first_plan)
             except ValueError as err:
                 if "Experiment budget reached" not in str(err):
                     raise
@@ -77,6 +80,7 @@ def main():
                                                    if row[0] == "1"), None)
             if run["plan"] is not None:
                 assert outcome(task, run["plan"]) == 1
+            if run["plan"] is not None and run.get("states") is not None:
                 table = models[task] = read_table(binary, log)
                 held = [t for t in traces(5) if t not in seen]
                 positives = hits = correct = 0
@@ -91,6 +95,8 @@ def main():
             direct = next((i for i, t in enumerate(traces(5), 1)
                            if i <= BUDGET and outcome(task, t)), None)
             print(task, json.dumps(run), "direct_search_episodes", direct, flush=True)
+    if args.first_plan:
+        return
     # Try each successful model on every other task with the existing transfer
     # driver. Both sides get identical feedback, depth and target-query budgets.
     wins = ties = losses = 0

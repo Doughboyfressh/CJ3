@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 
-def run_agent(binary, log, alphabet, bound, goal, prefix, oracle, budget, timeout, sensor=None):
+def run_agent(binary, log, alphabet, bound, goal, prefix, oracle, budget, timeout, sensor=None, *, finish_model=False):
     if not alphabet or any(not token or any(c.isspace() for c in token) for token in alphabet):
         raise ValueError("Events must be nonempty single tokens")
     if len(set(alphabet)) != len(alphabet) or any(token not in alphabet for token in prefix):
@@ -39,7 +39,7 @@ def run_agent(binary, log, alphabet, bound, goal, prefix, oracle, budget, timeou
                     previous[key] = values
                     print(values[sensor], *trace, file=out)
         return learn_goal(binary, log, projected, alphabet, bound, goal, prefix, oracle,
-                          budget, timeout, sensor, previous)
+                          budget, timeout, sensor, previous, finish_model)
 
 
 def validate_snapshot(values, sensor, previous):
@@ -51,7 +51,7 @@ def validate_snapshot(values, sensor, previous):
 
 
 def learn_goal(binary, log, projected, alphabet, bound, goal, prefix, oracle,
-               budget, timeout, sensor, previous):
+               budget, timeout, sensor, previous, finish_model):
     def heed(*args):
         return subprocess.run([binary, *args], text=True, capture_output=True, check=True,
                               timeout=timeout).stdout.strip()
@@ -121,11 +121,18 @@ def learn_goal(binary, log, projected, alphabet, bound, goal, prefix, oracle,
                     label = observe(trace)
                     if label != goal:
                         raise ValueError("Plan disagreed with the observed outcome on replay")
-                return {"states": states, "queries": count, "plan": plan, "observed": label}
+                reply = {"states": states, "queries": count, "plan": plan, "observed": label}
+                if bound is None:
+                    reply["model_evidence"] = "consistent with logged observations"
+                return reply
         fields = result.split()
         if not fields or fields[0] != "observe" or any(s not in alphabet for s in fields[1:]):
             raise ValueError(result)
-        save_observation(fields[1:])
+        trace = fields[1:]
+        label = save_observation(trace)
+        if bound is None and not finish_model and label == goal and trace[:len(prefix)] == prefix:
+            return {"states": None, "queries": count, "plan": trace[len(prefix):], "observed": label,
+                    "model_evidence": "observed plan only"}
 
 
 def main():
@@ -134,6 +141,8 @@ def main():
     parser.add_argument("log", type=Path)
     parser.add_argument("--events", nargs="+", required=True)
     parser.add_argument("--bound", type=int, help="Optional reachable-state bound for conformance checking")
+    parser.add_argument("--finish-model", action="store_true",
+                        help="Continue until a consistent model proposes a verified plan")
     parser.add_argument("--goal", choices=(0, 1), type=int, required=True)
     parser.add_argument("--sensor", help="Select a goal field in a JSON object of binary readings")
     parser.add_argument("--prefix", nargs="*", default=[])
@@ -145,7 +154,7 @@ def main():
     if not args.oracle or (args.bound is not None and args.bound < 1) or args.budget < 0 or args.timeout <= 0:
         parser.error("Supply an oracle command, positive bound and timeout, and nonnegative budget")
     result = run_agent(args.binary.resolve(), args.log, args.events, args.bound, args.goal,
-                       args.prefix, args.oracle, args.budget, args.timeout, args.sensor)
+                       args.prefix, args.oracle, args.budget, args.timeout, args.sensor, finish_model=args.finish_model)
     print(json.dumps(result))
 
 

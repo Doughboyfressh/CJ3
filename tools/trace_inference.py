@@ -97,6 +97,21 @@ def check_queue(binary, directory):
                             oracle, 100, 10)
     if provisional["plan"] != ["put", "put"] or provisional["observed"] != 1:
         raise ValueError(f"Goal-directed learning failed: {provisional}")
+    early_log = directory / "queue-first-hit.obs"
+    first = run_agent(binary, early_log, alphabet, None, 1, ["put"], oracle, 4, 10)
+    if first["plan"] != ["put"] or first["queries"] != 4 or first["states"] is not None:
+        raise ValueError(f"Goal reached on the budget boundary: {first}")
+    # Resume from exactly the saved probes, then compare with a cold full run.
+    resumed = run_agent(binary, early_log, alphabet, None, 1, ["put"], oracle, 100, 10,
+                        finish_model=True)
+    cold = run_agent(binary, directory / "queue-full.obs", alphabet, None, 1, ["put"], oracle, 100, 10,
+                     finish_model=True)
+    if not (resumed["states"] == cold["states"] == 3 and resumed["plan"] == cold["plan"] == ["put"]
+            and first["queries"] + resumed["queries"] == cold["queries"]):
+        raise ValueError(f"Saved goal evidence failed to resume: {resumed}, {cold}")
+    empty = run_agent(binary, directory / "empty-prefix.obs", alphabet, None, 0, [], oracle, 1, 10)
+    if empty["plan"] != [] or empty["observed"] != 0 or empty["queries"] != 1:
+        raise ValueError(f"Missed initial goal: {empty}")
     print(f"Queue without state bound: {provisional}")
     print(f"Queue: {counts[0]} self-selected queries; four shortest plans executed")
 

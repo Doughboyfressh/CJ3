@@ -77,6 +77,13 @@ from the two completed models, the UTF-8 model helped find a fraction plan in
 budget exhaustions. These four tasks measure behavior through a supplied
 action/feedback interface. They do not establish general intelligence.
 
+To compare the current goal-directed stopping rule on the same tasks, run
+`python3 tools/frozen_tasks.py out/heed --first-plan`. It returns the UTF-8
+plan after 29 experiments and the fraction plan after 21. Both other tasks
+still exhaust 96 experiments. The query order up to success is identical.
+These savings come from returning a witnessed solution sooner. The default
+evaluation continues to a provisional model for the held-out predictions.
+
 ## Learn a door rule by acting
 
 Build Heed, then run three episodes from the repository root:
@@ -157,7 +164,15 @@ plan. Reusing the log permits new goals without repeating known queries.
 Use a separate log for each process configuration. The oracle reads a JSON
 array of event names on standard input and prints `0` or `1`. Each invocation
 must reproduce the same initial state and implement every declared event.
-Omit `--bound` for goal-directed learning. In that mode Pi tries a plan,
+Omit `--bound` for goal-directed learning. When an experiment starts with
+the requested prefix and yields the desired output, Pi saves the result
+and returns the remaining actions immediately. An empty plan means the
+prefix itself achieved the goal. The reply reports `states: null` and
+`model_evidence: "observed plan only"` for a plan discovered this way.
+To continue to a provisional model, run again on the same log with
+`--finish-model`. The earlier observations count toward model learning.
+
+During model search Pi tries a plan,
 learns from a failed replay, and broadens its experiments when the current
 model cannot reach the goal. A successful replay establishes that particular
 plan works. The conformance guarantee requires a valid state bound and

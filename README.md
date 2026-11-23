@@ -221,6 +221,22 @@ draft. The confirmation flag is hidden from the learner. The benchmark
 compares with fresh state learning, checks equivalence to a separate
 specification, replays the witnesses, and runs an unchanged control.
 
+A verified single split can be exported with `--grow-bound N --save-pattern FILE`.
+On a different system, pass its learned baseline log and `--use-pattern FILE`.
+The pattern records a sequence of abstract action roles that reaches the
+affected state, the role that enters the copy, and the expected output
+before and after the original transition. Pi binds those roles against the
+new baseline and tests predictions against fresh target observations. A
+rejected pattern falls back to ordinary repair with the observations retained.
+The target still needs a resettable deterministic interface, goal examples
+and a valid state bound. This format covers single splits.
+
+Run `python tools/storage_transfer.py out/heed --pattern-only` to learn a
+pattern on the file store and transfer it to a simulated ticket dispenser
+with three baseline states and three actions. The benchmark checks all six
+action renamings against ordinary repair using the same learned baseline,
+and includes a dispenser that issues tickets immediately.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

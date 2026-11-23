@@ -224,7 +224,60 @@ def check_proposal(table, actions, bound, measurement):
     return True
 
 
-def grow_transfer(binary, source, actions, examples, observe, bound, budget):
+def extract_pattern(result):
+    """Abstract a verified split by an access trace and observable preconditions."""
+    if not result.get("local_model_verified") or result.get("local_edits") != 1 or not result.get("split"):
+        raise ValueError("Saving a pattern requires a verified single split")
+    split = result["split"]
+    events = result["events"]
+    table = result["table"]
+    parent, clone = split["state"], split["new_state"]
+    prefix = split["histories"][0]
+    event = split["event"]
+    # Bind by first occurrence, so neither environment names nor state IDs persist.
+    roles = list(dict.fromkeys([*prefix, event]))
+    successor = table[clone][1 + events.index(event)]
+    return {"format": "split-v1", "access": [roles.index(a) for a in prefix],
+            "event": roles.index(event), "before": table[parent][0], "after": table[successor][0]}
+
+
+def instantiate_pattern(pattern, source, actions):
+    if not isinstance(pattern, dict) or pattern.get("format") != "split-v1":
+        raise ValueError("Unknown repair pattern format")
+    prefix, event = pattern.get("access"), pattern.get("event")
+    if not isinstance(prefix, list) or any(type(x) is not int or x < 0 for x in [*prefix, event]):
+        raise ValueError("Invalid repair pattern roles")
+    roles = list(dict.fromkeys([*prefix, event]))
+    if roles != list(range(len(roles))) or any(pattern.get(k) not in (0, 1) for k in ("before", "after")):
+        raise ValueError("Invalid repair pattern conditions")
+    k = len(actions)
+    if k > 6 or len(roles) > k:
+        return {}
+    if factorial(k) * min(len(source) * k, factorial(k) // factorial(k - len(roles))) > 10000:
+        return {}
+    candidates = {}
+    seen = set()
+    for binding in permutations(range(1, k + 1), len(roles)):
+        state = 0
+        for role in prefix:
+            state = source[state][binding[role]]
+        col = binding[event]
+        row = source[state]
+        if row[0] != pattern["before"] or source[row[col]][0] != pattern["after"]:
+            continue
+        if (state, col) in seen:
+            continue
+        seen.add((state, col))
+        copied = [tuple(r) for r in source]
+        copied[state] = (*row[:col], len(source), *row[col + 1:])
+        copied.append(tuple(row))
+        for order in permutations(range(1, k + 1)):
+            model = tuple((r[0], *(r[i] for i in order)) for r in copied)
+            candidates[model] = 1
+    return candidates
+
+
+def grow_transfer(binary, source, actions, examples, observe, bound, budget, pattern=None):
     """Reuse repair probes; learn a larger table and verify a lower-bound witness."""
     if bound < len(source) or budget < 0:
         raise ValueError("Expected a bound at least the source size and a nonnegative budget")
@@ -242,17 +295,32 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget):
             log[key] = int(value)
         return log[key]
 
-    repair = repair_transfer(source, actions, examples, lambda tr: {sensor: measurement(tr)}, budget,
-                             allow_split=bound > len(source))
-    initial = len(log)
-    table = repair.get("table")
-
     def bounded_measurement(trace):
         if trace not in log and len(log) >= budget:
             return None
         return measurement(trace)
 
-    local = table is not None and check_proposal(table, actions, bound, bounded_measurement)
+    if any(len(row) != len(actions) + 1 for row in source) or len(set(actions)) != len(actions):
+        raise ValueError("Expected distinct actions and matching source alphabet")
+    def probe(trace):
+        return {sensor: measurement(trace)}
+
+    reused = False
+    if pattern is not None and bound > len(source):
+        candidates = instantiate_pattern(pattern, source, actions)
+        prior = identify_candidates(candidates, actions, sensor, probe, budget)
+        table = prior.get("table")
+        reused = table is not None and check_proposal(table, actions, bound, bounded_measurement)
+        if reused is None:
+            return {"status": "budget exhausted", "target_episodes": len(log)}
+    if reused:
+        repair = prior
+    else:
+        repair = repair_transfer(source, actions, examples, probe, budget - len(log),
+                                 allow_split=bound > len(source))
+    initial = len(log)
+    table = repair.get("table")
+    local = reused or (table is not None and check_proposal(table, actions, bound, bounded_measurement))
     if local is None:
         return {"status": "budget exhausted", "target_episodes": len(log)}
     edits = repair.get("minimum_edits") if local else None
@@ -319,7 +387,7 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget):
                  "histories": [paths[parent], paths[copy]]}
     return {"status": "checked under supplied bound", "events": actions, "table": table,
             "source_states": len(source), "target_states": len(table), "witnesses": witnesses,
-            "local_model_verified": local, "local_edits": edits, "split": split, "repair_status": repair["status"],
+            "local_model_verified": local, "pattern_verified": reused, "local_edits": edits, "split": split, "repair_status": repair["status"],
             "repair_episodes": initial, "target_episodes": len(log)}
 
 
@@ -331,11 +399,15 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--grow-bound", type=int, help="Check for additional states under a supplied target bound")
     mode.add_argument("--repair", action="store_true", help="Identify a renamed table with up to one changed transition")
+    parser.add_argument("--save-pattern", type=Path, help="Write a verified single-split pattern to a new file")
+    parser.add_argument("--use-pattern", type=Path, help="Try a saved pattern on the current source table")
     parser.add_argument("--events", nargs="+", required=True)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--budget", type=int, default=100)
     parser.add_argument("--oracle", nargs=argparse.REMAINDER, required=True)
     args = parser.parse_args()
+    if (args.use_pattern or args.save_pattern) and args.grow_bound is None:
+        parser.error("Repair patterns require --grow-bound")
     if not args.oracle:
         parser.error("Supply a resettable local oracle command")
     examples = json.loads(args.examples.read_text(encoding="utf-8"))
@@ -347,8 +419,14 @@ def main():
 
     table = read_table(args.binary.resolve(), args.source_log)
     if args.grow_bound is not None:
-        print(json.dumps(grow_transfer(args.binary.resolve(), table, args.events, examples, observe,
-                                       args.grow_bound, args.budget)))
+        pattern = json.loads(args.use_pattern.read_text()) if args.use_pattern else None
+        result = grow_transfer(args.binary.resolve(), table, args.events, examples, observe,
+                               args.grow_bound, args.budget, pattern)
+        if args.save_pattern:
+            learned = extract_pattern(result)
+            with args.save_pattern.open("x", encoding="utf-8") as out:
+                print(json.dumps(learned), file=out)
+        print(json.dumps(result))
         return
     if args.repair:
         print(json.dumps(repair_transfer(table, args.events, examples, observe, args.budget)))

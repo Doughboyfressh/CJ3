@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 from trace_agent import run_agent
-from trace_transfer import distinguish, grow_transfer, goal_sensor, predict, read_table, repair_transfer, try_transfer
+from trace_transfer import extract_pattern, distinguish, grow_transfer, goal_sensor, predict, read_table, repair_transfer, try_transfer
 from trace_inference import learn
 
 
@@ -173,10 +173,67 @@ def check_growth(binary, directory, source, actions, examples):
           "240 pairwise witnesses replayed; unchanged control has 4 states")
 
 
+def check_pattern(binary, directory, actions, examples):
+    # Generate and serialize the donor pattern in a separate CLI process.
+    labels = directory / "donor-labels.json"
+    labels.write_text(json.dumps(examples))
+    saved = directory / "split.json"
+    names = ["restore", "mark", "publish", "erase"]
+    command = [sys.executable, str(Path(__file__).with_name("trace_transfer.py")), binary,
+               directory / "source.obs", labels, "--grow-bound", "5", "--budget", "300",
+               "--save-pattern", saved, "--events", *actions, "--oracle", sys.executable,
+               __file__, "--confirm-sensors", *names]
+    donor = json.loads(subprocess.check_output(command, text=True, timeout=60))
+    pattern = json.loads(saved.read_text())
+    if pattern != extract_pattern(donor):
+        raise AssertionError("Pattern did not survive serialization")
+
+    # An independent ticket dispenser has no draft, published bit, or rollback.
+    symbols = ["a", "b", "c"]
+    goal = [({"ticket": 0}, 0), ({"ticket": 1}, 1)]
+    base = [(0, 1, 0, 0), (0, 1, 2, 0), (1, 2, 2, 0)]
+    learn(binary, directory, symbols, base, autonomous=True)
+    learned_base = read_table(binary, directory / "observations")
+    warm = cold = wins = 0
+    for names in permutations(["load", "issue", "clear"]):
+        def observe(trace, confirm=True):
+            loaded = issued = pending = False
+            for token in trace:
+                op = names[symbols.index(token)]
+                if op == "clear":
+                    loaded = issued = pending = False
+                elif op == "load":
+                    loaded, pending = True, False
+                elif loaded and not issued:
+                    issued = pending or not confirm
+                    pending = not issued
+            return {"ticket": int(issued)}
+
+        reference = [(0, 1, 0, 0), (0, 1, 3, 0), (1, 2, 2, 0), (0, 1, 2, 0)]
+        order = [["load", "issue", "clear"].index(name) + 1 for name in names]
+        expected = [(r[0], *(r[i] for i in order)) for r in reference]
+        result = grow_transfer(binary, learned_base, symbols, goal, observe, 4, 300, pattern)
+        baseline = grow_transfer(binary, learned_base, symbols, goal, observe, 4, 300)
+        if (not result["pattern_verified"] or distinguish(expected, result["table"]) is not None
+                or distinguish(expected, baseline["table"]) is not None):
+            raise AssertionError("Incorrect ticket dispenser model")
+        warm += result["target_episodes"]
+        cold += baseline["target_episodes"]
+        wins += result["target_episodes"] < baseline["target_episodes"]
+    control = grow_transfer(binary, learned_base, symbols, goal, lambda tr: observe(tr, False),
+                            4, 300, pattern)
+    unchanged = [(r[0], *(r[i] for i in order)) for r in base]
+    if control["pattern_verified"] or distinguish(unchanged, control["table"]) is not None:
+        raise AssertionError("Inapplicable pattern accepted")
+    print(f"File donor {donor['target_episodes']} episodes; 6 ticket dispensers: "
+          f"{warm} with pattern vs {cold} existing search; {wins} wins; negative control passed")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--repair-only", action="store_true")
+    parser.add_argument("--pattern-only", action="store_true")
     parser.add_argument("--growth-only", action="store_true")
     args = parser.parse_args()
     binary = args.binary.resolve()
@@ -189,6 +246,10 @@ def main():
                            1, [], [sys.executable, str(Path(__file__).with_name("trace_inference.py")),
                                    "--sqlite-oracle"], 200, 10)
         table = read_table(binary, log)
+        if args.pattern_only or not (args.growth_only or args.repair_only):
+            check_pattern(binary, Path(directory), actions, examples)
+        if args.pattern_only:
+            return
         if args.growth_only or not args.repair_only:
             check_growth(binary, Path(directory), table, actions, examples)
         if args.growth_only:

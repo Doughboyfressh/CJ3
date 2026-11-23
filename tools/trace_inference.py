@@ -1,7 +1,6 @@
 """Exercise Heed's trace learner against independent binary-output machines."""
 import argparse
 import json
-from collections import deque
 from pathlib import Path
 from queue import Empty, Full, Queue
 import random
@@ -11,21 +10,7 @@ import tempfile
 import sys
 
 from trace_agent import run_agent
-
-
-def distinguish(reference, hypothesis):
-    """Shortest differing output trace, or None if all reachable outputs agree."""
-    pending = deque([(0, 0, ())])
-    seen = {(0, 0)}
-    while pending:
-        left, right, trace = pending.popleft()
-        if reference[left][0] != hypothesis[right][0]:
-            return trace
-        for symbol, pair in enumerate(zip(reference[left][1:], hypothesis[right][1:])):
-            if pair not in seen:
-                seen.add(pair)
-                pending.append((*pair, trace + (symbol,)))
-    return None
+from trace_transfer import distinguish
 
 
 def learn(binary, directory, alphabet, reference, autonomous=False, observe=None):

@@ -180,6 +180,24 @@ for a JSON action list. The planner infers a single goal sensor and tries
 bijections for up to six actions. Its plan-length limit controls the cost
 of enumerating potential experiments.
 
+Use `--repair` with `trace_transfer.py` to identify a target with renamed
+actions and up to one changed transition. This mode starts from the source
+table and keeps the state count, initial state, and binary outputs fixed.
+Pi chooses traces that split the surviving tables, reports the minimum edit
+count, and returns a representative table once all survivors agree on all
+reachable traces. The JSON includes the target event order; the first entry
+of each row is its output and the remaining entries are successor states.
+The family assumption limits the identification claim. An episode budget
+can terminate the search while candidates still disagree.
+
+Run `python tools/storage_transfer.py out/heed --repair-only` to compare
+repair with fresh bounded learning. In the changed store, restoring into
+an empty draft moves the published bit into the draft and clears the
+published copy. The benchmark checks the full inferred behavior against
+a separate specification, exercises unseen continuations on real files,
+and verifies a recovery action. Unchanged controls use the original copy
+semantics under the same action renamings.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

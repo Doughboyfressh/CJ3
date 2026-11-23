@@ -2,16 +2,17 @@
 import argparse
 import json
 import subprocess
-from itertools import permutations
+from itertools import permutations, product
 from pathlib import Path
 import sys
 import tempfile
 
 from trace_agent import run_agent
-from trace_transfer import goal_sensor, read_table, try_transfer
+from trace_transfer import distinguish, goal_sensor, predict, read_table, repair_transfer, try_transfer
+from trace_inference import learn
 
 
-def file_readings(trace, roles):
+def file_readings(trace, roles, consume=False):
     # A draft bit is copied to or restored from a separate published file.
     with tempfile.TemporaryDirectory() as directory:
         draft, published = (Path(directory) / name for name in ("draft", "published"))
@@ -26,15 +27,80 @@ def file_readings(trace, roles):
             elif role == "publish":
                 published.write_bytes(draft.read_bytes())
             elif role == "restore":
+                move = consume and draft.read_bytes() == b"0" and published.read_bytes() == b"1"
                 draft.write_bytes(published.read_bytes())
+                if move:
+                    published.write_bytes(b"0")
         left, right = int(draft.read_bytes()), int(published.read_bytes())
         return {"s0": left != right, "s1": left, "s2": right}
+
+
+def reference_table(names, consume):
+    # Independent specification using state bits (draft, published).
+    result = []
+    for state in range(4):
+        draft, published = divmod(state, 2)
+        successors = {"mark": (1, published), "erase": (0, published),
+                      "publish": (draft, draft), "restore": (published, published)}
+        if consume and state == 1:
+            successors["restore"] = (1, 0)
+        result.append((published, *(2 * successors[n][0] + successors[n][1] for n in names)))
+    return result
+
+
+def check_repair(binary, directory, table, actions, examples):
+    adapted = cold = unchanged = heldout = 0
+    for names in permutations(["mark", "erase", "publish", "restore"]):
+        roles = dict(zip(actions, names))
+        for consume in (False, True):
+            samples = set()
+
+            def observe(trace):
+                samples.add(tuple(trace))
+                return file_readings(trace, roles, consume)
+
+            result = repair_transfer(table, actions, examples, observe, 100)
+            reference = reference_table(names, consume)
+            if result["status"] != "identified within family" or result["minimum_edits"] != int(consume):
+                raise AssertionError(result)
+            if distinguish(reference, result["table"]) is not None:
+                raise AssertionError("Identified table diverges from target specification")
+            if consume:
+                adapted += result["target_episodes"]
+                cost, _, _ = learn(binary, directory, actions, reference, autonomous=True,
+                                   observe=lambda tr: file_readings([actions[i] for i in tr], roles, True)["s2"])
+                cold += cost
+                # Exercise the changed edge, then republish; both probes use
+                # real files independently of the transition-table reference.
+                prefix = tuple(actions[names.index(role)] for role in ("mark", "publish", "erase", "restore"))
+                for suffix in product(actions, repeat=3):
+                    trace = prefix + suffix
+                    if trace not in samples:
+                        actual = file_readings(trace, roles, True)["s2"]
+                        if predict(result["table"], [actions.index(a) for a in trace]) != actual:
+                            raise AssertionError("Held-out file behavior differs")
+                        heldout += 1
+                if file_readings(prefix, roles, True)["s2"] != 0:
+                    raise AssertionError("Changed restore should consume the published bit")
+                # Choose a recovery action by prediction, then execute it.
+                plan = next(a for a in actions if predict(result["table"],
+                            [actions.index(e) for e in (*prefix, a)]))
+                if file_readings((*prefix, plan), roles, True)["s2"] != 1:
+                    raise AssertionError("Learned recovery plan failed")
+            else:
+                unchanged += result["target_episodes"]
+    if heldout == 0:
+        raise AssertionError("No held-out queries tested")
+    print(f"24 changed stores: repair {adapted}, fresh bounded Heed {cold} episodes; "
+          f"{heldout} held-out file checks; 24 unchanged controls: {unchanged} episodes")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
-    binary = parser.parse_args().binary.resolve()
+    parser.add_argument("--repair-only", action="store_true")
+    args = parser.parse_args()
+    binary = args.binary.resolve()
     actions = ["ka", "zu", "mi", "vo"]
     examples = [({"s0": 1, "s1": 1, "s2": 0}, 0),
                 ({"s0": 1, "s1": 0, "s2": 1}, 1)]
@@ -44,6 +110,9 @@ def main():
                            1, [], [sys.executable, str(Path(__file__).with_name("trace_inference.py")),
                                    "--sqlite-oracle"], 200, 10)
         table = read_table(binary, log)
+        check_repair(binary, Path(directory), table, actions, examples)
+        if args.repair_only:
+            return
         labels = Path(directory) / "goal.json"
         labels.write_text(json.dumps(examples), encoding="utf-8")
         demo = subprocess.check_output(

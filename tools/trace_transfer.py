@@ -97,13 +97,13 @@ def predict(table, trace):
     return table[state][0]
 
 
-def repair_transfer(table, actions, examples, observe, budget):
+def repair_transfer(table, actions, examples, observe, budget, allow_split=False):
     """Identify target behavior within all bijections and zero/one edge changes."""
     sensor = goal_sensor(examples)
     n, k = len(table), len(actions)
     if not n or not k or len(set(actions)) != k or any(len(row) != k + 1 for row in table):
         raise ValueError("Repair requires matching source and target alphabet sizes")
-    if k > 6 or factorial(k) * (1 + n * k * (n - 1)) > 10000:
+    if k > 6 or factorial(k) * (1 + n * k * (n - 1 + int(allow_split))) > 10000:
         raise ValueError("Repair exceeds the 10000-candidate search limit")
     if budget < 0:
         raise ValueError("Expected a nonnegative episode budget")
@@ -113,6 +113,12 @@ def repair_transfer(table, actions, examples, observe, budget):
         candidates[base] = 0
         for state, row in enumerate(base):
             for col in range(1, k + 1):
+                if allow_split:
+                    # Enter a copy of this state on this action. Its next
+                    # action follows the original row, including self-loops.
+                    fork = row[:col] + (n,) + row[col + 1:]
+                    variant = base[:state] + (fork,) + base[state + 1:] + (row,)
+                    candidates.setdefault(variant, 1)
                 for target in range(n):
                     if row[col] != target:
                         changed = row[:col] + (target,) + row[col + 1:]
@@ -146,6 +152,45 @@ def repair_transfer(table, actions, examples, observe, budget):
     return {"status": "observations contradict family", "target_episodes": episodes}
 
 
+def access_paths(table, actions):
+    paths = {0: ()}
+    queue = deque([0])
+    while queue:
+        state = queue.popleft()
+        for action, successor in zip(actions, table[state][1:]):
+            if successor not in paths:
+                paths[successor] = paths[state] + (action,)
+                queue.append(successor)
+    return paths
+
+
+def check_proposal(table, actions, bound, measurement):
+    """State cover plus distinguishing suffixes, for complete resettable machines."""
+    paths = access_paths(table, range(len(actions)))
+    if len(paths) != len(table) or len(table) > bound:
+        return False
+    suffixes = {()}
+    for left in range(len(table)):
+        for right in range(left):
+            probe = distinguish(table, table, (left, right))
+            if probe is None:
+                return False
+            suffixes.add(probe)
+    suffixes = sorted(suffixes)
+    # Every prefix, followed by up to bound - n + 1 inputs and a suffix.
+    for depth in range(bound - len(table) + 2):
+        for word in product(range(len(actions)), repeat=depth):
+            for prefix in paths.values():
+                for tail in suffixes:
+                    trace = prefix + word + tail
+                    observed = measurement(tuple(actions[i] for i in trace))
+                    if observed is None:
+                        return None
+                    if predict(table, trace) != observed:
+                        return False
+    return True
+
+
 def grow_transfer(binary, source, actions, examples, observe, bound, budget):
     """Reuse repair probes; learn a larger table and verify a lower-bound witness."""
     if bound < len(source) or budget < 0:
@@ -164,40 +209,45 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget):
             log[key] = int(value)
         return log[key]
 
-    repair = repair_transfer(source, actions, examples, lambda tr: {sensor: measurement(tr)}, budget)
+    repair = repair_transfer(source, actions, examples, lambda tr: {sensor: measurement(tr)}, budget,
+                             allow_split=bound > len(source))
     initial = len(log)
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "observations"
-        with path.open("w", encoding="utf-8") as out:
-            print("events", *actions, file=out)
-            for trace, value in log.items():
-                print(value, *trace, file=out)
-        while True:
-            reply = subprocess.check_output([binary, "states-check", path, str(bound)],
-                                            text=True, timeout=30).splitlines()
-            fields = reply[0].split()
-            if fields[:2] == ["consistent", "states"]:
-                table = [tuple(map(int, row.split())) for row in reply[1:]]
-                break
-            if fields[:1] != ["observe"]:
-                return {"status": reply[0], "target_episodes": len(log)}
-            trace = tuple(fields[1:])
-            if trace in log:
-                raise ValueError("Repeated native query")
-            if len(log) == budget:
-                return {"status": "budget exhausted", "target_episodes": len(log)}
-            value = measurement(trace)
-            with path.open("a", encoding="utf-8") as out:
-                print(value, *trace, file=out)
+    table = repair.get("table")
 
-    paths = {0: ()}
-    queue = deque([0])
-    while queue:
-        state = queue.popleft()
-        for action, successor in zip(actions, table[state][1:]):
-            if successor not in paths:
-                paths[successor] = paths[state] + (action,)
-                queue.append(successor)
+    def bounded_measurement(trace):
+        if trace not in log and len(log) >= budget:
+            return None
+        return measurement(trace)
+
+    local = table is not None and check_proposal(table, actions, bound, bounded_measurement)
+    if local is None:
+        return {"status": "budget exhausted", "target_episodes": len(log)}
+    if not local:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "observations"
+            with path.open("w", encoding="utf-8") as out:
+                print("events", *actions, file=out)
+                for trace, value in log.items():
+                    print(value, *trace, file=out)
+            while True:
+                reply = subprocess.check_output([binary, "states-check", path, str(bound)],
+                                                text=True, timeout=30).splitlines()
+                fields = reply[0].split()
+                if fields[:2] == ["consistent", "states"]:
+                    table = [tuple(map(int, row.split())) for row in reply[1:]]
+                    break
+                if fields[:1] != ["observe"]:
+                    return {"status": reply[0], "target_episodes": len(log)}
+                trace = tuple(fields[1:])
+                if trace in log:
+                    raise ValueError("Repeated native query")
+                if len(log) == budget:
+                    return {"status": "budget exhausted", "target_episodes": len(log)}
+                value = measurement(trace)
+                with path.open("a", encoding="utf-8") as out:
+                    print(value, *trace, file=out)
+
+    paths = access_paths(table, actions)
     # For each pair, execute the same continuation from both histories.
     # Different measured bits certify that the two histories require distinct states.
     witnesses = []
@@ -216,9 +266,17 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget):
                 if bits[0] == bits[1]:
                     raise ValueError("Target refuted proposed state distinction")
                 witnesses.append([paths[left], paths[right], tail, bits])
+    split = None
+    if local and len(table) == len(source) + 1:
+        copy = len(source)
+        parent, event = next((state, event) for state, row in enumerate(table[:copy])
+                             for event, successor in zip(actions, row[1:]) if successor == copy)
+        split = {"state": parent, "event": event, "new_state": copy,
+                 "histories": [paths[parent], paths[copy]]}
     return {"status": "checked under supplied bound", "events": actions, "table": table,
             "source_states": len(source), "target_states": len(table), "witnesses": witnesses,
-            "repair_status": repair["status"], "repair_episodes": initial, "target_episodes": len(log)}
+            "local_model_verified": local, "split": split, "repair_status": repair["status"],
+            "repair_episodes": initial, "target_episodes": len(log)}
 
 
 def main():

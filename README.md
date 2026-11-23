@@ -199,8 +199,12 @@ and verifies a recovery action. Unchanged controls use the original copy
 semantics under the same action renamings.
 
 When the target may need more states, use `--grow-bound N` in place of
-`--repair`. Pi carries the target observations from repair into its native
-state learner and checks the resulting model under the supplied upper bound.
+`--repair`. Pi tries redirecting one action to a copy of its originating state. The
+copy initially retains the original transitions. It checks the proposed
+table using access paths and suffixes that distinguish its states under
+the supplied upper bound. If the local models fail, the native state
+learner reuses all target observations. The JSON field `local_model_verified`
+records whether a local model passed conformance checking.
 If it finds more states than the source had, the JSON includes pairs of
 histories, a shared continuation for each pair, and both measured outputs.
 Pairwise differences among five histories establish a five-state lower bound

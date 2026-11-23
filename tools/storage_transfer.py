@@ -116,9 +116,15 @@ def check_growth(binary, directory, source, actions, examples):
         row[publish] = 4
         reference[2] = tuple(row)
         result = grow_transfer(binary, source, actions, examples, observe, 5, 1000)
-        if (result.get("target_states") != 5 or len(result["witnesses"]) != 10
+        if (not result.get("local_model_verified") or result.get("target_states") != 5 or len(result["witnesses"]) != 10
                 or distinguish(reference, result["table"]) is not None):
             raise AssertionError(result)
+        split = result["split"]
+        if roles[split["event"]] != "publish":
+            raise AssertionError("The split should distinguish a publication attempt")
+        predictions = [observe(history + (split["event"],))["s2"] for history in split["histories"]]
+        if predictions != [0, 1]:
+            raise AssertionError("Reported split failed on the target")
         for left, right, tail, bits in result["witnesses"]:
             if bits != [observe(left + tail)["s2"], observe(right + tail)["s2"]] or bits[0] == bits[1]:
                 raise AssertionError("State-count witness failed independent replay")
@@ -135,6 +141,15 @@ def check_growth(binary, directory, source, actions, examples):
                             lambda tr: file_readings(tr, roles), 5, 1000)
     if control.get("target_states") != 4 or control["witnesses"]:
         raise AssertionError(control)
+    combined = grow_transfer(binary, source, actions, examples,
+                             lambda tr: file_readings(tr, roles, consume=True, confirm=True), 5, 1000)
+    both = reference_table(names, True)
+    both.append(both[2])
+    row = list(both[2])
+    row[publish] = 4
+    both[2] = tuple(row)
+    if combined.get("local_model_verified") is not False or distinguish(both, combined["table"]) is not None:
+        raise AssertionError("The combined change requires full inference")
     print(f"24 confirmation stores: {adapted} target episodes vs {fresh} fresh; "
           "240 pairwise witnesses replayed; unchanged control has 4 states")
 

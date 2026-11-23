@@ -61,6 +61,14 @@ if [ -x out/t_heed ]; then
     out/t_heed memory out/t_heed.lessons use "sum of cubes" 4,5
   } > out/t_heed_memory.txt
   if cmp -s out/t_heed_memory.txt examples/native/golden/heed_memory.expect; then echo "ok   Heed transfers corrections across runs"; else echo "FAIL Heed lesson memory"; fail=1; fi
+  cp examples/native/golden/source_choice.in out/t_sources.lessons
+  {
+    out/t_heed memory out/t_sources.lessons teach "sum of steps" 2,5,2 8
+    out/t_heed memory out/t_sources.lessons teach "sum of steps" 4,1,4 6
+    out/t_heed memory out/t_sources.lessons teach "sum of steps" 3,5,2 9
+    out/t_heed memory out/t_sources.lessons use "sum of steps" 2,5,9
+  } > out/t_sources.txt
+  if cmp -s out/t_sources.txt examples/native/golden/source_choice.expect; then echo "ok   Heed discovers a source"; else echo "FAIL automatic source selection"; fail=1; fi
 fi
 if [ "$fail" = 0 ]; then echo "ALL PASS: fixpoint and $n programs"; exit 0; fi
 echo "SOME FAILED"

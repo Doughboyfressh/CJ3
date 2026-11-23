@@ -1,0 +1,12 @@
+heed1 brims sum 2,1,5 3
+heed1 brims sum 2,9,5 11
+heed1 brims sum 1,5,2 6
+heed1 brims sum 4,-3,9,8 1
+heed1 brims sum 4,6 10
+heed1 brims sum 0,8,0,7 8
+heed1 tails sum 5,1,2 3
+heed1 tails sum 5,9,2 11
+heed1 tails sum 2,5,1 6
+heed1 tails sum 8,9,-3,4 1
+heed1 tails sum 6,4 10
+heed1 tails sum 7,0,8,0 8

@@ -78,6 +78,15 @@ if exist out\t_heed.exe (
   ) > out\t_heed_memory.txt
   fc /b out\t_heed_memory.txt examples\native\golden\heed_memory.expect >nul
   if errorlevel 1 (echo FAIL Heed lesson memory & set fail=1) else (echo ok   Heed transfers corrections across runs)
+  copy /y examples\native\golden\source_choice.in out\t_sources.lessons > nul
+  (
+    out\t_heed.exe memory out\t_sources.lessons teach "sum of steps" 2,5,2 8
+    out\t_heed.exe memory out\t_sources.lessons teach "sum of steps" 4,1,4 6
+    out\t_heed.exe memory out\t_sources.lessons teach "sum of steps" 3,5,2 9
+    out\t_heed.exe memory out\t_sources.lessons use "sum of steps" 2,5,9
+  ) > out\t_sources.txt
+  fc /b out\t_sources.txt examples\native\golden\source_choice.expect >nul
+  if errorlevel 1 (echo FAIL automatic source selection & set fail=1) else (echo ok   Heed discovers a source)
 )
 if !fail!==0 (echo ALL PASS: fixpoint and !n! programs & exit /b 0)
 echo SOME FAILED

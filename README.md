@@ -115,6 +115,14 @@ Mind verifies each resulting conditional against every lesson. Question
 selection also tries changing one observation at a time at a candidate
 threshold, keeping the rest of the input fixed.
 
+During ordinary teaching Heed can discover a named source automatically when
+the target differs from a previous list-to-integer skill by a constant. With
+two distinct target answers it compares earlier skills on every saved target
+observation. If sources compete, it tries single-position changes to a lesson
+and asks a question that splits their predictions. With at least three distinct
+inputs and one matching nonzero offset, it records the named dependency and
+replays it on later corrections. Direct copies can still be taught explicitly.
+
 To save a calculation that follows future corrections, teach examples for
 its target phrase, then run `out/heed compose FILE "sum of SOURCE" "sum of TARGET"`
 using the taught words. Mind fits a small integer expression to the source

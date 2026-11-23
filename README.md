@@ -46,6 +46,25 @@ Linux x64 (nothing to install: the compiler and what it builds are static progra
 
 Either compiler builds for the other system: `pic SOURCE OUTPUT linux` or `pic SOURCE OUTPUT windows`.
 
+## Learn a door rule by acting
+
+Build Heed, then run three episodes from the repository root:
+
+```sh
+out/heed room hall follow out/doors.obs
+out/heed room annex follow out/doors.obs
+out/heed room annex follow
+```
+
+Use a new observation file for the first episode. The room layout, available
+moves and switch state are public. The simulator's `follow` or `latch` setting
+controls the first door and is private to the simulator. Softwell checks each
+attempt; Mind evaluates two candidate door rules. With both candidates viable,
+Heed searches for a reachable action where they predict different outcomes.
+It then plans a path to the exit. The observation file stores only switch state,
+whether it has ever been on in that episode, and whether a crossing succeeded.
+Reuse it across layouts with the same mechanism. Omitting the file starts cold.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

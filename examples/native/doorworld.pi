@@ -1,0 +1,150 @@
+# Public floor plan: start, exit, switch locations, undirected edges.
+# Edge kinds: 0 passage, 1 experimental door, 2 door open with switch off.
+skill dw_layout(layout) -> Any {
+  if layout == "hall" {
+    return [0,3,[0,4],[[0,1,0],[1,2,1],[2,3,2],[2,4,0]]]
+  }
+  return [3,0,[2,5],[[3,2,0],[2,4,1],[4,1,0],[1,0,2],[4,5,0]]]
+}
+
+# Observations for a trial are [switch now, switched on at least once, crossed].
+# The library contains two candidate transition rules, expressed in Mind.
+skill dw_models(rows) -> Any {
+  let out = []
+  for model in [O("head",[V("x")]),O("maxl",[V("x")])] {
+    let valid = true
+    for row in rows {
+      if sev(model,null,[row[0],row[1]],null,[]) != row[2] { valid = false }
+    }
+    if valid { out = append(out,model) }
+  }
+  return out
+}
+
+skill dw_actions(room,pos) -> Any {
+  let actions = []
+  if contains(room[2],pos) { actions = append(actions,[pos,3]) }
+  for e in room[3] {
+    if e[0] == pos { actions = append(actions,[e[1],e[2]]) }
+    if e[1] == pos { actions = append(actions,[e[0],e[2]]) }
+  }
+  return actions
+}
+
+# The simulator keeps its own latch. The policy has no access to the latch or
+# the mode. Softwell executes the permission check for each attempted action.
+skill dw_world(state,action,latched) -> Any {
+  let pos = state[0]
+  let on = state[1]
+  let latch = state[2]
+  gpu for kind in [action[1]] -> passed {
+    let passed = 1
+    if kind == 1 and on == 0 and latch == 0 { let passed = 0 }
+    if kind == 2 and on == 1 { let passed = 0 }
+  }
+  if aget(passed,0) == 1 { pos = action[0] }
+  if action[1] == 3 {
+    on = 1-on
+    if latched and on == 1 { latch = 1 }
+  }
+  return [pos,on,latch]
+}
+
+# Breadth-first search over predicted states. With competing rules, look
+# for the shortest reachable experiment on which their outcomes differ.
+skill dw_next(room,state,models,experiment) -> Any {
+  let queue = [[state,null]]
+  let seen = put({},str(state),true)
+  let index = 0
+  while index < len(queue) {
+    let item = queue[index]
+    index = index+1
+    let s = item[0]
+    for a in dw_actions(room,s[0]) {
+      let first = item[1]
+      if first == null { first = a }
+      let on = s[1]
+      let ever = s[2]
+      let pass = 1
+      if a[1] == 1 {
+        let values = [on,ever]
+        pass = sev(models[0],null,values,null,[])
+        for model in models {
+          if sev(model,null,values,null,[]) != pass {
+            if experiment { return first }
+            pass = 0
+          }
+        }
+      }
+      if a[1] == 2 { pass = 1-on }
+      if a[1] == 3 {
+        on = 1-on
+        ever = max(on,ever)
+      }
+      if pass == 1 {
+        let next = [a[0],on,ever]
+        if next[0] == room[1] and not experiment { return first }
+        if next[0] != room[1] and seen[str(next)] == null {
+          seen = put(seen,str(next),true)
+          queue = append(queue,[next,first])
+        }
+      }
+    }
+  }
+  return null
+}
+
+skill dw_run(layout,mode,path) -> Any {
+  if not contains(["hall","annex"],layout) or not contains(["follow","latch"],mode) {
+    return "Usage: heed room hall|annex follow|latch [observation-file]"
+  }
+  let rows = []
+  if path != null {
+    let text = read_file(path)
+    if text != null {
+      for line in split(text,"\n") {
+        if line != "" {
+          let row = hm_numbers(line)
+          if row == null or len(row) != 3 { return "Invalid door observation." }
+          for v in row { if v != 0 and v != 1 { return "Invalid door observation." } }
+          if row[0] > row[1] { return "Invalid door history." }
+          if not contains(rows,row) { rows = append(rows,row) }
+        }
+      }
+      if len(text) > 0 and slice(text,len(text)-1,len(text)) != "\n" { return "Incomplete door observation file." }
+    }
+  }
+  let room = dw_layout(layout)
+  let state = [room[0],0,0]
+  let ever = 0
+  let steps = 0
+  let tests = []
+  let models = dw_models(rows)
+  while state[0] != room[1] and steps < 100 {
+    if len(models) == 0 { return "Door observations contradict both candidate rules." }
+    let public = [state[0],state[1],ever]
+    let action = null
+    if len(models) > 1 { action = dw_next(room,public,models,true) }
+    if action == null { action = dw_next(room,public,models,false) }
+    if action == null { return "No route found." }
+    let next = dw_world(state,action,mode == "latch")
+    steps = steps+1
+    if action[1] == 1 {
+      let crossed = if next[0] == action[0] { 1 } else { 0 }
+      let row = [state[1],ever,crossed]
+      if not contains(rows,row) {
+        if path != null {
+          if not rt_append_file(path,hm_csv(row) ++ "\n") { return "Could not save observation." }
+        }
+        rows = append(rows,row)
+      }
+      let remaining = dw_models(rows)
+      if len(remaining) < len(models) { tests = append(tests,row) }
+      models = remaining
+    }
+    ever = max(ever,next[1])
+    state = next
+  }
+  if state[0] != room[1] { return "Action budget exhausted." }
+  return layout ++ " exit in " ++ str(steps) ++ " actions; distinguishing observations " ++ str(tests)
+}

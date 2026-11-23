@@ -79,6 +79,16 @@ if [ -x out/t_heed ]; then
     out/t_heed memory out/t_sources.lessons use "sum of brims" 6,1,9,3,8,5
   } > out/t_sources.txt
   if cmp -s out/t_sources.txt examples/native/golden/source_choice.expect; then echo "ok   Heed discovers a source"; else echo "FAIL automatic source selection"; fail=1; fi
+  {
+    for mode in follow latch; do
+      memory="out/t_door_$mode.obs"
+      rm -f "$memory"
+      out/t_heed room hall "$mode" "$memory"
+      out/t_heed room annex "$mode" "$memory"
+      out/t_heed room annex "$mode"
+    done
+  } > out/t_door.txt
+  if cmp -s out/t_door.txt examples/native/golden/door_memory.expect; then echo "ok   door rule transfers across rooms"; else echo "FAIL door transfer"; fail=1; fi
 fi
 if [ "$fail" = 0 ]; then echo "ALL PASS: fixpoint and $n programs"; exit 0; fi
 echo "SOME FAILED"

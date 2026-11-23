@@ -97,6 +97,16 @@ if exist out\t_heed.exe (
   ) > out\t_sources.txt
   fc /b out\t_sources.txt examples\native\golden\source_choice.expect >nul
   if errorlevel 1 (echo FAIL automatic source selection & set fail=1) else (echo ok   Heed discovers a source)
+  (
+    for %%m in (follow latch) do (
+      if exist out\t_door_%%m.obs del out\t_door_%%m.obs
+      out\t_heed.exe room hall %%m out\t_door_%%m.obs
+      out\t_heed.exe room annex %%m out\t_door_%%m.obs
+      out\t_heed.exe room annex %%m
+    )
+  ) > out\t_door.txt
+  fc /b out\t_door.txt examples\native\golden\door_memory.expect >nul
+  if errorlevel 1 (echo FAIL door transfer & set fail=1) else (echo ok   door rule transfers across rooms)
 )
 if !fail!==0 (echo ALL PASS: fixpoint and !n! programs & exit /b 0)
 echo SOME FAILED

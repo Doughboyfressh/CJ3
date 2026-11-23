@@ -146,3 +146,20 @@ From the repository root, `out/kimipiece encode e4b8ade69687` returns
 `[16717]`, and `out/kimipiece decode 16717` returns the original hex bytes.
 The vocabulary covers 163,584 ordinary merge ranks. Callers supply piece
 boundaries and handle special tokens and chat formatting separately.
+
+### Running Kimi router weights in Pi
+
+From the repository root, run `python tools/distill_kimi_gate.py` to reproduce
+the 1,429-byte projection from the saved BF16 fixtures. Build with
+`./build.sh examples/native/kimigatechoice.pi out/kimigatechoice`.
+For example, `out/kimigatechoice cat 2 ships -1` returns 1, the zero-based
+row index within the five saved layer-1 gate directions.
+
+The input is a signed mixture of the 44 available token embeddings. The builder
+takes exact integer dot products, subtracts the first direction's score, and
+rounds the four differences to multiples of 2^-20. At runtime Pi adds the
+stored coefficients. For weights w, rounding changes any pairwise margin
+by at most sum(abs(w)) in scaled units. Pi returns a winner only above this
+bound and returns `uncertain` otherwise. This transfers a linear operation
+from the saved weights. Running Kimi's contextual router would also require
+the preceding hidden states and the rest of the router.

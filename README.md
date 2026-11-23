@@ -158,6 +158,28 @@ the queue and an in-memory SQLite database from observations through plan
 execution. The SQLite adapter exposes insert, delete, commit, and rollback.
 Its observation is whether one row survives discarding pending changes.
 
+### Transfer a storage goal to unfamiliar actions
+
+`python tools/storage_transfer.py out/heed` learns a binary transition
+table from SQLite. A second environment implements draft and published
+bits in separate files. It exposes opaque event and sensor names. Two
+labeled snapshots identify the goal sensor without showing an action
+sequence. The transfer planner tries mappings between source and target
+actions, selects short target experiments that surviving mappings predict
+will succeed, and eliminates mappings after failed predictions. If the
+guided search runs out of proposals it explores the remaining sequences
+within the depth and episode bounds. A successful plan is executed on
+the target. The benchmark checks all 24 action renamings against direct
+shortest-first exploration and fresh goal-directed Heed. The source and
+target implement the same four-state storage abstraction.
+
+For another resettable target, run `python tools/trace_transfer.py --help`.
+Supply a native single-output source log, target event names, a JSON file
+of labeled target snapshots, and a command that returns a sensor object
+for a JSON action list. The planner infers a single goal sensor and tries
+bijections for up to six actions. Its plan-length limit controls the cost
+of enumerating potential experiments.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

@@ -250,6 +250,21 @@ It offers both the lamp and file-store repairs to dispensers with delayed
 issue, delayed clearing, or immediate operation. It compares model selection
 with both ordinary repair and being handed the applicable pattern.
 
+Add `--cost-history FILE.sqlite` alongside `--grow-bound` and one or more
+`--use-pattern` files to let Pi decide whether to consult them. For a new
+configuration Pi starts with ordinary repair. On subsequent runs it picks
+the strategy with fewer cumulative target experiments on completed pairs.
+The history key includes the baseline table, state bound, budget and pattern
+collection. It excludes the new target's outcomes. Ties use ordinary repair.
+
+After checking a model, Pi replays the alternative strategy against that
+model and records both costs. This spends local computation and requires
+no additional target calls. The replay assumes deterministic behavior and
+a valid state bound. Incomplete pairs do not update the averages. The
+`strategy`, `prior_tasks` and `paired_costs` fields expose the decision and
+the evidence added afterward. This policy optimizes target experiments;
+donor training and local execution time are separate costs.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

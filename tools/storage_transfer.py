@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 from trace_agent import run_agent
-from trace_transfer import extract_pattern, distinguish, grow_transfer, goal_sensor, predict, read_table, repair_transfer, try_transfer
+from trace_transfer import cost_aware_transfer, extract_pattern, distinguish, grow_transfer, goal_sensor, predict, read_table, repair_transfer, try_transfer
 from trace_inference import learn
 
 
@@ -213,6 +213,9 @@ def check_pattern(binary, directory, actions, examples):
     lamp_result = grow_transfer(binary, lamp_source, lamp_actions, [({"lit": 0}, 0), ({"lit": 1}, 1)],
                                 lamp_observe, 5, 300)
     library = [pattern, extract_pattern(lamp_result)]
+    policy_totals = [0, 0, 0]
+    strategies = []
+    heldout = [0, 0, 0]
     selected = generic = prior_known = none = none_generic = 0
     warm = cold = wins = 0
     for names in permutations(["load", "issue", "clear"]):
@@ -255,6 +258,22 @@ def check_pattern(binary, directory, actions, examples):
             if multi["matching_patterns"] != expected_matches or distinguish(target, multi["table"]) is not None:
                 raise AssertionError((names, idx, expected_matches, multi))
             ordinary = grow_transfer(binary, learned_base, symbols, goal, oracle, 4, 300)
+            observed = []
+            def counted(trace):
+                observed.append(tuple(trace))
+                return oracle(trace)
+            policy = cost_aware_transfer(binary, learned_base, symbols, goal, counted, 4, 300,
+                                         candidates, directory / "costs.sqlite")
+            if (policy["paired_costs"] != {"ordinary": ordinary["target_episodes"], "library": multi["target_episodes"]}
+                    or len(observed) != policy["target_episodes"]
+                    or distinguish(target, policy["table"]) is not None
+                    or policy["prior_tasks"] != len(strategies)):
+                raise AssertionError("Cost history or strategy replay disagrees with direct measurement")
+            strategies.append(policy["strategy"])
+            for j, run in enumerate((policy, multi, ordinary)):
+                policy_totals[j] += run["target_episodes"]
+                if len(strategies) > 9:
+                    heldout[j] += run["target_episodes"]
             if idx == 2:
                 none_generic += ordinary["target_episodes"]
                 none += multi["target_episodes"]
@@ -263,6 +282,9 @@ def check_pattern(binary, directory, actions, examples):
             selected += multi["target_episodes"]
             prior_known += known["target_episodes"]
             generic += ordinary["target_episodes"]
+    print(f"Last 9 first-seen tasks: {heldout} (adaptive, library, ordinary)")
+    print(f"18 sequential targets: {policy_totals[0]} adaptive, {policy_totals[1]} always library, "
+          f"{policy_totals[2]} always ordinary; {strategies.count('library')} library choices")
     print(f"12 applicable targets: {selected} library, {prior_known} preselected, {generic} generic; "
           f"6 immediate controls rejected both ({none} vs {none_generic} generic); lamp donor {lamp_result['target_episodes']}")
     control = grow_transfer(binary, learned_base, symbols, goal, lambda tr: observe(tr, False),

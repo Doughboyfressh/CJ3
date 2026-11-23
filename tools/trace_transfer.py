@@ -5,6 +5,7 @@ from math import factorial
 import json
 from pathlib import Path
 from itertools import permutations, product
+import sqlite3
 import subprocess
 import tempfile
 
@@ -403,6 +404,42 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget, pat
             "repair_episodes": initial, "target_episodes": len(log)}
 
 
+def cost_aware_transfer(binary, source, actions, examples, observe, bound, budget, patterns, history):
+    """Choose from prior paired costs, then measure both policies on the verified table."""
+    sensor = goal_sensor(examples)
+    # Action names and target outcomes are deliberately absent. Keep baseline
+    # column order: probe tie-breaking can affect the costs being predicted.
+    key = json.dumps([1, source, bound, budget, sorted(json.dumps(p, sort_keys=True) for p in patterns)])
+    with sqlite3.connect(history) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS costs "
+                   "(context TEXT PRIMARY KEY, tasks INTEGER, ordinary INTEGER, library INTEGER)")
+        row = db.execute("SELECT tasks, ordinary, library FROM costs WHERE context=?", (key,)).fetchone()
+    consult = row is not None and row[2] < row[1]
+    used = patterns if consult else None
+    result = grow_transfer(binary, source, actions, examples, observe, bound, budget, used)
+    result["strategy"] = "library" if consult else "ordinary"
+    result["prior_tasks"] = row[0] if row else 0
+    if "table" not in result:
+        return result
+    indices = {action: i for i, action in enumerate(actions)}
+    def replay(trace):
+        return {sensor: predict(result["table"], [indices[a] for a in trace])}
+    other = grow_transfer(binary, source, actions, examples, replay, bound, budget,
+                          None if consult else patterns)
+    # An unfinished alternative has unknown completion cost. Its cost so
+    # far is a lower bound; leave this pair out of the historical averages.
+    if "table" not in other:
+        return result
+    actual, alternate = result["target_episodes"], other["target_episodes"]
+    ordinary, library = (alternate, actual) if consult else (actual, alternate)
+    with sqlite3.connect(history) as db:
+        db.execute("INSERT INTO costs VALUES (?,1,?,?) ON CONFLICT(context) DO UPDATE SET "
+                   "tasks=tasks+1, ordinary=ordinary+excluded.ordinary, library=library+excluded.library",
+                   (key, ordinary, library))
+    result["paired_costs"] = {"ordinary": ordinary, "library": library}
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -414,12 +451,15 @@ def main():
     parser.add_argument("--save-pattern", type=Path, help="Write a verified single-split pattern to a new file")
     parser.add_argument("--use-pattern", action="append", type=Path, help="Try a saved pattern on the current source table")
     parser.add_argument("--events", nargs="+", required=True)
+    parser.add_argument("--cost-history", type=Path, help="Choose whether to use saved patterns from previous experiment counts")
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--budget", type=int, default=100)
     parser.add_argument("--oracle", nargs=argparse.REMAINDER, required=True)
     args = parser.parse_args()
     if (args.use_pattern or args.save_pattern) and args.grow_bound is None:
         parser.error("Repair patterns require --grow-bound")
+    if args.cost_history and not args.use_pattern:
+        parser.error("--cost-history requires --use-pattern")
     if not args.oracle:
         parser.error("Supply a resettable local oracle command")
     examples = json.loads(args.examples.read_text(encoding="utf-8"))
@@ -432,8 +472,11 @@ def main():
     table = read_table(args.binary.resolve(), args.source_log)
     if args.grow_bound is not None:
         pattern = [json.loads(path.read_text()) for path in args.use_pattern] if args.use_pattern else None
-        result = grow_transfer(args.binary.resolve(), table, args.events, examples, observe,
-                               args.grow_bound, args.budget, pattern)
+        params = (args.binary.resolve(), table, args.events, examples, observe, args.grow_bound, args.budget)
+        if args.cost_history:
+            result = cost_aware_transfer(*params, pattern, args.cost_history)
+        else:
+            result = grow_transfer(*params, pattern)
         if args.save_pattern:
             learned = extract_pattern(result)
             with args.save_pattern.open("x", encoding="utf-8") as out:

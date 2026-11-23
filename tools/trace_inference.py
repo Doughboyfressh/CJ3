@@ -116,7 +116,7 @@ def check_queue(binary, directory):
     print(f"Queue: {counts[0]} self-selected queries; four shortest plans executed")
 
 
-def sqlite_durable(trace):
+def sqlite_readings(trace):
     # Report whether the row survives discarding pending work. Each episode
     # uses a fresh database. The observation reveals no transaction state.
     connection = sqlite3.connect(":memory:")
@@ -133,8 +133,10 @@ def sqlite_durable(trace):
                 connection.rollback()
             else:
                 raise ValueError(token)
+        visible = connection.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         connection.rollback()
-        return connection.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        durable = connection.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        return {"visible": visible, "durable": durable, "pending_change": int(visible != durable)}
     finally:
         connection.close()
 
@@ -154,6 +156,20 @@ def check_sqlite(binary, directory):
     repaired = run_agent(binary, trial_log, alphabet, None, 0, prefix, oracle, 300, 10)
     if repaired["observed"] != 0 or "1 insert commit" not in trial_log.read_text().splitlines():
         raise ValueError(f"Failed to learn from a real rejected SQLite plan: {repaired}")
+    shared = directory / "sqlite-sensors.obs"
+    oracle = [sys.executable, str(Path(__file__).resolve()), "--sqlite-sensors"]
+    run_agent(binary, shared, alphabet, 4, 1, [], oracle, 300, 10, "durable")
+    first_goal_log = shared.read_bytes()
+    for sensor in ["visible", "pending_change"]:
+        shared.write_bytes(first_goal_log)
+        prefix = ["insert", "commit"]
+        reused = run_agent(binary, shared, alphabet, 4, 1, prefix, oracle, 300, 10, sensor)
+        cold = run_agent(binary, directory / (sensor + ".obs"), alphabet, 4, 1, prefix,
+                         oracle, 300, 10, sensor)
+        expected = [] if sensor == "visible" else ["delete"]
+        if reused["plan"] != cold["plan"] or reused["plan"] != expected or reused["queries"] >= cold["queries"]:
+            raise ValueError(f"Cross-goal transfer failed: {reused}, {cold}")
+        print(f"SQLite {sensor}: {reused['queries']} additional queries vs {cold['queries']} cold")
     print(f"SQLite without state bound: {repaired}")
     print(f"SQLite: {learned['queries']} self-selected queries; "
           f"persisted and removed a row; {undo['queries']} new training queries on restart")
@@ -186,6 +202,8 @@ if __name__ == "__main__":
         actions = ["put", "take"]
         print(queue_full(tuple(actions.index(token) for token in json.load(sys.stdin))))
     elif sys.argv[1:] == ["--sqlite-oracle"]:
-        print(sqlite_durable(json.load(sys.stdin)))
+        print(sqlite_readings(json.load(sys.stdin))["durable"])
+    elif sys.argv[1:] == ["--sqlite-sensors"]:
+        print(json.dumps(sqlite_readings(json.load(sys.stdin))))
     else:
         main()

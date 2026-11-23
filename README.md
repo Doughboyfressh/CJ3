@@ -133,6 +133,17 @@ plan works. The conformance guarantee requires a valid state bound and
 deterministic outputs.
 When that bound is loose the number of experiments can grow exponentially.
 
+For several observations per experiment, add `--sensor NAME` and use an
+oracle that prints a JSON object containing one 0 or 1 per named sensor.
+Pi saves every reading and rebuilds the native learner's evidence for the
+chosen goal from the same log. Changing the goal sensor reuses past traces
+and requests any missing experiments. For the SQLite example, use events
+`insert delete commit rollback`, bound 4, and oracle
+`python tools/trace_inference.py --sqlite-sensors`. Goals include `durable`
+(row survives rollback), `visible` (row visible now), and `pending_change`
+(rolling back would change row visibility). Each returned plan gets a fresh
+execution against the selected sensor.
+
 The native commands also work independently. A log starts with
 `events put take` followed by lines such as `0` for the initial observation,
 or `1 put put` for a trace. `heed states FILE` requests missing observations

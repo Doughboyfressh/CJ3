@@ -98,6 +98,14 @@ full phrase name and a list-to-integer type. For a worked transfer example,
 `witnesscheck` stores and reloads the vocabulary on Softwell's software SSD and
 searches for a new operation that calls the learned selector.
 
+When simpler rules fail, Heed can combine two positional skills learned from
+other phrases with the same reducer. Softwell evaluates four conditions on
+each lesson: first below last, last below first, equal endpoints, and even
+length. A switch must use different skills and have evidence on both sides.
+If switches disagree, Heed searches short ascending, descending, and tied-end
+examples for a question that minimizes the largest group remaining after an
+answer. A unique decision is exported as a typed Mind operation.
+
 The preservation property follows from the update itself. Write an input as
 `x = [first, last]` and let the rows of the invertible matrix `P` be the two
 anchors. For a candidate neuron `z(x) = max(0, first - last - k)`, solve

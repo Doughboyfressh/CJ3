@@ -303,6 +303,10 @@ skill hm_lessons(text) -> Any {
     if len(laws) == 0 {
       for reducer in hm_reducers() {
         let selectors = wn_positions(book[word],reducer)
+        if len(selectors) == 0 and len(keys(book)) > 1 {
+          let endpoints = wn_search(book[word],reducer)
+          if len(endpoints[0]) == 0 and not endpoints[1] { selectors = wn_switches(book,word,reducer) }
+        }
         if len(selectors) == 1 {
           let typed = [xparam(selectors[0]),"L","I"]
           out = append(out,["word",reducer ++ " of " ++ word,typed])

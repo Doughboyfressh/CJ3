@@ -274,7 +274,114 @@ skill wn_position_question(ids,models) -> Any {
   return null
 }
 
+# Reuse only positional skills uniquely resolved for other phrases.
+skill wn_switches(book,word,reducer) -> Any {
+  let rows = []
+  for ex in book[word] { if ex[0] == reducer { rows = append(rows,ex) } }
+  if len(rows) < 2 { return [] }
+  let skills = []
+  for other in keys(book) {
+    if other != word {
+      let candidates = wn_positions(book[other],reducer)
+      if len(candidates) == 1 and len(hm_laws(book[other])) == 0 {
+        if not contains(skills,candidates[0]) { skills = append(skills,candidates[0]) }
+      }
+    }
+  }
+  if len(skills) < 2 { return [] }
+  let x = V("x")
+  let head = O("head",[x])
+  let last = O("last",[x])
+  let gates = [O("<",[head,last]),O("<",[last,head]),O("==",[head,last]),O("==",[O("%",[O("len",[x]),Q(2)]),Q(0)])]
+  let yes = [skills,skills,skills,skills]
+  let no = yes
+  for ex in rows {
+    let xs = ex[1]
+    let h = xs[0]
+    let n = len(xs)
+    let t = xs[n-1]
+    gpu for gate in range(0,4) -> side {
+      let side = 0
+      if gate == 0 and h < t { let side = 1 }
+      if gate == 1 and t < h { let side = 1 }
+      if gate == 2 and h == t { let side = 1 }
+      if gate == 3 and n % 2 == 0 { let side = 1 }
+    }
+    let fit = []
+    for skilltree in skills {
+      if sev(skilltree,null,xs,null,[]) == ex[2] { fit = append(fit,skilltree) }
+    }
+    let nextyes = []
+    let nextno = []
+    for g in range(0,4) {
+      let keep = []
+      let branch = if aget(side,g) == 1 { yes[g] } else { no[g] }
+      for tree in branch { if contains(fit,tree) { keep = append(keep,tree) } }
+      if aget(side,g) == 1 {
+        nextyes = append(nextyes,keep)
+        nextno = append(nextno,no[g])
+      } else {
+        nextyes = append(nextyes,yes[g])
+        nextno = append(nextno,keep)
+      }
+    }
+    yes = nextyes
+    no = nextno
+  }
+  let models = []
+  for g in range(0,4) {
+    # Each branch must exclude at least one skill. This also excludes
+    # unseen branches and preserves simpler explanations.
+    if len(yes[g]) < len(skills) and len(no[g]) < len(skills) {
+      for a in yes[g] {
+        for b in no[g] {
+          if a != b {
+            let model = O("ite",[gates[g],a,b])
+            let valid = true
+            for ex in rows { if sev(model,null,ex[1],null,[]) != ex[2] { valid = false } }
+            if valid { models = append(models,model) }
+          }
+        }
+      }
+    }
+  }
+  return models
+}
+
+skill wn_switch_question(models,obs,reducer) -> Any {
+  let longest = 2
+  for ex in obs { if ex[0] == reducer { longest = max(longest,len(ex[1])) } }
+  let best = null
+  let bound = len(models)
+  for n in range(2,2*longest+4) {
+    let inner = range(1,n-1)
+    for ends in [[0,0],[0,n],[n,0]] {
+      let probe = [ends[0]] ++ inner ++ [ends[1]]
+      let buckets = {}
+      let worst = 0
+      for model in models {
+        let y = sev(model,null,probe,null,[])
+        if y == null { worst = len(models) }
+        let k = str(y)
+        let count = get(buckets,k,0)+1
+        buckets = put(buckets,k,count)
+        worst = max(worst,count)
+      }
+      if worst < bound {
+        best = probe
+        bound = worst
+      }
+      if bound == 1 { return best }
+    }
+  }
+  return best
+}
+
 skill wn_reply(obs,reducer,xs,teaching) -> Any {
+  return wn_book_reply({}, "",obs,reducer,xs,teaching)
+}
+
+skill wn_book_reply(book,word,obs,reducer,xs,teaching) -> Any {
   let result = wn_search(obs,reducer)
   let models = result[0]
   if result[1] {
@@ -290,8 +397,19 @@ skill wn_reply(obs,reducer,xs,teaching) -> Any {
     models = wn_position_models(obs,reducer,ids)
     positional = len(models) > 0
   }
+  let switching = false
+  if len(models) == 0 and len(keys(book)) > 1 {
+    models = wn_switches(book,word,reducer)
+    switching = len(models) > 0
+  }
   if len(models) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
   if teaching {
+    if switching {
+      if len(models) == 1 { return "Conditional hypothesis: " ++ show(models[0]) }
+      let probe = wn_switch_question(models,obs,reducer)
+      if probe != null { return "Conditional hypotheses disagree. Teach the answer for " ++ hm_csv(probe) ++ "." }
+      return "Multiple conditional hypotheses fit the lessons."
+    }
     if positional {
       if len(models) == 1 { return "Position hypothesis: " ++ show(models[0]) }
       let message = str(len(models)) ++ " position hypotheses fit the lessons."
@@ -311,6 +429,7 @@ skill wn_reply(obs,reducer,xs,teaching) -> Any {
     if value != y { agree = false }
   }
   if not agree {
+    if switching { return "Conditional hypotheses disagree. Teach the answer for " ++ hm_csv(xs) ++ "." }
     if positional { return "Position hypotheses disagree. Teach the answer for " ++ hm_csv(xs) ++ "." }
     let probe = wn_probe(obs,reducer,xs,models,answers)
     let parts = []

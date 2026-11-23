@@ -20,11 +20,41 @@ skill wc_transfer(text) -> Any {
   return lessons[0][1] ++ " -> " ++ show(fitted[0]) ++ " -> " ++ str(sev(fitted[0],null,held[0][0],null,lib))
 }
 
+# Transfer the learned switch to a second task: add one to its output.
+skill wc_switch(text) -> Any {
+  let lessons = load_lessons(text)
+  let base = []
+  let full = []
+  for lesson in lessons {
+    full = append(full,lesson[2])
+    if lesson[1] != "sum of zells" { base = append(base,lesson[2]) }
+  }
+  if len(full) != len(base)+1 { return "missing unique switch" }
+  let mem = save_lib(full)
+  let slot = rt_sw_ssd_alloc(len(mem)+8)
+  do rt_sw_ssd_puts(slot,mem)
+  full = load_lib(rt_sw_ssd_gets(slot))
+  let train = [[[1,7,4,8,9],8],[[10,7,4,8,9],5],[[2,3,8,2],9],[[1,5,8,9],6]]
+  let held = [[[6,1,0-8,4],0-7],[[3,8,5,3],6]]
+  let pl = pools()
+  let pre = prelude()
+  if solve(train,held,base,all_awake(base),pl,pre,4,10000)[0] != null { return "baseline solved" }
+  let tree = solve(train,held,full,all_awake(full),pl,pre,4,10000)[0]
+  if tree == null { return "composition failed" }
+  return [sev(tree,null,held[0][0],null,full),sev(tree,null,held[1][0],null,full)]
+}
+
 skill main() -> Any {
+  if arg(1) == "switch" { return wc_switch(read_file(arg(2))) }
   if arg(1) != null { return wc_transfer(read_file(arg(1))) }
   let text = "heed1 zells sum 2,1,5 1\nheed1 zells sum 2,9,5 9\nheed1 zells sum 5,1,2 1\nheed1 zells sum 5,2,1 2\n"
   do print("ambiguous exports: " ++ str(len(load_lessons(text))))
   do print(wc_transfer(text ++ "heed1 zells sum 8,7,6,5,4 6\n"))
+  let switching = "heed1 brins sum 2,1,5 1\nheed1 brins sum 2,9,5 9\nheed1 brins sum 5,1,2 1\nheed1 brins sum 5,2,1 2\nheed1 brins sum 0,1,2,3,4 1\nheed1 glims sum 2,1,5 1\nheed1 glims sum 2,9,5 9\nheed1 glims sum 5,1,2 1\nheed1 glims sum 5,2,1 2\nheed1 glims sum 0,1,2,3,4 2\nheed1 zells sum 1,7,4,8,9 7\nheed1 zells sum 1,2,5,3,9 2\nheed1 zells sum 10,7,4,9 4\nheed1 zells sum 10,2,5,9 5\nheed1 zells sum 10,7,0,4,1,9 4\n"
+  let observations = {}
+  for line in split(trim(switching),"\n") { observations = hm_take(observations,line) }
+  do print(wn_book_reply(observations,"zells",observations["zells"],"sum",[1,2],true))
+  do print(wc_switch(switching ++ "heed1 zells sum 0,1,2,0 2\nheed1 zells sum 0,1,2,4 1\n"))
   let rows = [["sum",[2,5],2],["sum",[5,2],11],["sum",[0,5],0]]
   do print(wn_reply(rows,"sum",[1,1],false))
   for r in [["sum",[5,0],15],["sum",[0-3,4],0-3],["sum",[4,0-3],18],["sum",[3,3],3]] {

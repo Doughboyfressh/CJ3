@@ -232,7 +232,7 @@ skill hm_command(path, command, phrase, csv, answer) -> Any {
   let obs = book[word]
   if obs == null { return "Teach an example for " ++ word ++ " first." }
   let laws = hm_laws(obs)
-  if len(laws) == 0 { return wn_reply(obs,ws[0],xs,command == "teach") }
+  if len(laws) == 0 { return wn_book_reply(book,word,obs,ws[0],xs,command == "teach") }
   if len(laws) == 1 {
     if command == "teach" { return "Learned " ++ word ++ ": " ++ show(laws[0][0]) ++ if laws[0][1] { " before reduction." } else { " after reduction." } }
     let y = hm_read(word, laws[0], phrase, xs)

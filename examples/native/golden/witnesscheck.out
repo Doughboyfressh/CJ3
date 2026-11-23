@@ -1,4 +1,4 @@
-Endpoint hypotheses disagree on this input. Teach its answer.
+Endpoint hypotheses disagree. Teach the answer for -1,1.
 (head(x) + (2 * max(0, (head(x) - last(x)))))
 289/289 new lists
 conflicting interiors: 0
@@ -8,4 +8,8 @@ Endpoint hypothesis: (last(x) + (3 * max(0, ((head(x) - last(x)) - 2))))
 21
 Endpoint hypothesis: (head(x) + (2 * max(0, ((head(x) - last(x)) - 2))))
 21
+Endpoint hypotheses disagree. Teach the answer for 4,1.
+15
+Endpoint threshold search is incomplete. Teach another example.
+999
 9

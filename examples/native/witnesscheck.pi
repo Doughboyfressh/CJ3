@@ -36,5 +36,11 @@ skill main() -> Any {
   }
   do print(wn_reply(skipped,"sum",[9,1],true))
   do print(wn_reply(skipped,"sum",[9,1],false))
+  let ambiguous = [["sum",[1,5],1],["sum",[2,4],2],["sum",[5,1],9]]
+  do print(wn_reply(ambiguous,"sum",[7,1],false))
+  do print(wn_reply(append(ambiguous,["sum",[4,1],6]),"sum",[7,1],false))
+  let wide = [["sum",[1,500],1],["sum",[2,400],2],["sum",[500,1],999]]
+  do print(wn_reply(wide,"sum",[700,1],false))
+  do print(wn_reply(wide,"sum",[500,1],false))
   return wn_reply([["sum",[2,5],2],["sum",[5,2],5]],"sum",[9,99,1],false)
 }

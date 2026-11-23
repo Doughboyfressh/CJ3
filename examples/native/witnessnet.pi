@@ -68,11 +68,12 @@ skill wn_missing_knot(rows,p,q,miss,d,a,b,lo,hi) -> Any {
       return lo+num // den
     }
   }
-  # These rows do not identify an isolated threshold in this interval.
-  return null
+  # With zero gain throughout, the missed lesson cannot be corrected.
+  if ml == 0 and mr == 0 { return null }
+  return "interval"
 }
 
-skill wn_fit(obs,reducer) -> Any {
+skill wn_search(obs,reducer) -> Any {
   let rows = []
   let knots = [0]
   let p = null
@@ -91,24 +92,35 @@ skill wn_fit(obs,reducer) -> Any {
       }
     }
   }
-  if q == null { return [] }
+  if q == null { return [[],false] }
   let d = p[0]*q[1]-p[1]*q[0]
   let a = p[2]*q[1]-p[1]*q[2]
   let b = p[0]*q[2]-p[2]*q[0]
   let linear = wn_verify(rows,[a,b,0],d,0)
-  if linear != null { return [linear] }
+  if linear != null { return [[linear],false] }
   let miss = null
   for r in rows {
     if d*r[2] != a*r[0]+b*r[1] { miss = r }
   }
-  if miss == null { return [] }
+  if miss == null { return [[],false] }
+  let incomplete = false
+  let remaining = 256
   let boundaries = sort(knots)
   for i in range(1,len(boundaries)) {
     let lo = boundaries[i-1]
     let hi = boundaries[i]
     if hi-lo > 1 {
       let k = wn_missing_knot(rows,p,q,miss,d,a,b,lo,hi)
-      if k != null { knots = append(knots,k) }
+      if k == "interval" {
+        if hi-lo-1 > remaining {
+          incomplete = true
+        } else {
+          knots = knots ++ range(lo+1,hi)
+          remaining = remaining-(hi-lo-1)
+        }
+      } else {
+        if k != null { knots = append(knots,k) }
+      }
     }
   }
   let models = []
@@ -124,19 +136,70 @@ skill wn_fit(obs,reducer) -> Any {
       if model != null { models = append(models,model) }
     }
   }
-  return models
+  return [models,incomplete]
+}
+
+skill wn_fit(obs,reducer) -> Any {
+  let result = wn_search(obs,reducer)
+  if result[1] { return [] }
+  return result[0]
+}
+
+# Ask a nearby, different question only if every possible reply identifies
+# one target answer among the verified models.
+skill wn_probe(obs,reducer,xs,models,answers) -> Any {
+  let t = xs[len(xs)-1]
+  let gap = xs[0]-t
+  for ex in obs {
+    if ex[0] == reducer {
+      let trained = ex[1][0]-ex[1][len(ex[1])-1]
+      for step in [0-1,1] {
+        let g = trained+step
+        if g != gap {
+          let probe = [t+g,t]
+          let buckets = {}
+          let settles = true
+          for i in range(0,len(models)) {
+            let reply = sev(models[i],null,probe,null,[])
+            let key = str(reply)
+            if reply == null or get(buckets,key,answers[i]) != answers[i] { settles = false }
+            buckets = put(buckets,key,answers[i])
+          }
+          if settles { return probe }
+        }
+      }
+    }
+  }
+  return xs
 }
 
 skill wn_reply(obs,reducer,xs,teaching) -> Any {
-  let models = wn_fit(obs,reducer)
+  let result = wn_search(obs,reducer)
+  let models = result[0]
+  if result[1] {
+    for ex in obs {
+      if not teaching and ex[0] == reducer and ex[1] == xs { return str(ex[2]) }
+    }
+    return "Endpoint threshold search is incomplete. Teach another example."
+  }
   if len(models) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
   if teaching {
     if len(models) == 1 { return "Endpoint hypothesis: " ++ show(models[0]) }
     return str(len(models)) ++ " endpoint hypotheses fit the lessons."
   }
   let y = sev(models[0],null,xs,null,[])
+  let answers = []
+  let agree = true
   for model in models {
-    if sev(model,null,xs,null,[]) != y { return "Endpoint hypotheses disagree on this input. Teach its answer." }
+    let value = sev(model,null,xs,null,[])
+    answers = append(answers,value)
+    if value != y { agree = false }
+  }
+  if not agree {
+    let probe = wn_probe(obs,reducer,xs,models,answers)
+    let parts = []
+    for n in probe { parts = append(parts,str(n)) }
+    return "Endpoint hypotheses disagree. Teach the answer for " ++ join(parts,",") ++ "."
   }
   if y == null { return "Meaning undefined for this input." }
   return str(y)

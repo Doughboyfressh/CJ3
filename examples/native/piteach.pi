@@ -1,0 +1,113 @@
+# Pi matches a teacher only by closing the version space, not by storing the teacher.
+# The teacher is never shown. Each step asks the question that most reduces the
+# answers still possible for the pending request, then keeps the teacher's reply.
+# Inside: double each element, then multiply. The pending list was not a lesson.
+# Outside: the range of the list. The survivors agree with each other and are still
+# wrong. One audit where they split eliminates both, so the answer is withdrawn.
+import "mindcore.pi"
+
+skill disagree(laws, target) -> Any {
+  if len(laws) < 2 { return false }
+  let y = hm_predict(laws[0], target)
+  for law in laws {
+    if hm_predict(law, target) != y { return true }
+  }
+  return false
+}
+
+skill forced(laws, target) -> Any {
+  if len(laws) == 0 { return null }
+  let y = hm_predict(laws[0], target)
+  for law in laws {
+    if hm_predict(law, target) != y { return null }
+  }
+  return y
+}
+
+skill range_of(xs) -> Any {
+  let hi = xs[0]
+  let lo = xs[0]
+  for v in xs {
+    if v > hi { let hi = v }
+    if v < lo { let lo = v }
+  }
+  return hi - lo
+}
+
+skill close(answer_of, obs, target) -> Any {
+  let laws = hm_laws(obs)
+  let seen = {}
+  let steps = 0
+  while steps < 4 and disagree(laws, target) {
+    let probe = hm_target_question(laws, target)
+    if probe == null { return [laws, steps] }
+    let key = probe[0] ++ " " ++ hm_csv(probe[1])
+    if get(seen, key, false) { return [laws, steps] }
+    let seen = put(seen, key, true)
+    let obs = append(obs, [probe[0], probe[1], answer_of(probe)])
+    let laws = hm_laws(obs)
+    let steps = steps + 1
+  }
+  return [laws, steps]
+}
+
+skill split_probe(laws) -> Any {
+  if len(laws) < 2 { return null }
+  for xs in [[0], [1], [2], [0 - 1], [2, 3], [1, 1], [0 - 2, 4], [0, 1, 3], [3, 5, 7], [8, 1, 3]] {
+    for reducer in hm_reducers() {
+      let y = hm_predict(laws[0], [reducer, xs])
+      let split = false
+      for law in laws {
+        if hm_predict(law, [reducer, xs]) != y { let split = true }
+      }
+      if split { return [reducer, xs] }
+    }
+  }
+  return null
+}
+
+skill audit(laws, answer_of) -> Any {
+  let probe = split_probe(laws)
+  if probe == null { return laws }
+  let y = answer_of(probe)
+  let kept = []
+  for law in laws {
+    if hm_predict(law, probe) == y { let kept = append(kept, law) }
+  }
+  return kept
+}
+skill teacher_double(ex) -> Any {
+  return hm_predict([O("*", [V("e"), Q(2)]), true], ex)
+}
+
+skill teacher_range(ex) -> Any {
+  return range_of(ex[1])
+}
+
+skill main() -> Any {
+  let target = ["product", [3, 5, 7]]
+  let fresh = ["product", [1, 4]]
+  let obs = [["product", [2, 3], teacher_double(["product", [2, 3]])]]
+  let done = close(teacher_double, obs, target)
+  let laws = audit(done[0], teacher_double)
+  let got = forced(laws, target)
+  let also = forced(laws, fresh)
+
+  let gap_target = ["sum", [4, 9]]
+  let gap_obs = [["sum", [2, 3], teacher_range(["sum", [2, 3]])]]
+  let gap = close(teacher_range, gap_obs, gap_target)
+  let gap_laws = gap[0]
+  let unaudited = forced(gap_laws, gap_target)
+  let audited = audit(gap_laws, teacher_range)
+
+  print(done[1] == 1)
+  print(len(done[0]) == 1)
+  print(len(laws) == 1)
+  print(got == 840)
+  print(also == 16)
+  print(unaudited == 9)
+  print(teacher_range(gap_target) == 5)
+  print(len(audited) == 0)
+  print(forced(audited, gap_target) == null)
+  return 0
+}

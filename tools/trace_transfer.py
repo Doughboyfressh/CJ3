@@ -306,11 +306,23 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget, pat
         return {sensor: measurement(trace)}
 
     reused = False
+    matches = []
     if pattern is not None and bound > len(source):
-        candidates = instantiate_pattern(pattern, source, actions)
+        patterns = pattern if isinstance(pattern, list) else [pattern]
+        origins = {}
+        for index, saved in enumerate(patterns):
+            for model in instantiate_pattern(saved, source, actions):
+                origins.setdefault(model, []).append(index)
+                if len(origins) > 10000:
+                    raise ValueError("Pattern collection exceeds 10000 candidate models")
+        # Vote once per distinct table. A repeated pattern must not change probe order.
+        candidates = dict.fromkeys(sorted(origins), 1)
         prior = identify_candidates(candidates, actions, sensor, probe, budget)
         table = prior.get("table")
         reused = table is not None and check_proposal(table, actions, bound, bounded_measurement)
+        if reused:
+            matches = sorted({index for model, indices in origins.items()
+                              if distinguish(table, model) is None for index in indices})
         if reused is None:
             return {"status": "budget exhausted", "target_episodes": len(log)}
     if reused:
@@ -387,7 +399,7 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget, pat
                  "histories": [paths[parent], paths[copy]]}
     return {"status": "checked under supplied bound", "events": actions, "table": table,
             "source_states": len(source), "target_states": len(table), "witnesses": witnesses,
-            "local_model_verified": local, "pattern_verified": reused, "local_edits": edits, "split": split, "repair_status": repair["status"],
+            "local_model_verified": local, "pattern_verified": reused, "matching_patterns": matches, "local_edits": edits, "split": split, "repair_status": repair["status"],
             "repair_episodes": initial, "target_episodes": len(log)}
 
 
@@ -400,7 +412,7 @@ def main():
     mode.add_argument("--grow-bound", type=int, help="Check for additional states under a supplied target bound")
     mode.add_argument("--repair", action="store_true", help="Identify a renamed table with up to one changed transition")
     parser.add_argument("--save-pattern", type=Path, help="Write a verified single-split pattern to a new file")
-    parser.add_argument("--use-pattern", type=Path, help="Try a saved pattern on the current source table")
+    parser.add_argument("--use-pattern", action="append", type=Path, help="Try a saved pattern on the current source table")
     parser.add_argument("--events", nargs="+", required=True)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--budget", type=int, default=100)
@@ -419,7 +431,7 @@ def main():
 
     table = read_table(args.binary.resolve(), args.source_log)
     if args.grow_bound is not None:
-        pattern = json.loads(args.use_pattern.read_text()) if args.use_pattern else None
+        pattern = [json.loads(path.read_text()) for path in args.use_pattern] if args.use_pattern else None
         result = grow_transfer(args.binary.resolve(), table, args.events, examples, observe,
                                args.grow_bound, args.budget, pattern)
         if args.save_pattern:

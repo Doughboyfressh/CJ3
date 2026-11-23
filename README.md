@@ -237,6 +237,19 @@ with three baseline states and three actions. The benchmark checks all six
 action renamings against ordinary repair using the same learned baseline,
 and includes a dispenser that issues tickets immediately.
 
+Repeat `--use-pattern FILE` to supply several saved repairs together. Pi
+combines their candidate tables and chooses probes that distinguish their
+predictions. After checking the selected model on the target, the JSON
+field `matching_patterns` lists the zero-based input indices that explain
+the verified behavior. Equivalent explanations can share a result. An
+empty list means no saved repair was verified. The ordinary learner then
+uses the observations already collected.
+
+The pattern benchmark also learns delayed shutdown from a simulated lamp.
+It offers both the lamp and file-store repairs to dispensers with delayed
+issue, delayed clearing, or immediate operation. It compares model selection
+with both ordinary repair and being handed the applicable pattern.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

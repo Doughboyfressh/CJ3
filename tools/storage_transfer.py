@@ -188,25 +188,50 @@ def check_pattern(binary, directory, actions, examples):
     if pattern != extract_pattern(donor):
         raise AssertionError("Pattern did not survive serialization")
 
+    replay = command.copy()
+    pos = replay.index("--save-pattern")
+    replay[pos:pos+2] = ["--use-pattern", saved, "--use-pattern", saved]
+    duplicate = json.loads(subprocess.check_output(replay, text=True, timeout=60))
+    if duplicate["matching_patterns"] != [0, 1]:
+        raise AssertionError("Equivalent saved patterns must remain ambiguous")
+
     # An independent ticket dispenser has no draft, published bit, or rollback.
     symbols = ["a", "b", "c"]
     goal = [({"ticket": 0}, 0), ({"ticket": 1}, 1)]
     base = [(0, 1, 0, 0), (0, 1, 2, 0), (1, 2, 2, 0)]
     learn(binary, directory, symbols, base, autonomous=True)
     learned_base = read_table(binary, directory / "observations")
+    # A four-state lamp requires two shutdown commands when fully lit.
+    # Its dim state and fourth command are absent from the ticket dispenser.
+    lamp_actions = ["power", "light", "off", "dim"]
+    lamp = [(0, 1, 0, 0, 0), (0, 1, 2, 0, 1), (1, 2, 2, 0, 3), (0, 3, 2, 0, 2)]
+    confirmed_lamp = [*lamp[:2], (1, 2, 2, 4, 3), lamp[3], lamp[2]]
+    learn(binary, directory, lamp_actions, lamp, autonomous=True)
+    lamp_source = read_table(binary, directory / "observations")
+    def lamp_observe(trace):
+        return {"lit": predict(confirmed_lamp, [lamp_actions.index(a) for a in trace])}
+    lamp_result = grow_transfer(binary, lamp_source, lamp_actions, [({"lit": 0}, 0), ({"lit": 1}, 1)],
+                                lamp_observe, 5, 300)
+    library = [pattern, extract_pattern(lamp_result)]
+    selected = generic = prior_known = none = none_generic = 0
     warm = cold = wins = 0
     for names in permutations(["load", "issue", "clear"]):
-        def observe(trace, confirm=True):
+        def observe(trace, confirm=True, delayed_clear=False):
             loaded = issued = pending = False
             for token in trace:
                 op = names[symbols.index(token)]
                 if op == "clear":
-                    loaded = issued = pending = False
+                    if issued and delayed_clear and not pending:
+                        pending = True
+                    else:
+                        loaded = issued = pending = False
                 elif op == "load":
                     loaded, pending = True, False
                 elif loaded and not issued:
                     issued = pending or not confirm
                     pending = not issued
+                else:
+                    pending = False
             return {"ticket": int(issued)}
 
         reference = [(0, 1, 0, 0), (0, 1, 3, 0), (1, 2, 2, 0), (0, 1, 2, 0)]
@@ -220,6 +245,26 @@ def check_pattern(binary, directory, actions, examples):
         warm += result["target_episodes"]
         cold += baseline["target_episodes"]
         wins += result["target_episodes"] < baseline["target_episodes"]
+        retract = [*base[:2], (1, 2, 2, 3), base[2]]
+        for idx, ref in enumerate([reference, retract, base]):
+            oracle = lambda trace: observe(trace, idx == 0, idx == 1)
+            candidates = list(reversed(library)) if names[0] == "clear" else library
+            multi = grow_transfer(binary, learned_base, symbols, goal, oracle, 4, 300, candidates)
+            target = [(r[0], *(r[i] for i in order)) for r in ref]
+            expected_matches = [candidates.index(library[idx])] if idx < 2 else []
+            if multi["matching_patterns"] != expected_matches or distinguish(target, multi["table"]) is not None:
+                raise AssertionError((names, idx, expected_matches, multi))
+            ordinary = grow_transfer(binary, learned_base, symbols, goal, oracle, 4, 300)
+            if idx == 2:
+                none_generic += ordinary["target_episodes"]
+                none += multi["target_episodes"]
+                continue
+            known = grow_transfer(binary, learned_base, symbols, goal, oracle, 4, 300, library[idx])
+            selected += multi["target_episodes"]
+            prior_known += known["target_episodes"]
+            generic += ordinary["target_episodes"]
+    print(f"12 applicable targets: {selected} library, {prior_known} preselected, {generic} generic; "
+          f"6 immediate controls rejected both ({none} vs {none_generic} generic); lamp donor {lamp_result['target_episodes']}")
     control = grow_transfer(binary, learned_base, symbols, goal, lambda tr: observe(tr, False),
                             4, 300, pattern)
     unchanged = [(r[0], *(r[i] for i in order)) for r in base]

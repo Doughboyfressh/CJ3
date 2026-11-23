@@ -23,7 +23,10 @@ SHARD_SIZE = 4697664072
 
 def fetch(first, count):
     start = OFFSET + first * WIDTH * 2
-    size = count * WIDTH * 2
+    return fetch_range(start, count * WIDTH * 2)
+
+
+def fetch_range(start, size):
     end = start + size - 1
     request = urllib.request.Request(f"{URL}?pi_slice={start}-{end}",
                                      headers={"Range": f"bytes={start}-{end}"})
@@ -31,10 +34,10 @@ def fetch(first, count):
         try:
             with urllib.request.urlopen(request, timeout=90) as response:
                 if response.status != 206 or response.headers.get("Content-Range") != f"bytes {start}-{end}/{SHARD_SIZE}":
-                    raise ValueError("Incorrect byte range for embedding tensor")
+                    raise ValueError("Incorrect checkpoint byte range")
                 raw = response.read(size + 1)
             if len(raw) != size:
-                raise OSError("Incomplete embedding block")
+                raise OSError("Incomplete checkpoint range")
             return raw
         except (OSError, urllib.error.URLError):
             if attempt == 3:

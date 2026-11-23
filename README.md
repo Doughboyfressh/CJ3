@@ -200,3 +200,28 @@ Run `python tools/check_kimi_vocabulary.py out/kimicontext out/head0.piv out/kim
 to compare the native result against direct matrix-vector products on
 separately fetched embedding rows. It covers both ends of the ID range,
 reserved tokens, zero-padding and sequences longer than the four-tap window.
+
+### Complete Kimi output head
+
+`python tools/build_kimi_readout.py out/kimi-output.npy` streams the pinned
+checkpoint's entire BF16 language-model output matrix, transposes it and
+atomically saves a 2,348,810,368-byte NumPy file. Each of the 163,840 token
+rows retains all 7,168 weights bit for bit. Supply the state *after* final
+normalization, or use the dense scorer with `--pre-norm` on the input to
+final RMSNorm. Its 7,168 BF16 scale weights come from bytes 4697621064
+through 4697635399 (inclusive) in shard 94. Producing the residual state
+requires the preceding decoder layers.
+
+* For a dense state, `python tools/kimi_readout.py out/kimi-output.npy hidden.npy --top 5`
+  prints token IDs and logits. The vector in hidden.npy should have shape
+  (7168,). The decoder processes weights in batches using float64 arithmetic.
+* For sparse integer coordinates, build
+  `./build.sh examples/native/kimireadout.pi out/kimireadout`, then run
+  `out/kimireadout out/kimi-output.npy 10 2 7167 -1`. That state has value 2
+  at dimension 10 and -1 at dimension 7167. All other coordinates are zero.
+  Pi reads only the specified columns. It rounds weights to Q32, checks the
+  gap between the top two scores against the sum of absolute coefficients,
+  and emits a token ID only when rounding cannot change the winner.
+* `python tools/check_kimi_readout.py out/kimi-output.npy out/kimireadout`
+  checks dense logits against separately downloaded checkpoint rows and
+  compares native greedy decisions with the complete float64 vocabulary scan.

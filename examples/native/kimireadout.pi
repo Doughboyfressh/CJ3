@@ -1,0 +1,65 @@
+# Greedy token from a sparse integer combination of final (post-norm) coordinates.
+skill integer(s) -> Any {
+  if s == null or len(s) == 0 or len(s) > 7 { return null }
+  let start = if slice(s,0,1) == "-" { 1 } else { 0 }
+  if start == len(s) { return null }
+  for ch in chars(slice(s,start,len(s))) { if not contains("0123456789",ch) { return null } }
+  return int(s)
+}
+
+skill main() -> Any {
+  if arg(3) == null { return "Usage: kimireadout TABLE DIM COEFFICIENT [DIM COEFFICIENT ...]" }
+  let path = arg(1)
+  let header = read_bytes(path,0,128)
+  if header == null or len(header) != 128 { return "Invalid output head." }
+  if aget(header,0) != 147 or arr_text(header,1,6) != "NUMPY" or aget(header,6) != 1 or aget(header,7) != 0 or aget(header,8) != 118 or aget(header,9) != 0 { return "Invalid output head." }
+  if trim(arr_text(header,10,128)) != "{'descr': '<u2', 'fortran_order': False, 'shape': (7168, 163840), }" { return "Unsupported output head layout." }
+  let lookup = arr(65536)
+  # Round BF16 values to Q32. Reject magnitudes >= 16 to bound the accumulator.
+  for bits in range(0,32768) {
+    let exponent = bits//128
+    let mantissa = 128+bits%128
+    let q = 0
+    if exponent >= 131 { let q = -1 } else {
+      if exponent >= 102 { let q = mantissa * (2^(exponent-102)) }
+      if exponent >= 94 and exponent < 102 {
+        let divisor = 2^(102-exponent)
+        let q = (mantissa+divisor//2)//divisor
+      }
+    }
+    do aset(lookup,bits,q)
+    if q >= 0 { do aset(lookup,bits+32768,0-q) }
+  }
+  let scores = arr(163840)
+  let total = 0
+  let pos = 2
+  while arg(pos) != null {
+    let dim = integer(arg(pos))
+    let coefficient = integer(arg(pos+1))
+    if dim == null or coefficient == null { return "Invalid coordinate pair." }
+    if dim < 0 or dim >= 7168 { return "Coordinate outside output head." }
+    let total = total+abs(coefficient)
+    if total > 1000000 { return "Total absolute coefficient exceeds 1000000." }
+    if coefficient != 0 {
+      let memory = mark()
+      let column = read_bytes(path,128+327680*dim,327680)
+      if column == null or len(column) != 327680 { return "Incomplete output head." }
+      for token in range(0,163840) {
+        let bits = aget(column,2*token)+256*aget(column,2*token+1)
+        if (bits%32768)//128 >= 131 { return "Weight outside accumulator budget." }
+        do aset(scores,token,aget(scores,token)+coefficient*aget(lookup,bits))
+      }
+      do release(memory,0)
+    }
+    let pos = pos+2
+  }
+  let best = 0
+  let next = 1
+  if aget(scores,1) > aget(scores,0) { let best = 1 let next = 0 }
+  for i in range(2,163840) {
+    if aget(scores,i) > aget(scores,best) { let next = best let best = i }
+    else { if aget(scores,i) > aget(scores,next) { let next = i } }
+  }
+  if aget(scores,best)-aget(scores,next) <= total { return "uncertain" }
+  return best
+}

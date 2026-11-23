@@ -202,9 +202,13 @@ When the target may need more states, use `--grow-bound N` in place of
 `--repair`. Pi tries redirecting one action to a copy of its originating state. The
 copy initially retains the original transitions. It checks the proposed
 table using access paths and suffixes that distinguish its states under
-the supplied upper bound. If the local models fail, the native state
+the supplied upper bound. If a single change fails, Pi tries one redirected transition composed
+with one split on a different transition. It eliminates combinations that
+disagree with observations already collected. This second search supports
+up to 50,000 generated combinations. If local models fail, the native state
 learner reuses all target observations. The JSON field `local_model_verified`
-records whether a local model passed conformance checking.
+records whether a local model passed conformance checking. `local_edits`
+reports its edit count, or null after full inference.
 If it finds more states than the source had, the JSON includes pairs of
 histories, a shared continuation for each pair, and both measured outputs.
 Pairwise differences among five histories establish a five-state lower bound

@@ -125,6 +125,10 @@ def repair_transfer(table, actions, examples, observe, budget, allow_split=False
                         variant = base[:state] + (changed,) + base[state + 1:]
                         candidates.setdefault(variant, 1)
 
+    return identify_candidates(candidates, actions, sensor, observe, budget)
+
+
+def identify_candidates(candidates, actions, sensor, observe, budget):
     episodes = 0
     while candidates:
         first = min(candidates, key=candidates.get)
@@ -150,6 +154,35 @@ def repair_transfer(table, actions, examples, observe, budget, allow_split=False
         episodes += 1
         candidates = {m: edits for m, edits in candidates.items() if predict(m, probe) == answer}
     return {"status": "observations contradict family", "target_episodes": episodes}
+
+
+def composed_candidates(source, actions, log):
+    """Compose an old-state redirect and a split, filtering on target evidence."""
+    n, k = len(source), len(actions)
+    edges = n * k
+    if factorial(k) * edges * (edges - 1) * (n - 1) > 50000:
+        return {}
+    indices = {action: i for i, action in enumerate(actions)}
+    evidence = [(tuple(indices[a] for a in trace), value) for trace, value in log.items()]
+    candidates = {}
+    for order in permutations(range(1, k + 1)):
+        base = tuple((row[0], *(row[i] for i in order)) for row in source)
+        for state, row in enumerate(base):
+            for col in range(1, k + 1):
+                for target in range(n):
+                    if target == row[col]:
+                        continue
+                    redirect = row[:col] + (target,) + row[col + 1:]
+                    edited = base[:state] + (redirect,) + base[state + 1:]
+                    for parent, original in enumerate(edited):
+                        for event in range(1, k + 1):
+                            if (parent, event) == (state, col):
+                                continue
+                            fork = original[:event] + (n,) + original[event + 1:]
+                            model = edited[:parent] + (fork,) + edited[parent + 1:] + (original,)
+                            if all(predict(model, trace) == y for trace, y in evidence):
+                                candidates[model] = 2
+    return candidates
 
 
 def access_paths(table, actions):
@@ -222,6 +255,17 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget):
     local = table is not None and check_proposal(table, actions, bound, bounded_measurement)
     if local is None:
         return {"status": "budget exhausted", "target_episodes": len(log)}
+    edits = repair.get("minimum_edits") if local else None
+    if not local and bound > len(source) and len(log) < budget:
+        candidates = composed_candidates(source, actions, log)
+        combined = identify_candidates(candidates, actions, sensor, lambda tr: {sensor: measurement(tr)},
+                                       budget - len(log))
+        table = combined.get("table")
+        local = table is not None and check_proposal(table, actions, bound, bounded_measurement)
+        if local is None:
+            return {"status": "budget exhausted", "target_episodes": len(log)}
+        if local:
+            edits = 2
     if not local:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "observations"
@@ -275,7 +319,7 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget):
                  "histories": [paths[parent], paths[copy]]}
     return {"status": "checked under supplied bound", "events": actions, "table": table,
             "source_states": len(source), "target_states": len(table), "witnesses": witnesses,
-            "local_model_verified": local, "split": split, "repair_status": repair["status"],
+            "local_model_verified": local, "local_edits": edits, "split": split, "repair_status": repair["status"],
             "repair_episodes": initial, "target_episodes": len(log)}
 
 

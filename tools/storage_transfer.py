@@ -104,7 +104,7 @@ def check_repair(binary, directory, table, actions, examples):
 
 
 def check_growth(binary, directory, source, actions, examples):
-    adapted = fresh = 0
+    adapted = fresh = combined_total = combined_fresh = 0
     for names in permutations(["mark", "erase", "publish", "restore"]):
         roles = dict(zip(actions, names))
         def observe(trace):
@@ -137,19 +137,38 @@ def check_growth(binary, directory, source, actions, examples):
         cost, _, _ = learn(binary, directory, actions, reference, autonomous=True,
                            observe=lambda tr: observe([actions[i] for i in tr])["s2"])
         fresh += cost
+        combined = grow_transfer(binary, source, actions, examples,
+                                 lambda tr: file_readings(tr, roles, consume=True, confirm=True), 5, 1000)
+        both = reference_table(names, True)
+        both.append(both[2])
+        row = list(both[2])
+        row[publish] = 4
+        both[2] = tuple(row)
+        if combined.get("local_edits") != 2 or distinguish(both, combined["table"]) is not None:
+            raise AssertionError("Failed to identify both changes")
+        sequence = ["mark", "publish", "publish", "erase", "restore", "publish", "publish"]
+        trace = []
+        for role, expected in zip(sequence, (0, 0, 1, 1, 0, 0, 1)):
+            trace.append(actions[names.index(role)])
+            predicted = predict(combined["table"], [actions.index(a) for a in trace])
+            if predicted != expected or file_readings(trace, roles, True, True)["s2"] != expected:
+                raise AssertionError("Combined publish, restore and recovery failed")
+        combined_total += combined["target_episodes"]
+        cost, _, _ = learn(binary, directory, actions, both, autonomous=True,
+                           observe=lambda tr: file_readings([actions[i] for i in tr], roles, True, True)["s2"])
+        combined_fresh += cost
     control = grow_transfer(binary, source, actions, examples,
                             lambda tr: file_readings(tr, roles), 5, 1000)
     if control.get("target_states") != 4 or control["witnesses"]:
         raise AssertionError(control)
-    combined = grow_transfer(binary, source, actions, examples,
-                             lambda tr: file_readings(tr, roles, consume=True, confirm=True), 5, 1000)
-    both = reference_table(names, True)
-    both.append(both[2])
-    row = list(both[2])
-    row[publish] = 4
-    both[2] = tuple(row)
-    if combined.get("local_model_verified") is not False or distinguish(both, combined["table"]) is not None:
-        raise AssertionError("The combined change requires full inference")
+    # Inverted outputs lie outside both local edit families.
+    def inverted(trace):
+        return {"s2": 1 - file_readings(trace, roles)["s2"]}
+    fallback = grow_transfer(binary, source, actions, examples, inverted, 5, 1000)
+    flipped = [(1 - row[0], *row[1:]) for row in reference_table(names, False)]
+    if fallback.get("local_model_verified") is not False or distinguish(flipped, fallback["table"]) is not None:
+        raise AssertionError("Out-of-family target failed full inference")
+    print(f"24 combined stores: {combined_total} target episodes vs {combined_fresh} fresh")
     print(f"24 confirmation stores: {adapted} target episodes vs {fresh} fresh; "
           "240 pairwise witnesses replayed; unchanged control has 4 states")
 

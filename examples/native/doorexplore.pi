@@ -178,6 +178,27 @@ skill dx_layout(layout) -> Any {
   return [0,size-1,[0,size],append(edges,[door+1,size,0])]
 }
 
+# Challenge a "once E has happened" rule by asking whether any other
+# visible event can revoke it. Compare the pair only on reachable walks.
+skill dx_reset_probe(room,model,rows) -> Any {
+  let trigger = model[0]
+  if trigger < 1 or model[1] != 1 { return null }
+  for reset in range(1,6) {
+    if reset != trigger {
+      let rival = [0-3,[trigger,reset],1,[[trigger]]]
+      let fits = true
+      for row in rows {
+        if fits and dx_history_predict(rival,row[0],0,[]) != row[1] { fits = false }
+      }
+      if fits {
+        let path = dx_path(room,[model,rival],true)
+        if path != null { return path }
+      }
+    }
+  }
+  return null
+}
+
 skill dx_run(layout,mode,path) -> Any {
   let room = dx_layout(layout)
   if room == null or not contains(["follow","latch","retry","delay","sequence","rearm"],mode) {
@@ -204,6 +225,15 @@ skill dx_run(layout,mode,path) -> Any {
       plan = dx_path(room,models,true)
     }
     if plan == null { return "No distinguishing experiment or common route available." }
+    let challenge = false
+    if not testing and len(models) == 1 {
+      let probe = dx_reset_probe(room,models[0],rows)
+      if probe != null {
+        challenge = true
+        testing = true
+        plan = probe
+      }
+    }
     if testing { experiments = experiments+1 }
     # Each trial begins in a fresh copy of the public layout.
     let world = [room[0],0,0]
@@ -289,7 +319,7 @@ skill dx_run(layout,mode,path) -> Any {
       if len(models) > 1 { rule = str(len(models)) ++ " consistent candidates" }
       return layout ++ " exit; rule " ++ rule ++ "; experiments " ++ str(experiments) ++ "; actions " ++ str(steps)
     }
-    if not expanded and len(models) >= before { return "Experiment failed to distinguish candidates." }
+    if not challenge and not expanded and len(models) >= before { return "Experiment failed to distinguish candidates." }
   }
   return "Stored observations contradict the candidate family."
 }

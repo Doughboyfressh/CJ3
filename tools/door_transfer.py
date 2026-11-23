@@ -11,6 +11,7 @@ import time
 RULES = {
     "follow": "current switch",
     "latch": "switch-on events >= 1",
+    "rearm": "last 1 of [2, 4] opens for [[4]]",
     "retry": "first-door attempts >= 1",
     "delay": "elapsed actions >= 3",
     "sequence": "first-door attempt occurred before the first switch-on; both occurred",
@@ -55,29 +56,38 @@ def rearm_histories(limit):
 def check_context_memory(binary, directory, layouts):
     history = directory / "rearm.obs"
     withheld = directory / "withheld.obs"
-    training = {(1,), (1, 4), (1, 4, 1, 2, 1), (1, 4, 1, 2, 1, 4), (1, 4, 1, 1)}
+    rule, trials, actions = run_episode(binary, "hall", "rearm", history)
+    if rule != RULES["rearm"] or trials == 0:
+        raise ValueError(f"Cold learner failed to identify the reset: {rule}")
+    observations = history.read_text()
+    training = set()
+    contradiction = False
+    for line in observations.splitlines():
+        _, sequence, label = line.split()
+        events = tuple(map(int, sequence.split(",")))
+        training.add(events)
+        if 4 in events and label == "0":
+            contradiction = True
+    if not contradiction:
+        raise ValueError("Cold learner never falsified the once-attempted rule")
     records = rearm_histories(9)
-
-    def write_rows(path, histories):
-        path.write_text("".join(
-            f"door2 {','.join(map(str, events))} {records[events]}\n"
-            for events in sorted(histories)
-        ))
-
-    write_rows(history, training)
     unseen = records.keys() - training
-    write_rows(withheld, unseen)
+
+    withheld.write_text("".join(
+        f"door2 {','.join(map(str, events))} {records[events]}\n"
+        for events in sorted(unseen)
+    ))
     score = subprocess.check_output([binary, "explore-score", history, withheld],
                                     text=True, timeout=30).strip()
     if score != f"{len(unseen)}/{len(unseen)} correct; 0 disputed":
         raise ValueError(f"Unseen rearm predictions: {score}")
     for layout in layouts:
-        # Start each layout with exactly the same five observations.
-        write_rows(history, training)
+        # Restore the original cold-training log before every layout.
+        history.write_text(observations)
         rule, trials, _ = run_episode(binary, layout, "rearm", history)
         if (rule, trials) != ("last 1 of [2, 4] opens for [[4]]", 0):
             raise ValueError(f"{layout}: unexpected rearm result {(rule, trials)}")
-    print(f"rearm: {score}; {len(layouts)} transferred layouts")
+    print(f"rearm: {actions} cold training actions; {score}; {len(layouts)} transferred layouts")
 
 
 def main():
@@ -103,7 +113,7 @@ def main():
         check_context_memory(binary, Path(directory), layouts)
         start = time.perf_counter()
         for mechanism, expected in RULES.items():
-            observations = Path(directory) / mechanism
+            observations = Path(directory) / (mechanism + ".benchmark")
             rule, trials, _ = run_episode(binary, "hall", mechanism, observations)
             if rule != expected:
                 raise ValueError(f"{mechanism}: learned {rule!r}")

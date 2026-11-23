@@ -89,10 +89,13 @@ an open door. It tries memory widths one through three over subsets of the
 five visible events, preferring shorter memory, then fewer event types. It
 keeps tied candidates and treats unobserved contexts as closed. In the
 `rearm` simulator, a door attempt arms the next crossing and switching on
-clears that permission. A cold goal run can finish before it sees a reset.
-The transfer check supplies five crossing observations including a reset,
-scores unseen walks with `out/heed explore-score TRAIN TEST`, then restarts
-Pi in each layout using only the five training observations.
+clears that permission. Before accepting a rule that one occurrence of an event grants
+permanent permission, Pi considers each other visible event as a possible
+reset. It discards rivals contradicted by recorded crossings and plans a
+reachable crossing where the remaining rival and the current rule disagree.
+The transfer check starts with an empty log, scores unseen walks with
+`out/heed explore-score TRAIN TEST`, and restores the resulting training log
+before each transfer layout. This challenge covers single-event resets.
 
 For an automated transfer comparison run `python tools/door_transfer.py out/heed`
 after building Heed. Each mechanism is learned in the hall, then exercised in

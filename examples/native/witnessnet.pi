@@ -1,6 +1,6 @@
 # Train a two-input integer readout. When it misses a lesson, grow one
 # rectifier of the endpoint gap. Its correction is zero on both pivot lessons.
-# Keep every admissible knot if the evidence cannot distinguish them.
+# Keep the verified candidates so they can vote on a new input.
 skill wn_hinge(row,k) -> Any { return max(0,row[0]-row[1]-k) }
 
 skill wn_program(weights,k) -> Any {
@@ -35,6 +35,43 @@ skill wn_verify(rows,nums,den,k) -> Any {
   return tree
 }
 
+# Subtract the endpoint plane matching the hinge at the two anchors.
+# The scaled residual is piecewise affine in the threshold k.
+skill wn_plane(p,q,k) -> Any {
+  let zp = wn_hinge(p,k)
+  let zq = wn_hinge(q,k)
+  return [zp*q[1]-p[1]*zq,p[0]*zq-zp*q[0]]
+}
+
+skill wn_gain(r,k,plane,d) -> Any {
+  return d*wn_hinge(r,k)-plane[0]*r[0]-plane[1]*r[1]
+}
+
+# For a fit, each row and the missed lesson must need the same correction
+# multiplier. Cross-multiply to avoid division. Between consecutive gaps
+# this consistency equation is affine, so two endpoint values give its root.
+skill wn_missing_knot(rows,p,q,miss,d,a,b,lo,hi) -> Any {
+  let left = wn_plane(p,q,lo)
+  let right = wn_plane(p,q,hi)
+  let ml = wn_gain(miss,lo,left,d)
+  let mr = wn_gain(miss,hi,right,d)
+  let err = d*miss[2]-a*miss[0]-b*miss[1]
+  for r in rows {
+    let e = d*r[2]-a*r[0]-b*r[1]
+    let l = e*ml-err*wn_gain(r,lo,left,d)
+    let h = e*mr-err*wn_gain(r,hi,right,d)
+    if l != 0 or h != 0 {
+      if (l < 0) == (h < 0) or l == 0 or h == 0 { return null }
+      let num = l*(hi-lo)
+      let den = l-h
+      if num % den != 0 { return null }
+      return lo+num // den
+    }
+  }
+  # These rows do not identify an isolated threshold in this interval.
+  return null
+}
+
 skill wn_fit(obs,reducer) -> Any {
   let rows = []
   let knots = [0]
@@ -65,12 +102,22 @@ skill wn_fit(obs,reducer) -> Any {
     if d*r[2] != a*r[0]+b*r[1] { miss = r }
   }
   if miss == null { return [] }
+  let boundaries = sort(knots)
+  for i in range(1,len(boundaries)) {
+    let lo = boundaries[i-1]
+    let hi = boundaries[i]
+    if hi-lo > 1 {
+      let k = wn_missing_knot(rows,p,q,miss,d,a,b,lo,hi)
+      if k != null { knots = append(knots,k) }
+    }
+  }
   let models = []
   for k in knots {
     # d*hinge - u*head - v*last vanishes on p and q by construction.
-    let u = wn_hinge(p,k)*q[1]-p[1]*wn_hinge(q,k)
-    let v = p[0]*wn_hinge(q,k)-wn_hinge(p,k)*q[0]
-    let gain = d*wn_hinge(miss,k)-u*miss[0]-v*miss[1]
+    let plane = wn_plane(p,q,k)
+    let u = plane[0]
+    let v = plane[1]
+    let gain = wn_gain(miss,k,plane,d)
     if gain != 0 {
       let err = d*miss[2]-a*miss[0]-b*miss[1]
       let model = wn_verify(rows,[a*gain-err*u,b*gain-err*v,d*err],d*gain,k)

@@ -72,7 +72,8 @@ nonempty lists of integers.
 When the scalar search runs out of explanations, `heed memory` can learn a rule for
 the endpoints of a list, scoped to the taught phrase. Two independent examples anchor a
 linear readout of the first and last numbers. A missed answer can recruit a rectifier
-of their difference, with its threshold chosen from zero and observed differences. The
+of their difference. Pi tries zero, the observed differences, and isolated integer
+thresholds implied by lessons between those boundaries. The
 update preserves both anchor answers exactly. Pi keeps integer-weight programs that
 reproduce every lesson for the phrase and asks for the answer when their predictions
 disagree. Correcting a lesson refits the network. For a runnable example, build

@@ -6,4 +6,6 @@ other reducer: 0
 insufficient rank: 0
 Endpoint hypothesis: (last(x) + (3 * max(0, ((head(x) - last(x)) - 2))))
 21
+Endpoint hypothesis: (head(x) + (2 * max(0, ((head(x) - last(x)) - 2))))
+21
 9

@@ -163,3 +163,25 @@ by at most sum(abs(w)) in scaled units. Pi returns a winner only above this
 bound and returns `uncertain` otherwise. This transfers a linear operation
 from the saved weights. Running Kimi's contextual router would also require
 the preceding hidden states and the rest of the router.
+
+### Context from Kimi's first value convolution
+
+Build with `./build.sh examples/native/kimicontext.pi out/kimicontext`.
+From the repository root, `out/kimicontext cold water` returns 128 signed
+integers describing the final position. Divide each by 65,536 to recover its
+activation. Replace `cold` with `hot` to change the preceding context.
+Inputs are space-separated names from the 44-token embedding fixture.
+
+This path covers layer 0's input RMS normalization, the first head's 128
+value projections, and their four-tap causal convolution, before activation.
+For each token the builder precomputes its normalized value projection once.
+Pi keeps those projections separate from the four lag coefficients, so the
+same small table works for every supported token sequence. Earlier positions
+are zero-padded. The attention recurrence and block output are outside this
+calculation.
+
+To reproduce the table, install NumPy and run
+`python tools/distill_kimi_context.py out/kimi-context-cache`.
+The builder reads three byte ranges from checkpoint revision
+`d9e99b0792a5e93b78ea9bea62a68167e36ddd9e` and checks their SHA-256 hashes.
+Its numerical reference uses the decoded checkpoint values in float64.

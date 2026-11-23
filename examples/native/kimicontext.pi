@@ -1,0 +1,42 @@
+# Final-position preactivation, first 128 value channels. Output units are 1/65536.
+skill main() -> Any {
+  if arg(1) == null { return "Usage: kimicontext TOKEN [TOKEN ...]" }
+  let data = read_file("examples/native/kimi_value_context.txt")
+  if data == null { return "Missing context table." }
+  let words = {}
+  let taps = []
+  for line in split(trim(data),"\n") {
+    let cells = split(line," ")
+    if len(cells) != 129 { return "Invalid context table." }
+    if len(taps) < 4 {
+      if cells[0] != "tap" ++ str(len(taps)) { return "Invalid tap order." }
+      let taps = append(taps,cells)
+    } else {
+      let words = put(words,cells[0],cells)
+    }
+  }
+  let count = 0
+  while arg(count+1) != null {
+    let row = words[arg(count+1)]
+    if row == null { return "Unknown token: " ++ arg(count+1) }
+    let count = count+1
+  }
+  let window = []
+  for lag in range(0,4) {
+    if lag < count { let window = append(window,words[arg(count-lag)]) }
+  }
+  let output = []
+  for c in range(1,129) {
+    let total = 0
+    for lag in range(0,4) {
+      if lag < count {
+        let row = window[lag]
+        let total = total + int(row[c])*int(taps[3-lag][c])
+      }
+    }
+    let rounded = (abs(total)+32768)//65536
+    if total < 0 { let rounded = 0-rounded }
+    let output = append(output,str(rounded))
+  }
+  return join(output," ")
+}

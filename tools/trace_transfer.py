@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from itertools import permutations, product
 import subprocess
+import tempfile
 
 
 def goal_sensor(examples):
@@ -74,10 +75,10 @@ def try_transfer(table, actions, examples, observe, max_depth, budget):
                 maps = [m for m in maps if not predicts(m, trace)]
     return None, len(tried)
 
-def distinguish(reference, hypothesis):
+def distinguish(reference, hypothesis, starts=(0, 0)):
     """Shortest differing output trace, or None if all reachable outputs agree."""
-    pending = deque([(0, 0, ())])
-    seen = {(0, 0)}
+    pending = deque([(*starts, ())])
+    seen = {starts}
     while pending:
         left, right, trace = pending.popleft()
         if reference[left][0] != hypothesis[right][0]:
@@ -145,12 +146,89 @@ def repair_transfer(table, actions, examples, observe, budget):
     return {"status": "observations contradict family", "target_episodes": episodes}
 
 
+def grow_transfer(binary, source, actions, examples, observe, bound, budget):
+    """Reuse repair probes; learn a larger table and verify a lower-bound witness."""
+    if bound < len(source) or budget < 0:
+        raise ValueError("Expected a bound at least the source size and a nonnegative budget")
+    if any(not token or any(c.isspace() for c in token) for token in actions):
+        raise ValueError("Native event names must be nonempty single tokens")
+    sensor = goal_sensor(examples)
+    log = {}
+
+    def measurement(trace):
+        key = tuple(trace)
+        if key not in log:
+            value = observe(list(key))[sensor]
+            if value not in (0, 1):
+                raise ValueError("Expected a binary target observation")
+            log[key] = int(value)
+        return log[key]
+
+    repair = repair_transfer(source, actions, examples, lambda tr: {sensor: measurement(tr)}, budget)
+    initial = len(log)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "observations"
+        with path.open("w", encoding="utf-8") as out:
+            print("events", *actions, file=out)
+            for trace, value in log.items():
+                print(value, *trace, file=out)
+        while True:
+            reply = subprocess.check_output([binary, "states-check", path, str(bound)],
+                                            text=True, timeout=30).splitlines()
+            fields = reply[0].split()
+            if fields[:2] == ["consistent", "states"]:
+                table = [tuple(map(int, row.split())) for row in reply[1:]]
+                break
+            if fields[:1] != ["observe"]:
+                return {"status": reply[0], "target_episodes": len(log)}
+            trace = tuple(fields[1:])
+            if trace in log:
+                raise ValueError("Repeated native query")
+            if len(log) == budget:
+                return {"status": "budget exhausted", "target_episodes": len(log)}
+            value = measurement(trace)
+            with path.open("a", encoding="utf-8") as out:
+                print(value, *trace, file=out)
+
+    paths = {0: ()}
+    queue = deque([0])
+    while queue:
+        state = queue.popleft()
+        for action, successor in zip(actions, table[state][1:]):
+            if successor not in paths:
+                paths[successor] = paths[state] + (action,)
+                queue.append(successor)
+    # For each pair, execute the same continuation from both histories.
+    # Different measured bits certify that the two histories require distinct states.
+    witnesses = []
+    if len(table) > len(source):
+        states = list(paths)[:len(source) + 1]
+        for i, left in enumerate(states):
+            for right in states[i+1:]:
+                suffix = distinguish(table, table, (left, right))
+                if suffix is None:
+                    raise ValueError("Inferred states are observationally equivalent")
+                tail = tuple(actions[a] for a in suffix)
+                traces = (paths[left] + tail, paths[right] + tail)
+                if len(log) + len(set(traces) - log.keys()) > budget:
+                    return {"status": "budget exhausted", "target_episodes": len(log)}
+                bits = [measurement(trace) for trace in traces]
+                if bits[0] == bits[1]:
+                    raise ValueError("Target refuted proposed state distinction")
+                witnesses.append([paths[left], paths[right], tail, bits])
+    return {"status": "checked under supplied bound", "events": actions, "table": table,
+            "source_states": len(source), "target_states": len(table), "witnesses": witnesses,
+            "repair_status": repair["status"], "repair_episodes": initial, "target_episodes": len(log)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("source_log", type=Path, help="Single-output native Heed log")
     parser.add_argument("examples", type=Path, help="JSON array of [target sensor object, success bit]")
-    parser.add_argument("--repair", action="store_true", help="Identify a renamed table with up to one changed transition")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--grow-bound", type=int, help="Check for additional states under a supplied target bound")
+    mode.add_argument("--repair", action="store_true", help="Identify a renamed table with up to one changed transition")
     parser.add_argument("--events", nargs="+", required=True)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--budget", type=int, default=100)
@@ -166,6 +244,10 @@ def main():
         return json.loads(result.stdout)
 
     table = read_table(args.binary.resolve(), args.source_log)
+    if args.grow_bound is not None:
+        print(json.dumps(grow_transfer(args.binary.resolve(), table, args.events, examples, observe,
+                                       args.grow_bound, args.budget)))
+        return
     if args.repair:
         print(json.dumps(repair_transfer(table, args.events, examples, observe, args.budget)))
         return

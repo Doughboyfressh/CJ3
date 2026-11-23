@@ -8,24 +8,32 @@ import sys
 import tempfile
 
 from trace_agent import run_agent
-from trace_transfer import distinguish, goal_sensor, predict, read_table, repair_transfer, try_transfer
+from trace_transfer import distinguish, grow_transfer, goal_sensor, predict, read_table, repair_transfer, try_transfer
 from trace_inference import learn
 
 
-def file_readings(trace, roles, consume=False):
+def file_readings(trace, roles, consume=False, confirm=False):
     # A draft bit is copied to or restored from a separate published file.
     with tempfile.TemporaryDirectory() as directory:
         draft, published = (Path(directory) / name for name in ("draft", "published"))
         draft.write_bytes(b"0")
         published.write_bytes(b"0")
+        awaiting_confirmation = False
         for token in trace:
             role = roles[token]
+            if role != "publish":
+                awaiting_confirmation = False
             if role == "mark":
                 draft.write_bytes(b"1")
             elif role == "erase":
                 draft.write_bytes(b"0")
             elif role == "publish":
-                published.write_bytes(draft.read_bytes())
+                if (confirm and not awaiting_confirmation and
+                        draft.read_bytes() == b"1" and published.read_bytes() == b"0"):
+                    awaiting_confirmation = True
+                else:
+                    published.write_bytes(draft.read_bytes())
+                    awaiting_confirmation = False
             elif role == "restore":
                 move = consume and draft.read_bytes() == b"0" and published.read_bytes() == b"1"
                 draft.write_bytes(published.read_bytes())
@@ -95,10 +103,47 @@ def check_repair(binary, directory, table, actions, examples):
           f"{heldout} held-out file checks; 24 unchanged controls: {unchanged} episodes")
 
 
+def check_growth(binary, directory, source, actions, examples):
+    adapted = fresh = 0
+    for names in permutations(["mark", "erase", "publish", "restore"]):
+        roles = dict(zip(actions, names))
+        def observe(trace):
+            return file_readings(trace, roles, confirm=True)
+        reference = reference_table(names, False)
+        publish = 1 + names.index("publish")
+        reference[4:] = [reference[2]]
+        row = list(reference[2])
+        row[publish] = 4
+        reference[2] = tuple(row)
+        result = grow_transfer(binary, source, actions, examples, observe, 5, 1000)
+        if (result.get("target_states") != 5 or len(result["witnesses"]) != 10
+                or distinguish(reference, result["table"]) is not None):
+            raise AssertionError(result)
+        for left, right, tail, bits in result["witnesses"]:
+            if bits != [observe(left + tail)["s2"], observe(right + tail)["s2"]] or bits[0] == bits[1]:
+                raise AssertionError("State-count witness failed independent replay")
+        target_actions = [actions[names.index(a)] for a in ("mark", "publish", "publish")]
+        for length, expected in enumerate([0, 0, 0, 1]):
+            trace = target_actions[:length]
+            if predict(result["table"], [actions.index(a) for a in trace]) != expected:
+                raise AssertionError("Incorrect confirmation plan")
+        adapted += result["target_episodes"]
+        cost, _, _ = learn(binary, directory, actions, reference, autonomous=True,
+                           observe=lambda tr: observe([actions[i] for i in tr])["s2"])
+        fresh += cost
+    control = grow_transfer(binary, source, actions, examples,
+                            lambda tr: file_readings(tr, roles), 5, 1000)
+    if control.get("target_states") != 4 or control["witnesses"]:
+        raise AssertionError(control)
+    print(f"24 confirmation stores: {adapted} target episodes vs {fresh} fresh; "
+          "240 pairwise witnesses replayed; unchanged control has 4 states")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--repair-only", action="store_true")
+    parser.add_argument("--growth-only", action="store_true")
     args = parser.parse_args()
     binary = args.binary.resolve()
     actions = ["ka", "zu", "mi", "vo"]
@@ -110,6 +155,10 @@ def main():
                            1, [], [sys.executable, str(Path(__file__).with_name("trace_inference.py")),
                                    "--sqlite-oracle"], 200, 10)
         table = read_table(binary, log)
+        if args.growth_only or not args.repair_only:
+            check_growth(binary, Path(directory), table, actions, examples)
+        if args.growth_only:
+            return
         check_repair(binary, Path(directory), table, actions, examples)
         if args.repair_only:
             return
@@ -150,9 +199,9 @@ def main():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] in (["--oracle"], ["--sensors"]):
+    if sys.argv[1:2] in (["--oracle"], ["--sensors"], ["--confirm-sensors"]):
         roles = dict(zip(["ka", "zu", "mi", "vo"], sys.argv[2:6]))
-        snapshot = file_readings(json.load(sys.stdin), roles)
-        print(json.dumps(snapshot) if sys.argv[1] == "--sensors" else int(snapshot[sys.argv[6]]))
+        snapshot = file_readings(json.load(sys.stdin), roles, confirm=sys.argv[1] == "--confirm-sensors")
+        print(json.dumps(snapshot) if sys.argv[1] != "--oracle" else int(snapshot[sys.argv[6]]))
     else:
         main()

@@ -198,6 +198,21 @@ a separate specification, exercises unseen continuations on real files,
 and verifies a recovery action. Unchanged controls use the original copy
 semantics under the same action renamings.
 
+When the target may need more states, use `--grow-bound N` in place of
+`--repair`. Pi carries the target observations from repair into its native
+state learner and checks the resulting model under the supplied upper bound.
+If it finds more states than the source had, the JSON includes pairs of
+histories, a shared continuation for each pair, and both measured outputs.
+Pairwise differences among five histories establish a five-state lower bound
+for deterministic behavior, independently of the upper-bound assumption.
+The episode budget covers identification and any additional witness queries.
+
+`python tools/storage_transfer.py out/heed --growth-only` exercises a store
+that requires two consecutive publish attempts to release a newly marked
+draft. The confirmation flag is hidden from the learner. The benchmark
+compares with fresh state learning, checks equivalence to a separate
+specification, replays the witnesses, and runs an unchanged control.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

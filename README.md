@@ -52,6 +52,31 @@ The native state learner asks for action sequences and observes their outcomes. 
 
 These experiments assume repeatable resets, deterministic behavior, and a supplied action set. Model verification uses a supplied upper bound on states. Counts above measure target interactions; local replay and the cost of acquiring earlier repairs are separate. [Run the process learner](#learn-and-control-a-resettable-process) or [try model transfer](#transfer-a-storage-goal-to-unfamiliar-actions).
 
+### Frozen-learner evaluation
+
+`python3 tools/frozen_tasks.py out/heed` runs four tasks chosen after freezing
+the native compiler, learner and Python drivers at
+[`0b4b535`](https://github.com/Doughboyfressh/CJ3/commit/0b4b535357c6485edbf50ddb6cf5cd4741e67684).
+Each task starts with an empty log. Pi receives three opaque action names,
+a goal of 1, and a binary observation after each reset-and-run experiment.
+The driver supplies no state bound or worked example. The budget is 96
+experiments per cold task. A direct-search baseline tries short traces first.
+
+| Task | First positive / episodes to return a plan | Unseen successful traces recognized |
+| --- | --- | --- |
+| Emit the euro character with an incremental UTF-8 decoder | 29 / 75 | 9 of 9 |
+| Reach 3/2 using doubling, increment and reciprocal | 21 / 56 | 4 of 10 |
+| Finish a balanced parenthesis sequence with nesting depth at least two | No positive in 96 | — |
+| Match a four-byte BLAKE2s digest | No positive in 96 | — |
+
+Unseen predictions cover all action traces through length five absent from
+the training log. Direct search found the first two goals on episodes 29 and
+21 and exhausted the budget on the other two. In six directed transfer runs
+from the two completed models, the UTF-8 model helped find a fraction plan in
+2 episodes versus 21. The remaining five tied direct search, including four
+budget exhaustions. These four tasks measure behavior through a supplied
+action/feedback interface. They do not establish general intelligence.
+
 ## Learn a door rule by acting
 
 Build Heed, then run three episodes from the repository root:

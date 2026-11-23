@@ -2,3 +2,13 @@ Learned steps: (e + -1) after reduction.
 What is sum of steps on 3,5,2?
 Learned sum of steps from sum of brims with offset 1.
 8
+Still ambiguous. Supply a different example.
+Learned doublets: max(e, digsum(primen(e))) after reduction.
+Learned doublets: (sigma(ndiv(e)) + digsum((2 + primen(e)))) after reduction.
+Learned sum of doublets from sum of steps: (n + n)
+16
+What is sum of steps on 0,1,2,3,0?
+Resolve the saved composition for sum of steps first.
+Revised sum of steps: if(((len(x) % 2) == 0), (sum(take(2, rev(x))) + 1), (sum(take(2, x)) + 1))
+28
+7

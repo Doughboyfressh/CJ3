@@ -292,6 +292,48 @@ skill hm_take(book, line) -> Any {
   return hm_record(book, f[1], f[2], xs, y)
 }
 
+# Keep the saved arithmetic, but test an alternate source on one branch.
+# Require observations on which each source alone fails. Only vocabulary
+# already available at the original recipe can participate (no cycles).
+skill hm_repair(recipe,source,lessons,rows) -> Any {
+  let x = V("x")
+  let n = O("len",[x])
+  let even = O("==",[O("%",[n,Q(2)]),Q(0)])
+  let lengths = []
+  for row in rows {
+    let size = len(row[1])
+    if not contains(lengths,size) { lengths = append(lengths,size) }
+  }
+  let gates = [even]
+  for size in lengths { gates = append(gates,O("<",[n,Q(size)])) }
+  let original = subst(recipe[2],subst(source[0],x))
+  let fits = []
+  for lesson in lessons {
+    if lesson[1] != recipe[1] and lesson[2][1] == "L" and lesson[2][2] == "I" {
+      let alternate = subst(recipe[2],subst(lesson[2][0],x))
+      let needs_original = false
+      let possible = true
+      for row in rows {
+        if sev(alternate,null,row[1],null,[]) != row[2] {
+          needs_original = true
+          if sev(original,null,row[1],null,[]) != row[2] { possible = false }
+        }
+      }
+      if possible and needs_original {
+        for gate in gates {
+          for branches in [[original,alternate],[alternate,original]] {
+            let tree = O("ite",[gate,branches[0],branches[1]])
+            let valid = true
+            for row in rows { if sev(tree,null,row[1],null,[]) != row[2] { valid = false } }
+            if valid and not contains(fits,tree) { fits = append(fits,tree) }
+          }
+        }
+      }
+    }
+  }
+  return fits
+}
+
 # A Heed lesson file, as Mind lessons. A word with one meaning becomes a building block.
 # A word that is still ambiguous is left out: Mind must not guess.
 skill hm_lessons(text) -> Any {
@@ -305,9 +347,14 @@ skill hm_replay(text,query) -> Any {
   let targets = {}
   if text == null { return [[],decision] }
   let bindings = hm_recipes(text)
+  let recorded = {}
+  let revised = {}
   for line in split(text,"\n") {
     let f = split(trim(line)," ")
+    if f[0] == "compose1" and len(f) >= 6 { recorded = put(recorded,f[2] ++ " of " ++ f[1],true) }
     if len(f) == 5 and f[0] == "heed1" {
+      let phrase = f[2] ++ " of " ++ f[1]
+      if recorded[phrase] == true { revised = put(revised,phrase,true) }
       if bindings[f[2] ++ " of " ++ f[1]] != null {
         let next = hm_take(targets,line)
         if next != null { targets = next }
@@ -368,8 +415,20 @@ skill hm_replay(text,query) -> Any {
         if source != null {
           let body = subst(recipe[2],source[0])
           let ok = true
+          let rows = []
           for ex in get(targets,f[1],[]) {
-            if ex[0] == f[2] and sev(body,ex[1],null,null,[]) != ex[2] { ok = false }
+            if ex[0] == f[2] {
+              rows = append(rows,ex)
+              if sev(body,ex[1],null,null,[]) != ex[2] { ok = false }
+            }
+          }
+          if not ok and revised[recipe[0]] == true {
+            let fits = hm_repair(recipe,source,out,rows)
+            if recipe[0] == query { decision = fits }
+            if len(fits) == 1 {
+              body = xparam(fits[0])
+              ok = true
+            }
           }
           if ok { out = append(out,["word",recipe[0],[body,"L","I"]]) }
         }

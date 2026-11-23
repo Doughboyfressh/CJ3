@@ -369,15 +369,29 @@ skill hm_command(path, command, phrase, csv, answer) -> Any {
   let name = ws[0] ++ " of " ++ word
   let dependency = hm_recipes(text)[name]
   if dependency != null {
-    let lessons = hm_lessons(text)
+    let replay = hm_replay(text,name)
+    let lessons = replay[0]
+    let repairs = replay[1]
     let derived = hm_named(lessons,name)
     if derived == null {
       if hm_named(lessons,dependency) == null {
         if hm_recipes(text)[dependency] != null { return "Resolve the saved composition for " ++ dependency ++ " first." }
         return "Resolve " ++ dependency ++ " before using " ++ name ++ ". Teach its answer for " ++ csv ++ "."
       }
+      if len(repairs) > 1 {
+        if command == "use" {
+          let y = sev(repairs[0],null,xs,null,[])
+          let agree = y != null
+          for model in repairs { if sev(model,null,xs,null,[]) != y { agree = false } }
+          if agree { return str(y) }
+        }
+        let probe = wn_switch_question(repairs,book[word],ws[0])
+        if probe != null { return hm_prompt(word,[ws[0],probe]) }
+        return "Several repairs fit. Teach a different example for " ++ name ++ "."
+      }
       return "The composition conflicts with a saved target lesson."
     }
+    if command == "teach" and len(repairs) == 1 { return "Revised " ++ name ++ ": " ++ show(repairs[0]) }
     let value = sev(derived[0],xs,null,null,[])
     if value == null { return "Meaning undefined for this input." }
     return str(value)

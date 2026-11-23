@@ -67,6 +67,16 @@ if [ -x out/t_heed ]; then
     out/t_heed memory out/t_sources.lessons teach "sum of steps" 4,1,4 6
     out/t_heed memory out/t_sources.lessons teach "sum of steps" 3,5,2 9
     out/t_heed memory out/t_sources.lessons use "sum of steps" 2,5,9
+    out/t_heed memory out/t_sources.lessons teach "sum of doublets" 2,5,9 16
+    out/t_heed memory out/t_sources.lessons teach "sum of doublets" 1,3,4 10
+    out/t_heed memory out/t_sources.lessons teach "sum of doublets" 4,5,6 20
+    out/t_heed compose out/t_sources.lessons "sum of steps" "sum of doublets"
+    out/t_heed memory out/t_sources.lessons use "sum of doublets" 2,5,9,4
+    out/t_heed memory out/t_sources.lessons teach "sum of steps" 2,5,9,4 14
+    out/t_heed memory out/t_sources.lessons use "sum of doublets" 2,5,9,4
+    out/t_heed memory out/t_sources.lessons teach "sum of steps" 0,1,2,3,0 2
+    out/t_heed memory out/t_sources.lessons use "sum of doublets" 6,1,9,3,8,5
+    out/t_heed memory out/t_sources.lessons use "sum of brims" 6,1,9,3,8,5
   } > out/t_sources.txt
   if cmp -s out/t_sources.txt examples/native/golden/source_choice.expect; then echo "ok   Heed discovers a source"; else echo "FAIL automatic source selection"; fail=1; fi
 fi

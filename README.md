@@ -143,6 +143,15 @@ rebuilds these hypotheses from the observations before replaying named
 compositions. The fallback uses at most five units of uniform program size
 for forward search and a cap of 30,000 retained forms per search.
 
+If a subsequent target lesson contradicts a saved composition, Heed keeps its
+arithmetic and tries switching between its original source and another resolved
+list-to-integer skill. It considers even/odd length and cutoffs at observed
+lengths. Each branch needs an example the other source gets wrong. Heed asks
+for a distinguishing example when repairs disagree. Replay exports a revised
+rule only when one candidate remains, then checks dependent calculations against
+their own observations. The lesson log preserves the original recipe and the
+evidence for the revision.
+
 The preservation property follows from the update itself. Write an input as
 `x = [first, last]` and let the rows of the invertible matrix `P` be the two
 anchors. For a candidate neuron `z(x) = max(0, first - last - k)`, solve

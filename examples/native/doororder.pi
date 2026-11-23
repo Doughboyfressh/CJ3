@@ -1,0 +1,51 @@
+# Build a Mind fold from two event symbols. States: unseen, armed, open,
+# blocked. A strict rule blocks on a premature B. A subsequence rule can
+# arm later. A first-of rule opens on A immediately unless B came first.
+skill dx_order_model(a,b,kind) -> Any {
+  let event = V("e")
+  let acc = ["p",0]
+  let hit_a = O("==",[event,Q(a)])
+  let hit_b = O("==",[event,Q(b)])
+  let premature = if kind == 1 { Q(0) } else { O("ite",[hit_b,Q(3),Q(0)]) }
+  let start = O("ite",[hit_a,Q(if kind == 2 { 2 } else { 1 }),premature])
+  let armed = O("ite",[hit_b,Q(2),Q(1)])
+  let transition = O("ite",[O("==",[acc,Q(0)]),start,O("ite",[O("==",[acc,Q(1)]),armed,acc])])
+  let folded = O("fold",[transition,Q(0),V("x")])
+  let expression = O("ite",[O("==",[folded,Q(2)]),Q(1),Q(0)])
+  return [0-2,a,b,kind,expression,transition]
+}
+
+skill dx_order_fit(rows) -> Any {
+  let keep = []
+  for a in range(1,6) {
+    for b in range(1,6) {
+      if a != b {
+        for kind in range(0,3) {
+          let m = dx_order_model(a,b,kind)
+          let ok = true
+          for row in rows {
+            if ok and sev(m[4],null,row[0],null,[]) != row[1] { ok = false }
+          }
+          if ok {
+            # Compile only survivors for the planner. Both execution paths
+            # come from the same Mind transition expression.
+            let table = []
+            for s in range(0,4) {
+              for e in range(1,6) { table = append(table,sev(m[5],s,null,e,[])) }
+            }
+            keep = append(keep,append(m,table))
+          }
+        }
+      }
+    }
+  }
+  return keep
+}
+
+skill dx_order_next(states,models,event) -> Any {
+  let next = []
+  for i in range(0,len(models)) {
+    next = append(next,models[i][6][states[i]*5+event-1])
+  }
+  return next
+}

@@ -13,6 +13,7 @@ RULES = {
     "latch": "switch-on events >= 1",
     "retry": "first-door attempts >= 1",
     "delay": "elapsed actions >= 3",
+    "sequence": "first-door attempt occurred before the first switch-on; both occurred",
 }
 
 
@@ -38,6 +39,15 @@ def main():
         for size in range(4, 13)
         for door in range(1, size - 2)
     ]
+    # Same location, switch and event counts; only the ordering differs.
+    with tempfile.TemporaryDirectory() as directory:
+        history = Path(directory) / "ordered.obs"
+        history.write_text("door2 2,1,4,1,1 0\ndoor2 1,4,1,2,1 1\n")
+        rule, trials, _ = run_episode(binary, "hall", "sequence", history)
+        if rule != RULES["sequence"] or trials == 0:
+            raise ValueError("The equal-count histories need a further experiment")
+        if run_episode(binary, "annex", "sequence", history)[:2] != (rule, 0):
+            raise ValueError("The order rule did not transfer across restart")
     start = time.perf_counter()
     print("mechanism  training_trials  layouts  transferred_actions  cold_actions  wins")
     with tempfile.TemporaryDirectory() as directory:

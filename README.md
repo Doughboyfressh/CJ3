@@ -69,6 +69,24 @@ them fail, it tries a bounded search for a scalar expression and checks it again
 example for the word. Supported operations are sum, product, count, largest, and smallest on
 nonempty lists of integers.
 
+When the scalar search runs out of explanations, `heed memory` can learn a rule for
+the endpoints of a list, scoped to the taught phrase. Two independent examples anchor a
+linear readout of the first and last numbers. A missed answer can recruit a rectifier
+of their difference, with its threshold chosen from zero and observed differences. The
+update preserves both anchor answers exactly. Pi keeps integer-weight programs that
+reproduce every lesson for the phrase and asks for the answer when their predictions
+disagree. Correcting a lesson refits the network. For a runnable example, build
+`examples/native/witnesscheck.pi`.
+
+The preservation property follows from the update itself. Write an input as
+`x = [first, last]` and let the rows of the invertible matrix `P` be the two
+anchors. For a candidate neuron `z(x) = max(0, first - last - k)`, solve
+`P c = [z(anchor1), z(anchor2)]`. Its correction feature is `g(x) = z(x) - x·c`.
+It is zero at both anchors. At a missed lesson with nonzero `g`, adding
+`(target - prediction) * g(x) / g(missed)` fixes that lesson while preserving
+the anchors. The implementation uses integer determinants, folds the correction
+into a single Mind expression, and checks the other lessons by executing it.
+
 Run `out/heed review out/lessons.txt` to use that memory in the ordinary Heed curriculum.
 When practice examples support multiple readings, Heed can save them and ask for a distinguishing
 example. Answer with `teach` and rerun `review` to see how the correction transfers.

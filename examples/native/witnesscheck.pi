@@ -1,0 +1,32 @@
+import "mindcore.pi"
+import "witnessnet.pi"
+
+skill main() -> Any {
+  let rows = [["sum",[2,5],2],["sum",[5,2],11],["sum",[0,5],0]]
+  do print(wn_reply(rows,"sum",[1,1],false))
+  for r in [["sum",[5,0],15],["sum",[0-3,4],0-3],["sum",[4,0-3],18],["sum",[3,3],3]] {
+    rows = append(rows,r)
+  }
+  let models = wn_fit(rows,"sum")
+  if len(models) != 1 { return "failed to recover a unique knot" }
+  do print(show(models[0]))
+  let hits = 0
+  for h in range(0-8,9) {
+    for t in range(0-8,9) {
+      if sev(models[0],null,[h,99,t],null,[]) == h+2*max(0,h-t) { hits = hits+1 }
+    }
+  }
+  do print(str(hits) ++ "/289 new lists")
+  do print("conflicting interiors: " ++ str(len(wn_fit(append(rows,["sum",[2,0,5],7]),"sum"))))
+  do print("other reducer: " ++ str(len(wn_fit(rows,"count"))))
+  do print("insufficient rank: " ++ str(len(wn_fit([["sum",[1,2],1],["sum",[2,4],2]],"sum"))))
+  let shifted = []
+  for ends in [[0,2],[3,1],[2,5],[6,1],[3,2],[8,0],[1,4]] {
+    let h = ends[0]
+    let t = ends[1]
+    shifted = append(shifted,["sum",ends,t+3*max(0,h-t-2)])
+  }
+  do print(wn_reply(shifted,"sum",[11,77,3],true))
+  do print(wn_reply(shifted,"sum",[11,77,3],false))
+  return wn_reply([["sum",[2,5],2],["sum",[5,2],5]],"sum",[9,99,1],false)
+}

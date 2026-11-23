@@ -1,0 +1,96 @@
+# Train a two-input integer readout. When it misses a lesson, grow one
+# rectifier of the endpoint gap. Its correction is zero on both pivot lessons.
+# Keep every admissible knot if the evidence cannot distinguish them.
+skill wn_hinge(row,k) -> Any { return max(0,row[0]-row[1]-k) }
+
+skill wn_program(weights,k) -> Any {
+  let head = O("head",[V("x")])
+  let tail = O("last",[V("x")])
+  let gap = O("-",[head,tail])
+  if k != 0 { gap = O("-",[gap,Q(k)]) }
+  let features = [head,tail,O("max",[Q(0),gap])]
+  let tree = null
+  for i in range(0,3) {
+    let w = weights[i]
+    if w != 0 {
+      let term = features[i]
+      if w != 1 { term = O("*",[Q(w),term]) }
+      if tree == null { tree = term } else { tree = O("+",[tree,term]) }
+    }
+  }
+  if tree == null { return Q(0) }
+  return tree
+}
+
+skill wn_verify(rows,nums,den,k) -> Any {
+  let weights = []
+  for v in nums {
+    if v % den != 0 { return null }
+    weights = append(weights,v // den)
+  }
+  let tree = wn_program(weights,k)
+  for r in rows {
+    if sev(tree,null,r[3],null,[]) != r[2] { return null }
+  }
+  return tree
+}
+
+skill wn_fit(obs,reducer) -> Any {
+  let rows = []
+  let knots = [0]
+  let p = null
+  let q = null
+  for ex in obs {
+    if ex[0] == reducer {
+      let xs = ex[1]
+      let r = [xs[0],xs[len(xs)-1],ex[2],xs]
+      rows = append(rows,r)
+      let gap = r[0]-r[1]
+      if not contains(knots,gap) { knots = append(knots,gap) }
+      if p == null {
+        if r[0] != 0 or r[1] != 0 { p = r }
+      } else {
+        if q == null and p[0]*r[1] != p[1]*r[0] { q = r }
+      }
+    }
+  }
+  if q == null { return [] }
+  let d = p[0]*q[1]-p[1]*q[0]
+  let a = p[2]*q[1]-p[1]*q[2]
+  let b = p[0]*q[2]-p[2]*q[0]
+  let linear = wn_verify(rows,[a,b,0],d,0)
+  if linear != null { return [linear] }
+  let miss = null
+  for r in rows {
+    if d*r[2] != a*r[0]+b*r[1] { miss = r }
+  }
+  if miss == null { return [] }
+  let models = []
+  for k in knots {
+    # d*hinge - u*head - v*last vanishes on p and q by construction.
+    let u = wn_hinge(p,k)*q[1]-p[1]*wn_hinge(q,k)
+    let v = p[0]*wn_hinge(q,k)-wn_hinge(p,k)*q[0]
+    let gain = d*wn_hinge(miss,k)-u*miss[0]-v*miss[1]
+    if gain != 0 {
+      let err = d*miss[2]-a*miss[0]-b*miss[1]
+      let model = wn_verify(rows,[a*gain-err*u,b*gain-err*v,d*err],d*gain,k)
+      if model != null { models = append(models,model) }
+    }
+  }
+  return models
+}
+
+skill wn_reply(obs,reducer,xs,teaching) -> Any {
+  let models = wn_fit(obs,reducer)
+  if len(models) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
+  if teaching {
+    if len(models) == 1 { return "Endpoint hypothesis: " ++ show(models[0]) }
+    return str(len(models)) ++ " endpoint hypotheses fit the lessons."
+  }
+  let y = sev(models[0],null,xs,null,[])
+  for model in models {
+    if sev(model,null,xs,null,[]) != y { return "Endpoint hypotheses disagree on this input. Teach its answer." }
+  }
+  if y == null { return "Meaning undefined for this input." }
+  return str(y)
+}

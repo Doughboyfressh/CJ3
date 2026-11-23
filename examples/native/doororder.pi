@@ -46,7 +46,12 @@ skill dx_order_next(states,models,event) -> Any {
   let next = []
   for i in range(0,len(models)) {
     let m = models[i]
-    let state = if m[0] == 0-3 { dx_context_step(states[i],m[1],m[2],event) } else { m[6][states[i]*5+event-1] }
+    let state = states[i]
+    if m[0] == 0-4 { state = dx_pair_step(m,state,event) } else {
+      if m[0] == 0-3 { state = dx_context_step(state,m[1],m[2],event) } else {
+        state = m[6][state*5+event-1]
+      }
+    }
     next = append(next,state)
   }
   return next
@@ -96,4 +101,39 @@ skill dx_context_fit(rows) -> Any {
     }
   }
   return []
+}
+
+
+# A composed reset monitors an ordered subsequence since the latest trigger.
+# 0 = closed, 2 = armed, 1 = armed with the first reset event observed.
+skill dx_pair_step(m,state,event) -> Any {
+  if event == m[1] { return 2 }
+  if state == 1 and event == m[3] { return 0 }
+  if state == 2 and event == m[2] { return 1 }
+  return state
+}
+
+skill dx_pair_fit(rows,trigger) -> Any {
+  let keep = []
+  for t in range(1,6) {
+    if trigger == 0 or t == trigger {
+      for a in range(1,6) {
+        for b in range(1,6) {
+          if a != t and b != t {
+            let m = [0-4,t,a,b]
+            let fits = true
+            for row in rows {
+              if fits {
+                let state = 0
+                for event in row[0] { state = dx_pair_step(m,state,event) }
+                if (state > 0) != (row[1] == 1) { fits = false }
+              }
+            }
+            if fits { keep = append(keep,m) }
+          }
+        }
+      }
+    }
+  }
+  return keep
 }

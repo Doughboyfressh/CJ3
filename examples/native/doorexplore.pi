@@ -30,6 +30,11 @@ skill dx_predict(model,on,counts) -> Any {
 # Predict a crossing from the observable history, with counters cached by
 # the caller. Search and replay share the projected-context transition.
 skill dx_history_predict(m,events,on,counts) -> Any {
+  if m[0] == 0-4 {
+    let state = 0
+    for event in events { state = dx_pair_step(m,state,event) }
+    return if state > 0 { 1 } else { 0 }
+  }
   if m[0] == 0-3 {
     return if contains(m[3],dx_context(m,events)) { 1 } else { 0 }
   }
@@ -86,7 +91,10 @@ skill dx_path(room,models,experiment) -> Any {
         let yes = len(dx_filter(ordinary,on,counts,1))
         for i in range(0,len(ordered)) {
           let state = item[4][i]
-          let open = if ordered[i][0] == 0-3 { contains(ordered[i][3],state) } else { state == 2 }
+          let m = ordered[i]
+          let open = state == 2
+          if m[0] == 0-4 { open = state > 0 }
+          if m[0] == 0-3 { open = contains(m[3],state) }
           if open { yes = yes+1 }
         }
         if yes > 0 and yes < len(models) {
@@ -107,7 +115,13 @@ skill dx_path(room,models,experiment) -> Any {
         if dest == room[1] and not experiment { return path }
         let bit = if kind == 3 { 1-on } else { on }
         let event = dx_event(kind,on)
-        let next = if len(ordinary) == 0 { counts } else { dx_update(counts,event) }
+        let next = counts
+        if len(ordinary) == 1 {
+          let m = ordinary[0]
+          if m[0] >= 0 and (m[0] == 0 or m[0] == event) and counts[m[0]] < m[1] {
+            next = slice(counts,0,m[0]) ++ [counts[m[0]]+1] ++ slice(counts,m[0]+1,6)
+          }
+        } else { if len(ordinary) > 1 { next = dx_update(counts,event) } }
         let states = dx_order_next(item[4],ordered,event)
         let key = str([dest,bit,next,states])
         if dest != room[1] and seen[key] == null {
@@ -144,6 +158,14 @@ skill dx_rows(text) -> Any {
   return rows
 }
 
+skill dx_memory_fit(rows) -> Any {
+  let context = dx_context_fit(rows)
+  if len(context) > 0 and context[0][2] == 1 { return context }
+  let pairs = dx_pair_fit(rows,0)
+  if len(pairs) > 0 { return pairs }
+  return context
+}
+
 skill dx_refit(rows) -> Any {
   let models = dx_models()
   for row in rows {
@@ -156,7 +178,7 @@ skill dx_refit(rows) -> Any {
     models = dx_filter(models,on,counts,row[1])
   }
   if len(models) == 0 { models = dx_order_fit(rows) }
-  if len(models) == 0 { return dx_context_fit(rows) }
+  if len(models) == 0 { return dx_memory_fit(rows) }
   return models
 }
 
@@ -196,13 +218,17 @@ skill dx_reset_probe(room,model,rows) -> Any {
       }
     }
   }
+  for rival in dx_pair_fit(rows,trigger) {
+    let path = dx_path(room,[model,rival],true)
+    if path != null { return path }
+  }
   return null
 }
 
 skill dx_run(layout,mode,path) -> Any {
   let room = dx_layout(layout)
-  if room == null or not contains(["follow","latch","retry","delay","sequence","rearm"],mode) {
-    return "Usage: heed explore hall|annex|corridor-SIZE-DOOR follow|latch|retry|delay|sequence|rearm [event-file]"
+  if room == null or not contains(["follow","latch","retry","delay","sequence","rearm","double-reset"],mode) {
+    return "Usage: heed explore hall|annex|corridor-SIZE-DOOR follow|latch|retry|delay|sequence|rearm|double-reset [event-file]"
   }
   let rows = []
   if path != null { rows = dx_rows(read_file(path)) }
@@ -239,6 +265,7 @@ skill dx_run(layout,mode,path) -> Any {
     let world = [room[0],0,0]
     let attempts = 0
     let ticks = 0
+    let switches_since_attempt = 0
     let armed = false
     let first_on = null
     let first_attempt = null
@@ -261,6 +288,11 @@ skill dx_run(layout,mode,path) -> Any {
         override = if first_on != null and first_attempt != null and first_attempt < first_on { 1 } else { 0 }
       }
       if mode == "rearm" and a[1] == 1 { override = if armed { 1 } else { 0 } }
+      if mode == "double-reset" and a[1] == 1 {
+        override = if attempts > 0 and switches_since_attempt < 2 { 1 } else { 0 }
+      }
+      if event == 4 { switches_since_attempt = 0 }
+      if event == 2 { switches_since_attempt = switches_since_attempt+1 }
       if event == 2 { armed = false }
       if event == 4 { armed = true }
       if first_on == null and event == 2 { first_on = ticks }
@@ -289,7 +321,7 @@ skill dx_run(layout,mode,path) -> Any {
           expanded = true
         }
         if len(keep) == 0 {
-          keep = dx_context_fit(rows)
+          keep = dx_memory_fit(rows)
           expanded = true
         }
         models = keep
@@ -316,6 +348,7 @@ skill dx_run(layout,mode,path) -> Any {
         }
       }
       if m[0] == 0-3 { rule = "last " ++ str(m[2]) ++ " of " ++ str(m[1]) ++ " opens for " ++ str(m[3]) }
+      if m[0] == 0-4 { rule = "event " ++ str(m[1]) ++ " arms until " ++ str([m[2],m[3]]) }
       if len(models) > 1 { rule = str(len(models)) ++ " consistent candidates" }
       return layout ++ " exit; rule " ++ rule ++ "; experiments " ++ str(experiments) ++ "; actions " ++ str(steps)
     }

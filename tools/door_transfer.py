@@ -11,6 +11,7 @@ import time
 RULES = {
     "follow": "current switch",
     "latch": "switch-on events >= 1",
+    "double-reset": "event 4 arms until [2, 2]",
     "rearm": "last 1 of [2, 4] opens for [[4]]",
     "retry": "first-door attempts >= 1",
     "delay": "elapsed actions >= 3",
@@ -31,33 +32,33 @@ def run_episode(binary, layout, mechanism, observations=None):
     return result[1], int(result[2]), int(result[3])
 
 
-def rearm_histories(limit):
+def reset_histories(limit, resets):
     """Enumerate legal hall walks and label each possible first-door crossing."""
-    pending = [(0, False, False, ())]
+    pending = [(0, False, 0, ())]
     records = {}
     while pending:
         pos, switch, armed, events = pending.pop()
         if pos in (1, 2):
-            records[events] = int(armed)
+            records[events] = int(armed > 0)
         if len(events) == limit:
             continue
         if pos in (0, 4):
-            pending.append((pos, not switch, armed if switch else False,
+            pending.append((pos, not switch, armed if switch else max(0, armed - 1),
                             events + ((3 if switch else 2),)))
         passage = {0: 1, 1: 0, 2: 4, 4: 2}[pos]
         pending.append((passage, switch, armed, events + (1,)))
         if pos in (1, 2):
-            pending.append((3 - pos if armed else pos, switch, True, events + (4,)))
+            pending.append((3 - pos if armed else pos, switch, resets, events + (4,)))
         if pos == 2 and switch:
             pending.append((pos, switch, armed, events + (5,)))
     return records
 
 
-def check_context_memory(binary, directory, layouts):
-    history = directory / "rearm.obs"
+def check_context_memory(binary, directory, layouts, mechanism, resets):
+    history = directory / (mechanism + ".obs")
     withheld = directory / "withheld.obs"
-    rule, trials, actions = run_episode(binary, "hall", "rearm", history)
-    if rule != RULES["rearm"] or trials == 0:
+    rule, trials, actions = run_episode(binary, "hall", mechanism, history)
+    if rule != RULES[mechanism] or trials == 0:
         raise ValueError(f"Cold learner failed to identify the reset: {rule}")
     observations = history.read_text()
     training = set()
@@ -70,7 +71,7 @@ def check_context_memory(binary, directory, layouts):
             contradiction = True
     if not contradiction:
         raise ValueError("Cold learner never falsified the once-attempted rule")
-    records = rearm_histories(9)
+    records = reset_histories(10, resets)
     unseen = records.keys() - training
 
     withheld.write_text("".join(
@@ -84,10 +85,10 @@ def check_context_memory(binary, directory, layouts):
     for layout in layouts:
         # Restore the original cold-training log before every layout.
         history.write_text(observations)
-        rule, trials, _ = run_episode(binary, layout, "rearm", history)
-        if (rule, trials) != ("last 1 of [2, 4] opens for [[4]]", 0):
+        rule, trials, _ = run_episode(binary, layout, mechanism, history)
+        if (rule, trials) != (RULES[mechanism], 0):
             raise ValueError(f"{layout}: unexpected rearm result {(rule, trials)}")
-    print(f"rearm: {actions} cold training actions; {score}; {len(layouts)} transferred layouts")
+    print(f"{mechanism}: {actions} cold training actions; {score}; {len(layouts)} transferred layouts")
 
 
 def main():
@@ -110,7 +111,8 @@ def main():
             raise ValueError("The order rule did not transfer across restart")
     print("mechanism  training_trials  layouts  transferred_actions  cold_actions  wins")
     with tempfile.TemporaryDirectory() as directory:
-        check_context_memory(binary, Path(directory), layouts)
+        for mechanism, resets in [("rearm", 1), ("double-reset", 2)]:
+            check_context_memory(binary, Path(directory), layouts, mechanism, resets)
         start = time.perf_counter()
         for mechanism, expected in RULES.items():
             observations = Path(directory) / (mechanism + ".benchmark")

@@ -74,7 +74,7 @@ that minimizes the largest group of rules left after a door crossing. It
 starts each experiment from the room entrance and records the action history
 and observed outcome. Restart with `out/heed explore annex latch out/events.obs`
 to transfer that evidence. Use a separate file for each fixed mechanism.
-Supported mechanisms are `follow`, `latch`, `retry`, `delay`, `sequence`, and `rearm`.
+Supported mechanisms are `follow`, `latch`, `retry`, `delay`, `sequence`, `rearm`, and `double-reset`.
 When count rules contradict recorded crossings or cannot lead to a goal or
 experiment, Pi also constructs Mind folds over ordered pairs of event types.
 The three templates distinguish a strict first-occurrence order, an ordered
@@ -95,7 +95,10 @@ reset. It discards rivals contradicted by recorded crossings and plans a
 reachable crossing where the remaining rival and the current rule disagree.
 The transfer check starts with an empty log, scores unseen walks with
 `out/heed explore-score TRAIN TEST`, and restores the resulting training log
-before each transfer layout. This challenge covers single-event resets.
+before each transfer layout. Pi also composes ordered pairs of reset events, including repeated events.
+The `double-reset` room clears permission on the second switch-on since the
+last door attempt. Verifying persistence against more rivals costs extra
+experiments even when the initial rule is correct.
 
 For an automated transfer comparison run `python tools/door_transfer.py out/heed`
 after building Heed. Each mechanism is learned in the hall, then exercised in
@@ -103,6 +106,46 @@ after building Heed. Each mechanism is learned in the hall, then exercised in
 process. Actions include experiments and the final goal route; resetting a
 trial is free. The experiment-selection policy gives identification priority
 when several rules remain. The timer excludes compilation.
+
+## Learn and control a resettable process
+
+Pi can infer a deterministic finite-state process with a binary observation.
+Give it the event names and, optionally, an upper bound on reachable states. Each
+experiment starts fresh, applies the requested events, and returns one bit.
+Pi uses distinguishing suffixes to separate histories and searches the
+learned transition graph for a shortest plan to the requested output.
+
+Run this example against Python's two-slot queue from the repository root:
+
+```sh
+python tools/trace_agent.py out/heed out/queue.obs --events put take --bound 3 --goal 1 --prefix put --oracle python tools/trace_inference.py --queue-oracle
+```
+
+The first run learns the queue and executes the prefix plus its proposed
+plan. Reusing the log permits new goals without repeating known queries.
+Use a separate log for each process configuration. The oracle reads a JSON
+array of event names on standard input and prints `0` or `1`. Each invocation
+must reproduce the same initial state and implement every declared event.
+Omit `--bound` for goal-directed learning. In that mode Pi tries a plan,
+learns from a failed replay, and broadens its experiments when the current
+model cannot reach the goal. A successful replay establishes that particular
+plan works. The conformance guarantee requires a valid state bound and
+deterministic outputs.
+When that bound is loose the number of experiments can grow exponentially.
+
+The native commands also work independently. A log starts with
+`events put take` followed by lines such as `0` for the initial observation,
+or `1 put put` for a trace. `heed states FILE` requests missing observations
+and exports a table consistent with the available evidence. The table starts
+at state zero, with one row per state containing its output and successor
+indices in the declared event order. `heed states-check FILE BOUND` also
+requests conformance experiments. `heed states-plan FILE GOAL [PREFIX]`
+returns a shortest continuation from a space-separated prefix.
+`python tools/trace_inference.py out/heed` independently checks equivalence
+by traversing pairs of reachable reference and learned states, and exercises
+the queue and an in-memory SQLite database from observations through plan
+execution. The SQLite adapter exposes insert, delete, commit, and rollback.
+Its observation is whether one row survives discarding pending changes.
 
 ## Teach Heed a word
 

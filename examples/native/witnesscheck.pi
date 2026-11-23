@@ -54,8 +54,15 @@ skill wc_boundary(text) -> Any {
   return wc_switch(text,train,held)
 }
 
+skill wc_relation(text) -> Any {
+  let train = [[[3,7,5,8,9],10],[[6,7,5,8,9],8],[[3,4,3,2],3],[[9,4,3,2],5]]
+  let held = [[[103,7,105,8,9],10],[[106,7,105,8,9],8]]
+  return wc_switch(text,train,held)
+}
+
 skill main() -> Any {
   if arg(1) == "switch" { return wc_order(read_file(arg(2))) }
+  if arg(1) == "relation" { return wc_relation(read_file(arg(2))) }
   if arg(1) == "boundary" { return wc_boundary(read_file(arg(2))) }
   if arg(1) != null { return wc_transfer(read_file(arg(1))) }
   let text = "heed1 zells sum 2,1,5 1\nheed1 zells sum 2,9,5 9\nheed1 zells sum 5,1,2 1\nheed1 zells sum 5,2,1 2\n"
@@ -72,6 +79,11 @@ skill main() -> Any {
   for line in split(trim(boundary),"\n") { book = hm_take(book,line) }
   do print(wn_book_reply(book,"zells",book["zells"],"sum",[2,7,1,6,9],true))
   do print(wc_boundary(boundary ++ "heed1 zells sum 2,7,0,8,9 9\n"))
+  let relation = prior ++ "heed1 zells sum 3,7,5,8,9 9\nheed1 zells sum 6,7,5,8,9 7\nheed1 zells sum 3,7,2,11,9 7\n"
+  let relations = {}
+  for line in split(trim(relation),"\n") { relations = hm_take(relations,line) }
+  do print(wn_book_reply(relations,"zells",relations["zells"],"sum",[3,7,2,11,9],true))
+  do print(wc_relation(relation ++ "heed1 zells sum 5,7,5,8,9 9\n"))
   let rows = [["sum",[2,5],2],["sum",[5,2],11],["sum",[0,5],0]]
   do print(wn_reply(rows,"sum",[1,1],false))
   for r in [["sum",[5,0],15],["sum",[0-3,4],0-3],["sum",[4,0-3],18],["sum",[3,3],3]] {

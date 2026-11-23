@@ -349,23 +349,39 @@ skill wn_switches(book,word,reducer) -> Any {
   # Construct predicates from the resolved vocabulary. Keep the constant
   # grammar finite and check both outcome branches against actual lessons.
   let outputs = skills ++ [head,last]
-  for feature in skills {
-    let values = []
-    let fits = []
-    let defined = true
-    for ex in rows {
-      let value = sev(feature,null,ex[1],null,[])
-      if value == null { defined = false }
-      values = append(values,value)
-      let matches = []
-      for tree in outputs {
-        if sev(tree,null,ex[1],null,[]) == ex[2] { matches = append(matches,tree) }
-      }
-      fits = append(fits,matches)
+  let columns = []
+  let fits = []
+  for tree in outputs {
+    let col = []
+    for ex in rows { col = append(col,sev(tree,null,ex[1],null,[])) }
+    columns = append(columns,col)
+  }
+  for i in range(0,len(rows)) {
+    let matches = []
+    for j in range(0,len(outputs)) {
+      if columns[j][i] == rows[i][2] { matches = append(matches,outputs[j]) }
     }
-    if defined {
-      for threshold in range(0-4,5) {
-        gpu for value in values -> left {
+    fits = append(fits,matches)
+  }
+  for f in range(0,len(outputs)) {
+    if not contains(columns[f],null) {
+      let comparisons = []
+      if f < len(skills) {
+        for t in range(0-4,5) { comparisons = append(comparisons,[Q(t),null,t]) }
+      }
+      for j in range(0,len(outputs)) {
+        if f != j and (f < len(skills) or j < len(skills)) and not contains(columns[j],null) {
+          comparisons = append(comparisons,[outputs[j],columns[j],0])
+        }
+      }
+      for comparison in comparisons {
+        let diffs = columns[f]
+        let threshold = comparison[2]
+        if comparison[1] != null {
+          diffs = []
+          for i in range(0,len(rows)) { diffs = append(diffs,columns[f][i]-comparison[1][i]) }
+        }
+        gpu for value in diffs -> left {
           let left = 0
           if value < threshold { let left = 1 }
         }
@@ -379,7 +395,7 @@ skill wn_switches(book,word,reducer) -> Any {
           if side == 1 { yesfits = keep } else { nofits = keep }
         }
         if len(yesfits) < len(outputs) and len(nofits) < len(outputs) {
-          let gate = O("<",[feature,Q(threshold)])
+          let gate = O("<",[outputs[f],comparison[0]])
           for a in yesfits {
             for b in nofits {
               if a != b {
@@ -418,17 +434,31 @@ skill wn_switch_question(models,obs,reducer) -> Any {
   let bound = len(models)
   # Isolate a learned threshold by changing one lesson value at a time.
   let cuts = []
+  let dynamic = []
+  let endpoints = [O("head",[V("x")]),O("last",[V("x")])]
   for model in models {
     let gate = model[2][0]
     if gate[1] == "<" and gate[2][1][0] == "q" {
       let k = gate[2][1][1]
       if not contains(cuts,k) { cuts = append(cuts,k) }
     }
+    if gate[1] == "<" and gate[2][1][0] == "op" {
+      if not contains(endpoints,gate[2][0]) or not contains(endpoints,gate[2][1]) {
+        for operand in gate[2] {
+          if not contains(dynamic,operand) { dynamic = append(dynamic,operand) }
+        }
+      }
+    }
   }
   for ex in obs {
     if ex[0] == reducer {
       let xs = ex[1]
-      for k in cuts {
+      let values = cuts
+      for operand in dynamic {
+        let v = sev(operand,null,xs,null,[])
+        if v != null and not contains(values,v) { values = append(values,v) }
+      }
+      for k in values {
         for i in range(0,len(xs)) {
           let probe = slice(xs,0,i) ++ [k] ++ slice(xs,i+1,len(xs))
           let worst = wn_probe_worst(models,probe)

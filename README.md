@@ -107,7 +107,9 @@ examples for a question that minimizes the largest group remaining after an
 answer. A unique decision is exported as a typed Mind operation.
 
 If those gates fail, Pi tries comparisons of a previously learned position
-with each integer threshold from -4 to 4. The two outcomes may use a learned
+with each integer threshold from -4 to 4. It also compares two selectors
+in either order, including a learned position against an endpoint. For these
+comparisons the second input supplies the threshold on every example. The two outcomes may use a learned
 position or an endpoint. Softwell evaluates the threshold comparisons, and
 Mind verifies each resulting conditional against every lesson. Question
 selection also tries changing one observation at a time at a candidate

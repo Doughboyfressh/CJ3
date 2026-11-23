@@ -1,5 +1,55 @@
 # Final-position preactivation, first 128 value channels. Output units are 1/65536.
+skill signed32(bytes,pos) -> Any {
+  let high = aget(bytes,pos+3)
+  if high >= 128 { let high = high-256 }
+  return aget(bytes,pos)+256*(aget(bytes,pos+1)+256*(aget(bytes,pos+2)+256*high))
+}
+
+skill rounded_q16(total) -> Any {
+  let rounded = (abs(total)+32768)//65536
+  if total < 0 { return 0-rounded }
+  return rounded
+}
+
+skill token_context() -> Any {
+  let path = arg(2)
+  if arg(3) == null { return "Usage: kimicontext --ids TABLE ID [ID ...]" }
+  let header = read_bytes(path,0,2052)
+  if header == null or len(header) != 2052 { return "Invalid vocabulary table." }
+  if arr_text(header,0,4) != "PIV1" { return "Invalid vocabulary table." }
+  let ids = arr(4)
+  let count = 0
+  while arg(count+3) != null {
+    let s = arg(count+3)
+    if len(s) == 0 or len(s) > 6 { return "Invalid token id." }
+    for c in chars(s) { if not contains("0123456789",c) { return "Invalid token id." } }
+    let id = int(s)
+    if id >= 163840 { return "Token outside embedding vocabulary." }
+    do aset(ids,count%4,id)
+    let count = count+1
+  }
+  let window = []
+  for lag in range(0,4) {
+    if lag < count {
+      let row = read_bytes(path,2052+512*aget(ids,(count-1-lag)%4),512)
+      if row == null or len(row) != 512 { return "Incomplete vocabulary table." }
+      let window = append(window,row)
+    }
+  }
+  let output = []
+  for c in range(0,128) {
+    let total = 0
+    for lag in range(0,len(window)) {
+      let tap = signed32(header,4+512*(3-lag)+4*c)
+      let total = total + tap*signed32(window[lag],4*c)
+    }
+    let output = append(output,str(rounded_q16(total)))
+  }
+  return join(output," ")
+}
+
 skill main() -> Any {
+  if arg(1) == "--ids" { return token_context() }
   if arg(1) == null { return "Usage: kimicontext TOKEN [TOKEN ...]" }
   let data = read_file("examples/native/kimi_value_context.txt")
   if data == null { return "Missing context table." }
@@ -34,9 +84,7 @@ skill main() -> Any {
         let total = total + int(row[c])*int(taps[3-lag][c])
       }
     }
-    let rounded = (abs(total)+32768)//65536
-    if total < 0 { let rounded = 0-rounded }
-    let output = append(output,str(rounded))
+    let output = append(output,str(rounded_q16(total)))
   }
   return join(output," ")
 }

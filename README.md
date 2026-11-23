@@ -185,3 +185,18 @@ To reproduce the table, install NumPy and run
 The builder reads three byte ranges from checkpoint revision
 `d9e99b0792a5e93b78ea9bea62a68167e36ddd9e` and checks their SHA-256 hashes.
 Its numerical reference uses the decoded checkpoint values in float64.
+
+The same executable accepts numeric IDs from the complete 163,840-row
+embedding tensor, including reserved rows. Build the binary projection with
+`OPENBLAS_NUM_THREADS=1 python tools/distill_kimi_vocabulary.py out/kimi-context-cache out/head0.piv`,
+then run `out/kimicontext --ids out/head0.piv 16717 255`. The builder fetches
+the pinned embedding tensor in 1,024-row batches and installs the output
+after all rows succeed. At inference Pi reads the 2,052-byte header and at
+most four 512-byte rows regardless of sequence length. The numeric-ID path
+returns the same Q16 value preactivations as the named-token path. The file
+contains one value head and occupies 83,888,132 bytes.
+
+Run `python tools/check_kimi_vocabulary.py out/kimicontext out/head0.piv out/kimi-context-cache`
+to compare the native result against direct matrix-vector products on
+separately fetched embedding rows. It covers both ends of the ID range,
+reserved tokens, zero-padding and sequences longer than the four-tap window.

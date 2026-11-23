@@ -289,7 +289,21 @@ skill hm_command(path, command, phrase, csv, answer) -> Any {
   let obs = book[word]
   if obs == null { return "Teach an example for " ++ word ++ " first." }
   let laws = hm_laws(obs)
-  if len(laws) == 0 { return wn_book_reply(book,word,obs,ws[0],xs,command == "teach") }
+  if len(laws) == 0 {
+    let reply = wn_book_reply(book,word,obs,ws[0],xs,command == "teach")
+    if reply != null { return reply }
+    let candidates = hm_replay(text,name)[1]
+    if len(candidates) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
+    let y = sev(candidates[0],null,xs,null,[])
+    if len(candidates) > 1 {
+      if command == "teach" or y != sev(candidates[1],null,xs,null,[]) {
+        return "Mind hypotheses disagree. Teach the answer for " ++ hm_csv(candidates[2]) ++ "."
+      }
+    }
+    if command == "teach" { return "Mind hypothesis: " ++ show(candidates[0]) }
+    if y == null { return "Meaning undefined for this input." }
+    return str(y)
+  }
   if len(laws) == 1 {
     if command == "teach" { return "Learned " ++ word ++ ": " ++ show(laws[0][0]) ++ if laws[0][1] { " before reduction." } else { " after reduction." } }
     let y = hm_read(word, laws[0], phrase, xs)

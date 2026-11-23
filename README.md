@@ -125,6 +125,16 @@ observations. An unresolved source or a conflicting target lesson withholds
 the calculation and its dependents. Saved formulas support integer constants,
 the source value, addition, subtraction, multiplication, minimum and maximum.
 
+When the specialized learners exhaust their explanations, Heed sends the
+original input/output pairs to Mind. Mind searches with the current base
+vocabulary and no held-out answers. It tries to find a rival of comparable
+size that also fits the lessons but disagrees on an unlabelled probe. When
+it finds one, Heed asks for the probe answer and withholds the vocabulary
+export. Otherwise the result is a bounded-search hypothesis. Lesson import
+rebuilds these hypotheses from the observations before replaying named
+compositions. The fallback uses at most five units of uniform program size
+for forward search and a cap of 30,000 retained forms per search.
+
 The preservation property follows from the update itself. Write an input as
 `x = [first, last]` and let the rows of the invertible matrix `P` be the two
 anchors. For a candidate neuron `z(x) = max(0, first - last - k)`, solve

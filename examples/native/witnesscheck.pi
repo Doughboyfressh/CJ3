@@ -94,6 +94,12 @@ skill main() -> Any {
   }
   let broken = load_lessons(linked ++ "heed1 steps sum 3,7,5,8,9 100\n")
   do print(hm_named(broken,"sum of steps") == null and hm_named(broken,"sum of doublets") == null)
+  let prefix = "heed1 brims sum 2,1,5 3\nheed1 brims sum 2,9,5 11\nheed1 brims sum 1,5,2 6\n"
+  let alternatives = hm_replay(prefix,"sum of brims")
+  do print(hm_named(alternatives[0],"sum of brims") == null and len(alternatives[1]) == 3)
+  prefix = prefix ++ "heed1 brims sum 4,-3,9,8 1\nheed1 brims sum 4,6 10\nheed1 brims sum 0,8,0,7 8\n"
+  let prefix_word = hm_named(load_lessons(prefix),"sum of brims")
+  do print(sev(prefix_word[0],[9,0-4,80,2],null,null,[]))
   let rows = [["sum",[2,5],2],["sum",[5,2],11],["sum",[0,5],0]]
   do print(wn_reply(rows,"sum",[1,1],false))
   for r in [["sum",[5,0],15],["sum",[0-3,4],0-3],["sum",[4,0-3],18],["sum",[3,3],3]] {

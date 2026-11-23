@@ -1409,6 +1409,22 @@ skill group_c(levels, pl, ty, c, u) -> Any {
 
 # active: which words are awake (not downscaled); -> [word-form tree or null, kept]
 skill solve(train, held, lib, active, pl, pre, maxsize, cap) -> Any {
+  return solve_search(train,held,lib,active,pl,pre,maxsize,cap,null,[])
+}
+
+# An optional rival must disagree with the initial hypothesis on an unlabelled
+# probe. Both must still satisfy the same labelled training data.
+skill different_on(tree,first,probes,lib) -> Any {
+  if first == null { return true }
+  for xs in probes {
+    let y = sev(tree,null,xs,null,lib)
+    let other = sev(first,null,xs,null,lib)
+    if y != null and other != null and y != other { return true }
+  }
+  return false
+}
+
+skill solve_search(train, held, lib, active, pl, pre, maxsize, cap, first, probes) -> Any {
   let n = len(train)
   let xs = []
   let target = []
@@ -1493,7 +1509,7 @@ skill solve(train, held, lib, active, pl, pre, maxsize, cap) -> Any {
     # every program that fits the examples gets its held-out check -- before deduplication, not after
     if lf[1] == tty and vec == target and fits < 64 {
       let fits = fits + 1
-      if verify(lf[0], held, lib, pre) { return [lf[0], total] }
+      if verify(lf[0], held, lib, pre) and different_on(lf[0],first,probes,lib) { return [lf[0], total] }
     }
     let lc = min(maxcost, cost_bits(counts, leaf_key(lf[0]), T, K))
     if capx != null { let lc = min(lc, u + capx) }
@@ -1569,7 +1585,7 @@ skill solve(train, held, lib, active, pl, pre, maxsize, cap) -> Any {
               if ok and fm[2] == tty and vec == target and fits < 64 {
                 let fits = fits + 1
                 let tree = [fm[0][0], fm[0][1], kids]
-                if verify(tree, held, lib, pre) { return [tree, total] }
+                if verify(tree, held, lib, pre) and different_on(tree,first,probes,lib) { return [tree, total] }
               }
               if ok {
                 if hset_add(seen, vkey(vec, fm[2])) {
@@ -1598,7 +1614,7 @@ skill solve(train, held, lib, active, pl, pre, maxsize, cap) -> Any {
     let levels = slice(levels, 0, s) ++ [here] ++ slice(levels, s + 1, len(levels))
   }
   # the language run backwards: every number program A already built names the B that would complete it
-  if tty == "I" {
+  if tty == "I" and first == null {
     let alg = null
     if len(pl0) > 5 { let alg = pl0[5] }
     let mt = mitm(levels, target, xs, held, lib, pre, alg)
@@ -1613,7 +1629,7 @@ skill solve(train, held, lib, active, pl, pre, maxsize, cap) -> Any {
       if sev(tree, null, xs[j], null, lib) != target[j] { let ok = false }
     }
     if ok {
-      if verify(tree, held, lib, pre) { return [tree, total] }
+      if verify(tree, held, lib, pre) and different_on(tree,first,probes,lib) { return [tree, total] }
     }
   }
   return [null, total]

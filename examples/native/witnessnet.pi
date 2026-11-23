@@ -511,7 +511,7 @@ skill wn_book_reply(book,word,obs,reducer,xs,teaching) -> Any {
     models = wn_switches(book,word,reducer)
     switching = len(models) > 0
   }
-  if len(models) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
+  if len(models) == 0 { return null }
   if teaching {
     if switching {
       if len(models) == 1 { return "Conditional hypothesis: " ++ show(models[0]) }

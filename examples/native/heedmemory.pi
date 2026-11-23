@@ -295,9 +295,15 @@ skill hm_take(book, line) -> Any {
 # A Heed lesson file, as Mind lessons. A word with one meaning becomes a building block.
 # A word that is still ambiguous is left out: Mind must not guess.
 skill hm_lessons(text) -> Any {
+  return hm_replay(text,null)[0]
+}
+
+skill hm_replay(text,query) -> Any {
+  let decision = []
+  let pending = []
   let book = {}
   let targets = {}
-  if text == null { return [] }
+  if text == null { return [[],decision] }
   let bindings = hm_recipes(text)
   for line in split(text,"\n") {
     let f = split(trim(line)," ")
@@ -317,16 +323,38 @@ skill hm_lessons(text) -> Any {
     if len(laws) == 1 { let out = append(out, ["word", word, hm_as_word(laws[0])]) }
     if len(laws) == 0 {
       for reducer in hm_reducers() {
-        let selectors = wn_positions(book[word],reducer)
-        if len(selectors) == 0 and len(keys(book)) > 1 {
-          let endpoints = wn_search(book[word],reducer)
-          if len(endpoints[0]) == 0 and not endpoints[1] { selectors = wn_switches(book,word,reducer) }
-        }
-        if len(selectors) == 1 {
-          let typed = [xparam(selectors[0]),"L","I"]
-          out = append(out,["word",reducer ++ " of " ++ word,typed])
+        let rows = []
+        for ex in book[word] { if ex[0] == reducer { rows = append(rows,[ex[1],ex[2]]) } }
+        if len(rows) > 0 {
+          let selectors = wn_positions(book[word],reducer)
+          if len(selectors) == 0 {
+            let endpoints = wn_search(book[word],reducer)
+            if len(endpoints[0]) == 0 and not endpoints[1] {
+              if len(keys(book)) > 1 { selectors = wn_switches(book,word,reducer) }
+              if len(selectors) == 0 {
+                pending = append(pending,[reducer ++ " of " ++ word,rows])
+              }
+            }
+          }
+          if len(selectors) == 1 {
+            let typed = [xparam(selectors[0]),"L","I"]
+            out = append(out,["word",reducer ++ " of " ++ word,typed])
+          }
         }
       }
+    }
+  }
+  # Replay from observations and the current base vocabulary. Fallback words
+  # never depend on other fallback words in this pass, so order cannot create cycles.
+  let lib = []
+  for lesson in out { lib = append(lib,lesson[2]) }
+  for item in pending {
+    let m = mark()
+    let candidates = hm_mind_search(item[1],lib)
+    candidates = release(m,candidates)
+    if item[0] == query { decision = candidates }
+    if len(candidates) == 1 {
+      out = append(out,["word",item[0],[xparam(candidates[0]),"L","I"]])
     }
   }
   # Dependencies are recorded only after their sources resolve. Walk the
@@ -348,7 +376,7 @@ skill hm_lessons(text) -> Any {
       }
     }
   }
-  return out
+  return [out,decision]
 }
 
 # compose1 TARGET REDUCER SOURCE REDUCER PREFIX-EXPRESSION
@@ -384,4 +412,23 @@ skill hm_named(lessons,name) -> Any {
     if lesson[0] == "word" and lesson[1] == name { return lesson[2] }
   }
   return null
+}
+
+skill hm_mind_search(rows,lib) -> Any {
+  let active = all_awake(lib)
+  let pl = pools()
+  let pre = prelude()
+  let m = mark()
+  let first = solve(rows,[],lib,active,pl,pre,5,30000)[0]
+  first = release(m,first)
+  if first == null { return [] }
+  let probes = [[0],[3,1],[1,3],[5,2,7],[2,5,0-3,8],[4,0,7,1,2]]
+  for ex in rows { probes = append(probes,reverse(ex[0])) }
+  let second = solve_search(rows,[],lib,active,pl,pre,min(5,tsize(first)),30000,first,probes)[0]
+  if second != null {
+    for xs in probes {
+      if different_on(second,first,[xs],lib) { return [expand(first,lib),expand(second,lib),xs] }
+    }
+  }
+  return [expand(first,lib)]
 }

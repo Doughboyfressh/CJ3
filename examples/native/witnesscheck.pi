@@ -84,6 +84,16 @@ skill main() -> Any {
   for line in split(trim(relation),"\n") { relations = hm_take(relations,line) }
   do print(wn_book_reply(relations,"zells",relations["zells"],"sum",[3,7,2,11,9],true))
   do print(wc_relation(relation ++ "heed1 zells sum 5,7,5,8,9 9\n"))
+  let linked = relation ++ "heed1 steps sum 3,7,5,8,9 10\nheed1 steps sum 6,7,5,8,9 8\ncompose1 steps sum zells sum + p0 1\ncompose1 doublets sum steps sum + p0 p0\n"
+  do print(hm_named(load_lessons(linked),"sum of steps") == null)
+  for answer in [9,7] {
+    linked = linked ++ "heed1 zells sum 5,7,5,8,9 " ++ str(answer) ++ "\n"
+    let replay = load_lessons(linked)
+    let calc = hm_named(replay,"sum of doublets")
+    do print(sev(calc[0],[105,7,105,8,9],null,null,[]))
+  }
+  let broken = load_lessons(linked ++ "heed1 steps sum 3,7,5,8,9 100\n")
+  do print(hm_named(broken,"sum of steps") == null and hm_named(broken,"sum of doublets") == null)
   let rows = [["sum",[2,5],2],["sum",[5,2],11],["sum",[0,5],0]]
   do print(wn_reply(rows,"sum",[1,1],false))
   for r in [["sum",[5,0],15],["sum",[0-3,4],0-3],["sum",[4,0-3],18],["sum",[3,3],3]] {

@@ -115,6 +115,16 @@ Mind verifies each resulting conditional against every lesson. Question
 selection also tries changing one observation at a time at a candidate
 threshold, keeping the rest of the input fixed.
 
+To save a calculation that follows future corrections, teach examples for
+its target phrase, then run `out/heed compose FILE "sum of SOURCE" "sum of TARGET"`
+using the taught words. Mind fits a small integer expression to the source
+outputs and target answers. The lesson log records the expression and the
+source phrase it calls. On the next `memory use` or Mind lesson import, Pi
+rebinds saved calculations in dependency order and checks their target
+observations. An unresolved source or a conflicting target lesson withholds
+the calculation and its dependents. Saved formulas support integer constants,
+the source value, addition, subtraction, multiplication, minimum and maximum.
+
 The preservation property follows from the update itself. Write an input as
 `x = [first, last]` and let the rows of the invertible matrix `P` be the two
 anchors. For a candidate neuron `z(x) = max(0, first - last - k)`, solve

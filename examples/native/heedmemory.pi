@@ -229,19 +229,26 @@ skill hm_record(book, word, reducer, xs, y) -> Any {
 }
 
 skill hm_load(path) -> Any {
+  return hm_book(read_file(path))
+}
+
+skill hm_book(text) -> Any {
   let book = {}
-  let text = read_file(path)
   if text == null or text == "" { return book }
   if slice(text,len(text)-1,len(text)) != "\n" { return null }
   for line in split(text,"\n") {
     if line != "" {
       let f = split(trim(line)," ")
-      if len(f) != 5 or f[0] != "heed1" { return null }
-      if not hm_word(f[1]) or not contains(hm_reducers(),f[2]) { return null }
-      let xs = hm_numbers(f[3])
-      let y = hm_number(f[4])
-      if xs == null or y == null { return null }
-      book = hm_record(book,f[1],f[2],xs,y)
+      if f[0] == "compose1" {
+        if hm_recipe(f) == null { return null }
+      } else {
+        if len(f) != 5 or f[0] != "heed1" { return null }
+        if not hm_word(f[1]) or not contains(hm_reducers(),f[2]) { return null }
+        let xs = hm_numbers(f[3])
+        let y = hm_number(f[4])
+        if xs == null or y == null { return null }
+        book = hm_record(book,f[1],f[2],xs,y)
+      }
     }
   }
   return book
@@ -289,11 +296,19 @@ skill hm_take(book, line) -> Any {
 # A word that is still ambiguous is left out: Mind must not guess.
 skill hm_lessons(text) -> Any {
   let book = {}
+  let targets = {}
   if text == null { return [] }
-  for line in split(text, "\n") {
-    if line != "" {
-      let next = hm_take(book, line)
-      if next != null { let book = next }
+  let bindings = hm_recipes(text)
+  for line in split(text,"\n") {
+    let f = split(trim(line)," ")
+    if len(f) == 5 and f[0] == "heed1" {
+      if bindings[f[2] ++ " of " ++ f[1]] != null {
+        let next = hm_take(targets,line)
+        if next != null { targets = next }
+      } else {
+        let next = hm_take(book,line)
+        if next != null { book = next }
+      }
     }
   }
   let out = []
@@ -314,5 +329,59 @@ skill hm_lessons(text) -> Any {
       }
     }
   }
+  # Dependencies are recorded only after their sources resolve. Walk the
+  # append order, substituting today's source before replaying target lessons.
+  for line in split(text,"\n") {
+    let f = split(trim(line)," ")
+    if f[0] == "compose1" {
+      let recipe = hm_recipe(f)
+      if recipe != null {
+        let source = hm_named(out,recipe[1])
+        if source != null {
+          let body = subst(recipe[2],source[0])
+          let ok = true
+          for ex in get(targets,f[1],[]) {
+            if ex[0] == f[2] and sev(body,ex[1],null,null,[]) != ex[2] { ok = false }
+          }
+          if ok { out = append(out,["word",recipe[0],[body,"L","I"]]) }
+        }
+      }
+    }
+  }
   return out
+}
+
+# compose1 TARGET REDUCER SOURCE REDUCER PREFIX-EXPRESSION
+skill hm_recipe(f) -> Any {
+  if len(f) < 6 or f[0] != "compose1" { return null }
+  if not hm_word(f[1]) or not hm_word(f[3]) { return null }
+  if not contains(hm_reducers(),f[2]) or not contains(hm_reducers(),f[4]) { return null }
+  let tokens = slice(f,5,len(f))
+  let slots = 1
+  for token in tokens {
+    if slots == 0 { return null }
+    if contains(["+","-","*","min","max"],token) { slots = slots+1 } else {
+      if token != "p0" and hm_number(token) == null { return null }
+      slots = slots-1
+    }
+  }
+  if slots != 0 or not contains(tokens,"p0") { return null }
+  return [f[2] ++ " of " ++ f[1],f[4] ++ " of " ++ f[3],parse_at(tokens,0,[])[0]]
+}
+
+skill hm_recipes(text) -> Any {
+  let bindings = {}
+  if text == null { return bindings }
+  for line in split(text,"\n") {
+    let recipe = hm_recipe(split(trim(line)," "))
+    if recipe != null { bindings = put(bindings,recipe[0],recipe[1]) }
+  }
+  return bindings
+}
+
+skill hm_named(lessons,name) -> Any {
+  for lesson in lessons {
+    if lesson[0] == "word" and lesson[1] == name { return lesson[2] }
+  }
+  return null
 }

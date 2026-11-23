@@ -211,6 +211,45 @@ skill hm_read(word, law, phrase, xs) -> Any {
   return sev(tree, null, xs, null, [])
 }
 
+# Learn the outer arithmetic from target examples. Persist the expression
+# and source phrase, so a later process can bind it to revised evidence.
+skill hd_compose(path,from,to) -> Any {
+  let src = hm_phrase(from)
+  let dst = hm_phrase(to)
+  if path == null or src == null or dst == null or src == dst or arg(5) != null {
+    return "Usage: heed compose FILE \"sum of SOURCE\" \"sum of TARGET\""
+  }
+  let text = read_file(path)
+  let book = hm_book(text)
+  if book == null { return "Unreadable or incomplete lesson file." }
+  let name = src[0] ++ " of " ++ src[1]
+  let target = dst[0] ++ " of " ++ dst[1]
+  let bindings = hm_recipes(text)
+  if bindings[target] != null { return "A composition is already recorded for " ++ target ++ "." }
+  for other in keys(bindings) {
+    if bindings[other] == target { return "This phrase already supplies a saved composition." }
+  }
+  let source = hm_named(hm_lessons(text),name)
+  if source == null { return "Teach or resolve " ++ name ++ " first." }
+  let train = []
+  let values = {}
+  for ex in get(book,dst[1],[]) {
+    if ex[0] == dst[0] {
+      let v = sev(source[0],ex[1],null,null,[])
+      if v == null { return "Source is undefined on a target lesson." }
+      values = put(values,str(v),true)
+      train = append(train,[v,ex[2]])
+    }
+  }
+  if len(keys(values)) < 2 { return "Teach target examples with distinct source values first." }
+  let fitted = solve(train,[],[],[],pools(),prelude(),4,10000)[0]
+  if fitted == null { return "No supported composition fits the target lessons." }
+  let line = join(["compose1",dst[1],dst[0],src[1],src[0],ser(xparam(fitted))]," ")
+  if hm_recipe(split(line," ")) == null { return "No supported composition fits the target lessons." }
+  if not rt_append_file(path,line ++ "\n") { return "Could not save the composition." }
+  return "Learned " ++ target ++ " from " ++ name ++ ": " ++ show(fitted)
+}
+
 skill hm_command(path, command, phrase, csv, answer) -> Any {
   let ws = hm_phrase(phrase)
   let xs = hm_numbers(csv)
@@ -218,7 +257,8 @@ skill hm_command(path, command, phrase, csv, answer) -> Any {
   if ws == null or xs == null or path == null or not contains(["teach", "use"], command) or extra {
     return "Usage: heed memory FILE teach|use \"sum of WORD\" 2,3 [answer]"
   }
-  let book = hm_load(path)
+  let text = read_file(path)
+  let book = hm_book(text)
   if book == null { return "Unreadable or incomplete lesson file." }
   let word = ws[1]
   if command == "teach" {
@@ -226,8 +266,25 @@ skill hm_command(path, command, phrase, csv, answer) -> Any {
     if y == null { return "Give a whole-number observation." }
     let record = hm_line(word, [ws[0], xs, y])
     if not rt_append_file(path, record) { return "Could not save the observation." }
-    book = hm_load(path)
+    text = read_file(path)
+    book = hm_book(text)
     if book == null { return "Could not read the saved observation." }
+  }
+  let name = ws[0] ++ " of " ++ word
+  let dependency = hm_recipes(text)[name]
+  if dependency != null {
+    let lessons = hm_lessons(text)
+    let derived = hm_named(lessons,name)
+    if derived == null {
+      if hm_named(lessons,dependency) == null {
+        if hm_recipes(text)[dependency] != null { return "Resolve the saved composition for " ++ dependency ++ " first." }
+        return "Resolve " ++ dependency ++ " before using " ++ name ++ ". Teach its answer for " ++ csv ++ "."
+      }
+      return "The composition conflicts with a saved target lesson."
+    }
+    let value = sev(derived[0],xs,null,null,[])
+    if value == null { return "Meaning undefined for this input." }
+    return str(value)
   }
   let obs = book[word]
   if obs == null { return "Teach an example for " ++ word ++ " first." }
@@ -275,6 +332,7 @@ skill hd_told(rules, fam, steps, task, domain, readings) -> Any {
 skill hd_pct(a, b) -> Any { return str(a) ++ " of " ++ str(b) }
 
 skill main() -> Any {
+  if arg(1) == "compose" { return hd_compose(arg(2),arg(3),arg(4)) }
   if arg(1) == "inquire" { return sl_session(arg(2), arg(3)) }
   if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
   let readings = {}

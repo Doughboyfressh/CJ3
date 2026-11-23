@@ -65,6 +65,24 @@ It then plans a path to the exit. The observation file stores only switch state,
 whether it has ever been on in that episode, and whether a crossing succeeded.
 Reuse it across layouts with the same mechanism. Omitting the file starts cold.
 
+### Discover a memory from action histories
+
+`out/heed explore hall latch out/events.obs` searches 19 candidate rules:
+the current switch state, or a threshold of one to three on elapsed actions
+or one of five observable event counts. Heed plans a reachable experiment
+that minimizes the largest group of rules left after a door crossing. It
+starts each experiment from the room entrance and records the action history
+and observed outcome. Restart with `out/heed explore annex latch out/events.obs`
+to transfer that evidence. Use a separate file for each fixed mechanism.
+Supported mechanisms are `follow`, `latch`, `retry`, and `delay`.
+
+For an automated transfer comparison run `python tools/door_transfer.py out/heed`
+after building Heed. Each mechanism is learned in the hall, then exercised in
+46 other layouts with and without the event file. Each run starts a fresh
+process. Actions include experiments and the final goal route; resetting a
+trial is free. The experiment-selection policy gives identification priority
+when several rules remain. The timer excludes compilation.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

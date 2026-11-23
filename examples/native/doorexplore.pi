@@ -1,0 +1,203 @@
+# Learn from raw events. A model is [event, required count]; event 0 is
+# elapsed actions, events 1..5 are visible action types. [-1,0] reads the
+# switch now. Count thresholds generate the memory candidates uniformly.
+skill dx_models() -> Any {
+  let models = [[0-1,0]]
+  for event in range(0,6) {
+    for count in range(1,4) { models = append(models,[event,count]) }
+  }
+  return models
+}
+
+# Six saturated counters suffice for predicting the complete candidate family.
+skill dx_update(counts,event) -> Any {
+  let next = []
+  for i in range(0,6) {
+    let c = counts[i]
+    if i == 0 or i == event { c = min(3,c+1) }
+    next = append(next,c)
+  }
+  return next
+}
+
+skill dx_predict(model,on,counts) -> Any {
+  if model[0] < 0 { return on }
+  return if counts[model[0]] >= model[1] { 1 } else { 0 }
+}
+
+skill dx_filter(models,on,counts,outcome) -> Any {
+  let keep = []
+  for m in models {
+    if dx_predict(m,on,counts) == outcome { keep = append(keep,m) }
+  }
+  return keep
+}
+
+skill dx_event(kind,on) -> Any {
+  if kind == 3 { return if on == 0 { 2 } else { 3 } }
+  if kind == 1 { return 4 }
+  if kind == 2 { return 5 }
+  return 1
+}
+
+skill dx_zero() -> Any { return [0,0,0,0,0,0] }
+
+# Search reachable histories shared by all surviving models. A diagnostic
+# path ends at the first crossing that splits them; ties cost fewest actions.
+# A goal path ends at the exit. The simulator's hidden mode is never passed.
+skill dx_path(room,models,experiment) -> Any {
+  let queue = [[room[0],0,dx_zero(),[]]]
+  let index = 0
+  let seen = {}
+  let best = null
+  let bound = len(models)
+  while index < len(queue) {
+    let item = queue[index]
+    index = index+1
+    let pos = item[0]
+    let on = item[1]
+    let counts = item[2]
+    for a in dw_actions(room,pos) {
+      let kind = a[1]
+      let path = append(item[3],a)
+      let dest = a[0]
+      if kind == 1 {
+        let yes = len(dx_filter(models,on,counts,1))
+        if yes > 0 and yes < len(models) {
+          let worst = max(yes,len(models)-yes)
+          if experiment and worst < bound {
+            best = path
+            bound = worst
+            if 2*bound <= len(models)+1 { return best }
+          }
+          # The successor is uncertain; never plan past this crossing.
+          dest = null
+        } else {
+          if yes == 0 { dest = pos }
+        }
+      }
+      if kind == 2 and on == 1 { dest = pos }
+      if dest != null {
+        if dest == room[1] and not experiment { return path }
+        let bit = if kind == 3 { 1-on } else { on }
+        let next = dx_update(counts,dx_event(kind,on))
+        let key = str([dest,bit,next])
+        if dest != room[1] and seen[key] == null {
+          seen = put(seen,key,true)
+          queue = append(queue,[dest,bit,next,path])
+        }
+      }
+    }
+  }
+  return best
+}
+
+skill dx_replay(text) -> Any {
+  let models = dx_models()
+  if text == null or text == "" { return models }
+  if slice(text,len(text)-1,len(text)) != "\n" { return null }
+  for line in split(text,"\n") {
+    if line != "" {
+      let parts = split(line," ")
+      if len(parts) != 3 or parts[0] != "door2" { return null }
+      let events = hm_numbers(parts[1])
+      let y = hm_number(parts[2])
+      if events == null or (y != 0 and y != 1) { return null }
+      let counts = dx_zero()
+      let on = 0
+      for e in events {
+        if e < 1 or e > 5 { return null }
+        if (e == 2 and on == 1) or (e == 3 and on == 0) { return null }
+        if e == 2 or e == 3 { on = 1-on }
+        counts = dx_update(counts,e)
+      }
+      models = dx_filter(models,on,counts,y)
+    }
+  }
+  return models
+}
+
+# A generated corridor has two doors, a starting switch, and an alcove
+# switch behind the first door. Moving the doors changes the optimal route.
+skill dx_layout(layout) -> Any {
+  if layout == "hall" or layout == "annex" { return dw_layout(layout) }
+  let f = split(layout,"-")
+  if len(f) != 3 or f[0] != "corridor" { return null }
+  let size = hm_number(f[1])
+  let door = hm_number(f[2])
+  if size == null or door == null { return null }
+  if size < 4 or size > 16 or door < 1 or door >= size-2 { return null }
+  let edges = []
+  for i in range(0,size-1) {
+    let kind = if i == door { 1 } else { if i == size-2 { 2 } else { 0 } }
+    edges = append(edges,[i,i+1,kind])
+  }
+  return [0,size-1,[0,size],append(edges,[door+1,size,0])]
+}
+
+skill dx_run(layout,mode,path) -> Any {
+  let room = dx_layout(layout)
+  if room == null or not contains(["follow","latch","retry","delay"],mode) {
+    return "Usage: heed explore hall|annex|corridor-SIZE-DOOR follow|latch|retry|delay [event-file]"
+  }
+  let models = dx_models()
+  if path != null { models = dx_replay(read_file(path)) }
+  if models == null { return "Invalid door event file." }
+  let experiments = 0
+  let steps = 0
+  while len(models) > 0 {
+    let testing = len(models) > 1
+    let plan = dx_path(room,models,testing)
+    if testing and plan == null {
+      testing = false
+      plan = dx_path(room,models,false)
+    }
+    if plan == null { return "No distinguishing experiment or common route available." }
+    if testing { experiments = experiments+1 }
+    # Each trial begins in a fresh copy of the public layout.
+    let world = [room[0],0,0]
+    let attempts = 0
+    let ticks = 0
+    let events = []
+    let counts = dx_zero()
+    let before = len(models)
+    for a in plan {
+      let event = dx_event(a[1],world[1])
+      let override = 0-1
+      if a[1] == 1 and (mode == "retry" or mode == "delay") {
+        # Independent simulator counters; the learner sees only the resulting move.
+        let open = (mode == "retry" and attempts > 0) or (mode == "delay" and ticks >= 3)
+        override = if open { 1 } else { 0 }
+      }
+      let next = dw_step(world,a,mode == "latch",override)
+      if a[1] == 1 { attempts = attempts+1 }
+      ticks = ticks+1
+      steps = steps+1
+      if a[1] == 1 {
+        let y = if next[0] == a[0] { 1 } else { 0 }
+        let keep = dx_filter(models,world[1],counts,y)
+        if path != null and len(keep) < len(models) {
+          if not rt_append_file(path,"door2 " ++ hm_csv(events) ++ " " ++ str(y) ++ "\n") { return "Could not save events." }
+        }
+        models = keep
+        if len(models) == 0 { return "Observed crossing contradicts the candidate family." }
+      }
+      events = append(events,event)
+      counts = dx_update(counts,event)
+      world = next
+    }
+    if not testing {
+      if world[0] != room[1] { return "Predicted route failed." }
+      let m = models[0]
+      let rule = "current switch"
+      if m[0] >= 0 {
+        let names = ["elapsed actions","passage attempts","switch-on events","switch-off events","first-door attempts","second-door attempts"]
+        rule = names[m[0]] ++ " >= " ++ str(m[1])
+      }
+      if len(models) > 1 { rule = str(len(models)) ++ " consistent candidates" }
+      return layout ++ " exit; rule " ++ rule ++ "; experiments " ++ str(experiments) ++ "; actions " ++ str(steps)
+    }
+    if len(models) >= before { return "Experiment failed to distinguish candidates." }
+  }
+  return "Stored observations contradict the candidate family."
+}

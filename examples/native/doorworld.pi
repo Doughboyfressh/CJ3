@@ -34,12 +34,17 @@ skill dw_actions(room,pos) -> Any {
 # The simulator keeps its own latch. The policy has no access to the latch or
 # the mode. Softwell executes the permission check for each attempted action.
 skill dw_world(state,action,latched) -> Any {
+  return dw_step(state,action,latched,0-1)
+}
+
+skill dw_step(state,action,latched,door_override) -> Any {
   let pos = state[0]
   let on = state[1]
   let latch = state[2]
   gpu for kind in [action[1]] -> passed {
     let passed = 1
     if kind == 1 and on == 0 and latch == 0 { let passed = 0 }
+    if kind == 1 and door_override >= 0 { let passed = door_override }
     if kind == 2 and on == 1 { let passed = 0 }
   }
   if aget(passed,0) == 1 { pos = action[0] }

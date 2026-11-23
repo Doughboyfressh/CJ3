@@ -2,6 +2,8 @@ ambiguous exports: 0
 sum of zells -> (1 + w0(x)) -> -7
 Conditional hypotheses disagree. Teach the answer for 0,1,2,0.
 [-7, 6]
+Conditional hypotheses disagree. Teach the answer for 2,7,0,8,9.
+[4, 5]
 Endpoint hypotheses disagree. Teach the answer for -1,1.
 (head(x) + (2 * max(0, (head(x) - last(x)))))
 289/289 new lists

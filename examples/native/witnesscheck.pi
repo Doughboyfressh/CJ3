@@ -21,7 +21,7 @@ skill wc_transfer(text) -> Any {
 }
 
 # Transfer the learned switch to a second task: add one to its output.
-skill wc_switch(text) -> Any {
+skill wc_switch(text,train,held) -> Any {
   let lessons = load_lessons(text)
   let base = []
   let full = []
@@ -34,8 +34,6 @@ skill wc_switch(text) -> Any {
   let slot = rt_sw_ssd_alloc(len(mem)+8)
   do rt_sw_ssd_puts(slot,mem)
   full = load_lib(rt_sw_ssd_gets(slot))
-  let train = [[[1,7,4,8,9],8],[[10,7,4,8,9],5],[[2,3,8,2],9],[[1,5,8,9],6]]
-  let held = [[[6,1,0-8,4],0-7],[[3,8,5,3],6]]
   let pl = pools()
   let pre = prelude()
   if solve(train,held,base,all_awake(base),pl,pre,4,10000)[0] != null { return "baseline solved" }
@@ -44,8 +42,21 @@ skill wc_switch(text) -> Any {
   return [sev(tree,null,held[0][0],null,full),sev(tree,null,held[1][0],null,full)]
 }
 
+skill wc_order(text) -> Any {
+  let train = [[[1,7,4,8,9],8],[[10,7,4,8,9],5],[[2,3,8,2],9],[[1,5,8,9],6]]
+  let held = [[[6,1,0-8,4],0-7],[[3,8,5,3],6]]
+  return wc_switch(text,train,held)
+}
+
+skill wc_boundary(text) -> Any {
+  let train = [[[1,7,0-2,8,9],8],[[1,7,2,8,9],10],[[3,4,0,2],3],[[2,9,0-1,3],10]]
+  let held = [[[9,3,0-8,6],4],[[3,7,0,1,4],5]]
+  return wc_switch(text,train,held)
+}
+
 skill main() -> Any {
-  if arg(1) == "switch" { return wc_switch(read_file(arg(2))) }
+  if arg(1) == "switch" { return wc_order(read_file(arg(2))) }
+  if arg(1) == "boundary" { return wc_boundary(read_file(arg(2))) }
   if arg(1) != null { return wc_transfer(read_file(arg(1))) }
   let text = "heed1 zells sum 2,1,5 1\nheed1 zells sum 2,9,5 9\nheed1 zells sum 5,1,2 1\nheed1 zells sum 5,2,1 2\n"
   do print("ambiguous exports: " ++ str(len(load_lessons(text))))
@@ -54,7 +65,13 @@ skill main() -> Any {
   let observations = {}
   for line in split(trim(switching),"\n") { observations = hm_take(observations,line) }
   do print(wn_book_reply(observations,"zells",observations["zells"],"sum",[1,2],true))
-  do print(wc_switch(switching ++ "heed1 zells sum 0,1,2,0 2\nheed1 zells sum 0,1,2,4 1\n"))
+  do print(wc_order(switching ++ "heed1 zells sum 0,1,2,0 2\nheed1 zells sum 0,1,2,4 1\n"))
+  let prior = split(switching,"heed1 zells")[0]
+  let boundary = prior ++ "heed1 zells sum 2,7,-1,8,9 7\nheed1 zells sum 2,7,1,8,9 9\nheed1 zells sum 2,7,1,6,9 9\n"
+  let book = {}
+  for line in split(trim(boundary),"\n") { book = hm_take(book,line) }
+  do print(wn_book_reply(book,"zells",book["zells"],"sum",[2,7,1,6,9],true))
+  do print(wc_boundary(boundary ++ "heed1 zells sum 2,7,0,8,9 9\n"))
   let rows = [["sum",[2,5],2],["sum",[5,2],11],["sum",[0,5],0]]
   do print(wn_reply(rows,"sum",[1,1],false))
   for r in [["sum",[5,0],15],["sum",[0-3,4],0-3],["sum",[4,0-3],18],["sum",[3,3],3]] {

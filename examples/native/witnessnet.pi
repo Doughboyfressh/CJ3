@@ -288,7 +288,7 @@ skill wn_switches(book,word,reducer) -> Any {
       }
     }
   }
-  if len(skills) < 2 { return [] }
+  if len(skills) == 0 { return [] }
   let x = V("x")
   let head = O("head",[x])
   let last = O("last",[x])
@@ -345,7 +345,70 @@ skill wn_switches(book,word,reducer) -> Any {
       }
     }
   }
+  if len(models) > 0 { return models }
+  # Construct predicates from the resolved vocabulary. Keep the constant
+  # grammar finite and check both outcome branches against actual lessons.
+  let outputs = skills ++ [head,last]
+  for feature in skills {
+    let values = []
+    let fits = []
+    let defined = true
+    for ex in rows {
+      let value = sev(feature,null,ex[1],null,[])
+      if value == null { defined = false }
+      values = append(values,value)
+      let matches = []
+      for tree in outputs {
+        if sev(tree,null,ex[1],null,[]) == ex[2] { matches = append(matches,tree) }
+      }
+      fits = append(fits,matches)
+    }
+    if defined {
+      for threshold in range(0-4,5) {
+        gpu for value in values -> left {
+          let left = 0
+          if value < threshold { let left = 1 }
+        }
+        let yesfits = outputs
+        let nofits = outputs
+        for i in range(0,len(rows)) {
+          let side = aget(left,i)
+          let branch = if side == 1 { yesfits } else { nofits }
+          let keep = []
+          for tree in branch { if contains(fits[i],tree) { keep = append(keep,tree) } }
+          if side == 1 { yesfits = keep } else { nofits = keep }
+        }
+        if len(yesfits) < len(outputs) and len(nofits) < len(outputs) {
+          let gate = O("<",[feature,Q(threshold)])
+          for a in yesfits {
+            for b in nofits {
+              if a != b {
+                let model = O("ite",[gate,a,b])
+                let valid = true
+                for ex in rows { if sev(model,null,ex[1],null,[]) != ex[2] { valid = false } }
+                if valid { models = append(models,model) }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
   return models
+}
+
+skill wn_probe_worst(models,probe) -> Any {
+  let buckets = {}
+  let worst = 0
+  for model in models {
+    let y = sev(model,null,probe,null,[])
+    if y == null { return len(models) }
+    let key = str(y)
+    let count = get(buckets,key,0)+1
+    buckets = put(buckets,key,count)
+    worst = max(worst,count)
+  }
+  return worst
 }
 
 skill wn_switch_question(models,obs,reducer) -> Any {
@@ -353,20 +416,36 @@ skill wn_switch_question(models,obs,reducer) -> Any {
   for ex in obs { if ex[0] == reducer { longest = max(longest,len(ex[1])) } }
   let best = null
   let bound = len(models)
+  # Isolate a learned threshold by changing one lesson value at a time.
+  let cuts = []
+  for model in models {
+    let gate = model[2][0]
+    if gate[1] == "<" and gate[2][1][0] == "q" {
+      let k = gate[2][1][1]
+      if not contains(cuts,k) { cuts = append(cuts,k) }
+    }
+  }
+  for ex in obs {
+    if ex[0] == reducer {
+      let xs = ex[1]
+      for k in cuts {
+        for i in range(0,len(xs)) {
+          let probe = slice(xs,0,i) ++ [k] ++ slice(xs,i+1,len(xs))
+          let worst = wn_probe_worst(models,probe)
+          if worst < bound {
+            best = probe
+            bound = worst
+          }
+          if bound == 1 { return best }
+        }
+      }
+    }
+  }
   for n in range(2,2*longest+4) {
     let inner = range(1,n-1)
     for ends in [[0,0],[0,n],[n,0]] {
       let probe = [ends[0]] ++ inner ++ [ends[1]]
-      let buckets = {}
-      let worst = 0
-      for model in models {
-        let y = sev(model,null,probe,null,[])
-        if y == null { worst = len(models) }
-        let k = str(y)
-        let count = get(buckets,k,0)+1
-        buckets = put(buckets,k,count)
-        worst = max(worst,count)
-      }
+      let worst = wn_probe_worst(models,probe)
       if worst < bound {
         best = probe
         bound = worst

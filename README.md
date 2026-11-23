@@ -106,6 +106,13 @@ If switches disagree, Heed searches short ascending, descending, and tied-end
 examples for a question that minimizes the largest group remaining after an
 answer. A unique decision is exported as a typed Mind operation.
 
+If those gates fail, Pi tries comparisons of a previously learned position
+with each integer threshold from -4 to 4. The two outcomes may use a learned
+position or an endpoint. Softwell evaluates the threshold comparisons, and
+Mind verifies each resulting conditional against every lesson. Question
+selection also tries changing one observation at a time at a candidate
+threshold, keeping the rest of the input fixed.
+
 The preservation property follows from the update itself. Write an input as
 `x = [first, last]` and let the rows of the invertible matrix `P` be the two
 anchors. For a candidate neuron `z(x) = max(0, first - last - k)`, solve

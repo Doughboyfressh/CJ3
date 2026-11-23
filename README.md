@@ -74,7 +74,7 @@ that minimizes the largest group of rules left after a door crossing. It
 starts each experiment from the room entrance and records the action history
 and observed outcome. Restart with `out/heed explore annex latch out/events.obs`
 to transfer that evidence. Use a separate file for each fixed mechanism.
-Supported mechanisms are `follow`, `latch`, `retry`, `delay`, and `sequence`.
+Supported mechanisms are `follow`, `latch`, `retry`, `delay`, `sequence`, and `rearm`.
 When count rules contradict recorded crossings or cannot lead to a goal or
 experiment, Pi also constructs Mind folds over ordered pairs of event types.
 The three templates distinguish a strict first-occurrence order, an ordered
@@ -82,6 +82,17 @@ subsequence, and the first event of a pair. Each program is checked against
 the raw recorded crossings. Planning uses transition tables evaluated from
 the surviving programs. New event files retain every distinct trial history
 and its crossing outcome; older files can be replayed as partial evidence.
+
+When every count and order program contradicts the observations, Pi learns
+which events to retain and which recent sequences of those events predict
+an open door. It tries memory widths one through three over subsets of the
+five visible events, preferring shorter memory, then fewer event types. It
+keeps tied candidates and treats unobserved contexts as closed. In the
+`rearm` simulator, a door attempt arms the next crossing and switching on
+clears that permission. A cold goal run can finish before it sees a reset.
+The transfer check supplies five crossing observations including a reset,
+scores unseen walks with `out/heed explore-score TRAIN TEST`, then restarts
+Pi in each layout using only the five training observations.
 
 For an automated transfer comparison run `python tools/door_transfer.py out/heed`
 after building Heed. Each mechanism is learned in the hall, then exercised in

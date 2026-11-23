@@ -460,6 +460,7 @@ skill hd_told(rules, fam, steps, task, domain, readings) -> Any {
 skill hd_pct(a, b) -> Any { return str(a) ++ " of " ++ str(b) }
 
 skill main() -> Any {
+  if arg(1) == "explore-score" { return dx_score(arg(2),arg(3)) }
   if arg(1) == "explore" { return dx_run(arg(2),arg(3),arg(4)) }
   if arg(1) == "room" { return dw_run(arg(2),arg(3),arg(4)) }
   if arg(1) == "compose" { return hd_compose(arg(2),arg(3),arg(4)) }

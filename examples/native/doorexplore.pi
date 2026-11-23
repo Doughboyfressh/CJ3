@@ -27,6 +27,16 @@ skill dx_predict(model,on,counts) -> Any {
   return if counts[model[0]] >= model[1] { 1 } else { 0 }
 }
 
+# Predict a crossing from the observable history, with counters cached by
+# the caller. Search and replay share the projected-context transition.
+skill dx_history_predict(m,events,on,counts) -> Any {
+  if m[0] == 0-3 {
+    return if contains(m[3],dx_context(m,events)) { 1 } else { 0 }
+  }
+  if m[0] == 0-2 { return sev(m[4],null,events,null,[]) }
+  return dx_predict(m,on,counts)
+}
+
 skill dx_filter(models,on,counts,outcome) -> Any {
   let keep = []
   for m in models {
@@ -52,9 +62,9 @@ skill dx_path(room,models,experiment) -> Any {
   let ordered = []
   let initial = []
   for model in models {
-    if model[0] == 0-2 {
+    if model[0] <= 0-2 {
       ordered = append(ordered,model)
-      initial = append(initial,0)
+      initial = append(initial,if model[0] == 0-3 { [] } else { 0 })
     } else { ordinary = append(ordinary,model) }
   }
   let queue = [[room[0],0,dx_zero(),[],initial]]
@@ -74,7 +84,11 @@ skill dx_path(room,models,experiment) -> Any {
       let dest = a[0]
       if kind == 1 {
         let yes = len(dx_filter(ordinary,on,counts,1))
-        for state in item[4] { if state == 2 { yes = yes+1 } }
+        for i in range(0,len(ordered)) {
+          let state = item[4][i]
+          let open = if ordered[i][0] == 0-3 { contains(ordered[i][3],state) } else { state == 2 }
+          if open { yes = yes+1 }
+        }
         if yes > 0 and yes < len(models) {
           let worst = max(yes,len(models)-yes)
           if experiment and worst < bound {
@@ -141,7 +155,8 @@ skill dx_refit(rows) -> Any {
     }
     models = dx_filter(models,on,counts,row[1])
   }
-  if len(models) == 0 { return dx_order_fit(rows) }
+  if len(models) == 0 { models = dx_order_fit(rows) }
+  if len(models) == 0 { return dx_context_fit(rows) }
   return models
 }
 
@@ -165,8 +180,8 @@ skill dx_layout(layout) -> Any {
 
 skill dx_run(layout,mode,path) -> Any {
   let room = dx_layout(layout)
-  if room == null or not contains(["follow","latch","retry","delay","sequence"],mode) {
-    return "Usage: heed explore hall|annex|corridor-SIZE-DOOR follow|latch|retry|delay|sequence [event-file]"
+  if room == null or not contains(["follow","latch","retry","delay","sequence","rearm"],mode) {
+    return "Usage: heed explore hall|annex|corridor-SIZE-DOOR follow|latch|retry|delay|sequence|rearm [event-file]"
   }
   let rows = []
   if path != null { rows = dx_rows(read_file(path)) }
@@ -174,7 +189,7 @@ skill dx_run(layout,mode,path) -> Any {
   let models = dx_refit(rows)
   let experiments = 0
   let steps = 0
-  let widened = len(models) > 0 and models[0][0] == 0-2
+  let widened = len(models) > 0 and models[0][0] <= 0-2
   while len(models) > 0 {
     let testing = len(models) > 1
     let plan = dx_path(room,models,testing)
@@ -194,6 +209,7 @@ skill dx_run(layout,mode,path) -> Any {
     let world = [room[0],0,0]
     let attempts = 0
     let ticks = 0
+    let armed = false
     let first_on = null
     let first_attempt = null
     let expanded = false
@@ -214,6 +230,9 @@ skill dx_run(layout,mode,path) -> Any {
       if mode == "sequence" and a[1] == 1 {
         override = if first_on != null and first_attempt != null and first_attempt < first_on { 1 } else { 0 }
       }
+      if mode == "rearm" and a[1] == 1 { override = if armed { 1 } else { 0 } }
+      if event == 2 { armed = false }
+      if event == 4 { armed = true }
       if first_on == null and event == 2 { first_on = ticks }
       if first_attempt == null and event == 4 { first_attempt = ticks }
       let next = dw_step(world,a,mode == "latch",override)
@@ -231,7 +250,7 @@ skill dx_run(layout,mode,path) -> Any {
         }
         let keep = []
         for m in models {
-          let predicted = if m[0] == 0-2 { sev(m[4],null,events,null,[]) } else { dx_predict(m,world[1],counts) }
+          let predicted = dx_history_predict(m,events,world[1],counts)
           if predicted == y { keep = append(keep,m) }
         }
         if len(keep) == 0 and not widened {
@@ -239,8 +258,12 @@ skill dx_run(layout,mode,path) -> Any {
           widened = true
           expanded = true
         }
+        if len(keep) == 0 {
+          keep = dx_context_fit(rows)
+          expanded = true
+        }
         models = keep
-        if len(models) == 0 { return "No count or event-order program fits the observations." }
+        if len(models) == 0 { return "No bounded door memory fits the observations." }
       }
       events = append(events,event)
       counts = dx_update(counts,event)
@@ -262,10 +285,39 @@ skill dx_run(layout,mode,path) -> Any {
           if m[3] == 1 { a ++ " followed later by " ++ b } else { a ++ " was first of {" ++ a ++ ", " ++ b ++ "}" }
         }
       }
+      if m[0] == 0-3 { rule = "last " ++ str(m[2]) ++ " of " ++ str(m[1]) ++ " opens for " ++ str(m[3]) }
       if len(models) > 1 { rule = str(len(models)) ++ " consistent candidates" }
       return layout ++ " exit; rule " ++ rule ++ "; experiments " ++ str(experiments) ++ "; actions " ++ str(steps)
     }
     if not expanded and len(models) >= before { return "Experiment failed to distinguish candidates." }
   }
   return "Stored observations contradict the candidate family."
+}
+
+# Fit on the saved observations once and score a separate log without
+# allowing held-out outcomes to update the memory.
+skill dx_score(train_path,test_path) -> Any {
+  if train_path == null or test_path == null { return "Usage: heed explore-score TRAIN TEST" }
+  let train = dx_rows(read_file(train_path))
+  let test = dx_rows(read_file(test_path))
+  if train == null or test == null or len(train) == 0 or len(test) == 0 { return "Expected two nonempty event logs." }
+  let models = dx_refit(train)
+  if len(models) == 0 { return "No bounded door memory fits the observations." }
+  let right = 0
+  let disputed = 0
+  for row in test {
+    for known in train { if known[0] == row[0] { return "Training and scoring histories overlap." } }
+    let on = 0
+    let counts = dx_zero()
+    for event in row[0] {
+      if event == 2 or event == 3 { on = 1-on }
+      counts = dx_update(counts,event)
+    }
+    let yes = 0
+    for m in models { yes = yes+dx_history_predict(m,row[0],on,counts) }
+    if yes > 0 and yes < len(models) { disputed = disputed+1 } else {
+      if (yes > 0 and row[1] == 1) or (yes == 0 and row[1] == 0) { right = right+1 }
+    }
+  }
+  return str(right) ++ "/" ++ str(len(test)) ++ " correct; " ++ str(disputed) ++ " disputed"
 }

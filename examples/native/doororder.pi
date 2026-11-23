@@ -45,7 +45,55 @@ skill dx_order_fit(rows) -> Any {
 skill dx_order_next(states,models,event) -> Any {
   let next = []
   for i in range(0,len(models)) {
-    next = append(next,models[i][6][states[i]*5+event-1])
+    let m = models[i]
+    let state = if m[0] == 0-3 { dx_context_step(states[i],m[1],m[2],event) } else { m[6][states[i]*5+event-1] }
+    next = append(next,state)
   }
   return next
+}
+
+# Learn a projected suffix memory. The symbols to remember and the open
+# contexts both come from observations. An unseen context predicts closed.
+skill dx_context_step(context,symbols,width,event) -> Any {
+  if not contains(symbols,event) { return context }
+  let tail = append(context,event)
+  return slice(tail,max(0,len(tail)-width),len(tail))
+}
+
+skill dx_context(model,events) -> Any {
+  let context = []
+  for event in events { context = dx_context_step(context,model[1],model[2],event) }
+  return context
+}
+
+skill dx_context_fit(rows) -> Any {
+  let alphabets = [[]]
+  for e in range(1,6) {
+    let extra = []
+    for symbols in alphabets { extra = append(extra,append(symbols,e)) }
+    alphabets = alphabets ++ extra
+  }
+  for width in range(1,4) {
+    for size in range(1,6) {
+      let keep = []
+      for symbols in alphabets {
+        if len(symbols) == size {
+          let model = [0-3,symbols,width]
+          let opened = []
+          let labels = {}
+          let fits = true
+          for row in rows {
+            let context = dx_context(model,row[0])
+            let key = str(context)
+            if labels[key] != null and labels[key] != row[1] { fits = false }
+            labels = put(labels,key,row[1])
+            if row[1] == 1 and not contains(opened,context) { opened = append(opened,context) }
+          }
+          if fits { keep = append(keep,append(model,opened)) }
+        }
+      }
+      if len(keep) > 0 { return keep }
+    }
+  }
+  return []
 }

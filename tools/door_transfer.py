@@ -30,6 +30,56 @@ def run_episode(binary, layout, mechanism, observations=None):
     return result[1], int(result[2]), int(result[3])
 
 
+def rearm_histories(limit):
+    """Enumerate legal hall walks and label each possible first-door crossing."""
+    pending = [(0, False, False, ())]
+    records = {}
+    while pending:
+        pos, switch, armed, events = pending.pop()
+        if pos in (1, 2):
+            records[events] = int(armed)
+        if len(events) == limit:
+            continue
+        if pos in (0, 4):
+            pending.append((pos, not switch, armed if switch else False,
+                            events + ((3 if switch else 2),)))
+        passage = {0: 1, 1: 0, 2: 4, 4: 2}[pos]
+        pending.append((passage, switch, armed, events + (1,)))
+        if pos in (1, 2):
+            pending.append((3 - pos if armed else pos, switch, True, events + (4,)))
+        if pos == 2 and switch:
+            pending.append((pos, switch, armed, events + (5,)))
+    return records
+
+
+def check_context_memory(binary, directory, layouts):
+    history = directory / "rearm.obs"
+    withheld = directory / "withheld.obs"
+    training = {(1,), (1, 4), (1, 4, 1, 2, 1), (1, 4, 1, 2, 1, 4), (1, 4, 1, 1)}
+    records = rearm_histories(9)
+
+    def write_rows(path, histories):
+        path.write_text("".join(
+            f"door2 {','.join(map(str, events))} {records[events]}\n"
+            for events in sorted(histories)
+        ))
+
+    write_rows(history, training)
+    unseen = records.keys() - training
+    write_rows(withheld, unseen)
+    score = subprocess.check_output([binary, "explore-score", history, withheld],
+                                    text=True, timeout=30).strip()
+    if score != f"{len(unseen)}/{len(unseen)} correct; 0 disputed":
+        raise ValueError(f"Unseen rearm predictions: {score}")
+    for layout in layouts:
+        # Start each layout with exactly the same five observations.
+        write_rows(history, training)
+        rule, trials, _ = run_episode(binary, layout, "rearm", history)
+        if (rule, trials) != ("last 1 of [2, 4] opens for [[4]]", 0):
+            raise ValueError(f"{layout}: unexpected rearm result {(rule, trials)}")
+    print(f"rearm: {score}; {len(layouts)} transferred layouts")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path, help="Path to the Heed executable")
@@ -48,9 +98,10 @@ def main():
             raise ValueError("The equal-count histories need a further experiment")
         if run_episode(binary, "annex", "sequence", history)[:2] != (rule, 0):
             raise ValueError("The order rule did not transfer across restart")
-    start = time.perf_counter()
     print("mechanism  training_trials  layouts  transferred_actions  cold_actions  wins")
     with tempfile.TemporaryDirectory() as directory:
+        check_context_memory(binary, Path(directory), layouts)
+        start = time.perf_counter()
         for mechanism, expected in RULES.items():
             observations = Path(directory) / mechanism
             rule, trials, _ = run_episode(binary, "hall", mechanism, observations)

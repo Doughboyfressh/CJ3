@@ -42,5 +42,12 @@ skill main() -> Any {
   let wide = [["sum",[1,500],1],["sum",[2,400],2],["sum",[500,1],999]]
   do print(wn_reply(wide,"sum",[700,1],false))
   do print(wn_reply(wide,"sum",[500,1],false))
+  let interior = [["sum",[2,1,5],1],["sum",[2,9,5],9]]
+  do print(wn_reply(interior,"sum",[8,7,6,5,4],false))
+  let center = append(interior,["sum",[8,7,6,5,4],6])
+  do print(wn_reply(center,"sum",[9,3,0-8,2],false))
+  let second = append(interior,["sum",[8,7,6,5,4],7])
+  do print(wn_reply(second,"sum",[9,3,0-8,2],false))
+  do print(wn_reply(second,"sum",[9],false))
   return wn_reply([["sum",[2,5],2],["sum",[5,2],5]],"sum",[9,99,1],false)
 }

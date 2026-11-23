@@ -82,6 +82,13 @@ reproduce every lesson for the phrase and asks for the answer when their predict
 disagree. Correcting a lesson refits the network. For a runnable example, build
 `examples/native/witnesscheck.pi`.
 
+When two examples for the same phrase have the same endpoints and different
+answers, Heed also searches positional features. Softwell's software GPU runs
+an equality check at each list position. Pi uses the results to filter fixed
+offsets from either end and a length-dependent middle (right middle for even
+lengths). Mind replays each surviving expression against every lesson. A query
+on which those expressions disagree prompts another lesson.
+
 The preservation property follows from the update itself. Write an input as
 `x = [first, last]` and let the rows of the invertible matrix `P` be the two
 anchors. For a candidate neuron `z(x) = max(0, first - last - k)`, solve

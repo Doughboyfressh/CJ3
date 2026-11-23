@@ -173,6 +173,64 @@ skill wn_probe(obs,reducer,xs,models,answers) -> Any {
   return xs
 }
 
+# A collision proves that every endpoint-only rule fails. Only then search
+# for a positional selector. Nonnegative ids count from the left, negative
+# ids from the right, and null denotes the right middle on even lengths.
+skill wn_positions(obs,reducer) -> Any {
+  let seen = {}
+  let collision = false
+  let rows = []
+  let shortest = null
+  for ex in obs {
+    if ex[0] == reducer {
+      let xs = ex[1]
+      let key = str([xs[0],xs[len(xs)-1]])
+      if get(seen,key,ex[2]) != ex[2] { collision = true }
+      seen = put(seen,key,ex[2])
+      rows = append(rows,ex)
+      if shortest == null or len(xs) < shortest { shortest = len(xs) }
+    }
+  }
+  if not collision { return [] }
+  let ids = [null]
+  for i in range(1,shortest) {
+    ids = append(ids,i)
+    ids = append(ids,0-1-i)
+  }
+  for ex in rows {
+    let xs = ex[1]
+    let label = ex[2]
+    # One software GPU lane per position. Left/right/center candidates
+    # sharing an input position reuse its equality result.
+    gpu for value in xs -> matches {
+      let matches = 0
+      if value == label { let matches = 1 }
+    }
+    let kept = []
+    for id in ids {
+      let at = len(xs) // 2
+      if id != null { if id < 0 { at = len(xs)+id } else { at = id } }
+      if aget(matches,at) == 1 { kept = append(kept,id) }
+    }
+    ids = kept
+    if len(ids) == 0 { return [] }
+  }
+  let models = []
+  for id in ids {
+    let source = V("x")
+    let offset = O("//",[O("len",[source]),Q(2)])
+    if id != null {
+      if id < 0 { source = O("rev",[source]) }
+      offset = Q(if id < 0 { 0-1-id } else { id })
+    }
+    let tree = O("head",[O("drop",[offset,source])])
+    let valid = true
+    for ex in rows { if sev(tree,null,ex[1],null,[]) != ex[2] { valid = false } }
+    if valid { models = append(models,tree) }
+  }
+  return models
+}
+
 skill wn_reply(obs,reducer,xs,teaching) -> Any {
   let result = wn_search(obs,reducer)
   let models = result[0]
@@ -182,8 +240,17 @@ skill wn_reply(obs,reducer,xs,teaching) -> Any {
     }
     return "Endpoint threshold search is incomplete. Teach another example."
   }
+  let positional = false
+  if len(models) == 0 {
+    models = wn_positions(obs,reducer)
+    positional = len(models) > 0
+  }
   if len(models) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
   if teaching {
+    if positional {
+      if len(models) == 1 { return "Position hypothesis: " ++ show(models[0]) }
+      return str(len(models)) ++ " position hypotheses fit the lessons."
+    }
     if len(models) == 1 { return "Endpoint hypothesis: " ++ show(models[0]) }
     return str(len(models)) ++ " endpoint hypotheses fit the lessons."
   }
@@ -196,6 +263,7 @@ skill wn_reply(obs,reducer,xs,teaching) -> Any {
     if value != y { agree = false }
   }
   if not agree {
+    if positional { return "Position hypotheses disagree. Teach the answer for " ++ hm_csv(xs) ++ "." }
     let probe = wn_probe(obs,reducer,xs,models,answers)
     let parts = []
     for n in probe { parts = append(parts,str(n)) }

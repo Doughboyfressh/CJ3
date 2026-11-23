@@ -176,7 +176,7 @@ skill wn_probe(obs,reducer,xs,models,answers) -> Any {
 # A collision proves that every endpoint-only rule fails. Only then search
 # for a positional selector. Nonnegative ids count from the left, negative
 # ids from the right, and null denotes the right middle on even lengths.
-skill wn_positions(obs,reducer) -> Any {
+skill wn_position_ids(obs,reducer) -> Any {
   let seen = {}
   let collision = false
   let rows = []
@@ -215,6 +215,10 @@ skill wn_positions(obs,reducer) -> Any {
     ids = kept
     if len(ids) == 0 { return [] }
   }
+  return ids
+}
+
+skill wn_position_models(obs,reducer,ids) -> Any {
   let models = []
   for id in ids {
     let source = V("x")
@@ -225,10 +229,49 @@ skill wn_positions(obs,reducer) -> Any {
     }
     let tree = O("head",[O("drop",[offset,source])])
     let valid = true
-    for ex in rows { if sev(tree,null,ex[1],null,[]) != ex[2] { valid = false } }
+    for ex in obs { if ex[0] == reducer and sev(tree,null,ex[1],null,[]) != ex[2] { valid = false } }
     if valid { models = append(models,tree) }
   }
   return models
+}
+
+skill wn_positions(obs,reducer) -> Any {
+  return wn_position_models(obs,reducer,wn_position_ids(obs,reducer))
+}
+
+# An index-labelled list gives distinct answers wherever the selectors differ.
+# If m is the largest offset from either end, length 2*m+3 separates the
+# left offsets, the midpoint, and the right offsets. Shorter valid lengths
+# are tried first, so the first perfect split also minimizes question length.
+skill wn_position_question(ids,models) -> Any {
+  let lanes = []
+  let m = 0
+  for id in ids {
+    if id == null { lanes = append(lanes,0) } else {
+      lanes = append(lanes,id)
+      m = max(m,if id < 0 { 0-1-id } else { id })
+    }
+  }
+  for n in range(max(m+1,len(models)),2*m+4) {
+    gpu for code in lanes -> position {
+      let position = code
+      if code == 0 { let position = n // 2 }
+      if code < 0 { let position = n+code }
+    }
+    let seen = {}
+    for i in range(0,len(lanes)) { seen = put(seen,str(aget(position,i)),true) }
+    if len(keys(seen)) == len(models) {
+      let probe = range(0,n)
+      let replies = {}
+      for model in models {
+        let y = sev(model,null,probe,null,[])
+        if y == null { return null }
+        replies = put(replies,str(y),true)
+      }
+      if len(keys(replies)) == len(models) { return probe }
+    }
+  }
+  return null
 }
 
 skill wn_reply(obs,reducer,xs,teaching) -> Any {
@@ -240,16 +283,21 @@ skill wn_reply(obs,reducer,xs,teaching) -> Any {
     }
     return "Endpoint threshold search is incomplete. Teach another example."
   }
+  let ids = []
   let positional = false
   if len(models) == 0 {
-    models = wn_positions(obs,reducer)
+    ids = wn_position_ids(obs,reducer)
+    models = wn_position_models(obs,reducer,ids)
     positional = len(models) > 0
   }
   if len(models) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
   if teaching {
     if positional {
       if len(models) == 1 { return "Position hypothesis: " ++ show(models[0]) }
-      return str(len(models)) ++ " position hypotheses fit the lessons."
+      let message = str(len(models)) ++ " position hypotheses fit the lessons."
+      let probe = wn_position_question(ids,models)
+      if probe != null { return message ++ " Teach the answer for " ++ hm_csv(probe) ++ "." }
+      return message
     }
     if len(models) == 1 { return "Endpoint hypothesis: " ++ show(models[0]) }
     return str(len(models)) ++ " endpoint hypotheses fit the lessons."

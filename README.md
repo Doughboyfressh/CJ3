@@ -87,7 +87,10 @@ answers, Heed also searches positional features. Softwell's software GPU runs
 an equality check at each list position. Pi uses the results to filter fixed
 offsets from either end and a length-dependent middle (right middle for even
 lengths). Mind replays each surviving expression against every lesson. A query
-on which those expressions disagree prompts another lesson.
+on which those expressions disagree prompts another lesson. During teaching,
+Softwell evaluates which positions the surviving selectors would read at each
+length. Pi asks for the shortest list on which all selectors are defined and
+every answer identifies a single selector, using distinct integers as labels.
 
 Mind can load the same Heed lesson file to reuse a resolved positional selector.
 When exactly one selector survives for a phrase, the lesson reader gives it the

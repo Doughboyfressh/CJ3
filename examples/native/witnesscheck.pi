@@ -66,6 +66,7 @@ skill main() -> Any {
   do print(wn_reply(wide,"sum",[700,1],false))
   do print(wn_reply(wide,"sum",[500,1],false))
   let interior = [["sum",[2,1,5],1],["sum",[2,9,5],9]]
+  do print(wn_reply(interior,"sum",[2,9,5],true))
   do print(wn_reply(interior,"sum",[8,7,6,5,4],false))
   let center = append(interior,["sum",[8,7,6,5,4],6])
   do print(wn_reply(center,"sum",[9,3,0-8,2],false))

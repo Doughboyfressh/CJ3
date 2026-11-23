@@ -4,7 +4,7 @@ from collections import deque
 from math import factorial
 import json
 from pathlib import Path
-from itertools import permutations, product
+from itertools import chain, islice, permutations, product
 import sqlite3
 import subprocess
 import tempfile
@@ -404,19 +404,62 @@ def grow_transfer(binary, source, actions, examples, observe, bound, budget, pat
             "repair_episodes": initial, "target_episodes": len(log)}
 
 
-def cost_aware_transfer(binary, source, actions, examples, observe, bound, budget, patterns, history):
+def choose_diagnostic(records):
+    """Compare the empirical cost of one paid probe to the best unconditional policy."""
+    if not records:
+        return None
+    tasks = sum(r[3] for r in records)
+    best = min(sum(r[i] for r in records) for i in (1, 2))
+    choice = None
+    for index in range(len(records[0][0])):
+        groups = [[r for r in records if r[0][index] == bit] for bit in "01"]
+        if any(sum(r[3] for r in group) < 2 for group in groups):
+            continue
+        totals = [(sum(r[1] for r in group), sum(r[2] for r in group)) for group in groups]
+        cost = tasks + sum(min(pair) for pair in totals)
+        if cost < best:
+            best = cost
+            choice = index, [library < ordinary for ordinary, library in totals]
+    return choice
+
+
+def cost_aware_transfer(binary, source, actions, examples, observe, bound, budget, patterns, history, diagnostic=False):
     """Choose from prior paired costs, then measure both policies on the verified table."""
     sensor = goal_sensor(examples)
     # Action names and target outcomes are deliberately absent. Keep baseline
     # column order: probe tie-breaking can affect the costs being predicted.
     key = json.dumps([1, source, bound, budget, sorted(json.dumps(p, sort_keys=True) for p in patterns)])
+    probes = list(islice(chain.from_iterable(product(range(len(actions)), repeat=n)
+                                            for n in range(4)), 256)) if diagnostic else []
+    records = []
     with sqlite3.connect(history) as db:
         db.execute("CREATE TABLE IF NOT EXISTS costs "
                    "(context TEXT PRIMARY KEY, tasks INTEGER, ordinary INTEGER, library INTEGER)")
         row = db.execute("SELECT tasks, ordinary, library FROM costs WHERE context=?", (key,)).fetchone()
+        if diagnostic:
+            db.execute("CREATE TABLE IF NOT EXISTS diagnostic_cases "
+                       "(context TEXT, bits TEXT, ordinary INTEGER, library INTEGER, tasks INTEGER, "
+                       "PRIMARY KEY(context,bits))")
+            records = db.execute("SELECT bits, ordinary, library, tasks FROM diagnostic_cases WHERE context=?",
+                                 (key,)).fetchall()
     consult = row is not None and row[2] < row[1]
+    choice = choose_diagnostic(records) if budget > 0 else None
+    early = None
+    if choice is not None:
+        index, policies = choice
+        trace = [actions[i] for i in probes[index]]
+        bit = observe(trace)[sensor]
+        if bit not in (0, 1):
+            raise ValueError("Expected binary diagnostic observation")
+        consult = policies[int(bit)]
+        early = {"trace": trace, "value": int(bit)}
+    repair_budget = budget - int(early is not None)
     used = patterns if consult else None
-    result = grow_transfer(binary, source, actions, examples, observe, bound, budget, used)
+    result = grow_transfer(binary, source, actions, examples, observe, bound, repair_budget, used)
+    repair_cost = result["target_episodes"]
+    result["target_episodes"] += int(early is not None)
+    if diagnostic:
+        result["early_observation"] = early
     result["strategy"] = "library" if consult else "ordinary"
     result["prior_tasks"] = row[0] if row else 0
     if "table" not in result:
@@ -430,12 +473,17 @@ def cost_aware_transfer(binary, source, actions, examples, observe, bound, budge
     # far is a lower bound; leave this pair out of the historical averages.
     if "table" not in other:
         return result
-    actual, alternate = result["target_episodes"], other["target_episodes"]
+    actual, alternate = repair_cost, other["target_episodes"]
     ordinary, library = (alternate, actual) if consult else (actual, alternate)
     with sqlite3.connect(history) as db:
         db.execute("INSERT INTO costs VALUES (?,1,?,?) ON CONFLICT(context) DO UPDATE SET "
                    "tasks=tasks+1, ordinary=ordinary+excluded.ordinary, library=library+excluded.library",
                    (key, ordinary, library))
+        if diagnostic:
+            bits = "".join(str(predict(result["table"], trace)) for trace in probes)
+            db.execute("INSERT INTO diagnostic_cases VALUES (?,?,?,?,1) ON CONFLICT(context,bits) "
+                       "DO UPDATE SET tasks=tasks+1, ordinary=ordinary+excluded.ordinary, "
+                       "library=library+excluded.library", (key, bits, ordinary, library))
     result["paired_costs"] = {"ordinary": ordinary, "library": library}
     return result
 
@@ -451,6 +499,7 @@ def main():
     parser.add_argument("--save-pattern", type=Path, help="Write a verified single-split pattern to a new file")
     parser.add_argument("--use-pattern", action="append", type=Path, help="Try a saved pattern on the current source table")
     parser.add_argument("--events", nargs="+", required=True)
+    parser.add_argument("--diagnostic", action="store_true", help="Learn whether to buy one observation before choosing a strategy")
     parser.add_argument("--cost-history", type=Path, help="Choose whether to use saved patterns from previous experiment counts")
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--budget", type=int, default=100)
@@ -458,6 +507,8 @@ def main():
     args = parser.parse_args()
     if (args.use_pattern or args.save_pattern) and args.grow_bound is None:
         parser.error("Repair patterns require --grow-bound")
+    if args.diagnostic and not args.cost_history:
+        parser.error("--diagnostic requires --cost-history")
     if args.cost_history and not args.use_pattern:
         parser.error("--cost-history requires --use-pattern")
     if not args.oracle:
@@ -474,7 +525,7 @@ def main():
         pattern = [json.loads(path.read_text()) for path in args.use_pattern] if args.use_pattern else None
         params = (args.binary.resolve(), table, args.events, examples, observe, args.grow_bound, args.budget)
         if args.cost_history:
-            result = cost_aware_transfer(*params, pattern, args.cost_history)
+            result = cost_aware_transfer(*params, pattern, args.cost_history, args.diagnostic)
         else:
             result = grow_transfer(*params, pattern)
         if args.save_pattern:

@@ -265,6 +265,17 @@ a valid state bound. Incomplete pairs do not update the averages. The
 the evidence added afterward. This policy optimizes target experiments;
 donor training and local execution time are separate costs.
 
+With `--diagnostic --cost-history FILE.sqlite`, Pi can buy one reset-and-run
+observation before selecting a strategy. On previous verified models it
+scores up to 256 candidate traces of zero to three actions. Each possible
+output must have occurred on at least two previous tasks. Pi buys a probe
+only if branching on its result would have beaten the best fixed strategy
+on those cases after charging one experiment per task. It logs the actual
+trace and measured bit in `early_observation`, or null when it skips the
+probe. The probe consumes one episode from the shared budget; the strategy
+then runs from reset. Historical savings estimate future value and depend
+on how similar the incoming workload is to earlier tasks.
+
 ## Teach Heed a word
 
 Heed can learn where a word acts in a list instruction. For example, doubling each number and

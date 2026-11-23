@@ -214,6 +214,8 @@ def check_pattern(binary, directory, actions, examples):
                                 lamp_observe, 5, 300)
     library = [pattern, extract_pattern(lamp_result)]
     policy_totals = [0, 0, 0]
+    diagnostic_totals = [0, 0]
+    probes_used = 0
     strategies = []
     heldout = [0, 0, 0]
     selected = generic = prior_known = none = none_generic = 0
@@ -269,6 +271,14 @@ def check_pattern(binary, directory, actions, examples):
                     or distinguish(target, policy["table"]) is not None
                     or policy["prior_tasks"] != len(strategies)):
                 raise AssertionError("Cost history or strategy replay disagrees with direct measurement")
+            observed.clear()
+            contextual = cost_aware_transfer(binary, learned_base, symbols, goal, counted, 4, 300,
+                                             candidates, directory / "diagnostic.sqlite", True)
+            if len(observed) != contextual["target_episodes"] or distinguish(target, contextual["table"]) is not None:
+                raise AssertionError("Diagnostic cost or target model incorrect")
+            probes_used += contextual["early_observation"] is not None
+            diagnostic_totals[0] += contextual["target_episodes"]
+            diagnostic_totals[1] += policy["target_episodes"]
             strategies.append(policy["strategy"])
             for j, run in enumerate((policy, multi, ordinary)):
                 policy_totals[j] += run["target_episodes"]
@@ -282,6 +292,44 @@ def check_pattern(binary, directory, actions, examples):
             selected += multi["target_episodes"]
             prior_known += known["target_episodes"]
             generic += ordinary["target_episodes"]
+    print(f"18 first-seen targets: {diagnostic_totals[0]} diagnostic vs {diagnostic_totals[1]} historical; "
+          f"{probes_used} probes bought")
+    # A recurring two-configuration workload. The policy receives neither
+    # fixture identity nor the outcome until it pays for a target episode.
+    # The second configuration exposes its controls in reverse order.
+    delayed = [(0, 1, 0, 0), (0, 1, 3, 0), (1, 2, 2, 0), (0, 1, 2, 0)]
+    immediate = [(r[0], r[3], r[2], r[1]) for r in base]
+    totals = [0, 0]
+    probes = decisions = 0
+    branches = set()
+    for turn in range(16):
+        machine = (delayed, immediate)[turn % 2]
+        def run_trace(trace):
+            return {"ticket": predict(machine, [symbols.index(symbol) for symbol in trace])}
+        for j, enabled in enumerate([False, True]):
+            calls = []
+            def target_observer(trace):
+                calls.append(tuple(trace))
+                return run_trace(trace)
+            run = cost_aware_transfer(binary, learned_base, symbols, goal, target_observer, 4, 300,
+                                      [pattern], directory / f"recurring-{j}.sqlite", enabled)
+            if len(calls) != run["target_episodes"] or distinguish(machine, run["table"]) is not None:
+                raise AssertionError("Recurring workload did not match replay")
+            if turn >= 4:
+                totals[j] += len(calls)
+                if enabled:
+                    probes += run["early_observation"] is not None
+                    decisions += run["strategy"] != previous_strategy
+                    if run["early_observation"]:
+                        early = run["early_observation"]
+                        branches.add((tuple(early["trace"]), early["value"], run["strategy"]))
+            if not enabled:
+                previous_strategy = run["strategy"]
+    if {x[2] for x in branches} != {"ordinary", "library"} or totals[1] >= totals[0]:
+        raise AssertionError("Paid diagnostic did not distinguish the recurring configurations")
+    print(f"Diagnostic branches: {sorted(branches)}")
+    print(f"12 repeats after 4 calibration tasks: {totals[1]} diagnostic vs {totals[0]} historical; "
+          f"{probes} paid probes, {decisions} changed choices")
     print(f"Last 9 first-seen tasks: {heldout} (adaptive, library, ordinary)")
     print(f"18 sequential targets: {policy_totals[0]} adaptive, {policy_totals[1]} always library, "
           f"{policy_totals[2]} always ordinary; {strategies.count('library')} library choices")

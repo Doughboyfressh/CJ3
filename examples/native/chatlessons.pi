@@ -1,3 +1,4 @@
+import "chatneuron.pi"
 import "curvenet.pi"
 import "researchmemory.pi"
 import "heedlessons.pi"
@@ -82,6 +83,14 @@ skill chat_saved_probe() -> Any {
 skill chat_handle(st,line) -> Any {
   let text = lower(trim(line))
   if ends(text,".") or ends(text,"?") { let text = trim(slice(text,0,len(text)-1)) }
+  let st = neuron_start(st)
+  if text == "neuron status" {
+    let slot = st["neuron_slot"]
+    if slot < 0 { return ["Shared unit unavailable: Softwell SSD is full.",st,false] }
+    let value = int(rt_sw_ssd_real(slot,0))
+    let note = if st["neuron_unsaved"] { " Some feedback is session-only." } else { "" }
+    return ["Shared surprise estimate: " ++ str(value) ++ "/1024." ++ note,st,false]
+  }
   let curve = chat_curve(st,text)
   if curve != null { return curve }
   if text == "what can you do" {

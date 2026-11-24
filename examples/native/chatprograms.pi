@@ -135,10 +135,13 @@ skill chat_meaning(text) -> Any {
 # exact experiment requested, even across unrelated conversation turns.
 skill chat_plan(st,line) -> Any {
   let text = lower(line)
+  let probed = false
+  let expected = null
+  let witness = null
   let current = st["planning"]
   let pending = st["plan_probe"]
   if text == "cancel plan" {
-    return ["Plan cleared.",put(put(st,"planning",null),"plan_probe",null),false]
+    return ["Plan cleared.",put(put(put(st,"planning",null),"plan_probe",null),"neuron_expected",null),false]
   }
   let raw = null
   let goal = null
@@ -175,11 +178,31 @@ skill chat_plan(st,line) -> Any {
     if not labelled and (st["lesson_probe"] != null or not contains(["0","1"],text)) { return null }
     let bit = if labelled { trim(slice(text,8,len(text))) } else { text }
     if not contains(["0","1"],bit) { return ["Give outcome 0 or outcome 1.",st,false] }
+    let probed = st["neuron_probed"]
+    if st["neuron_expected"] != null {
+      let st = neuron_observe(st,if bit == st["neuron_expected"] { 0 } else { 1 })
+    }
     let raw = current[0] ++ "\n" ++ trim(bit ++ " " ++ pending)
     let goal = current[1]
     let prefix = current[2]
+    if probed and bit == str(goal) {
+      let steps = split(pending)
+      let start = if prefix == null { [] } else { split(prefix) }
+      if slice(steps,0,len(start)) == start {
+        let witness = trim("plan " ++ join(slice(steps,len(start),len(steps))," "))
+      }
+    }
   }
-  let answer = ts_observations(raw,prefix,null,goal)
+  let answer = if witness == null { ts_observations(raw,prefix,null,goal) } else { witness }
+  if answer == "Goal unreachable in learned model." and not probed and neuron_gate(st) {
+    let check = ts_observations(raw,prefix,2,goal)
+    if slice(check,0,8) == "observe " {
+      let answer = check
+      let predicted = ts_observations(raw,slice(check,8,len(check)),null,null)
+      if slice(predicted,0,8) == "predict " { let expected = slice(predicted,8,len(predicted)) }
+      let probed = true
+    }
+  }
   let probe = null
   if slice(answer,0,8) == "observe " {
     let probe = slice(answer,8,len(answer))
@@ -189,5 +212,6 @@ skill chat_plan(st,line) -> Any {
     if slice(answer,0,4) != "plan" and answer != "Goal unreachable in learned model." { return [answer,st,false] }
   }
   let updated = put(put(st,"planning",[raw,goal,prefix]),"plan_probe",probe)
+  let updated = put(put(updated,"neuron_expected",expected),"neuron_probed",probed)
   return [answer,put(updated,"program_result",answer),false]
 }

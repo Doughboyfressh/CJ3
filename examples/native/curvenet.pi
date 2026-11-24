@@ -105,10 +105,32 @@ skill chat_curve(st,text) -> Any {
   let reply = str(net[3]) ++ " samples, " ++ str(max(0,net[2]-2)) ++ " hidden ReLU neurons."
   if teach {
     if not rt_append_file(path,suffix) { return ["Could not save curve lessons.",st,false] }
+    let prior = st["neuron_curve_prediction"]
+    if prior != null and prior[0] == path and prior[3] == data {
+      for record in reverse(slice(words,i+1,len(words))) {
+        let pair = split(record,"=")
+        if prior[1] == pair[0] {
+          let st = neuron_observe(st,if prior[2] == pair[1] { 0 } else { 1 })
+          let st = put(st,"neuron_curve_prediction",null)
+          break
+        }
+      }
+    }
   } else {
     if words[i+1] != "neurons" or len(words) != i+2 {
       if len(words) != i+3 or words[i+1] != "at" or cn_int(words[i+2]) == null { return ["Use curve NAME neurons or curve NAME at X.",st,false] }
       let reply = cn_predict(net,cn_int(words[i+2]))
+      if reply != "Outside the taught range." {
+        let st = put(st,"neuron_curve_prediction",[path,words[i+2],reply,source])
+        if neuron_gate(st) {
+          let token = words[i+2] ++ "="
+          let known = slice(source,0,len(token)) == token
+          for sep in [" ","\n","\t","\r"] { if contains(source,sep ++ token) { let known = true } }
+          if not known {
+            let reply = reply ++ ". Can you check it? Teach curve " ++ words[i] ++ " " ++ token ++ "VALUE with the observed integer."
+          }
+        }
+      }
     }
   }
   if cached == null or cached[0] != path or cached[1] != source { let st = put(st,"curve_cache",[path,source,net]) }

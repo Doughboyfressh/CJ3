@@ -128,6 +128,32 @@ learner retains original observations so that a correction can restore a bend.
 A single example supports only that input. Predictions outside the taught
 range are withheld. A lookup also checks the lesson file for changes.
 
+### A shared recurrent unit for checking predictions
+
+Curve learning and goal planning use one scalar state on Softwell's modeled
+SSD. If a later observed integer confirms or contradicts a curve prediction
+at the same input, the shared unit updates. A planner probe with a known
+model prediction supplies the same feedback. The update moves the estimate
+one quarter of the way toward 1 for a surprise or 0 for an agreement, rounded
+in units of 1/1024. The neutral initial estimate is 1/2. A feedback log in
+`out/chat_neuron.log` restores the state for new chat sessions.
+
+A score over 1/2 enables one extra conformance probe when the planner reports
+an unreachable goal. The checker uses a two-state bound to propose that probe;
+this is a search heuristic, not a bound on the actual world. A measured cold
+Softwell page read during the gate raises the threshold by 1/8. If an observed
+sequence reaches the requested goal from the requested prefix, chat can return
+that witnessed plan immediately. The same gate asks for an observed value
+when chat interpolates a previously untaught curve input.
+
+Use `Neuron status` to inspect the estimate. For example, teach `ramp` with
+`0=0 4=4`, ask for its value at 2, and teach the correction `2=3`.
+Then say `Plan goal 1 using events press` and reply with outcomes 0, 0 and 1.
+The extra experiment discovers `plan press press`. For a switch that always
+returns 0, the extra experiment costs one reply without finding a plan.
+This estimate tracks recent prediction errors; its value is not a calibrated
+probability for a new domain.
+
 ## Quick start
 
 From the repository root, build Heed and give it two lessons using a fresh lesson file. The sum alone leaves several explanations for “ravels.” The product distinguishes doubling each element from doubling the final result.

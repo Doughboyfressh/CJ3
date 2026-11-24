@@ -1,7 +1,7 @@
 """Compare provisional models before and after refinement on twelve reproducible machines."""
 import argparse
 from collections import Counter
-from itertools import product
+from itertools import count as depths, product
 from pathlib import Path
 import random
 import subprocess
@@ -12,7 +12,48 @@ from refine_model import refine, successor
 ACTIONS = ("a", "b", "c")
 
 
-def evaluate(binary, directory, seed):
+def shortest_unseen(table, seen, alphabet_size):
+    for depth in depths():
+        for trace in product(range(alphabet_size), repeat=depth):
+            if trace not in seen:
+                return trace
+
+
+def observations(log):
+    return {tuple(row.split()[1:]) for row in log.read_text().splitlines()[1:]}
+
+
+def compare(binary, log, observe, baseline, depth):
+    """The control pays exactly the treatment's total, including refit queries."""
+    control_log = log.with_suffix(".control")
+    control_log.write_bytes(log.read_bytes())
+    targeted = refine(binary, log, observe)
+    control = refine(binary, control_log, observe, budget=targeted["queries"], choose_probe=shortest_unseen)
+    assert control["queries"] == targeted["queries"]
+    counts = Counter(observations_per_arm=control["queries"])
+    for name, result in (("targeted", targeted), ("shortest", control)):
+        counts[name + "_complete"] = int("table" in result)
+    if "table" not in targeted or "table" not in control:
+        return counts
+    counts["paired"] = 1
+    seen = observations(log) | observations(control_log)
+    for trace in product(ACTIONS, repeat=depth):
+        if trace in seen:
+            continue
+        label = observe(trace)
+        indices = [ACTIONS.index(x) for x in trace]
+        counts["held_out"] += 1
+        counts["positives"] += label
+        for name, model in (("original", baseline), ("targeted", targeted["table"]), ("shortest", control["table"])):
+            predicted = model[successor(model, 0, indices)][0]
+            counts[name + "_errors"] += predicted != label
+            counts[name + "_hits"] += predicted == label == 1
+    delta = counts["shortest_errors"] - counts["targeted_errors"]
+    counts["targeted_win" if delta > 0 else "shortest_win" if delta < 0 else "tie"] = 1
+    return counts
+
+
+def evaluate(binary, directory, seed, matched=False):
     rng = random.Random(20261124 + seed)
     size = 4 + seed % 4
     target = [[rng.randrange(2), *(rng.randrange(size) for _ in ACTIONS)] for _ in range(size)]
@@ -40,6 +81,8 @@ def evaluate(binary, directory, seed):
         with log.open("a") as handle:
             print(observe(trace), *trace, file=handle)
         count += 1
+    if matched:
+        return compare(binary, log, observe, baseline, 6)
     result = refine(binary, log, observe)
     if "table" not in result:
         return {"unfinished_refinement": 1}
@@ -58,11 +101,26 @@ def evaluate(binary, directory, seed):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--matched", action="store_true", help="Compare to shortest-unseen at identical cost")
+    parser.add_argument("--fraction-log", type=Path, help="Run the matched comparison on a copy of a frozen fraction log")
+    parser.add_argument("--first-seed", type=int, default=0)
+    parser.add_argument("--machines", type=int, default=12)
     args = parser.parse_args()
+    if args.machines < 1:
+        parser.error("--machines must be positive")
     total = Counter()
     with tempfile.TemporaryDirectory() as directory:
-        for seed in range(12):
-            result = evaluate(args.binary.resolve(), Path(directory), seed)
+        if args.fraction_log:
+            from frozen_tasks import outcome
+            from trace_transfer import read_table
+            log = Path(directory) / "fraction"
+            log.write_bytes(args.fraction_log.read_bytes())
+            binary = args.binary.resolve()
+            print("fraction", dict(compare(binary, log, lambda trace: outcome("fraction", trace),
+                                           read_table(binary, log), 7)))
+            raise SystemExit(0)
+        for seed in range(args.first_seed, args.first_seed + args.machines):
+            result = evaluate(args.binary.resolve(), Path(directory), seed, args.matched)
             print(seed, dict(result))
             total.update(result)
     print("total", dict(total))

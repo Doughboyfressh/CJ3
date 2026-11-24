@@ -117,6 +117,26 @@ one refinement did not finish. The baseline stops when it finds a consistent
 table and can spend fewer observations. These figures do not establish an
 advantage over every alternative use of the remaining budget.
 
+For a cost-matched control, keep a copy of the original 56-observation log
+before running refinement. Both arms use the focused suffix splitter. Only
+the choice of probe differs. The control tries the shortest unseen trace,
+and gets exactly the number of observations the targeted arm used, including
+refits. The evaluation excludes the union of both training logs.
+
+```sh
+python3 tools/check_refinement.py out/heed --fraction-log out/fraction-original.obs
+python3 tools/check_refinement.py out/heed --matched --first-seed 100 --machines 48
+```
+
+On the fraction task, each arm spent 75 observations total. Of 52 unseen
+positive traces of exactly length seven, targeted probes recognized 20 and
+the control recognized 14, with zero false positives in either arm. On 48
+fresh finite machines, three initial models exhausted the budget. Among the
+45 remaining, targeted refinement completed 38 models and shortest-unseen
+completed 40. On all 36 paired completions the error counts tied, totaling
+130 errors per arm across 26,032 common unseen length-six traces. The
+fraction result does not justify preferring targeted probes by default.
+
 ## Learn a door rule by acting
 
 Build Heed, then run three episodes from the repository root:

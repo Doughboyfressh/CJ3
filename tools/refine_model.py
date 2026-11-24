@@ -32,7 +32,7 @@ def challenge(table, seen, alphabet_size):
     return None if best is None else best[2]
 
 
-def refine(binary, log, observe, budget=96, timeout=30):
+def refine(binary, log, observe, budget=96, timeout=30, *, choose_probe=challenge):
     data = log.read_text()
     if not data.endswith("\n"):
         raise ValueError("Incomplete observation log")
@@ -55,7 +55,7 @@ def refine(binary, log, observe, budget=96, timeout=30):
         lines = subprocess.check_output([binary, "states-refine", log], text=True, timeout=timeout).splitlines()
         if lines[0].startswith("consistent states "):
             table = [list(map(int, row.split())) for row in lines[1:]]
-            trial = challenge(table, seen, len(alphabet))
+            trial = None if count == budget else choose_probe(table, seen, len(alphabet))
             if trial is None or count == budget:
                 return {"status": "consistent with observations", "queries": count, "table": table}
         elif lines[0].split()[:1] == ["observe"]:

@@ -218,34 +218,40 @@ skill hm_command(path, command, phrase, csv, answer) -> Any {
   if ws == null or xs == null or path == null or not contains(["teach", "use"], command) or extra {
     return "Usage: heed memory FILE teach|use \"sum of WORD\" 2,3 [answer]"
   }
+  return hm_turn(path,command,ws,phrase,xs,answer)[0]
+}
+
+# Each reply carries its pending measurement and the law used for a resolved result.
+skill hm_turn(path,command,ws,phrase,xs,answer) -> Any {
   let book = hm_load(path)
-  if book == null { return "Unreadable or incomplete lesson file." }
+  if book == null { return ["Unreadable or incomplete lesson file.",null,null] }
   let word = ws[1]
   if command == "teach" {
     let y = hm_number(answer)
-    if y == null { return "Give a whole-number observation." }
+    if y == null { return ["Give a whole-number observation.",null,null] }
     let record = hm_line(word, [ws[0], xs, y])
-    if not rt_append_file(path, record) { return "Could not save the observation." }
+    if not rt_append_file(path, record) { return ["Could not save the observation.",null,null] }
     book = hm_load(path)
-    if book == null { return "Could not read the saved observation." }
+    if book == null { return ["Could not read the saved observation.",null,null] }
   }
   let obs = book[word]
-  if obs == null { return "Teach an example for " ++ word ++ " first." }
+  if obs == null { return ["Teach an example for " ++ word ++ " first.",null,null] }
   let laws = hm_laws(obs)
-  if len(laws) == 0 { return "Observations saved. Bounded search found no consistent meaning." }
+  if len(laws) == 0 { return ["Observations saved. Bounded search found no consistent meaning.",null,null] }
   if len(laws) == 1 {
-    if command == "teach" { return "Learned " ++ word ++ ": " ++ show(laws[0][0]) ++ if laws[0][1] { " before reduction." } else { " after reduction." } }
+    if command == "teach" { return ["Learned " ++ word ++ ": " ++ show(laws[0][0]) ++ if laws[0][1] { " before reduction." } else { " after reduction." },null,laws[0]] }
     let y = hm_read(word, laws[0], phrase, xs)
-    if y == null { return "Meaning undefined for this input." }
-    return str(y)
+    if y == null { return ["Meaning undefined for this input.",null,null] }
+    return [str(y),null,laws[0]]
   }
   if command == "use" {
     let y = hm_read(word, laws[0], phrase, xs)
     let agree = y != null
     for law in laws { if hm_read(word, law, phrase, xs) != y { agree = false } }
-    if agree { return str(y) }
+    if agree { return [str(y),null,null] }
     let probe = hm_target_question(laws,[ws[0],xs])
-    if probe != null { return hm_prompt(word,probe) }
+    if probe != null { return [hm_prompt(word,probe),probe,null] }
   }
-  return hm_ask(word, laws)
+  let probe = hm_question(laws)
+  return [hm_prompt(word,probe),probe,null]
 }

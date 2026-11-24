@@ -78,6 +78,15 @@ fi
   [ "$(./ask "Who is Ann's grandparent?")" = "Tom is Ann's grandparent." ]
   [ "$(./chat --remember violet)" = "saved (1 notes)" ]
   [ "$(./chat --recall violet)" = "violet" ]
+  printf '%s\n' 'The sum of nells for 2 and 3 is 10.' '24.' | ./chat > lesson.txt
+  grep -Fx 'What is product of nells on 2,3?' lesson.txt
+  grep -Fx 'Learned nells: (e * 2) before reduction.' lesson.txt
+  printf '%s\n' "What's the product of nells for 2, 4, and 6?" | ./chat > answer.txt
+  grep -Fx '384. I applied (e * 2) to each input, then took the product of 4,8,12.' answer.txt
+  printf '%s\n' 'The product of vems for 0 is 0.' 'What is the product of vems for 4,5,6?' "Who is Ann's grandparent?" '-105' | ./chat > resumed.txt
+  grep -Fx 'What is product of vems on 3,5,7?' resumed.txt
+  grep -Fx "Tom is Ann's grandparent." resumed.txt
+  grep -Fx -- '-120' resumed.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

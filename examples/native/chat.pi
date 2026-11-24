@@ -1,7 +1,7 @@
 # Native Pi dialogue with persistent facts and searchable notes.
 import "conversation.pi"
 import "notes.pi"
-import "heedlessons.pi"
+import "chatlessons.pi"
 
 skill main() -> Any {
   # Console output uses UTF-8.
@@ -23,5 +23,5 @@ skill main() -> Any {
     return join(found, "\n")
   }
   if arg(1) != null { return "Usage: chat [--remember NOTE | --recall QUERY | memory FILE teach|use PHRASE LIST [ANSWER]]" }
-  return converse("out/chat_facts.txt")
+  return converse_with("out/chat_facts.txt",chat_handle)
 }

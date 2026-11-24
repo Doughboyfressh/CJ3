@@ -28,6 +28,13 @@ ending input, `out/ask "Who is Ann's grandparent?"` answers
 also supports `--remember NOTE` and `--recall QUERY`, which use a separate
 plain-text notebook at `out/brain_memory.txt`. On Windows use the .exe files.
 
+In ordinary chat, enter `The sum of nells for 2 and 3 is 10.` Pi asks for
+their product. Reply `24`, restart chat, and ask `What's the product of nells
+for 2, 4, and 6?` Pi answers 384 and shows the transformed inputs 4, 8, 12.
+Chat saves observations in `out/chat_lessons.txt`. A pending clarification
+belongs to the current session. Reply with a signed integer, or type `cancel`.
+When the clarification settles an earlier question, Pi answers it immediately.
+
 Chat uses Pi's native English fact and question grammar. Use `chat memory` with the same arguments as `heed memory` below to teach
 and apply executable rules. Both commands share the same lesson reader and
 can take turns updating the same file.

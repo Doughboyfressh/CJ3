@@ -226,24 +226,6 @@ skill hm_record(book, word, reducer, xs, y) -> Any {
   return put(book,word,append(updated,[reducer,xs,y]))
 }
 
-skill hm_load(path) -> Any {
-  let book = {}
-  let text = read_file(path)
-  if text == null or text == "" { return book }
-  if slice(text,len(text)-1,len(text)) != "\n" { return null }
-  for line in split(text,"\n") {
-    if line != "" {
-      let f = split(trim(line)," ")
-      if len(f) != 5 or f[0] != "heed1" { return null }
-      if not hm_word(f[1]) or not contains(hm_reducers(),f[2]) { return null }
-      let xs = hm_numbers(f[3])
-      let y = hm_number(f[4])
-      if xs == null or y == null { return null }
-      book = hm_record(book,f[1],f[2],xs,y)
-    }
-  }
-  return book
-}
 
 skill hm_line(word, ex) -> Any {
   return "heed1 " ++ word ++ " " ++ ex[0] ++ " " ++ hm_csv(ex[1]) ++ " " ++ str(ex[2]) ++ "\n"

@@ -14,13 +14,7 @@ skill main() -> Any {
       let words = append(words, arg(i))
       let i = i + 1
     }
-    if arg(1) == "--remember" {
-      if mem_add(join(words, " ")) == null { return "could not save note to " ++ MEMFILE() }
-      return "saved (" ++ str(len(mem_all())) ++ " notes)"
-    }
-    let found = mem_find(join(words, " "), 5)
-    if len(found) == 0 { return "no notes about that" }
-    return join(found, "\n")
+    return note_command(arg(1) == "--remember",join(words," "))
   }
   if arg(1) != null { return "Usage: chat [--remember NOTE | --recall QUERY | memory FILE teach|use PHRASE LIST [ANSWER]]" }
   let pending = chat_saved_probe()

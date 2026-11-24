@@ -95,6 +95,38 @@ fi
   printf '%s\n' cancel | ./chat > cancelled.txt
   grep -Fx 'Question cancelled.' cancelled.txt
   [ "$(./chat </dev/null)" = "Goodbye. I know 6 facts." ]
+  printf '%s\n' 'Navo maps grid 1,1/2,3 to 1,1/3,2.' | ./chat > spatial.txt
+  grep -Fx 'Learned navo as gfliph(_).' spatial.txt
+  "$root/out/t_heed" grid out/chat_lessons.txt teach zemi 1,1/2,3 1,2/1,3
+  printf '%s\n' 'Apply navo, then zemi to grid 1,2,3/4,5,6.' 'Reverse the order.' | ./chat > sequence.txt
+  grep -Fx '[[3, 6], [2, 5], [1, 4]]' sequence.txt
+  grep -Fx '[[4, 1], [5, 2], [6, 3]]' sequence.txt
+  [ "$(./chat memory out/chat_lessons.txt use 'product of nells' 2,4,6)" = "384" ]
+  printf '%s\n' 'Navo maps list 2,1,3 to 3,2,1.' | ./chat > list-lesson.txt
+  grep -Fx 'Learned navo as rev(sort(_)).' list-lesson.txt
+  [ "$("$root/out/t_heed" order out/chat_lessons.txt use navo 4,9,1)" = "[9, 4, 1]" ]
+  printf '%s\n' 'Apply navo to list 4,9,1.' 'Apply navo then reverse to 4,9,1.' 'Reverse the order.' 'Apply navo to 1,2/3,4.' | ./chat > shapes.txt
+  printf '%s\n' '[9, 4, 1]' '[1, 4, 9]' '[9, 4, 1]' '[[2, 1], [4, 3]]' 'Goodbye. I know 6 facts.' > shapes.expect
+  cmp shapes.expect shapes.txt
+  ln -s "$root/examples" examples
+  ln -s "$root/out/t_g2" out/pic
+  printf '%s\n' 'events on' '0' '1 on' '1 on on' > light.obs
+  printf '%s\n' 'Demo? ||| Juniper ||| local ||| Telescope log' > out/research.kb
+  printf '%s\n' 'Remember that Juniper is a telescope.' 'Teach language dax => RED' 'Teach language dax twice => RED RED' 'Teach language lug => BLUE' 'Teach language lug twice => BLUE BLUE' 'Teach language zup => GREEN' | ./chat >/dev/null
+  printf '%s\n' 'Recall my note about the telescope.' 'Interpret zup twice' 'Plan goal 1 | light.obs' 'Research Demo?' 'Run program tongue | mini' 'Run program ../missing' | ./chat > programs.txt
+  grep -Fx 'Juniper is a telescope.' programs.txt
+  grep -Fx 'GREEN GREEN' programs.txt
+  grep -Fx 'plan on' programs.txt
+  grep -Fx 'evidence: Telescope log' programs.txt
+  grep -Fx '  new sentences: 10 of 10 read rightly' programs.txt
+  grep -Fx "Unknown native program. Ask 'list programs' from the Pi checkout." programs.txt
+  printf '%s\n' 'Pivot maps list 2,1,3 to 3,1,2.' 'Teach language bim => sort' 'Teach language zor => reverse' 'Teach language kef => pivot' 'Teach language bim again => sort then sort' 'Teach language zor again => reverse then reverse' | ./chat >/dev/null
+  printf '%s\n' 'Kef again' 'Kef on 4,9,1' 'Kef again on 4,9,1' 'Which telescope is mine?' 'Demo?' "Who is Ann's grandparent?" 'Unrelatedxyz?' | ./chat > coordinated.txt
+  printf '%s\n' 'pivot then pivot' '[1, 9, 4]' '[4, 9, 1]' 'Related notebook entries:' 'Juniper is a telescope.' 'Juniper' 'evidence: Telescope log' 'source: local' "Tom is Ann's grandparent." "I don't understand that yet." 'Goodbye. I know 6 facts.' > coordinated.expect
+  cmp coordinated.expect coordinated.txt
+  printf '%s\n' 'Plan goal 1 using events on' 'outcome 0' "Who is Ann's grandparent?" 'outcome 2' '1' '1' 'Plan goal 0' 'Cancel plan' 'outcome 1' | ./chat > planning.txt
+  printf '%s\n' 'Starting from reset, what is the outcome before any events? Reply outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on? Reply outcome 0 or outcome 1.' "Tom is Ann's grandparent." 'Give outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on on? Reply outcome 0 or outcome 1.' 'plan on' 'plan' 'Plan cleared.' 'There is no pending planning observation.' 'Goodbye. I know 6 facts.' > planning.expect
+  cmp planning.expect planning.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

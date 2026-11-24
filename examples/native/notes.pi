@@ -70,3 +70,23 @@ skill mem_find(query, k) -> Any {
   for i in best { let out = append(out, notes[i]) }
   return out
 }
+
+skill note_command(save, text) -> Any {
+  if save {
+    if mem_add(text) == null { return "could not save note to " ++ MEMFILE() }
+    return "saved (" ++ str(len(mem_all())) ++ " notes)"
+  }
+  let found = mem_find(text,5)
+  if len(found) == 0 { return "no notes about that" }
+  return join(found,"\n")
+}
+
+skill chat_note(line) -> Any {
+  let text = lower(line)
+  for prefix in ["remember that ","remember ","recall my note about ","recall "] {
+    if slice(text,0,len(prefix)) == prefix {
+      return note_command(slice(prefix,0,8) == "remember",slice(line,len(prefix),len(line)))
+    }
+  }
+  return null
+}

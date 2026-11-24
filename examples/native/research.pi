@@ -7,6 +7,7 @@
 #     sentence's score (a candidate that is only the question's own words cannot vote)
 #   5 remember: out\research.kb  (question ||| answer ||| source ||| evidence); asked again -> from memory
 #   out\research.exe "question"     out\research.exe test   (20 questions; an answer key used only to score)
+import "researchmemory.pi"
 import "browselib.pi"
 import "slots.pi"
 import "readmodel.pi"
@@ -1617,16 +1618,6 @@ skill docs_for(terms) -> Any {
   return docs
 }
 
-skill recall(q) -> Any {
-  let t = read_file("out\\research.kb")
-  if t == null { return null }
-  for line in split(t, "\n") {
-    let p = split(line, " ||| ")
-    if len(p) == 4 and lower(p[0]) == lower(q) { return p }
-  }
-  return null
-}
-
 skill remember(q, a) -> Any {
   let old = read_file("out\\research.kb")
   let line = q ++ " ||| " ++ a[0] ++ " ||| " ++ a[3] ++ " ||| " ++ a[2]
@@ -1635,7 +1626,7 @@ skill remember(q, a) -> Any {
 }
 
 skill ask(q) -> Any {
-  let m = recall(q)
+  let m = research_recall(q)
   if m != null { return [m[1], "from memory", m[3], m[2]] }
   let a = answer(q)
   if a[0] != null { do remember(q, a) }
@@ -2509,6 +2500,7 @@ skill main() -> Any {
     return out ++ "\n(answer key used only to score)"
   }
   let q = arg(1)
+  if q == "--question" { let q = arg(2) }
   if q == null { return "usage: research.exe \"question\" | test" }
   if has_arg("why") {
     let types = null

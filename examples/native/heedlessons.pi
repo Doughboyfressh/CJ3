@@ -22,6 +22,8 @@ import "mindcore.pi"
 import "tonguelib.pi"
 import "scopelearn.pi"
 import "heedmemory.pi"
+import "heedcondition.pi"
+import "heedtransform.pi"
 
 # an instruction's words: lower case, a comma a word of its own
 skill hd_words(text) -> Any { return split(join(split(lower(text), ","), " , ")) }
@@ -254,4 +256,35 @@ skill hm_turn(path,command,ws,phrase,xs,answer) -> Any {
   }
   let probe = hm_question(laws)
   return [hm_prompt(word,probe),probe,null]
+}
+
+skill hm_load(path) -> Any {
+  let book = {}
+  let text = read_file(path)
+  if text == null or text == "" { return book }
+  if slice(text,len(text)-1,len(text)) != "\n" { return null }
+  for line in split(text,"\n") {
+    if line != "" {
+      let f = split(trim(line)," ")
+      if len(f) != 5 { return null }
+      let key = f[1]
+      let xs = null
+      let y = null
+      if f[0] == "heed2" {
+        if not contains(["grid","order"],f[2]) { return null }
+        let name = join(split(key,"_")," ")
+        if ht_name(name) != name or join(hd_words(name),"_") != key { return null }
+        key = f[2] ++ ":" ++ name
+        xs = ht_value(f[2],f[3])
+        y = ht_value(f[2],f[4])
+      } else {
+        if f[0] != "heed1" or not hm_word(key) or not contains(hm_reducers(),f[2]) { return null }
+        xs = hm_numbers(f[3])
+        y = hm_number(f[4])
+      }
+      if xs == null or y == null { return null }
+      book = hm_record(book,key,f[2],xs,y)
+    }
+  }
+  return book
 }

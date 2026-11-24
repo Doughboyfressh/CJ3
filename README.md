@@ -40,6 +40,76 @@ Chat uses Pi's native English fact and question grammar. Use `chat memory` with 
 and apply executable rules. Both commands share the same lesson reader and
 can take turns updating the same file.
 
+In the same chat, teach spatial operations by showing input and output grids.
+Separate columns with commas and rows with slashes.
+
+```text
+Navo maps grid 1,1/2,3 to 1,1/3,2.
+Zemi maps grid 1,1/2,3 to 1,2/1,3.
+Apply navo, then zemi to grid 1,2,3/4,5,6.
+Reverse the order.
+```
+
+The two results are `[[3, 6], [2, 5], [1, 4]]` and `[[4, 1], [5, 2], [6, 3]]`.
+Chat keeps the last successful transformation and its original input during the
+conversation. The learned operations persist alongside arithmetic lessons in
+`out/chat_lessons.txt`. Heed can use that same file with `heed grid`.
+
+Teach a list operation with `Biggest first maps list 2,1,3 to 3,2,1.`
+Then `Apply biggest first to 4,9,1.` returns `[9, 4, 1]`. Chat reads a flat
+input as a list and slash-separated rows as a grid. Specify `to grid` for
+a single-row grid. A phrase can have a different learned meaning for each
+input type. Both support sequences and the follow-up `Reverse the order.`
+
+### Other capabilities in chat
+
+Start chat from the repository root after building it with the normal build
+script. These turns use the existing notebook, Tongue, trace planner, research
+program, and screen reader.
+
+| Chat turn | Result |
+| --- | --- |
+| `Remember that my telescope is called Juniper.` | Saves a notebook entry available across sessions and through `--recall`. |
+| `Recall my note about the telescope.` | Retrieves matching entries. |
+| `Teach language dax => RED` | Saves a phrase and its meaning. A later example with the same phrase corrects it. |
+| `Interpret dax twice` | Uses Tongue's rules induced from your examples. Teach examples of “twice” first. |
+| `Plan goal 1 &#124; out/queue.obs` | Finds an action sequence from a trace log, or requests a missing observation. An optional third field supplies events already taken. The first line of the log is `events` followed by the alphabet. Subsequent lines contain an outcome (0 or 1) followed by its events. |
+| `Research Who discovered Ceres?` | Runs the research program and returns its answer and evidence when available. |
+| `Read the screen` | Runs Look on the runtime's screen. Linux uses the modeled desktop. |
+| `List programs` | Discovers native source files with a main entry point in this checkout. |
+| `Run program tongue &#124; mini` | Compiles and runs the named entry point. Each field after the name is one argument. |
+| `Remember that result` | Saves the last program, planning, or language reply to the notebook. |
+
+To plan without preparing a file, say `Plan goal 1 using events on`. Pi asks
+for the outcome at reset, then for the outcome of specific sequences starting
+from reset. Give each result as `outcome 0` or `outcome 1`. You can ask an
+unrelated question and return to the pending experiment. A bare 0 or 1 also
+works when no arithmetic clarification is pending. With outcomes 0 at reset,
+1 after `on`, and 1 after `on on`, Pi returns `plan on`. Ask `Plan goal 0`
+to reuse those observations. A bare `plan` means the starting state already
+meets the goal. The inferred model and its observations belong to this chat
+session; `Cancel plan` clears them. When starting from a trace file, chat
+holds a snapshot and keeps subsequent answers in the session.
+
+Ordinary turns can also use what Pi has learned. Teach a list operation with
+`Pivot maps list 2,1,3 to 3,1,2.`, then give the language example
+`Teach language kef => pivot`. After restarting chat, `Kef on 4,9,1`
+returns `[1, 9, 4]`. Tongue interprets the phrase and Heed evaluates the
+operation on the supplied input. Learned phrases can also resolve to a
+sequence such as `pivot then pivot`.
+
+For questions the fact engine cannot settle, chat checks saved research for
+the same question and includes its recorded source and evidence. If there is
+no matching research, it can return related notebook entries as quotations
+under a separate label. Explicit `Research` requests still use the research
+program.
+
+Program calls use the local compiler under `out/`, share the checkout's working
+directory, and return up to 64 KiB of output. They run with the same file, device,
+and data requirements as standalone calls. Child programs receive end-of-input
+on stdin. Libraries are reached through their callers. Python experiment drivers
+on other branches require their own checkout and dependencies.
+
 ## Quick start
 
 From the repository root, build Heed and give it two lessons using a fresh lesson file. The sum alone leaves several explanations for “ravels.” The product distinguishes doubling each element from doubling the final result.

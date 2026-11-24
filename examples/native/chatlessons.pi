@@ -1,3 +1,4 @@
+import "curvenet.pi"
 import "researchmemory.pi"
 import "heedlessons.pi"
 import "english.pi"
@@ -81,8 +82,10 @@ skill chat_saved_probe() -> Any {
 skill chat_handle(st,line) -> Any {
   let text = lower(trim(line))
   if ends(text,".") or ends(text,"?") { let text = trim(slice(text,0,len(text)-1)) }
+  let curve = chat_curve(st,text)
+  if curve != null { return curve }
   if text == "what can you do" {
-    return ["Teach me facts, list or grid operations, or language examples. Ask me to remember or recall a note, research a question, read the screen, or plan a goal from observations. Ask 'list programs' for native programs.",st,false]
+    return ["Teach me facts, list or grid operations, language examples, or numeric curves. Ask me to remember or recall a note, research a question, read the screen, or plan a goal from observations. Ask 'list programs' for native programs.",st,false]
   }
   if text == "remember that result" {
     if st["program_result"] == null { return ["Run a program or ask for a result first.",st,false] }

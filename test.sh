@@ -127,6 +127,11 @@ fi
   printf '%s\n' 'Plan goal 1 using events on' 'outcome 0' "Who is Ann's grandparent?" 'outcome 2' '1' '1' 'Plan goal 0' 'Cancel plan' 'outcome 1' | ./chat > planning.txt
   printf '%s\n' 'Starting from reset, what is the outcome before any events? Reply outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on? Reply outcome 0 or outcome 1.' "Tom is Ann's grandparent." 'Give outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on on? Reply outcome 0 or outcome 1.' 'plan on' 'plan' 'Plan cleared.' 'There is no pending planning observation.' 'Goodbye. I know 6 facts.' > planning.expect
   cmp planning.expect planning.txt
+  printf '%s\n' 'Teach curve wave 8=0 0=0 2=3 6=-3 4=0' | ./chat > trained.txt
+  grep -Fx '5 samples, 2 hidden ReLU neurons.' trained.txt
+  printf '%s\n' 'Curve wave at 5' 'Curve wave at 8' 'Curve wave at 9' 'Teach curve wave 2=0 6=0' 'Teach curve wave 3=9 bad' 'Curve wave at 3' | ./chat > curves.txt
+  printf '%s\n' '-3/2' '0' 'Outside the taught range.' '5 samples, 0 hidden ReLU neurons.' 'Use integer X=Y lessons between -100000000 and 100000000.' '0' 'Goodbye. I know 6 facts.' > curves.expect
+  cmp curves.expect curves.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

@@ -110,6 +110,24 @@ and data requirements as standalone calls. Child programs receive end-of-input
 on stdin. Libraries are reached through their callers. Python experiment drivers
 on other branches require their own checkout and dependencies.
 
+### Growing a neural curve in chat
+
+`Teach curve tide 0=0 2=3 4=0 6=3 8=0` learns a scalar function with three hidden
+ReLU units. Ask `Curve tide neurons` for its size and `Curve tide at 3` for the
+exact interpolated value `3/2`. Teaching another value at the same input corrects
+that lesson. Names use letters. Each name has its own lesson file under `out/`.
+Input and output lessons accept integers from −100,000,000 to 100,000,000.
+
+Pi joins consecutive observations with straight lines. Each change of slope at
+a breakpoint contributes one hidden ReLU, weighted by the difference between
+successive slopes. The network uses the first line as its affine baseline.
+Within the observed range this represents the same function as summing all
+those weighted ReLUs. Chat stores the breakpoints and selects the active
+segment by binary search. Collinear samples require no extra units. The
+learner retains original observations so that a correction can restore a bend.
+A single example supports only that input. Predictions outside the taught
+range are withheld. A lookup also checks the lesson file for changes.
+
 ## Quick start
 
 From the repository root, build Heed and give it two lessons using a fresh lesson file. The sum alone leaves several explanations for “ravels.” The product distinguishes doubling each element from doubling the final result.

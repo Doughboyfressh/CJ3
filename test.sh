@@ -108,6 +108,18 @@ fi
   printf '%s\n' 'Apply navo to list 4,9,1.' 'Apply navo then reverse to 4,9,1.' 'Reverse the order.' 'Apply navo to 1,2/3,4.' | ./chat > shapes.txt
   printf '%s\n' '[9, 4, 1]' '[1, 4, 9]' '[9, 4, 1]' '[[2, 1], [4, 3]]' 'Goodbye. I know 6 facts.' > shapes.expect
   cmp shapes.expect shapes.txt
+  ln -s "$root/examples" examples
+  ln -s "$root/out/t_g2" out/pic
+  printf '%s\n' 'events on' '0' '1 on' '1 on on' > light.obs
+  printf '%s\n' 'Demo? ||| Juniper ||| local ||| Telescope log' > out/research.kb
+  printf '%s\n' 'Remember that Juniper is a telescope.' 'Teach language dax => RED' 'Teach language dax twice => RED RED' 'Teach language lug => BLUE' 'Teach language lug twice => BLUE BLUE' 'Teach language zup => GREEN' | ./chat >/dev/null
+  printf '%s\n' 'Recall my note about the telescope.' 'Interpret zup twice' 'Plan goal 1 | light.obs' 'Research Demo?' 'Run program tongue | mini' 'Run program ../missing' | ./chat > programs.txt
+  grep -Fx 'Juniper is a telescope.' programs.txt
+  grep -Fx 'GREEN GREEN' programs.txt
+  grep -Fx 'plan on' programs.txt
+  grep -Fx 'evidence: Telescope log' programs.txt
+  grep -Fx '  new sentences: 10 of 10 read rightly' programs.txt
+  grep -Fx "Unknown native program. Ask 'list programs' from the Pi checkout." programs.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

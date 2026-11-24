@@ -61,6 +61,31 @@ input as a list and slash-separated rows as a grid. Specify `to grid` for
 a single-row grid. A phrase can have a different learned meaning for each
 input type. Both support sequences and the follow-up `Reverse the order.`
 
+### Other capabilities in chat
+
+Start chat from the repository root after building it with the normal build
+script. These turns use the existing notebook, Tongue, trace planner, research
+program, and screen reader.
+
+| Chat turn | Result |
+| --- | --- |
+| `Remember that my telescope is called Juniper.` | Saves a notebook entry available across sessions and through `--recall`. |
+| `Recall my note about the telescope.` | Retrieves matching entries. |
+| `Teach language dax => RED` | Saves a phrase and its meaning. A later example with the same phrase corrects it. |
+| `Interpret dax twice` | Uses Tongue's rules induced from your examples. Teach examples of “twice” first. |
+| `Plan goal 1 &#124; out/queue.obs` | Finds an action sequence from a trace log, or requests a missing observation. An optional third field supplies events already taken. The first line of the log is `events` followed by the alphabet. Subsequent lines contain an outcome (0 or 1) followed by its events. |
+| `Research Who discovered Ceres?` | Runs the research program and returns its answer and evidence when available. |
+| `Read the screen` | Runs Look on the runtime's screen. Linux uses the modeled desktop. |
+| `List programs` | Discovers native source files with a main entry point in this checkout. |
+| `Run program tongue &#124; mini` | Compiles and runs the named entry point. Each field after the name is one argument. |
+| `Remember that result` | Saves the last program, planning, or language reply to the notebook. |
+
+Program calls use the local compiler under `out/`, share the checkout's working
+directory, and return up to 64 KiB of output. They run with the same file, device,
+and data requirements as standalone calls. Child programs receive end-of-input
+on stdin. Libraries are reached through their callers. Python experiment drivers
+on other branches require their own checkout and dependencies.
+
 ## Quick start
 
 From the repository root, build Heed and give it two lessons using a fresh lesson file. The sum alone leaves several explanations for “ravels.” The product distinguishes doubling each element from doubling the final result.

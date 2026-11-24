@@ -1,0 +1,134 @@
+import "tracestates.pi"
+
+# Run native entry points from this checkout. Libraries have no main of their own.
+skill chat_program_name(name) -> Any {
+  if len(name) == 0 { return false }
+  for ch in chars(name) {
+    if not contains("abcdefghijklmnopqrstuvwxyz0123456789_",ch) { return false }
+  }
+  return true
+}
+
+skill chat_source(name) -> Any {
+  if not chat_program_name(name) { return null }
+  let path = "examples/native/" ++ name ++ ".pi"
+  let src = read_file(path)
+  if src == null { return null }
+  for line in split(src,"\n") {
+    if slice(line,0,11) == "skill main(" { return path }
+  }
+  return null
+}
+
+skill chat_programs() -> Any {
+  let files = listdir("examples/native")
+  if files == null { return "Start chat from the Pi checkout to discover its programs." }
+  let names = []
+  for file in files {
+    if ends(file,".pi") {
+      let name = slice(file,0,len(file)-3)
+      let m = mark()
+      let found = release(m,chat_source(name) != null)
+      if found and name != "chat" { let names = append(names,name) }
+    }
+  }
+  return "Run a program with 'run program NAME'. Separate arguments with |.\n" ++ join(sort(names),", ")
+}
+
+skill chat_exec(command, log) -> Any {
+  let h = rt_spawn_out(command,log)
+  if h == null { return [false,"Could not start the program."] }
+  let rc = wait(h,1000)
+  while rc == null { let rc = wait(h,1000) }
+  let n = rt_file_size(log)
+  let reply = read_at(log,0,min(n,65536))
+  if reply == null { let reply = "" }
+  if n > 65536 { let reply = reply ++ "\nOutput truncated at 65536 bytes." }
+  if rc != 0 { return [false,"Program exited with " ++ str(rc) ++ ".\n" ++ reply] }
+  return [true,trim(reply)]
+}
+
+skill chat_run(name,args) -> Any {
+  if name == "chat" { return "You are already in chat." }
+  let src = chat_source(name)
+  if src == null { return "Unknown native program. Ask 'list programs' from the Pi checkout." }
+  let suffix = if platform() == "windows" { ".exe" } else { "" }
+  let base = "out/chat-worker-" ++ str(rt_chat_pid())
+  let exe = base ++ suffix
+  let log = base ++ ".log"
+  let cmd = exe
+  for a in args {
+    # Both runtime command-line parsers accept a double-quoted argument.
+    if contains(a,"\"") or ends(a,"\\") { return "An argument cannot contain a double quote or end in a backslash." }
+    let cmd = cmd ++ " \"" ++ a ++ "\""
+  }
+  let compiler = "out/pic" ++ suffix
+  if rt_file_size(compiler) == 0 { return "Build the native Pi compiler in out/ first." }
+  do rt_chat_unlink(exe)
+  let built = chat_exec(compiler ++ " " ++ src ++ " " ++ exe,log)
+  let reply = "Compilation failed. " ++ built[1]
+  if built[0] and rt_file_size(exe) > 0 { let reply = chat_exec(cmd,log)[1] }
+  do rt_chat_unlink(exe)
+  do rt_chat_unlink(log)
+  return reply
+}
+
+skill chat_program_turn(line) -> Any {
+  let text = lower(line)
+  let language = chat_language(line)
+  if language != null { return language }
+  let plan = chat_plan(line)
+  if plan != null { return plan }
+  if text == "list programs" or text == "list programs." { return chat_programs() }
+  if text == "read the screen" or text == "read the screen." { return chat_run("look",["screen"]) }
+  if slice(text,0,9) == "research " { return chat_run("research",["--question",slice(line,9,len(line))]) }
+  if slice(text,0,12) != "run program " { return null }
+  let parts = split(slice(line,12,len(line)),"|")
+  let args = []
+  for i in range(1,len(parts)) { let args = append(args,trim(parts[i])) }
+  return chat_run(lower(trim(parts[0])),args)
+}
+
+# Learn phrases from demonstrations with Tongue, keeping corrections across sessions.
+skill chat_language(line) -> Any {
+  let text = lower(line)
+  let teach = slice(text,0,15) == "teach language "
+  if not teach and slice(text,0,10) != "interpret " { return null }
+  let path = "out/chat_language.txt"
+  if teach {
+    let pair = split(slice(line,15,len(line))," => ")
+    if len(pair) != 2 or trim(pair[0]) == "" or trim(pair[1]) == "" {
+      return "Use teach language PHRASE => MEANING."
+    }
+    if not rt_append_file(path,join(pair," => ") ++ "\n") { return "Could not save the language example." }
+    return "Learned the example."
+  }
+  let history = read_file(path)
+  if history == null { return "Teach a language example first." }
+  let known = {}
+  let phrases = []
+  for record in split(history,"\n") {
+    let pair = split(record," => ")
+    if len(pair) == 2 {
+      let phrase = join(split(lower(pair[0]))," ")
+      if known[phrase] == null { let phrases = append(phrases,phrase) }
+      let known = put(known,phrase,split(trim(pair[1])))
+    }
+  }
+  let examples = []
+  for phrase in phrases { let examples = append(examples,[split(phrase),known[phrase]]) }
+  let rules = tg_learn(examples)
+  let result = tg_understand(rules,tg_familiar(rules,examples),split(slice(text,10,len(text))))
+  if result == null { return "I need another language example to interpret that phrase." }
+  return join(result," ")
+}
+
+skill chat_plan(line) -> Any {
+  if slice(lower(line),0,10) != "plan goal " { return null }
+  let fields = split(slice(line,10,len(line))," | ")
+  if len(fields) < 2 or len(fields) > 3 or not contains(["0","1"],fields[0]) {
+    return "Use plan goal 0 or 1 | observation file | optional event prefix."
+  }
+  let prefix = if len(fields) == 3 { fields[2] } else { null }
+  return ts_command(fields[1],prefix,null,hm_number(fields[0]))
+}

@@ -7071,6 +7071,19 @@ skill rt_file_size(path) -> Any {
   return rt_tag(peek(p))
 }
 
+# A chat subprocess owns its temporary executable and output by process ID.
+skill rt_chat_pid() -> Any {
+  if ostarget() { return rt_tag(lsys(39)) }
+  return rt_tag(rt_u32(wcallp(rt_proc("kernel32.dll", "GetCurrentProcessId"))))
+}
+
+skill rt_chat_unlink(path) -> Any {
+  if ostarget() { do lsys(87, rt_cstr(path)) } else {
+    do wcallp(rt_proc("kernel32.dll", "DeleteFileA"), rt_cstr(path))
+  }
+  return rt_tag(0)
+}
+
 # the local time -> [year, month, day, hour, minute, second]
 skill rt_now() -> Any {
   let t = rt_zero(rt_alloc(16), 16)

@@ -2509,6 +2509,7 @@ skill main() -> Any {
     return out ++ "\n(answer key used only to score)"
   }
   let q = arg(1)
+  if q == "--question" { let q = arg(2) }
   if q == null { return "usage: research.exe \"question\" | test" }
   if has_arg("why") {
     let types = null

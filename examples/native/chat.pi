@@ -1,11 +1,12 @@
 # Native Pi dialogue with persistent facts and searchable notes.
 import "conversation.pi"
 import "notes.pi"
+import "heedlessons.pi"
 
 skill main() -> Any {
-  # the console speaks UTF-8 (em dashes, emoji, the inline-eval brackets)
+  # Console output uses UTF-8.
   do rt_console_utf8()
-  # the memory without the brain: chat --remember NOTE / chat --recall QUERY
+  if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
   if arg(1) == "--remember" or arg(1) == "--recall" {
     let words = []
     let i = 2
@@ -21,6 +22,6 @@ skill main() -> Any {
     if len(found) == 0 { return "no notes about that" }
     return join(found, "\n")
   }
-  if arg(1) != null { return "Usage: chat [--remember NOTE | --recall QUERY]" }
+  if arg(1) != null { return "Usage: chat [--remember NOTE | --recall QUERY | memory FILE teach|use PHRASE LIST [ANSWER]]" }
   return converse("out/chat_facts.txt")
 }

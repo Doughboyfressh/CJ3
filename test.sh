@@ -78,6 +78,9 @@ fi
   [ "$(./ask "Who is Ann's grandparent?")" = "Tom is Ann's grandparent." ]
   [ "$(./chat --remember violet)" = "saved (1 notes)" ]
   [ "$(./chat --recall violet)" = "violet" ]
+  ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
+  "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
+  [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]
 )
 if [ "$?" = 0 ]; then echo "ok   native chat and ask share persistent facts"; else echo "FAIL native dialogue integration"; fail=1; fi
 if [ "$fail" = 0 ]; then echo "ALL PASS: fixpoint and $n programs"; exit 0; fi

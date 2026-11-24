@@ -28,8 +28,9 @@ ending input, `out/ask "Who is Ann's grandparent?"` answers
 also supports `--remember NOTE` and `--recall QUERY`, which use a separate
 plain-text notebook at `out/brain_memory.txt`. On Windows use the .exe files.
 
-Chat uses Pi's native English fact and question grammar. The Heed lesson
-interface below handles learning rules from examples.
+Chat uses Pi's native English fact and question grammar. Use `chat memory` with the same arguments as `heed memory` below to teach
+and apply executable rules. Both commands share the same lesson reader and
+can take turns updating the same file.
 
 ## Quick start
 

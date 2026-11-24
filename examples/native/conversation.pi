@@ -15,11 +15,10 @@ skill load_facts(mem) -> Any {
 }
 
 skill converse(mem) -> Any {
-  return converse_with(mem,handle)
+  return converse_with(mem,handle,load_facts(mem))
 }
 
-skill converse_with(mem,respond) -> Any {
-  let st = load_facts(mem)
+skill converse_with(mem,respond,st) -> Any {
   let going = true
   while going {
     let m = mark()

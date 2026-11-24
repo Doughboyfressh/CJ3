@@ -37,11 +37,50 @@ skill chat_lesson(text) -> Any {
   return [command,ws,xs,answer]
 }
 
+# Each complete journal record supersedes the previous one. Delimit both ends
+# so a partial append cannot erase the last complete question.
+skill chat_save_probe(probe) -> Any {
+  let record = "clear"
+  if probe != null {
+    let record = hm_prompt(probe[0][1],[probe[0][0],probe[1]])
+    if probe[2] != null {
+      let target = probe[2]
+      let record = record ++ "|" ++ hm_prompt(target[1][1],[target[1][0],target[2]])
+    }
+  }
+  return rt_append_file("out/chat_questions.txt","\n" ++ record ++ "!\n")
+}
+
+skill chat_saved_probe() -> Any {
+  let data = read_file("out/chat_questions.txt")
+  if data == null { return null }
+  for line in reverse(split(data,"\n")) {
+    if line == "clear!" { return null }
+    if ends(line,"?!") {
+      let parts = split(slice(line,0,len(line)-1),"|")
+      if len(parts) <= 2 {
+        let questions = []
+        for part in parts {
+          let q = chat_lesson(lower(slice(part,0,len(part)-1)))
+          if ends(part,"?") and q != null and q[0] == "use" { let questions = append(questions,q) }
+        }
+        if len(questions) == len(parts) {
+          let q = questions[0]
+          let target = if len(parts) == 2 { questions[1] } else { null }
+          return [q[1],q[2],target]
+        }
+      }
+    }
+  }
+  return null
+}
+
 skill chat_handle(st,line) -> Any {
   let text = lower(trim(line))
   if ends(text,".") or ends(text,"?") { let text = trim(slice(text,0,len(text)-1)) }
   let pending = st["lesson_probe"]
   if pending != null and text == "cancel" {
+    if not chat_save_probe(null) { return ["Could not save the cancellation.",st,false] }
     return ["Question cancelled.",put(st,"lesson_probe",null),false]
   }
   let request = chat_lesson(text)
@@ -64,6 +103,9 @@ skill chat_handle(st,line) -> Any {
   if request[0] == "use" { let target = request }
   let next = null
   if r[1] != null { let next = [[r[1][0],ws[1]],r[1][1],target] }
+  if pending != next {
+    if not chat_save_probe(next) { return ["Could not save the clarification state. Please retry.",st,false] }
+  }
   let reply = r[0]
   if command == "use" and r[2] != null {
     let law = r[2]

@@ -15,6 +15,10 @@ skill load_facts(mem) -> Any {
 }
 
 skill converse(mem) -> Any {
+  return converse_with(mem,handle)
+}
+
+skill converse_with(mem,respond) -> Any {
   let st = load_facts(mem)
   let going = true
   while going {
@@ -23,7 +27,7 @@ skill converse(mem) -> Any {
     if line == null {
       let going = false
     } else {
-      let r = handle(st, line)
+      let r = respond(st, line)
       if r[0] != "" { do print(r[0]) }
       let r = release(m, r)
       let st = r[1]

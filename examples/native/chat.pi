@@ -23,5 +23,11 @@ skill main() -> Any {
     return join(found, "\n")
   }
   if arg(1) != null { return "Usage: chat [--remember NOTE | --recall QUERY | memory FILE teach|use PHRASE LIST [ANSWER]]" }
-  return converse_with("out/chat_facts.txt",chat_handle)
+  let pending = chat_saved_probe()
+  let st = load_facts("out/chat_facts.txt")
+  if pending != null {
+    let st = put(st,"lesson_probe",pending)
+    do print(hm_prompt(pending[0][1],[pending[0][0],pending[1]]))
+  }
+  return converse_with("out/chat_facts.txt",chat_handle,st)
 }

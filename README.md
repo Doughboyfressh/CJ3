@@ -31,8 +31,9 @@ plain-text notebook at `out/brain_memory.txt`. On Windows use the .exe files.
 In ordinary chat, enter `The sum of nells for 2 and 3 is 10.` Pi asks for
 their product. Reply `24`, restart chat, and ask `What's the product of nells
 for 2, 4, and 6?` Pi answers 384 and shows the transformed inputs 4, 8, 12.
-Chat saves observations in `out/chat_lessons.txt`. A pending clarification
-belongs to the current session. Reply with a signed integer, or type `cancel`.
+Chat saves observations in `out/chat_lessons.txt`. Chat also saves its pending question and the original request in
+`out/chat_questions.txt`. After a restart it repeats the pending question.
+Reply with a signed integer, or type `cancel` to clear it across sessions.
 When the clarification settles an earlier question, Pi answers it immediately.
 
 Chat uses Pi's native English fact and question grammar. Use `chat memory` with the same arguments as `heed memory` below to teach

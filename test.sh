@@ -95,6 +95,13 @@ fi
   printf '%s\n' cancel | ./chat > cancelled.txt
   grep -Fx 'Question cancelled.' cancelled.txt
   [ "$(./chat </dev/null)" = "Goodbye. I know 6 facts." ]
+  printf '%s\n' 'Navo maps grid 1,1/2,3 to 1,1/3,2.' | ./chat > spatial.txt
+  grep -Fx 'Learned navo as gfliph(_).' spatial.txt
+  "$root/out/t_heed" grid out/chat_lessons.txt teach zemi 1,1/2,3 1,2/1,3
+  printf '%s\n' 'Apply navo, then zemi to grid 1,2,3/4,5,6.' 'Reverse the order.' | ./chat > sequence.txt
+  grep -Fx '[[3, 6], [2, 5], [1, 4]]' sequence.txt
+  grep -Fx '[[4, 1], [5, 2], [6, 3]]' sequence.txt
+  [ "$(./chat memory out/chat_lessons.txt use 'product of nells' 2,4,6)" = "384" ]
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

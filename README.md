@@ -40,6 +40,21 @@ Chat uses Pi's native English fact and question grammar. Use `chat memory` with 
 and apply executable rules. Both commands share the same lesson reader and
 can take turns updating the same file.
 
+In the same chat, teach spatial operations by showing input and output grids.
+Separate columns with commas and rows with slashes.
+
+```text
+Navo maps grid 1,1/2,3 to 1,1/3,2.
+Zemi maps grid 1,1/2,3 to 1,2/1,3.
+Apply navo, then zemi to grid 1,2,3/4,5,6.
+Reverse the order.
+```
+
+The two results are `[[3, 6], [2, 5], [1, 4]]` and `[[4, 1], [5, 2], [6, 3]]`.
+Chat keeps the last successful grid instruction and its original input during the
+conversation. The learned operations persist alongside arithmetic lessons in
+`out/chat_lessons.txt`. Heed can use that same file with `heed grid`.
+
 ## Quick start
 
 From the repository root, build Heed and give it two lessons using a fresh lesson file. The sum alone leaves several explanations for “ravels.” The product distinguishes doubling each element from doubling the final result.

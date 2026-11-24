@@ -27,12 +27,15 @@ skill hd_pct(a, b) -> Any { return str(a) ++ " of " ++ str(b) }
 skill main() -> Any {
   if arg(1) == "inquire" { return sl_session(arg(2), arg(3)) }
   if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
+  if contains(["grid","order"],arg(1)) { return ht_command(arg(1),arg(2),arg(3),arg(4),arg(5),arg(6)) }
   let readings = {}
   if arg(1) == "review" {
     if arg(2) == null { return "Usage: heed review FILE" }
     let book = hm_load(arg(2))
     if book == null { return "Unreadable or incomplete lesson file." }
-    for word in keys(book) { readings = put(readings,word,hm_laws(book[word])) }
+    for word in keys(book) {
+      if hm_word(word) { readings = put(readings,word,hm_laws(book[word])) }
+    }
   }
   let domains = ["lists", "text", "grids"]
   let pl = pools()

@@ -18,6 +18,20 @@ Two other experiments approach language learning differently. Tongue induces rea
 
 On this branch, you can teach Heed a word and use it in a new calculation. The research branch extends Heed to learn hidden states, plan actions, and choose when to reuse earlier repairs. It includes runnable SQLite, queue, file-store, and simulated-dispenser experiments. [Read the research branch and benchmarks](https://github.com/Doughboyfressh/CJ3/tree/pi/neural-list-router#research-results).
 
+## Native chat
+
+Build `examples/native/chat.pi` and `examples/native/ask.pi` with the build
+script for your platform. From the repository root, run `out/chat` and enter
+`Tom is Bob's parent.` and `Bob is Ann's parent.` on separate lines. After
+ending input, `out/ask "Who is Ann's grandparent?"` answers
+`Tom is Ann's grandparent.` Both commands use `out/chat_facts.txt`. Chat
+also supports `--remember NOTE` and `--recall QUERY`, which use a separate
+plain-text notebook at `out/brain_memory.txt`. On Windows use the .exe files.
+
+Chat uses Pi's native English fact and question grammar. Use `chat memory` with the same arguments as `heed memory` below to teach
+and apply executable rules. Both commands share the same lesson reader and
+can take turns updating the same file.
+
 ## Quick start
 
 From the repository root, build Heed and give it two lessons using a fresh lesson file. The sum alone leaves several explanations for “ravels.” The product distinguishes doubling each element from doubling the final result.

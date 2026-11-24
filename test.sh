@@ -62,6 +62,27 @@ if [ -x out/t_heed ]; then
   } > out/t_heed_memory.txt
   if cmp -s out/t_heed_memory.txt examples/native/golden/heed_memory.expect; then echo "ok   Heed transfers corrections across runs"; else echo "FAIL Heed lesson memory"; fail=1; fi
 fi
+# Exercise both native dialogue entry points with an isolated profile.
+(
+  set -e
+  profile=$(mktemp -d)
+  trap 'rm -rf "$profile"' EXIT
+  mkdir "$profile/out"
+  root=$PWD
+  out/t_g2 examples/native/chat.pi "$profile/chat" >/dev/null
+  out/t_g2 examples/native/ask.pi "$profile/ask" >/dev/null
+  cd "$profile"
+  ./chat < "$root/examples/native/golden/agent_teach.in" >/dev/null
+  ./chat < "$root/examples/native/golden/agent_recall.in" > recall.txt
+  cmp recall.txt "$root/examples/native/golden/agent_recall.expect"
+  [ "$(./ask "Who is Ann's grandparent?")" = "Tom is Ann's grandparent." ]
+  [ "$(./chat --remember violet)" = "saved (1 notes)" ]
+  [ "$(./chat --recall violet)" = "violet" ]
+  ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
+  "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
+  [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]
+)
+if [ "$?" = 0 ]; then echo "ok   native chat and ask share persistent facts"; else echo "FAIL native dialogue integration"; fail=1; fi
 if [ "$fail" = 0 ]; then echo "ALL PASS: fixpoint and $n programs"; exit 0; fi
 echo "SOME FAILED"
 exit 1

@@ -1,12 +1,12 @@
-# chat: talk with Pi. Each line you type is a question; Pi's brain answers with its hands (run_pi) and its memory
-# (remember / recall, notes kept across runs), and keeps the whole conversation so follow-ups make sense.
-# An empty line ends it. (Thinking stays in the brain; only answers are printed.)
-import "flashbrain.pi"
+# Native Pi dialogue with persistent facts and searchable notes.
+import "conversation.pi"
+import "notes.pi"
+import "heedlessons.pi"
 
 skill main() -> Any {
-  # the console speaks UTF-8 (em dashes, emoji, the inline-eval brackets)
+  # Console output uses UTF-8.
   do rt_console_utf8()
-  # the memory without the brain: chat --remember NOTE / chat --recall QUERY
+  if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
   if arg(1) == "--remember" or arg(1) == "--recall" {
     let words = []
     let i = 2
@@ -15,39 +15,13 @@ skill main() -> Any {
       let i = i + 1
     }
     if arg(1) == "--remember" {
-      do mem_add(join(words, " "))
+      if mem_add(join(words, " ")) == null { return "could not save note to " ++ MEMFILE() }
       return "saved (" ++ str(len(mem_all())) ++ " notes)"
     }
     let found = mem_find(join(words, " "), 5)
     if len(found) == 0 { return "no notes about that" }
     return join(found, "\n")
   }
-  # the brain is Qwen3.8 Flash Next (flashbrain.pi); chat --ornith [--web] keeps the old one
-  if arg(1) != "--ornith" { return fb_chat(arg(1) == "--web" or arg(2) == "--web") }
-  # chat --web: Pi can also build websites (save_file, start_site, fetch; the site lives in out\site\, served on
-  # 127.0.0.1:8080 only)
-  let br = if arg(2) == "--web" { brain_open_web(null, true) } else { brain_open() }
-  if typeof(br) == "text" { return br }
-  let sess = chat_new(br)
-  do print("Pi is ready (" ++ str(len(mem_all())) ++ " notes in memory). Ask anything; an empty line ends.")
-  let turns = 0
-  while true {
-    let q = input()
-    if q == null { return "bye" }
-    if trim(q) == "" { return "bye" }
-    let mm = mark()
-    let t0 = ticks()
-    let r = chat_turn(br, sess, trim(q), 20000)
-    # the whole turn (thinking, programs, Pi's replies) goes to out\chat_log.txt, appended
-    let old = read_file("out\\chat_log.txt")
-    if old == null { let old = "" }
-    do write_file("out\\chat_log.txt", old ++ "=== turn " ++ str(turns + 1) ++ ": " ++ trim(q) ++ "\n" ++ r[6] ++ "\n\n")
-    let line = r[2] ++ "\n  (" ++ str(r[3]) ++ " tokens, " ++ str(r[4]) ++ " tools, " ++ str(ticks() - t0) ++ " ms"
-    if r[5] { let line = line ++ "; the conversation was full, so Pi started a new one (notes kept)" }
-    let kept = release(mm, [r[0], line ++ ")"])
-    let sess = kept[0]
-    do print(kept[1])
-    let turns = turns + 1
-  }
-  return "bye"
+  if arg(1) != null { return "Usage: chat [--remember NOTE | --recall QUERY | memory FILE teach|use PHRASE LIST [ANSWER]]" }
+  return converse("out/chat_facts.txt")
 }

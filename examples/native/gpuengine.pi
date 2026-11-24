@@ -997,7 +997,7 @@ skill ge_k_acomb() -> Any {
   return s ++ "st.global.f64 [%rd14], %fd2;\nret;\n}\n"
 }
 
-# ==== looking into and editing Ornith =================================================================================
+# ==== activation inspection and editing =================================================================================
 # ablate: one block per token: the expert block's output y = X - H loses its part along the unit direction D (scale
 # in percent: 100 removes it entirely): X -= D (D . y) scale / 100
 skill ge_k_ablate() -> Any {

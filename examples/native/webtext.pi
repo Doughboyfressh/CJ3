@@ -1,6 +1,6 @@
-# webtext: the parts of flashtools.pi that need no network and no terminal -- a web page to text, tool output made
+# webtext: the parts of hosttools.pi that need no network and no terminal -- a web page to text, tool output made
 # harmless for the brain, text cut without splitting a character
-import "flashtools.pi"
+import "hosttools.pi"
 
 skill page(s) -> Any {
   let b = arr(len(s) + 1)

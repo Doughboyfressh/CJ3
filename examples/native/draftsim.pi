@@ -1,9 +1,8 @@
-# draftsim LOG [k]: how much Pi's drafts (pidraft.pi) would save on a real brain conversation, by replay. The log's
+# draftsim LOG TOKENIZER.gguf [k]: how much Pi's drafts (pidraft.pi) would save on a real brain conversation, by replay. The log's
 # own tokens are the truth (greedy decoding gives them again): at each step the draft is checked against them, the
 # agreeing prefix is kept plus the one token the verifying pass gives anyway. Tool responses and the user's lines are
 # fed (prefill), not scored.
 import "braintok.pi"
-import "forwardlib.pi"
 import "pidraft.pi"
 
 # the log as [text, scored] pieces: tool responses and "=== turn" lines are not the brain's words
@@ -36,9 +35,10 @@ skill ds_pieces(text) -> Any {
 }
 
 skill main() -> Any {
-  let path = if arg(1) != null { arg(1) } else { "out\\flash_chat_log.txt" }
-  let k = if arg(2) != null { int(arg(2)) } else { 4 }
-  let tk = tk_load(MODEL())
+  if arg(2) == null { return "Usage: draftsim LOG TOKENIZER.gguf [k]" }
+  let path = arg(1)
+  let k = if arg(3) != null { int(arg(3)) } else { 4 }
+  let tk = tk_load(arg(2))
   let ids = []
   let sc = []
   for pc in ds_pieces(read_file(path)) {

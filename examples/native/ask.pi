@@ -9,5 +9,7 @@ skill main() -> Any {
     let i = i+1
   }
   if len(words) == 0 { return "Usage: ask QUESTION" }
-  return handle(load_facts("out/chat_facts.txt"),join(words," "))[0]
+  let reply = handle(load_facts("out/chat_facts.txt"),join(words," "))
+  if reply[2] { return "Use chat to teach new facts." }
+  return reply[0]
 }

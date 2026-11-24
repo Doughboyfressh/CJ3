@@ -249,4 +249,3 @@ skill hm_command(path, command, phrase, csv, answer) -> Any {
   }
   return hm_ask(word, laws)
 }
-

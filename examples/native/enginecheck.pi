@@ -1,6 +1,6 @@
-# enginecheck: the comparisons enginetest.cmd makes (one per run, so a failure names itself) -> "ok ..." or "FAIL ..."
+# enginecheck: compare saved numeric traces and reference files -> "ok ..." or "FAIL ..."
 #   enginecheck trace A B TOL   two logit traces ("step token logit" lines): the same tokens, |logit| apart <= TOL
-#   enginecheck kern A B TOL    flashk outputs ("name e type n rows y..."): every value within TOL relative (or 1e-6)
+#   enginecheck kern A B TOL    kernel outputs ("name e type n rows y..."): every value within TOL relative (or 1e-6)
 #   enginecheck same A B        byte-identical files
 #   enginecheck has A TEXT      file A contains TEXT
 

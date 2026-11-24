@@ -144,7 +144,10 @@ skill ts_follow(transitions,trace) -> Any {
 
 skill ts_command(path,request,bound,goal) -> Any {
   if path == null { return "Usage: heed states FILE [space-separated trace]" }
-  let raw = read_file(path)
+  return ts_observations(read_file(path),request,bound,goal)
+}
+
+skill ts_observations(raw,request,bound,goal) -> Any {
   if raw == null or raw == "" { return "Missing trace file." }
   let lines = split(raw,"\n")
   let header = split(trim(lines[0])," ")

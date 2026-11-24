@@ -90,6 +90,8 @@ skill chat_handle(st,line) -> Any {
   }
   let notebook = chat_note(trim(line))
   if notebook != null { return [notebook,st,false] }
+  let plan = chat_plan(st,trim(line))
+  if plan != null { return plan }
   let program = chat_program_turn(trim(line))
   if program != null { return [program,put(st,"program_result",program),false] }
   let transform = chat_transform(st,text)

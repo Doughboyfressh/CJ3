@@ -124,6 +124,9 @@ fi
   printf '%s\n' 'Kef again' 'Kef on 4,9,1' 'Kef again on 4,9,1' 'Which telescope is mine?' 'Demo?' "Who is Ann's grandparent?" 'Unrelatedxyz?' | ./chat > coordinated.txt
   printf '%s\n' 'pivot then pivot' '[1, 9, 4]' '[4, 9, 1]' 'Related notebook entries:' 'Juniper is a telescope.' 'Juniper' 'evidence: Telescope log' 'source: local' "Tom is Ann's grandparent." "I don't understand that yet." 'Goodbye. I know 6 facts.' > coordinated.expect
   cmp coordinated.expect coordinated.txt
+  printf '%s\n' 'Plan goal 1 using events on' 'outcome 0' "Who is Ann's grandparent?" 'outcome 2' '1' '1' 'Plan goal 0' 'Cancel plan' 'outcome 1' | ./chat > planning.txt
+  printf '%s\n' 'Starting from reset, what is the outcome before any events? Reply outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on? Reply outcome 0 or outcome 1.' "Tom is Ann's grandparent." 'Give outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on on? Reply outcome 0 or outcome 1.' 'plan on' 'plan' 'Plan cleared.' 'There is no pending planning observation.' 'Goodbye. I know 6 facts.' > planning.expect
+  cmp planning.expect planning.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

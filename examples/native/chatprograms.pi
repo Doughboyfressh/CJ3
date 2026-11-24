@@ -77,8 +77,6 @@ skill chat_program_turn(line) -> Any {
   let text = lower(line)
   let language = chat_language(line)
   if language != null { return language }
-  let plan = chat_plan(line)
-  if plan != null { return plan }
   if text == "list programs" or text == "list programs." { return chat_programs() }
   if text == "read the screen" or text == "read the screen." { return chat_run("look",["screen"]) }
   if slice(text,0,9) == "research " { return chat_run("research",["--question",slice(line,9,len(line))]) }
@@ -133,12 +131,63 @@ skill chat_meaning(text) -> Any {
   return join(result," ")
 }
 
-skill chat_plan(line) -> Any {
-  if slice(lower(line),0,10) != "plan goal " { return null }
-  let fields = split(slice(line,10,len(line))," | ")
-  if len(fields) < 2 or len(fields) > 3 or not contains(["0","1"],fields[0]) {
-    return "Use plan goal 0 or 1 | observation file | optional event prefix."
+# Keep observations, goal and starting prefix together. Replies refer to the
+# exact experiment requested, even across unrelated conversation turns.
+skill chat_plan(st,line) -> Any {
+  let text = lower(line)
+  let current = st["planning"]
+  let pending = st["plan_probe"]
+  if text == "cancel plan" {
+    return ["Plan cleared.",put(put(st,"planning",null),"plan_probe",null),false]
   }
-  let prefix = if len(fields) == 3 { fields[2] } else { null }
-  return ts_command(fields[1],prefix,null,hm_number(fields[0]))
+  let raw = null
+  let goal = null
+  let prefix = null
+  if slice(text,0,10) == "plan goal " {
+    let spec = slice(line,10,len(line))
+    let fields = split(spec," | ")
+    if len(fields) == 2 or len(fields) == 3 {
+      let goal = hm_number(fields[0])
+      let raw = read_file(fields[1])
+      if raw == null { return ["Missing trace file.",st,false] }
+      if len(fields) == 3 { let prefix = fields[2] }
+    } else {
+      let words = split(spec)
+      let goal = hm_number(words[0])
+      if len(words) == 1 and current != null {
+        let raw = current[0]
+        let prefix = current[2]
+      } else {
+        if len(words) < 4 or lower(words[1]) != "using" or lower(words[2]) != "events" {
+          return ["Use plan goal 1 using events EVENT ... or plan goal 1 | observation file | optional event prefix.",st,false]
+        }
+        let raw = "events " ++ join(slice(words,3,len(words))," ")
+      }
+    }
+    if goal != 0 and goal != 1 { return ["Give a binary goal (0 or 1).",st,false] }
+  } else {
+    let labelled = slice(text,0,8) == "outcome "
+    if pending == null {
+      if labelled { return ["There is no pending planning observation.",st,false] }
+      return null
+    }
+    # A bare number may already answer Heed’s arithmetic clarification.
+    if not labelled and (st["lesson_probe"] != null or not contains(["0","1"],text)) { return null }
+    let bit = if labelled { trim(slice(text,8,len(text))) } else { text }
+    if not contains(["0","1"],bit) { return ["Give outcome 0 or outcome 1.",st,false] }
+    let raw = current[0] ++ "\n" ++ trim(bit ++ " " ++ pending)
+    let goal = current[1]
+    let prefix = current[2]
+  }
+  let answer = ts_observations(raw,prefix,null,goal)
+  let probe = null
+  if slice(answer,0,8) == "observe " {
+    let probe = slice(answer,8,len(answer))
+    let experiment = if probe == "" { "before any events" } else { "after " ++ probe }
+    let answer = "Starting from reset, what is the outcome " ++ experiment ++ "? Reply outcome 0 or outcome 1."
+  } else {
+    if slice(answer,0,4) != "plan" and answer != "Goal unreachable in learned model." { return [answer,st,false] }
+  }
+  let updated = put(put(st,"planning",[raw,goal,prefix]),"plan_probe",probe)
+  return [answer,put(updated,"program_result",answer),false]
 }

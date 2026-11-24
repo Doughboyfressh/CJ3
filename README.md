@@ -80,6 +80,17 @@ program, and screen reader.
 | `Run program tongue &#124; mini` | Compiles and runs the named entry point. Each field after the name is one argument. |
 | `Remember that result` | Saves the last program, planning, or language reply to the notebook. |
 
+To plan without preparing a file, say `Plan goal 1 using events on`. Pi asks
+for the outcome at reset, then for the outcome of specific sequences starting
+from reset. Give each result as `outcome 0` or `outcome 1`. You can ask an
+unrelated question and return to the pending experiment. A bare 0 or 1 also
+works when no arithmetic clarification is pending. With outcomes 0 at reset,
+1 after `on`, and 1 after `on on`, Pi returns `plan on`. Ask `Plan goal 0`
+to reuse those observations. A bare `plan` means the starting state already
+meets the goal. The inferred model and its observations belong to this chat
+session; `Cancel plan` clears them. When starting from a trace file, chat
+holds a snapshot and keeps subsequent answers in the session.
+
 Ordinary turns can also use what Pi has learned. Teach a list operation with
 `Pivot maps list 2,1,3 to 3,1,2.`, then give the language example
 `Teach language kef => pivot`. After restarting chat, `Kef on 4,9,1`

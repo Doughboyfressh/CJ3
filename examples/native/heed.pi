@@ -1,3 +1,4 @@
+import "tracestates.pi"
 import "heedlessons.pi"
 
 # Read learned corrections before less specific grammar rules, only in the taught domain.
@@ -25,6 +26,12 @@ skill hd_told(rules, fam, steps, task, domain, readings) -> Any {
 skill hd_pct(a, b) -> Any { return str(a) ++ " of " ++ str(b) }
 
 skill main() -> Any {
+  if arg(1) == "states-check" {
+    let bound = hm_number(arg(3))
+    if bound == null or bound < 1 { return "Give a positive state bound." }
+    return ts_command(arg(2),null,bound,null)
+  }
+  if arg(1) == "states" { return ts_command(arg(2),arg(3),null,null) }
   if arg(1) == "inquire" { return sl_session(arg(2), arg(3)) }
   if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
   if contains(["grid","order"],arg(1)) { return ht_command(arg(1),arg(2),arg(3),arg(4),arg(5),arg(6)) }

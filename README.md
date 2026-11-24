@@ -154,6 +154,29 @@ returns 0, the extra experiment costs one reply without finding a plan.
 This estimate tracks recent prediction errors; its value is not a calibrated
 probability for a new domain.
 
+### Repair history in chat
+
+Build `examples/native/heed.pi` and `examples/native/chat.pi` and run chat
+from the checkout with Python 3 on PATH. Alternate `repair task slow` and
+`repair task fast` to run the two bundled resettable dispenser simulations.
+The Python driver from the research branch chooses a repair strategy from
+paired observation costs stored in `out/repair_history.sqlite`. Once both
+diagnostic outcomes have enough support, it buys an early observation only
+when the observed savings would cover the cost. Chat reports the chosen
+strategy and the number of times the target was actually observed. The
+alternative strategy is measured by replay against the verified inferred
+table. Only completed pairs update the cost history.
+
+The shared unit breaks a tie between equally costly strategies (a high
+surprise estimate favors trying the pattern library). After a paid probe
+with a historical majority prediction, its observed bit updates the shared
+unit. An even split produces no prediction feedback. To use a custom
+simulation, put `repair_NAME.json` in `out/` following the bundled examples.
+The target table supplies reset-and-run outcomes; the selector sees only
+those observations. The historical database format and context keys match
+the research driver; a matching research database can be used at the same
+path. These counts measure simulated target interactions.
+
 ## Quick start
 
 From the repository root, build Heed and give it two lessons using a fresh lesson file. The sum alone leaves several explanations for “ravels.” The product distinguishes doubling each element from doubling the final result.

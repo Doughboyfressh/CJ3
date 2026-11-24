@@ -142,6 +142,14 @@ fi
   grep -Fx 'Goal unreachable in learned model.' constant.txt
   grep -Fx 'Shared surprise estimate: 552/1024.' constant.txt
   grep -Fx '7/2. Can you check it? Teach curve ramp 3=VALUE with the observed integer.' constant.txt
+  ln -s "$root/tools" tools
+  ln -s "$root/out/t_heed" out/heed
+  printf '%s\n' 'repair task slow' 'repair task fast' 'repair task slow' 'repair task fast' | ./chat > calibration.txt
+  printf '%s\n' 'repair task slow' 'repair task fast' | ./chat > recurring.txt
+  grep -Fx 'library repair; checked under supplied bound; 32 target observations; 4 prior verified comparisons.' recurring.txt
+  grep -Fx 'Paid diagnostic: c b -> 0' recurring.txt
+  grep -Fx 'ordinary repair; checked under supplied bound; 54 target observations; 5 prior verified comparisons.' recurring.txt
+  grep -Fx 'Paid diagnostic: c b -> 1' recurring.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

@@ -215,3 +215,20 @@ skill chat_plan(st,line) -> Any {
   let updated = put(put(updated,"neuron_expected",expected),"neuron_probed",probed)
   return [answer,put(updated,"program_result",answer),false]
 }
+
+skill chat_repair(st,text) -> Any {
+  if slice(text,0,12) != "repair task " { return null }
+  let name = slice(text,12,len(text))
+  if not hm_word(name) { return ["Give a task name using letters.",st,false] }
+  let python = if platform() == "windows" { "python" } else { "python3" }
+  let log = "out/chat-repair-" ++ str(rt_chat_pid()) ++ ".log"
+  let tie = if neuron_gate(st) { "library" } else { "ordinary" }
+  let result = chat_exec(python ++ " tools/chat_repair.py " ++ name ++ " " ++ tie,log)
+  do rt_chat_unlink(log)
+  if not result[0] { return [result[1],st,false] }
+  let lines = split(result[1],"\n")
+  if len(lines) < 2 or not contains(["0","1","none"],lines[0]) { return ["Incomplete repair result.",st,false] }
+  if lines[0] != "none" { let st = neuron_observe(st,hm_number(lines[0])) }
+  let reply = join(slice(lines,1,len(lines)),"\n")
+  return [reply,put(st,"program_result",reply),false]
+}

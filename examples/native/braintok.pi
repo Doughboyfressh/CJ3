@@ -1,5 +1,5 @@
-# The brain's tokenizer, in Pi: Ornith's byte-level BPE read from its own GGUF file -- 248,320 tokens, 247,587 merge
-# rules, and the qwen35 pre-tokenizer pattern written out as a scanner (no regex engine, no outside library).
+# Byte-level BPE read from a compatible GGUF tokenizer.
+# The qwen35 pre-tokenizer is implemented as a scanner.
 #   tk = tk_load(path)      -> [byte -> token id, merge table keys, ranks, results]   (~2 s)
 #   tk_encode(tk, text)     -> token ids
 # Merges live in an open-addressing hash table over integers: key id(a) x 2^18 + id(b) -> (rank, id(ab)), so encoding

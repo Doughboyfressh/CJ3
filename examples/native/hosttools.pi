@@ -1,4 +1,4 @@
-# flashtools: Pi's reach beyond its sandbox -- a terminal (shell) and the internet (web), tools of the brain's turn
+# hosttools: Pi's reach beyond its sandbox -- a terminal (shell) and the internet (web), tools of the brain's turn
 # (run_pi stays what it was: programs that compute and print). The user asked for full access, always on, so nothing is
 # blocked here. What stands instead: every action is shown in the chat and logged before it runs (out\pi_actions.log),
 # a command has a time limit (its whole process tree ends with it), and what comes back is capped and made harmless as

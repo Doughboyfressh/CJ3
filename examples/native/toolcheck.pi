@@ -1,6 +1,6 @@
-# toolcheck: flashtools.pi against the real terminal and the real internet, without the brain or the GPU. Every command
+# toolcheck: hosttools.pi against the real terminal and the real internet, without the brain or the GPU. Every command
 # here only reads. Not a golden: its output depends on the machine and the network.
-import "flashtools.pi"
+import "hosttools.pi"
 
 skill head(s) -> Any {
   print(slice(s, 0, min(len(s), 700)))

@@ -14,7 +14,7 @@
 #   out\arc3.exe [game ids, comma separated | all] [actions per game]      (needs the ARC-AGI-3 server on :8001)
 import "json.pi"
 
-skill http(method, path, obj) -> Any {
+skill arc_request(method, path, obj) -> Any {
   let body = ""
   if obj != null { let body = json_text(obj) }
   let req = method ++ " " ++ path ++ " HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " ++ str(len(body)) ++ "\r\n\r\n" ++ body
@@ -486,7 +486,7 @@ skill targets_of(grid, mecol) -> Any {
   return out
 }
 
-skill play(gid, card, budget) -> Any {
+skill arc_play(gid, card, budget) -> Any {
   let grid = arr(4096)
   let prev = arr(4096)
   let mask = arr(4096)
@@ -500,7 +500,7 @@ skill play(gid, card, budget) -> Any {
   let masked = 0
   let w = new_world()
   let m = mark()
-  let r = take(http("POST", "/api/cmd/RESET", {"game_id": gid, "card_id": card}), grid, w, mask, 0 - 1)
+  let r = take(arc_request("POST", "/api/cmd/RESET", {"game_id": gid, "card_id": card}), grid, w, mask, 0 - 1)
   let r = release(m, r)
   if r == null { return [gid, 0, 0, 0, "no server"] }
   let guid = r[4]
@@ -625,12 +625,12 @@ skill play(gid, card, budget) -> Any {
     let m = mark()
     let resp = null
     if a < 0 or state == "GAME_OVER" {
-      let resp = http("POST", "/api/cmd/RESET", {"game_id": gid, "card_id": card, "guid": guid})
+      let resp = arc_request("POST", "/api/cmd/RESET", {"game_id": gid, "card_id": card, "guid": guid})
       let resets = resets + 1
     } else {
       let code = aget(w["acode"], cur * MAXA() + a)
       let act = [code // 4096, code % 64, code % 4096 // 64]
-      let resp = http("POST", "/api/cmd/ACTION" ++ str(act[0]), act_body(gid, card, guid, act))
+      let resp = arc_request("POST", "/api/cmd/ACTION" ++ str(act[0]), act_body(gid, card, guid, act))
     }
     let r = take(resp, grid, w, mask, mecol)
     let r = release(m, r)
@@ -753,7 +753,7 @@ skill main() -> Any {
   let budget = 300
   if arg(2) != null { let budget = num(arg(2)) }
   let games = []
-  let listing = http("GET", "/api/games", null)
+  let listing = arc_request("GET", "/api/games", null)
   if listing == null { return "The ARC-AGI-3 server is not running (C:\\Users\\Dough\\arc3_env\\serve.py)." }
   for g in listing {
     let id = split(g["game_id"], "-")[0]
@@ -771,17 +771,17 @@ skill main() -> Any {
     }
     let games = mine
   }
-  let card = http("POST", "/api/scorecard/open", {})["card_id"]
+  let card = arc_request("POST", "/api/scorecard/open", {})["card_id"]
   let total = 0
   let possible = 0
   let solved = 0
   for gid in sort(games) {
-    let r = play(gid, card, budget)
+    let r = arc_play(gid, card, budget)
     do print(split(r[0], "-")[0] ++ ": levels " ++ str(r[1]) ++ " of " ++ str(r[2]) ++ " in " ++ str(r[3]) ++ " actions (" ++ r[4] ++ ")")
     let total = total + r[1]
     let possible = possible + r[2]
     if r[1] == r[2] and r[2] > 0 { let solved = solved + 1 }
   }
-  do http("POST", "/api/scorecard/close", {"card_id": card})
+  do arc_request("POST", "/api/scorecard/close", {"card_id": card})
   return "Pi finished " ++ str(total) ++ " of " ++ str(possible) ++ " levels; " ++ str(solved) ++ " of " ++ str(len(games)) ++ " games won (" ++ str(budget) ++ " actions per game)."
 }

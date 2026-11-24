@@ -13,7 +13,26 @@
 #   remember  examples/grown_ledger.txt: every decision with its numbers; a decided rule is never tried again
 #   langgrow          one round
 #   langgrow --dry    perceive, decide and learn; build and change nothing
-import "brain.pi"
+skill brain_find(s, sub, from) -> Any {
+  let n = len(s)
+  let k = len(sub)
+  let i = from
+  while i + k <= n {
+    if slice(s, i, i + k) == sub { return i }
+    let i = i + 1
+  }
+  return 0 - 1
+}
+
+# Compatibility prelude for compiling previously recorded examples.
+skill hands_lib() -> Any {
+  # (a write can fail while the other side has the file open: each one is repeated until it works; the wait between
+  # looks is a short spin, so the program does not hold the file)
+  let s = "skill think_put(path, s) -> Any {\n  while write_file(path, s) == null { let z = 0 }\n  return s\n}\nskill think_call(op, h, q) -> Any {\n  do think_put(\"out/think_resp.txt\", \"\")\n  do think_put(\"out/think_req.txt\", op ++ \"\\n\" ++ str(h) ++ \"\\n\" ++ q)\n  let r = \"\"\n  while len(r) == 0 {\n    for z in range(0, 300000) { let z2 = z }\n    let r = read_file(\"out/think_resp.txt\")\n    if r == null { let r = \"\" }\n  }\n  return r\n}\n"
+  let s = s ++ "skill ask(q) -> Any { return think_call(\"ask\", 0, str(q)) }\nskill think(q) -> Any { return num(think_call(\"think\", 0, str(q))) }\nskill think_more(t, q) -> Any { return num(think_call(\"more\", t, str(q))) }\nskill thought(t) -> Any { return think_call(\"text\", t, \"\") }\n"
+  return s
+}
+
 
 skill GR_KEYWORDS() -> Any { return ["skill", "let", "if", "else", "while", "for", "in", "return", "do", "and", "or", "not", "true", "false", "null", "fn", "import", "reach", "break", "continue", "Any"] }
 skill GR_LEDGER() -> Any { return "examples\\grown_ledger.txt" }

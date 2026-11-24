@@ -1,5 +1,5 @@
 # The intelligence of one write, and why the rest of the vector is not it.
-# Ornith's hidden width is 2048. One such write, packed Q4_K, is 8 blocks of 144 bytes = 1,152 bytes.
+# The example uses a hidden width of 2048. One such write, packed Q4_K, is 8 blocks of 144 bytes = 1,152 bytes.
 # Bus B = ceil(1152/32) = 36. Page-in P = ceil(1152/4) = 288. And 8*36 = 288, so P = 8B.
 # The copy is already on the ceiling of the bus theorem. A cleverer copy cannot be cheaper.
 # Distillation wins only by not copying the vector.

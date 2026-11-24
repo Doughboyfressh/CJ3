@@ -102,6 +102,12 @@ fi
   grep -Fx '[[3, 6], [2, 5], [1, 4]]' sequence.txt
   grep -Fx '[[4, 1], [5, 2], [6, 3]]' sequence.txt
   [ "$(./chat memory out/chat_lessons.txt use 'product of nells' 2,4,6)" = "384" ]
+  printf '%s\n' 'Navo maps list 2,1,3 to 3,2,1.' | ./chat > list-lesson.txt
+  grep -Fx 'Learned navo as rev(sort(_)).' list-lesson.txt
+  [ "$("$root/out/t_heed" order out/chat_lessons.txt use navo 4,9,1)" = "[9, 4, 1]" ]
+  printf '%s\n' 'Apply navo to list 4,9,1.' 'Apply navo then reverse to 4,9,1.' 'Reverse the order.' 'Apply navo to 1,2/3,4.' | ./chat > shapes.txt
+  printf '%s\n' '[9, 4, 1]' '[1, 4, 9]' '[9, 4, 1]' '[[2, 1], [4, 3]]' 'Goodbye. I know 6 facts.' > shapes.expect
+  cmp shapes.expect shapes.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

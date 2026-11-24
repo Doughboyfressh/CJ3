@@ -51,9 +51,15 @@ Reverse the order.
 ```
 
 The two results are `[[3, 6], [2, 5], [1, 4]]` and `[[4, 1], [5, 2], [6, 3]]`.
-Chat keeps the last successful grid instruction and its original input during the
+Chat keeps the last successful transformation and its original input during the
 conversation. The learned operations persist alongside arithmetic lessons in
 `out/chat_lessons.txt`. Heed can use that same file with `heed grid`.
+
+Teach a list operation with `Biggest first maps list 2,1,3 to 3,2,1.`
+Then `Apply biggest first to 4,9,1.` returns `[9, 4, 1]`. Chat reads a flat
+input as a list and slash-separated rows as a grid. Specify `to grid` for
+a single-row grid. A phrase can have a different learned meaning for each
+input type. Both support sequences and the follow-up `Reverse the order.`
 
 ## Quick start
 

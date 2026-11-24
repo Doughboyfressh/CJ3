@@ -80,6 +80,19 @@ program, and screen reader.
 | `Run program tongue &#124; mini` | Compiles and runs the named entry point. Each field after the name is one argument. |
 | `Remember that result` | Saves the last program, planning, or language reply to the notebook. |
 
+Ordinary turns can also use what Pi has learned. Teach a list operation with
+`Pivot maps list 2,1,3 to 3,1,2.`, then give the language example
+`Teach language kef => pivot`. After restarting chat, `Kef on 4,9,1`
+returns `[1, 9, 4]`. Tongue interprets the phrase and Heed evaluates the
+operation on the supplied input. Learned phrases can also resolve to a
+sequence such as `pivot then pivot`.
+
+For questions the fact engine cannot settle, chat checks saved research for
+the same question and includes its recorded source and evidence. If there is
+no matching research, it can return related notebook entries as quotations
+under a separate label. Explicit `Research` requests still use the research
+program.
+
 Program calls use the local compiler under `out/`, share the checkout's working
 directory, and return up to 64 KiB of output. They run with the same file, device,
 and data requirements as standalone calls. Child programs receive end-of-input

@@ -120,6 +120,10 @@ fi
   grep -Fx 'evidence: Telescope log' programs.txt
   grep -Fx '  new sentences: 10 of 10 read rightly' programs.txt
   grep -Fx "Unknown native program. Ask 'list programs' from the Pi checkout." programs.txt
+  printf '%s\n' 'Pivot maps list 2,1,3 to 3,1,2.' 'Teach language bim => sort' 'Teach language zor => reverse' 'Teach language kef => pivot' 'Teach language bim again => sort then sort' 'Teach language zor again => reverse then reverse' | ./chat >/dev/null
+  printf '%s\n' 'Kef again' 'Kef on 4,9,1' 'Kef again on 4,9,1' 'Which telescope is mine?' 'Demo?' "Who is Ann's grandparent?" 'Unrelatedxyz?' | ./chat > coordinated.txt
+  printf '%s\n' 'pivot then pivot' '[1, 9, 4]' '[4, 9, 1]' 'Related notebook entries:' 'Juniper is a telescope.' 'Juniper' 'evidence: Telescope log' 'source: local' "Tom is Ann's grandparent." "I don't understand that yet." 'Goodbye. I know 6 facts.' > coordinated.expect
+  cmp coordinated.expect coordinated.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

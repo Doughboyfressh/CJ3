@@ -1,3 +1,4 @@
+import "researchmemory.pi"
 import "heedlessons.pi"
 import "english.pi"
 import "chatprograms.pi"
@@ -104,7 +105,13 @@ skill chat_handle(st,line) -> Any {
     let request = ["teach",pending[0],pending[1],text]
     let target = pending[2]
   }
-  if request == null { return handle(st,line) }
+  if request == null {
+    let fact = handle(st,line)
+    let reply = fact[0]
+    if reply != "I don't understand that yet." and reply != "Not as far as I know." and slice(reply,0,12) != "I don't know" { return fact }
+    let grounded = chat_grounded(st,text,line)
+    return if grounded == null { fact } else { grounded }
+  }
   let ws = request[1]
   let xs = request[2]
   let command = request[0]
@@ -148,6 +155,12 @@ skill chat_transform(st,text) -> Any {
       return [ht_command(domain,path,"teach",lesson[0],pair[0],pair[1]),st,false]
     }
   }
+  return chat_apply(st,text)
+}
+
+skill chat_apply(st,text) -> Any {
+  let path = "out/chat_lessons.txt"
+  let domain = "order"
   let steps = []
   let raw = null
   if text == "reverse the order" {
@@ -184,4 +197,40 @@ skill chat_transform(st,text) -> Any {
   let result = ht_command(domain,path,"use",join(steps,", then "),raw,null)
   if slice(result,0,1) == "[" { let st = put(st,"transform_request",[domain,steps,raw]) }
   return [result,st,false]
+}
+
+# An interpretation can name a Heed operation. Only transformations with an
+# actual numeric input enter that evaluator; learned text stays data elsewhere.
+skill chat_grounded(st,text,line) -> Any {
+  let parts = split(text," on ")
+  if len(parts) > 1 {
+    let raw = parts[len(parts)-1]
+    let domain = if contains(raw,"/") { "grid" } else { "order" }
+    if ht_value(domain,raw) != null {
+      let phrase = join(slice(parts,0,len(parts)-1)," on ")
+      let names = chat_meaning(phrase)
+      let taught = names != null
+      if names == null { let names = phrase }
+      let action = chat_apply(st,"apply " ++ lower(names) ++ " to " ++ raw)
+      if action != null {
+        if slice(action[0],0,1) == "[" { return [action[0],put(action[1],"program_result",action[0]),false] }
+        let book = hm_load("out/chat_lessons.txt")
+        if taught or (book != null and book[domain ++ ":" ++ phrase] != null) { return action }
+      }
+    }
+  }
+  let meaning = chat_meaning(text)
+  if meaning != null { return [meaning,put(st,"program_result",meaning),false] }
+  let words = split(text)
+  if len(words) == 0 { return null }
+  if not ends(trim(line),"?") and not contains(["who","what","when","where","which","how","why"],words[0]) { return null }
+  let item = research_recall(text)
+  if item != null {
+    let reply = item[1] ++ "\nevidence: " ++ item[3] ++ "\nsource: " ++ item[2]
+    return [reply,put(st,"program_result",reply),false]
+  }
+  let notes = mem_find(text,3)
+  if len(notes) == 0 { return null }
+  let reply = "Related notebook entries:\n" ++ join(notes,"\n")
+  return [reply,put(st,"program_result",reply),false]
 }

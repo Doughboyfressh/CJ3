@@ -103,23 +103,33 @@ skill chat_language(line) -> Any {
     if not rt_append_file(path,join(pair," => ") ++ "\n") { return "Could not save the language example." }
     return "Learned the example."
   }
-  let history = read_file(path)
-  if history == null { return "Teach a language example first." }
+  let result = chat_meaning(slice(text,10,len(text)))
+  if result == null { return "I need another language example to interpret that phrase." }
+  return result
+}
+
+skill chat_meaning(text) -> Any {
+  let history = read_file("out/chat_language.txt")
+  if history == null or text == "" { return null }
+  let vocabulary = {}
   let known = {}
   let phrases = []
   for record in split(history,"\n") {
     let pair = split(record," => ")
     if len(pair) == 2 {
       let phrase = join(split(lower(pair[0]))," ")
+      for word in split(phrase) { let vocabulary = put(vocabulary,word,true) }
       if known[phrase] == null { let phrases = append(phrases,phrase) }
       let known = put(known,phrase,split(trim(pair[1])))
     }
   }
+  let words = split(text)
+  for word in words { if vocabulary[word] == null { return null } }
   let examples = []
   for phrase in phrases { let examples = append(examples,[split(phrase),known[phrase]]) }
   let rules = tg_learn(examples)
-  let result = tg_understand(rules,tg_familiar(rules,examples),split(slice(text,10,len(text))))
-  if result == null { return "I need another language example to interpret that phrase." }
+  let result = tg_understand(rules,tg_familiar(rules,examples),words)
+  if result == null { return null }
   return join(result," ")
 }
 

@@ -110,6 +110,50 @@ and data requirements as standalone calls. Child programs receive end-of-input
 on stdin. Libraries are reached through their callers. Python experiment drivers
 on other branches require their own checkout and dependencies.
 
+### Growing a neural curve in chat
+
+`Teach curve tide 0=0 2=3 4=0 6=3 8=0` learns a scalar function with three hidden
+ReLU units. Ask `Curve tide neurons` for its size and `Curve tide at 3` for the
+exact interpolated value `3/2`. Teaching another value at the same input corrects
+that lesson. Names use letters. Each name has its own lesson file under `out/`.
+Input and output lessons accept integers from −100,000,000 to 100,000,000.
+
+Pi joins consecutive observations with straight lines. Each change of slope at
+a breakpoint contributes one hidden ReLU, weighted by the difference between
+successive slopes. The network uses the first line as its affine baseline.
+Within the observed range this represents the same function as summing all
+those weighted ReLUs. Chat stores the breakpoints and selects the active
+segment by binary search. Collinear samples require no extra units. The
+learner retains original observations so that a correction can restore a bend.
+A single example supports only that input. Predictions outside the taught
+range are withheld. A lookup also checks the lesson file for changes.
+
+### A shared recurrent unit for checking predictions
+
+Curve learning and goal planning use one scalar state on Softwell's modeled
+SSD. If a later observed integer confirms or contradicts a curve prediction
+at the same input, the shared unit updates. A planner probe with a known
+model prediction supplies the same feedback. The update moves the estimate
+one quarter of the way toward 1 for a surprise or 0 for an agreement, rounded
+in units of 1/1024. The neutral initial estimate is 1/2. A feedback log in
+`out/chat_neuron.log` restores the state for new chat sessions.
+
+A score over 1/2 enables one extra conformance probe when the planner reports
+an unreachable goal. The checker uses a two-state bound to propose that probe;
+this is a search heuristic, not a bound on the actual world. A measured cold
+Softwell page read during the gate raises the threshold by 1/8. If an observed
+sequence reaches the requested goal from the requested prefix, chat can return
+that witnessed plan immediately. The same gate asks for an observed value
+when chat interpolates a previously untaught curve input.
+
+Use `Neuron status` to inspect the estimate. For example, teach `ramp` with
+`0=0 4=4`, ask for its value at 2, and teach the correction `2=3`.
+Then say `Plan goal 1 using events press` and reply with outcomes 0, 0 and 1.
+The extra experiment discovers `plan press press`. For a switch that always
+returns 0, the extra experiment costs one reply without finding a plan.
+This estimate tracks recent prediction errors; its value is not a calibrated
+probability for a new domain.
+
 ## Quick start
 
 From the repository root, build Heed and give it two lessons using a fresh lesson file. The sum alone leaves several explanations for “ravels.” The product distinguishes doubling each element from doubling the final result.

@@ -127,6 +127,21 @@ fi
   printf '%s\n' 'Plan goal 1 using events on' 'outcome 0' "Who is Ann's grandparent?" 'outcome 2' '1' '1' 'Plan goal 0' 'Cancel plan' 'outcome 1' | ./chat > planning.txt
   printf '%s\n' 'Starting from reset, what is the outcome before any events? Reply outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on? Reply outcome 0 or outcome 1.' "Tom is Ann's grandparent." 'Give outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on on? Reply outcome 0 or outcome 1.' 'plan on' 'plan' 'Plan cleared.' 'There is no pending planning observation.' 'Goodbye. I know 6 facts.' > planning.expect
   cmp planning.expect planning.txt
+  printf '%s\n' 'Teach curve wave 8=0 0=0 2=3 6=-3 4=0' | ./chat > trained.txt
+  grep -Fx '5 samples, 2 hidden ReLU neurons.' trained.txt
+  printf '%s\n' 'Curve wave at 5' 'Curve wave at 8' 'Curve wave at 9' 'Teach curve wave 2=0 6=0' 'Teach curve wave 3=9 bad' 'Curve wave at 3' | ./chat > curves.txt
+  printf '%s\n' '-3/2' '0' 'Outside the taught range.' '5 samples, 0 hidden ReLU neurons.' 'Use integer X=Y lessons between -100000000 and 100000000.' '0' 'Goodbye. I know 6 facts.' > curves.expect
+  cmp curves.expect curves.txt
+  printf '%s\n' 'Plan goal 1 using events press' '0' '0' | ./chat > baseline.txt
+  grep -Fx 'Goal unreachable in learned model.' baseline.txt
+  printf '%s\n' 'Teach curve ramp 0=0 4=4' 'Curve ramp at 2' 'Teach curve ramp 2=3' | ./chat >/dev/null
+  printf '%s\n' 'Plan goal 1 using events press' '0' '0' '1' 'Neuron status' | ./chat > transfer.txt
+  grep -Fx 'plan press press' transfer.txt
+  grep -Fx 'Shared surprise estimate: 736/1024.' transfer.txt
+  printf '%s\n' 'Plan goal 1 using events press' '0' '0' '0' 'Neuron status' 'Curve ramp at 3' | ./chat > constant.txt
+  grep -Fx 'Goal unreachable in learned model.' constant.txt
+  grep -Fx 'Shared surprise estimate: 552/1024.' constant.txt
+  grep -Fx '7/2. Can you check it? Teach curve ramp 3=VALUE with the observed integer.' constant.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

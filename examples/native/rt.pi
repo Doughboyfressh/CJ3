@@ -1171,7 +1171,7 @@ skill rt_less(a, b) -> Any {
 
 # sort(xs): a stable bottom-up merge sort (equal items keep their order, as the interpreter's sort does)
 skill rt_sort(xs) -> Any {
-  if rt_kind(xs) != 2 { return 0 }
+  if rt_kind(xs) != 2 and rt_kind(xs) != 8 { return 0 }
   let n = peek(xs + 8)
   let a = rt_list_new(n)
   let b = rt_list_new(n)

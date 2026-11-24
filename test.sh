@@ -95,6 +95,12 @@ fi
   printf '%s\n' cancel | ./chat > cancelled.txt
   grep -Fx 'Question cancelled.' cancelled.txt
   [ "$(./chat </dev/null)" = "Goodbye. I know 6 facts." ]
+  printf '%s\n' 'What is the product of nells for 2 and 3?' 'No, it should be twelve.' 'No, it should be 12.' 'What is the product of nells for 3,5,7?' | ./chat > corrected.txt
+  grep -Fx 'Give a whole-number correction.' corrected.txt
+  grep -Fx '210. I took the product first, then applied (e * 2).' corrected.txt
+  printf '%s\n' 'What is the product of nells for 4 and 5?' "Who is Ann's grandparent?" 'The correct answer is 30.' | ./chat > grounded.txt
+  grep -Fx '40. I took the product first, then applied (e * 2).' grounded.txt
+  grep -Fx 'Which result? Give the word, inputs, and corrected answer.' grounded.txt
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]

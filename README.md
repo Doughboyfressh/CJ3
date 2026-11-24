@@ -36,6 +36,12 @@ Chat saves observations in `out/chat_lessons.txt`. Chat also saves its pending q
 Reply with a signed integer, or type `cancel` to clear it across sessions.
 When the clarification settles an earlier question, Pi answers it immediately.
 
+To correct a numeric prediction, reply `No, it should be 12.` Pi records the
+corrected result for the same word, operation and inputs, then fits the rule
+to the saved observations again. The correction applies to the immediately
+preceding prediction in this chat. After changing subjects or restarting,
+give the observation explicitly.
+
 Chat uses Pi's native English fact and question grammar. Use `chat memory` with the same arguments as `heed memory` below to teach
 and apply executable rules. Both commands share the same lesson reader and
 can take turns updating the same file.

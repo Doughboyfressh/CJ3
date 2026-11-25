@@ -1,0 +1,19 @@
+import "chatprofile.pi"
+skill research_key(q) -> Any {
+  let key = lower(trim(q))
+  if len(key) > 0 and contains(["?","."],slice(key,len(key)-1,len(key))) {
+    let key = trim(slice(key,0,len(key)-1))
+  }
+  return key
+}
+
+skill research_recall(q) -> Any {
+  let t = read_file(chat_data("research.kb"))
+  if t == null { return null }
+  let key = research_key(q)
+  for line in split(t, "\n") {
+    let p = split(line, " ||| ")
+    if len(p) == 4 and research_key(p[0]) == key { return p }
+  }
+  return null
+}

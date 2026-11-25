@@ -4,6 +4,10 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import subprocess
+import tempfile
+
+from repair_memory import repair_history
 
 from trace_transfer import cost_aware_transfer, predict
 
@@ -36,12 +40,19 @@ def run(name, prefer_library_on_tie):
         return {"goal": predict(target, [indices[action] for action in trace])}
 
     binary = Path("out/heed.exe" if sys.platform == "win32" else "out/heed").resolve()
+    if not binary.is_file() and Path(".pi-profile/active").is_file():
+        compiler = binary.with_name("pic" + binary.suffix)
+        with tempfile.TemporaryDirectory(dir=binary.parent) as directory:
+            built = Path(directory) / binary.name
+            subprocess.run([compiler, "examples/native/heed.pi", built], check=True,
+                           stdout=subprocess.DEVNULL)
+            built.replace(binary)
     if not binary.is_file():
         raise ValueError("Build examples/native/heed.pi before running repair tasks.")
     result = cost_aware_transfer(binary, config["source"], actions,
                                  [({"goal": 0}, 0), ({"goal": 1}, 1)], observe,
                                  bound, config["budget"], config["patterns"],
-                                 "out/repair_history.sqlite", diagnostic=True,
+                                 repair_history(), diagnostic=True,
                                  prefer_library_on_tie=prefer_library_on_tie)
     if measured != result["target_episodes"]:
         raise ValueError("Reported experiment count disagrees with the target observer.")
@@ -62,5 +73,5 @@ def run(name, prefer_library_on_tie):
 if __name__ == "__main__":
     try:
         run(sys.argv[1], sys.argv[2:] == ["library"])
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.CalledProcessError) as exc:
         sys.exit(str(exc))

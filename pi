@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 
+from tools.repair_memory import repair_history
+
 root = Path(__file__).resolve().parent
 os.chdir(root)
 windows = os.name == "nt"
@@ -32,4 +34,5 @@ if not (profile / "active").is_file():
         except OSError:
             if not (profile / "active").is_file():
                 raise
+repair_history()
 sys.exit(subprocess.call([str(binary), *sys.argv[1:]]))

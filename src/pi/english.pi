@@ -1,0 +1,453 @@
+# English as a front end to Pi's own meaning. Reading compiles a sentence into terms the reasoning engine
+# (logic.pi) understands -- facts, rules, queries; writing turns terms back into English. The grammar is data:
+# sentence patterns whose slots are typed ($N a name, $C a singular noun, $P a plural noun, $R a relation noun,
+# $V a verb, $W a bare noun phrase, $A an article or "every"/"each"). Words: morphology (plurals, irregulars) and
+# the closed-class vocabulary are written in; open-class words are taken as they come.
+import "logic.pi"
+
+skill closed() -> Any {
+  return ["a", "an", "the", "every", "each", "all", "some", "no", "is", "are", "am", "was", "were", "be", "does",
+    "do", "did", "can", "cannot", "not", "has", "have", "who", "what", "which", "whom", "and", "or", "of", "to",
+    "in", "on", "at", "by", "for", "with", "'s", "as", "than", "that", "this", "these", "those", "it", "they", "he",
+    "she", "we", "you", "i", "me", "him", "her", "them", "us"]
+}
+skill dets() -> Any { return ["a", "an", "every", "each"] }
+
+skill irregular() -> Any {
+  return {"children": "child", "people": "person", "men": "man", "women": "woman", "mice": "mouse", "geese": "goose",
+    "feet": "foot", "teeth": "tooth", "fish": "fish", "sheep": "sheep", "deer": "deer", "wolves": "wolf",
+    "knives": "knife", "leaves": "leaf", "lives": "life", "wives": "wife", "halves": "half", "calves": "calf",
+    "oxen": "ox", "dice": "die"}
+}
+
+skill ends(w, suf) -> Any {
+  let n = len(w)
+  let m = len(suf)
+  if m > n { return false }
+  return slice(w, n - m, n) == suf
+}
+
+skill singular(w) -> Any {
+  let irr = irregular()[w]
+  if irr != null { return irr }
+  let n = len(w)
+  if n > 3 and ends(w, "ies") { return slice(w, 0, n - 3) ++ "y" }
+  if ends(w, "sses") or ends(w, "shes") or ends(w, "ches") or ends(w, "xes") or ends(w, "zes") { return slice(w, 0, n - 2) }
+  if n > 2 and ends(w, "s") and ends(w, "ss") == false and ends(w, "us") == false and ends(w, "is") == false { return slice(w, 0, n - 1) }
+  return w
+}
+
+skill plural(w) -> Any {
+  let irr = irregular()
+  for k in keys(irr) {
+    if irr[k] == w { return k }
+  }
+  let n = len(w)
+  if n > 1 and ends(w, "y") and contains("aeiou", slice(w, n - 2, n - 1)) == false { return slice(w, 0, n - 1) ++ "ies" }
+  if ends(w, "s") or ends(w, "x") or ends(w, "z") or ends(w, "ch") or ends(w, "sh") { return w ++ "es" }
+  return w ++ "s"
+}
+
+skill article(w) -> Any {
+  if contains(["hour", "honest", "honor", "heir"], w) { return "an" }
+  if slice(w, 0, 3) == "uni" or slice(w, 0, 2) == "eu" or slice(w, 0, 3) == "one" or slice(w, 0, 3) == "use" { return "a" }
+  if len(w) > 0 and contains("aeiou", slice(w, 0, 1)) { return "an" }
+  return "a"
+}
+
+skill cap(s) -> Any {
+  if len(s) == 0 { return s }
+  return upper(slice(s, 0, 1)) ++ slice(s, 1, len(s))
+}
+
+skill iscap(o) -> Any {
+  if len(o) == 0 { return false }
+  return slice(o, 0, 1) != lower(slice(o, 0, 1))
+}
+
+skill join_and(xs) -> Any {
+  let n = len(xs)
+  if n == 0 { return "" }
+  if n == 1 { return xs[0] }
+  return join(slice(xs, 0, n - 1), ", ") ++ " and " ++ xs[n - 1]
+}
+
+skill isword(c) -> Any { return len(c) > 0 and contains("abcdefghijklmnopqrstuvwxyz0123456789'", lower(c)) }
+
+# words, lowercased, with their original spellings alongside; "Bob's" -> bob 's, "can't"/"can not" -> cannot,
+# "doesn't" -> does not
+skill tokenize(line) -> Any {
+  let words = []
+  let cur = ""
+  for c in chars(line) {
+    if isword(c) {
+      let cur = cur ++ c
+    } else {
+      if len(cur) > 0 { let words = append(words, cur) }
+      let cur = ""
+    }
+  }
+  if len(cur) > 0 { let words = append(words, cur) }
+  let toks = []
+  let origs = []
+  for w in words {
+    let lw = lower(w)
+    if lw == "can't" or lw == "cant" {
+      let toks = append(toks, "cannot")
+      let origs = append(origs, "cannot")
+    } else if ends(lw, "n't") {
+      let stem = slice(lw, 0, len(lw) - 3)
+      let toks = append(append(toks, stem), "not")
+      let origs = append(append(origs, stem), "not")
+    } else if len(lw) > 2 and ends(lw, "'s") {
+      let toks = append(append(toks, slice(lw, 0, len(lw) - 2)), "'s")
+      let origs = append(append(origs, slice(w, 0, len(w) - 2)), "'s")
+    } else {
+      let toks = append(toks, lw)
+      let origs = append(origs, w)
+    }
+  }
+  let t2 = []
+  let o2 = []
+  let i = 0
+  while i < len(toks) {
+    if toks[i] == "can" and i + 1 < len(toks) and toks[i + 1] == "not" {
+      let t2 = append(t2, "cannot")
+      let o2 = append(o2, "cannot")
+      let i = i + 2
+    } else {
+      let t2 = append(t2, toks[i])
+      let o2 = append(o2, origs[i])
+      let i = i + 1
+    }
+  }
+  return [t2, o2]
+}
+
+# one pattern against the words -> bindings [slot, value, extra] in order, or null
+skill match(pat, toks, origs, names) -> Any {
+  if len(pat) != len(toks) { return null }
+  let cl = closed()
+  let out = []
+  for i in range(0, len(pat)) {
+    let p = pat[i]
+    let t = toks[i]
+    let o = origs[i]
+    if slice(p, 0, 1) != "$" {
+      if t != p { return null }
+    } else if p == "$A" {
+      if contains(dets(), t) == false { return null }
+    } else {
+      if contains(cl, t) { return null }
+      let known = contains(names, t)
+      let capd = iscap(o)
+      let pl = singular(t) != t
+      if p == "$N" {
+        if known == false {
+          if capd == false { return null }
+          if i == 0 and pl { return null }
+        }
+        let out = append(out, ["N", t, o])
+      } else if p == "$C" {
+        if pl or known { return null }
+        if capd and i > 0 { return null }
+        let out = append(out, ["C", t, o])
+      } else if p == "$P" {
+        if pl == false or known { return null }
+        if capd and i > 0 { return null }
+        let out = append(out, ["P", singular(t), o])
+      } else if p == "$R" {
+        let out = append(out, ["R", singular(t), o])
+      } else if p == "$RP" {
+        if pl == false { return null }
+        let out = append(out, ["R", singular(t), o])
+      } else if p == "$V" {
+        let out = append(out, ["V", t, o])
+      } else {
+        if known { return null }
+        let out = append(out, ["W", singular(t), t])
+      }
+    }
+  }
+  return out
+}
+
+# statements Pi can read, as [meaning, pattern]
+skill stmts() -> Any {
+  return [
+    ["rel", ["$N", "is", "$N", "'s", "$R"]],
+    ["relof", ["$N", "is", "the", "$R", "of", "$N"]],
+    ["relof", ["$N", "is", "$A", "$R", "of", "$N"]],
+    ["rel2", ["$N", "and", "$N", "are", "$N", "'s", "$RP"]],
+    ["isa", ["$N", "is", "$A", "$C"]],
+    ["isa", ["$A", "$C", "is", "$A", "$C"]],
+    ["isa", ["all", "$P", "are", "$P"]],
+    ["isa", ["$P", "are", "$P"]],
+    ["hasa", ["$A", "$C", "has", "$A", "$C"]],
+    ["hasw", ["$A", "$C", "has", "$W"]],
+    ["hasa", ["$P", "have", "$A", "$C"]],
+    ["hasw", ["$P", "have", "$W"]],
+    ["hasa", ["$N", "has", "$A", "$C"]],
+    ["hasw", ["$N", "has", "$W"]],
+    ["can", ["$A", "$C", "can", "$V"]],
+    ["can", ["$P", "can", "$V"]],
+    ["can", ["$N", "can", "$V"]],
+    ["cannot", ["$A", "$C", "cannot", "$V"]],
+    ["cannot", ["$P", "cannot", "$V"]],
+    ["cannot", ["$N", "cannot", "$V"]]
+  ]
+}
+
+# questions Pi can answer, as [kind, pattern]
+skill questions() -> Any {
+  return [
+    ["isq", ["is", "$N", "$A", "$C"]],
+    ["isq", ["is", "$A", "$C", "$A", "$C"]],
+    ["isq", ["are", "$P", "$P"]],
+    ["hasq", ["does", "$N", "have", "$A", "$C"]],
+    ["hasq", ["does", "$N", "have", "$W"]],
+    ["hasq", ["does", "$A", "$C", "have", "$A", "$C"]],
+    ["hasq", ["does", "$A", "$C", "have", "$W"]],
+    ["hasq", ["do", "$P", "have", "$A", "$C"]],
+    ["hasq", ["do", "$P", "have", "$W"]],
+    ["canq", ["can", "$N", "$V"]],
+    ["canq", ["can", "$A", "$C", "$V"]],
+    ["canq", ["can", "$P", "$V"]],
+    ["whoof", ["who", "is", "$N", "'s", "$R"]],
+    ["whoof", ["who", "are", "$N", "'s", "$RP"]],
+    ["whoof2", ["who", "is", "the", "$R", "of", "$N"]],
+    ["whoof2", ["who", "are", "the", "$RP", "of", "$N"]],
+    ["whom", ["who", "is", "$N", "$A", "$R", "of"]],
+    ["whatis", ["what", "is", "$A", "$C"]],
+    ["whatis", ["what", "are", "$P"]],
+    ["whathas", ["what", "does", "$A", "$C", "have"]],
+    ["whathas", ["what", "do", "$P", "have"]],
+    ["whathas", ["what", "does", "$N", "have"]]
+  ]
+}
+
+# -> ["stmt" or "q", meaning, bindings], or null if no pattern fits
+skill parse(st, line) -> Any {
+  let t = tokenize(line)
+  let toks = t[0]
+  if len(toks) == 0 { return null }
+  for tp in stmts() {
+    let b = match(tp[1], toks, t[1], st["names"])
+    if b != null { return ["stmt", tp[0], b] }
+  }
+  for tp in questions() {
+    let b = match(tp[1], toks, t[1], st["names"])
+    if b != null { return ["q", tp[0], b] }
+  }
+  return null
+}
+
+# "X is Y's child" is stored as "Y is X's parent" (and so on), so one fact serves both directions
+skill relfact(r, x, y) -> Any {
+  if r == "child" { return ["parent", y, x] }
+  if r == "grandchild" { return ["grandparent", y, x] }
+  if r == "descendant" { return ["ancestor", y, x] }
+  return [r, x, y]
+}
+
+# a statement's meaning -> [facts, [[noun, how it was phrased], ...]]
+skill facts_of(id, b) -> Any {
+  let v0 = b[0][1]
+  if id == "rel" { return [[relfact(b[2][1], v0, b[1][1])], []] }
+  if id == "relof" { return [[relfact(b[1][1], v0, b[2][1])], []] }
+  if id == "rel2" { return [[relfact(b[3][1], v0, b[2][1]), relfact(b[3][1], b[1][1], b[2][1])], []] }
+  if id == "isa" { return [[["is_a", v0, b[1][1]]], []] }
+  if id == "hasa" {
+    let c = b[1][1]
+    return [[["has", v0, c]], [[c, article(c) ++ " " ++ c]]]
+  }
+  if id == "hasw" { return [[["has", v0, b[1][1]]], [[b[1][1], b[1][2]]]] }
+  if id == "can" { return [[["can", v0, b[1][1]]], []] }
+  return [[["cannot", v0, b[1][1]]], []]
+}
+
+# what Pi knows about the world before it is told anything: how kinds, properties, abilities and family relate
+skill base_rules() -> Any {
+  return [
+    [["kind_of", "?x", "?y"], [["is_a", "?x", "?y"]]],
+    [["kind_of", "?x", "?y"], [["is_a", "?x", "?z"], ["kind_of", "?z", "?y"]]],
+    [["prop", "?x", "?p"], [["has", "?x", "?p"]]],
+    [["prop", "?x", "?p"], [["kind_of", "?x", "?y"], ["has", "?y", "?p"]]],
+    [["can_inh", "?x", "?v"], [["can", "?x", "?v"]]],
+    [["can_inh", "?x", "?v"], [["kind_of", "?x", "?y"], ["can", "?y", "?v"]]],
+    [["no_inh", "?x", "?v"], [["cannot", "?x", "?v"]]],
+    [["no_inh", "?x", "?v"], [["kind_of", "?x", "?y"], ["cannot", "?y", "?v"]]],
+    [["able", "?x", "?v"], [["can_inh", "?x", "?v"], ["not", ["no_inh", "?x", "?v"]]]],
+    [["ancestor", "?x", "?y"], [["parent", "?x", "?y"]]],
+    [["ancestor", "?x", "?y"], [["parent", "?x", "?z"], ["ancestor", "?z", "?y"]]],
+    [["child", "?x", "?y"], [["parent", "?y", "?x"]]],
+    [["descendant", "?x", "?y"], [["ancestor", "?y", "?x"]]],
+    [["grandparent", "?x", "?y"], [["parent", "?x", "?z"], ["parent", "?z", "?y"]]],
+    [["grandchild", "?x", "?y"], [["grandparent", "?y", "?x"]]],
+    [["sibling", "?x", "?y"], [["parent", "?z", "?x"], ["parent", "?z", "?y"], ["neq", "?x", "?y"]]]
+  ]
+}
+
+skill new_state() -> Any {
+  return {"kb": base_rules(), "facts": [], "names": [], "disp": {}, "phr": {}, "said": []}
+}
+
+skill note_names(st, b) -> Any {
+  let names = st["names"]
+  let disp = st["disp"]
+  for x in b {
+    if x[0] == "N" {
+      if contains(names, x[1]) == false { let names = append(names, x[1]) }
+      if iscap(x[2]) { let disp = put(disp, x[1], x[2]) }
+    }
+  }
+  return put(put(st, "names", names), "disp", disp)
+}
+
+skill disp(st, e) -> Any {
+  let d = st["disp"][e]
+  if d == null { return e }
+  return d
+}
+skill np(st, e) -> Any {
+  if contains(st["names"], e) { return disp(st, e) }
+  return article(e) ++ " " ++ e
+}
+skill poss(st, e) -> Any { return disp(st, e) ++ "'s" }
+skill phrase(st, lemma) -> Any {
+  let p = st["phr"][lemma]
+  if p == null { return lemma }
+  return p
+}
+
+skill say_fact(st, f) -> Any {
+  let r = f[0]
+  if r == "is_a" { return cap(np(st, f[1])) ++ " is " ++ article(f[2]) ++ " " ++ f[2] ++ "." }
+  if r == "has" { return cap(np(st, f[1])) ++ " has " ++ phrase(st, f[2]) ++ "." }
+  if r == "can" { return cap(np(st, f[1])) ++ " can " ++ f[2] ++ "." }
+  if r == "cannot" { return cap(np(st, f[1])) ++ " cannot " ++ f[2] ++ "." }
+  return cap(disp(st, f[1])) ++ " is " ++ poss(st, f[2]) ++ " " ++ r ++ "."
+}
+
+skill add_fact(st, f) -> Any {
+  return put(put(st, "facts", append(st["facts"], f)), "kb", append(st["kb"], [f, []]))
+}
+
+# a direct clash with what is already known (can vs cannot)
+skill contradiction(st, f) -> Any {
+  if f[0] == "can" {
+    let c = ["cannot", f[1], f[2]]
+    if contains(st["facts"], c) { return c }
+  }
+  if f[0] == "cannot" {
+    let c = ["can", f[1], f[2]]
+    if contains(st["facts"], c) { return c }
+  }
+  return null
+}
+
+# Pi checks itself: what it says back must read as exactly the same fact
+skill roundtrip(st, f, s) -> Any {
+  let p = parse(st, s)
+  if p == null { return false }
+  if p[0] != "stmt" { return false }
+  let fs = facts_of(p[1], p[2])[0]
+  return len(fs) == 1 and fs[0] == f
+}
+
+skill answer(st, id, b) -> Any {
+  let kb = st["kb"]
+  if id == "isq" {
+    let x = b[0][1]
+    let c = b[1][1]
+    if holds(kb, ["kind_of", x, c]) { return "Yes, " ++ np(st, x) ++ " is " ++ article(c) ++ " " ++ c ++ "." }
+    return "Not as far as I know."
+  }
+  if id == "hasq" {
+    let x = b[0][1]
+    let l = b[1][1]
+    if holds(kb, ["prop", x, l]) { return "Yes, " ++ np(st, x) ++ " has " ++ phrase(st, l) ++ "." }
+    return "Not as far as I know."
+  }
+  if id == "canq" {
+    let x = b[0][1]
+    let v = b[1][1]
+    if holds(kb, ["able", x, v]) { return "Yes, " ++ np(st, x) ++ " can " ++ v ++ "." }
+    if holds(kb, ["no_inh", x, v]) { return "No, " ++ np(st, x) ++ " cannot " ++ v ++ "." }
+    return "I don't know whether " ++ np(st, x) ++ " can " ++ v ++ "."
+  }
+  if id == "whoof" or id == "whoof2" {
+    let n = b[0][1]
+    let r = b[1][1]
+    if id == "whoof2" {
+      let r = b[0][1]
+      let n = b[1][1]
+    }
+    let xs = values_of(kb, [r, "?who", n], "?who")
+    if len(xs) == 0 { return "I don't know who " ++ poss(st, n) ++ " " ++ r ++ " is." }
+    let ds = []
+    for x in xs { let ds = append(ds, disp(st, x)) }
+    if len(xs) == 1 { return cap(ds[0]) ++ " is " ++ poss(st, n) ++ " " ++ r ++ "." }
+    return cap(join_and(ds)) ++ " are " ++ poss(st, n) ++ " " ++ plural(r) ++ "."
+  }
+  if id == "whom" {
+    let n = b[0][1]
+    let r = b[1][1]
+    let ys = values_of(kb, [r, n, "?who"], "?who")
+    if len(ys) == 0 { return "I don't know whom " ++ disp(st, n) ++ " is " ++ article(r) ++ " " ++ r ++ " of." }
+    let ds = []
+    for y in ys { let ds = append(ds, disp(st, y)) }
+    return cap(disp(st, n)) ++ " is " ++ article(r) ++ " " ++ r ++ " of " ++ join_and(ds) ++ "."
+  }
+  if id == "whatis" {
+    let c = b[0][1]
+    let ys = values_of(kb, ["is_a", c, "?what"], "?what")
+    if len(ys) == 0 { return "I don't know what " ++ np(st, c) ++ " is." }
+    let ds = []
+    for y in ys { let ds = append(ds, article(y) ++ " " ++ y) }
+    return cap(np(st, c)) ++ " is " ++ join_and(ds) ++ "."
+  }
+  let x = b[0][1]
+  let ps = values_of(kb, ["prop", x, "?what"], "?what")
+  if len(ps) == 0 { return "I don't know of anything " ++ np(st, x) ++ " has." }
+  let ds = []
+  for p in ps { let ds = append(ds, phrase(st, p)) }
+  return cap(np(st, x)) ++ " has " ++ join_and(ds) ++ "."
+}
+
+# one line of English in -> [reply, new state, whether anything was learned]
+skill handle(st, line) -> Any {
+  let p = parse(st, line)
+  if p == null {
+    if len(trim(line)) == 0 { return ["", st, false] }
+    return ["I don't understand that yet.", st, false]
+  }
+  let st = note_names(st, p[2])
+  if p[0] == "q" { return [answer(st, p[1], p[2]), st, false] }
+  let fp = facts_of(p[1], p[2])
+  let st2 = st
+  for ph in fp[1] { let st2 = put(st2, "phr", put(st2["phr"], ph[0], ph[1])) }
+  let replies = []
+  let changed = false
+  for f in fp[0] {
+    let s = say_fact(st2, f)
+    if contains(st2["facts"], f) {
+      let replies = append(replies, "I already knew that: " ++ s)
+    } else {
+      let clash = contradiction(st2, f)
+      if clash != null {
+        let replies = append(replies, "That contradicts what I know: " ++ say_fact(st2, clash))
+      } else {
+        let st2 = add_fact(st2, f)
+        let st2 = put(st2, "said", append(st2["said"], s))
+        let changed = true
+        if roundtrip(st2, f, s) {
+          let replies = append(replies, "Noted: " ++ s)
+        } else {
+          let replies = append(replies, "Noted, though I cannot yet say it back exactly: " ++ s)
+        }
+      }
+    }
+  }
+  return [join(replies, " "), st2, changed]
+}

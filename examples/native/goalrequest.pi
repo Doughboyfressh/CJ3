@@ -1,18 +1,1 @@
-# A session has one active binary observation. Only its owner interprets the
-# context and resumes the task. Providers submit an answer against its identity.
-skill goal_request(st,question,subject,context,resume) -> Any {
-  let last = st["goal_sequence"]
-  let id = if last == null { 1 } else { last+1 }
-  let request = {"id":id,"subject":subject,"question":question,"context":context,"resume":resume}
-  return put(put(st,"goal_sequence",id),"goal_request",request)
-}
-
-skill goal_answer(st,request,bit) -> Any {
-  let active = st["goal_request"]
-  if active == null or active["id"] != request["id"] or active["question"] != request["question"] {
-    return ["The pending observation has changed.",st,false]
-  }
-  if not contains(["0","1"],bit) { return ["Give outcome 0 or outcome 1.",st,false] }
-  let resume = active["resume"]
-  return resume(st,active,bit)
-}
+import "../../src/pi/goalrequest.pi"

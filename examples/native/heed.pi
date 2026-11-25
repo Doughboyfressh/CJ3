@@ -31,10 +31,12 @@ skill main() -> Any {
     if bound == null or bound < 1 { return "Give a positive state bound." }
     return ts_command(arg(2),null,bound,null)
   }
+  if arg(1) == "states-refine" { return ts_read(arg(2),null,null,null,true) }
   if arg(1) == "states" { return ts_command(arg(2),arg(3),null,null) }
   if arg(1) == "inquire" { return sl_session(arg(2), arg(3)) }
   if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
   if contains(["grid","order"],arg(1)) { return ht_command(arg(1),arg(2),arg(3),arg(4),arg(5),arg(6)) }
+  if arg(1) != "review" { return hd_rounds() }
   let readings = {}
   if arg(1) == "review" {
     if arg(2) == null { return "Usage: heed review FILE" }
@@ -152,4 +154,311 @@ skill main() -> Any {
   }
   do print("  told again: " ++ hd_pct(right2, total2) ++ " done rightly (with the English of stage 2 alone: " ++ hd_pct(right0, total2) ++ ")")
   return "done"
+}
+
+skill hd_third(domain) -> Any {
+  if domain == "lists" {
+    return [
+      ["doubles sorted", fn(xs) => sort(tmap(xs, fn(v) => v * 2))],
+      ["sum of doubles of positives", fn(xs) => sum(tmap(tfilter(xs, fn(v) => v > 0), fn(v) => v * 2))],
+      ["sum of squares of negatives", fn(xs) => sum(tmap(tfilter(xs, fn(v) => v < 0), fn(v) => v * v))],
+      ["negatives sorted, biggest first", fn(xs) => reverse(sort(tfilter(xs, fn(v) => v < 0)))],
+      ["evens sorted, biggest first", fn(xs) => reverse(sort(tfilter(xs, fn(v) => v % 2 == 0)))],
+      ["sum of three smallest", fn(xs) => sum(ttake(3, sort(xs)))],
+      ["three smallest of positives", fn(xs) => ttake(3, sort(tfilter(xs, fn(v) => v > 0)))],
+      ["product of doubles of evens", fn(xs) => t_prod(tmap(tfilter(xs, fn(v) => v % 2 == 0), fn(v) => v * 2))]
+    ]
+  }
+  if domain == "text" {
+    return [
+      ["letters before n, sorted", fn(xs) => sort(tfilter(xs, fn(v) => v < 110))],
+      ["uppercase, sorted, reversed", fn(xs) => reverse(sort(tmap(xs, fn(v) => v - 32)))],
+      ["count letters after m, sorted", fn(xs) => len(sort(tfilter(xs, fn(v) => v > 109)))]
+    ]
+  }
+  return [
+    ["transpose, recolour 1 to 5", fn(g) => transpose(t_recol(g, 1, 5))],
+    ["mirror left-right, then flip", fn(g) => reverse(t_fliph(g))],
+    ["flip upside down, recolour 1 to 5", fn(g) => reverse(t_recol(g, 1, 5))],
+    ["mirror, then flip", fn(g) => reverse(t_fliph(g))]
+  ]
+}
+
+# ---- reading, and checking a reading ---------------------------------------------------------------------------
+# an instruction read with no examples -> the words of meaning, or null
+skill hd_read(rules, fam, text) -> Any { return tg_understand(rules, fam, hd_words(text)) }
+
+# TOLD: [the program or null, how it went: "right", "wrong" or "cannot read"]
+skill hd_orders(toks) -> Any {
+  if len(toks) <= 1 { return [toks] }
+  let out = []
+  for i in range(0, len(toks)) {
+    for rest in hd_orders(slice(toks, 0, i) ++ slice(toks, i + 1, len(toks))) { let out = append(out, [toks[i]] ++ rest) }
+  }
+  return out
+}
+
+# how many letters two words share from the start
+skill hd_alike(a, b) -> Any {
+  let n = 0
+  while n < len(a) and n < len(b) and slice(a, n, n + 1) == slice(b, n, n + 1) { let n = n + 1 }
+  return n
+}
+
+# the known steps, those named by a word that looks like w first (the more letters shared, the sooner)
+skill hd_likely(rules, w, known) -> Any {
+  let ks = []
+  for k in known {
+    let best = 0
+    for r in rules {
+      if len(r[0]) == 1 and r[1] == [k] {
+        let a = hd_alike(w, r[0][0])
+        if a >= 4 and a > best { let best = a }
+      }
+    }
+    let ks = append(ks, tg_pad(100 - best) ++ " " ++ k)
+  }
+  let out = []
+  for s in sort(ks) { let out = append(out, slice(s, 5, len(s))) }
+  return out
+}
+
+# does every sentence heard that has the word w still do what it did, if w meant the step k?
+skill hd_still(mem, rules, fam, steps, w, k) -> Any {
+  let rules2 = [[[w], [k]]] ++ rules
+  for mm in mem {
+    if contains(mm[0], w) {
+      let toks = tg_understand(rules2, fam, mm[0])
+      if toks == null { return false }
+      if hd_fits(hd_program(toks, steps, hd_input(mm[3])), mm[2], mm[3]) == false { return false }
+    }
+  }
+  return true
+}
+
+# does the step k do nothing here? (the program fits as well without it: then these examples say nothing about a
+# word that would mean k -- "keep the positives" changes no word of letters, and must not become what a comma means)
+skill hd_idle(toks, k, steps, xin, f, domain) -> Any {
+  for i in range(0, len(toks)) {
+    if toks[i] == k and len(toks) > 1 {
+      let without = slice(toks, 0, i) ++ slice(toks, i + 1, len(toks))
+      if hd_fits(hd_program(without, steps, xin), f, domain) { return true }
+    }
+  }
+  return false
+}
+
+# SHOWN: mend the reading of an instruction with its examples, cheapest mending first
+# -> [the words of meaning, how it was mended], or null (then it is for the search)
+skill hd_mend(mem, rules, fam, steps, task, domain) -> Any {
+  let words = hd_words(task[0])
+  let xin = hd_input(domain)
+  let toks = tg_understand(rules, fam, words)
+  if toks != null {
+    if hd_fits(hd_program(toks, steps, xin), task[1], domain) { return [toks, "its reading fits the examples"] }
+    if len(toks) <= 4 {
+      for o in hd_orders(toks) {
+        if hd_fits(hd_program(o, steps, xin), task[1], domain) { return [o, "the words were right, the order is mended"] }
+      }
+    }
+  }
+  let known = sort(keys(steps))
+  # one new word: the step Pi already knows that makes the sentence fit. Several may fit one sentence ("sum of
+  # doubles" is as well sum(x ++ x)); the step a look-alike word already names is tried first ("double")
+  for w in tg_strangers(rules, words) {
+    for k in hd_likely(rules, w, known) {
+      let t2 = tg_understand([[[w], [k]]] ++ rules, fam, words)
+      if t2 != null {
+        if hd_fits(hd_program(t2, steps, xin), task[1], domain) {
+          if hd_idle(t2, k, steps, xin, task[1], domain) == false { return [t2, "\"" ++ w ++ "\" is new: it must mean " ++ k] }
+        }
+      }
+    }
+  }
+  # a word Pi knows means something else here -- allowed only if what it has heard with that word still holds
+  for w in words {
+    let was = tg_read(rules, [w])
+    if was != null {
+      for k in known {
+        if [k] != was {
+          let t3 = tg_understand([[[w], [k]]] ++ rules, fam, words)
+          if t3 != null {
+            if hd_fits(hd_program(t3, steps, xin), task[1], domain) {
+              if hd_idle(t3, k, steps, xin, task[1], domain) == false {
+                if hd_still(mem, rules, fam, steps, w, k) { return [t3, "\"" ++ w ++ "\" was mistaken: it means " ++ k] }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return null
+}
+
+# ---- what Pi has heard: memories [words, meaning, the task's function, its domain] -> the English ------------------
+skill hd_pairs(mem) -> Any {
+  let out = []
+  for mm in mem { let out = append(out, [mm[0], mm[1]]) }
+  return out
+}
+
+# a sentence kept whole, word for word, whose words now read (without that rule) to a program that fits its
+# examples: the reading replaces what the search wrote. -> [memories, how many gave way]
+skill hd_settle(mem, rules, fam, steps) -> Any {
+  let out = []
+  let changed = 0
+  for mm in mem {
+    let keep = mm
+    if len(mm[0]) >= 2 {
+      let others = []
+      let whole = false
+      for r in rules {
+        if r[0] == mm[0] { let whole = true } else { let others = append(others, r) }
+      }
+      if whole {
+        let toks = tg_understand(others, fam, mm[0])
+        if toks != null {
+          if toks != mm[1] {
+            if hd_fits(hd_program(toks, steps, hd_input(mm[3])), mm[2], mm[3]) {
+              let keep = [mm[0], toks, mm[2], mm[3]]
+              let changed = changed + 1
+            }
+          }
+        }
+      }
+    }
+    let out = append(out, keep)
+  }
+  return [out, changed]
+}
+
+# the English of everything heard, settled: -> [rules, fam, memories]
+skill hd_english(mem, steps) -> Any {
+  let rules = tg_learn(hd_pairs(mem))
+  let fam = tg_familiar(rules, hd_pairs(mem))
+  let going = 3
+  while going > 0 {
+    let st = hd_settle(mem, rules, fam, steps)
+    if st[1] == 0 { let going = 0 } else {
+      let mem = st[0]
+      let rules = tg_learn(hd_pairs(mem))
+      let fam = tg_familiar(rules, hd_pairs(mem))
+      let going = going - 1
+    }
+  }
+  return [rules, fam, mem]
+}
+
+skill hd_set(round, domain) -> Any {
+  if round == 1 { return hd_tasks(domain, true) }
+  if round == 2 { return hd_new(domain) }
+  return hd_third(domain)
+}
+
+skill hd_rounds() -> Any {
+  let domains = ["lists", "text", "grids"]
+  let pl = pools()
+  let pre = prelude()
+  let g = default_genome()
+  do print("PRACTICE -- each task solved by search, from examples:")
+  let mem = []
+  let steps = {}
+  for d in domains {
+    for t in hd_tasks(d, false) {
+      let r = attempt_task_g(t, d, [], [], pl, pre, g)
+      if r[0] == null { do print("  " ++ t[0] ++ ": not found") } else {
+        let mn = hd_meaning(r[0], steps)
+        let steps = mn[1]
+        let mem = append(mem, [hd_words(t[0]), mn[0], t[1], d])
+        do print("  " ++ t[0] ++ ": " ++ show(r[0]))
+      }
+    }
+  }
+  let en = hd_english(mem, steps)
+  let rules = en[0]
+  let fam = en[1]
+  let mem = en[2]
+  do print("")
+  do print("the English Pi made of it: " ++ str(len(rules)) ++ " rules from " ++ str(len(mem)) ++ " names")
+  do print(tg_show(rules))
+  let summary = []
+  for round in [1, 2, 3] {
+    do print("ROUND " ++ str(round) ++ " -- TOLD (no examples):")
+    let right = 0
+    let total = 0
+    let beyond = 0
+    let again = 0
+    let failed = []
+    for d in domains {
+      for t in hd_set(round, d) {
+        let r = hd_told(rules, fam, steps, t, d, {})
+        let total = total + 1
+        let line = "  " ++ t[0] ++ ": " ++ r[1]
+        if r[0] != null { let line = line ++ "   " ++ show(r[0]) }
+        if r[1] == "right" {
+          let right = right + 1
+          # one it was shown the answer to in an earlier round is remembered, not worked out: said so, and counted apart
+          for q in mem {
+            if q[0] == hd_words(t[0]) and q[3] == d {
+              let again = again + 1
+              let line = line ++ "   (remembered: it was shown this one before)"
+            }
+          }
+          if round == 1 {
+            # could Pi have found this one from examples, by search, as it found the tasks it practised?
+            let s = attempt_task_g(t, d, [], [], pl, pre, g)
+            if s[0] == null {
+              let beyond = beyond + 1
+              let line = line ++ "   (beyond its search: shown examples and no words, it finds nothing)"
+            }
+          }
+        } else { let failed = append(failed, [t, d]) }
+        do print(line)
+      }
+    }
+    let line = "  told: " ++ str(right) ++ " of " ++ str(total) ++ " done rightly"
+    if round == 1 { let line = line ++ "; " ++ str(beyond) ++ " of those are beyond what its search finds from examples" }
+    if again > 0 { let line = line ++ "; " ++ str(again) ++ " of those remembered from being shown, " ++ str(right - again) ++ " of " ++ str(total - again) ++ " new ones worked out" }
+    do print(line)
+    let sm = "round " ++ str(round) ++ ": " ++ str(right - again) ++ " of " ++ str(total - again)
+    if again > 0 { let sm = sm ++ " new (and " ++ str(again) ++ " remembered)" }
+    let summary = append(summary, sm)
+    if len(failed) > 0 {
+      do print("ROUND " ++ str(round) ++ " -- SHOWN (examples for the " ++ str(len(failed)) ++ " it did not get):")
+      let searched = 0
+      let mended = 0
+      for ft in failed {
+        let t = ft[0]
+        let d = ft[1]
+        let md = hd_mend(mem, rules, fam, steps, t, d)
+        let toks = null
+        if md != null {
+          let toks = md[0]
+          let mended = mended + 1
+          do print("  " ++ t[0] ++ ": " ++ md[1] ++ "   " ++ show(hd_program(toks, steps, hd_input(d))))
+        } else {
+          let r = attempt_task_g(t, d, [], [], pl, pre, g)
+          if r[0] == null { do print("  " ++ t[0] ++ ": not mended, and not found by search") } else {
+            let mn = hd_meaning(r[0], steps)
+            let steps = mn[1]
+            let toks = mn[0]
+            let searched = searched + 1
+            do print("  " ++ t[0] ++ ": by search   " ++ show(r[0]))
+          }
+        }
+        if toks != null { let mem = append(mem, [hd_words(t[0]), toks, t[1], d]) }
+      }
+      # the English is made again from everything heard
+      let en = hd_english(mem, steps)
+      let rules = en[0]
+      let fam = en[1]
+      let mem = en[2]
+      do print("  mended from its own reading: " ++ str(mended) ++ "; left to the search: " ++ str(searched) ++ "; the English is now " ++ str(len(rules)) ++ " rules from " ++ str(len(mem)) ++ " sentences")
+    }
+    do print("")
+  }
+  do print("the English at the end:")
+  do print(tg_show(rules))
+  return "told, with no examples -- " ++ join(summary, "; ")
 }

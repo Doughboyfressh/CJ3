@@ -83,6 +83,17 @@ skill chat_saved_probe() -> Any {
 skill chat_handle(st,line) -> Any {
   let text = lower(trim(line))
   if ends(text,".") or ends(text,"?") { let text = trim(slice(text,0,len(text)-1)) }
+  let request = chat_lesson(text)
+  for prefix in ["no, it should be ", "it should be ", "the correct answer is "] {
+    if slice(text,0,len(prefix)) != prefix { continue }
+    let prediction = st["last_prediction"]
+    if prediction == null { return ["Which result? Give the word, inputs, and corrected answer.",st,false] }
+    let answer = trim(slice(text,len(prefix),len(text)))
+    if hm_number(answer) == null { return ["Give a whole-number correction.",st,false] }
+    let request = ["teach",prediction[0],prediction[1],answer]
+    break
+  }
+  if text != "" { let st = put(st,"last_prediction",null) }
   let st = neuron_start(st)
   if text == "neuron status" {
     let slot = st["neuron_slot"]
@@ -115,7 +126,6 @@ skill chat_handle(st,line) -> Any {
     if not chat_save_probe(null) { return ["Could not save the cancellation.",st,false] }
     return ["Question cancelled.",put(st,"lesson_probe",null),false]
   }
-  let request = chat_lesson(text)
   let target = null
   if pending != null and hm_number(text) != null {
     let request = ["teach",pending[0],pending[1],text]
@@ -154,6 +164,9 @@ skill chat_handle(st,line) -> Any {
       let reply = reply ++ ". I took the " ++ ws[0] ++ " first, then applied " ++ show(law[0]) ++ "."
     }
   }
+  let last = null
+  if command == "use" and hm_number(r[0]) != null { let last = [ws,xs] }
+  let st = put(st,"last_prediction",last)
   return [reply,put(st,"lesson_probe",next),false]
 }
 

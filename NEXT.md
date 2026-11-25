@@ -1823,3 +1823,35 @@ User approved all five: (1) Pi drafts tokens for its own brain (speculative deco
   is one opaque piece.
 - Next: read first and check against the examples before searching (the reading is a guess the examples can
   confirm); senses chosen by type; the mind's nights naming steps that words already name.
+
+## 2026-11-12 -- The reading checked against the examples (user: "Yes")
+- What was wrong. A word got its meaning from the program the search happened to write ("doubles" came out as
+  "twice the result"), and once examples arrived Pi threw its own reading away and searched from nothing.
+- Now, in heed.pi, three rounds of TOLD (the instruction alone) then SHOWN (examples for what it missed). Shown
+  examples, Pi checks its reading against them before anything else, and mends it, cheapest first: the reading
+  fits; the words are right and the order is not; one word is new and a step Pi already knows makes the sentence
+  fit; a known word means something else here (only if every earlier sentence with it still does what it did);
+  none of these, the search. A reading that is ill-typed is never run. A guessed step that does nothing to the
+  examples is no evidence for a word (it had taken "," and "first" for steps). Of the steps that fit, the one a
+  look-alike word already names is tried first ("doubles" beside "double").
+- Settling: a sentence kept whole, whose words now read to a program that does the same on every input, gives
+  way to the reading. Replay reaches rules with an unread word in them ("$1 of squares" beside "$1 of $2":
+  "squares" becomes a word).
+- In the learner (tonguelib.pi): a sentence known by heart no longer refutes a rule it is the exception to.
+  Before this, being corrected on "mirror, then flip" cost Pi the rule "$1 , then flip", and it could not read
+  "mirror left-right, then flip" a round later. And the checks no longer read everything again: a rule put in or
+  moved can only change the sentences that hold every plain word of its pattern. SCAN: the same output to the
+  byte, 59 s -> 46 s.
+- Numbers (the golden file). Round 1 told: 7 of 21, as before (nothing to check against yet); shown the 14 it
+  missed: 2 mended from its own reading ("doubles" from one sentence, with no search; "largest square", the order),
+  11 by search, 1 by neither. Round 2 told: 16 of 19 new instructions (14 of the same 19 before this change;
+  "count doubles" and "product of doubles" are now right). Round 3 told: 14 of 14 new.
+  The counts now leave out a sentence Pi had been shown before and say so (one in round 2, one in round 3).
+- What is still wrong, plainly. (a) Most corrections still come from the search: 14 of the 17 it was shown,
+  against 2 mended by reading. Two unknown words in one sentence, and the reading is no help. (b) One meaning per word
+  stands: "mirror" for a grid is kept only inside whole sentences. (c) "doubles" is tied to "double" by four
+  shared letters, which is not morphology. (d) ", biggest first" is three rules, not one meaning, and "evens,
+  biggest first" was never learned. (e) Every instruction in rounds 2 and 3 was written by hand from words Pi
+  had met; 14 of 14 says it uses 60 sentences consistently, not that it reads English.
+- Next: senses chosen by the type of what a step is given; a word's ending as a rule of its own; instructions
+  written by someone who has not read Pi's word list.

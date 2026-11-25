@@ -111,15 +111,51 @@ skill hd_input(domain) -> Any {
 }
 
 # is this program what the task's author meant? run on every input Pi has for the domain, the held-out ones too
-skill hd_right(tree, f, domain) -> Any {
+# the kind of value a program gives (I a number, L a list, G a grid, C a truth), or null if its pieces do not
+# fit one another -- a grid step given a list is not a program, and is never run
+skill hd_kind(t, sigs) -> Any {
+  let h = t[0]
+  if h == "v" {
+    if t[1] == "x" { return "L" }
+    if t[1] == "g" { return "G" }
+    return "I"
+  }
+  if h == "q" or h == "p" { return "I" }
+  if h != "op" { return null }
+  let sig = sigs[t[1]]
+  if sig == null { return null }
+  if len(sig[0]) != len(t[2]) { return null }
+  for i in range(0, len(sig[0])) {
+    let want = sig[0][i]
+    if want != "F" and want != "P" and want != "F2" {
+      if hd_kind(t[2][i], sigs) != want { return null }
+    }
+  }
+  return sig[1]
+}
+
+skill hd_sigs() -> Any {
+  let sigs = {}
+  for o in optable() { let sigs = put(sigs, o[0], [o[1], o[2]]) }
+  return sigs
+}
+
+skill hd_agrees(tree, f, inputs) -> Any {
   if tree == null { return false }
-  for v in train_inputs(domain) ++ held_inputs(domain) {
+  if hd_kind(tree, hd_sigs()) == null { return false }
+  for v in inputs {
     let y = sev(tree, null, v, null, [])
     if y == null { return false }
     if y != f(v) { return false }
   }
   return true
 }
+
+# the score: is this program what the task's author meant? run on every input, the held-out ones too
+skill hd_right(tree, f, domain) -> Any { return hd_agrees(tree, f, train_inputs(domain) ++ held_inputs(domain)) }
+
+# Pi's own check: does it fit the examples Pi was shown? (the held-out inputs are not Pi's to look at)
+skill hd_fits(tree, f, domain) -> Any { return hd_agrees(tree, f, train_inputs(domain)) }
 
 skill hd_tasks(domain, unseen) -> Any {
   if unseen {

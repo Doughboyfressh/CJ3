@@ -83,6 +83,23 @@ skill chat_saved_probe() -> Any {
 skill chat_handle(st,line) -> Any {
   let text = lower(trim(line))
   if ends(text,".") or ends(text,"?") { let text = trim(slice(text,0,len(text)-1)) }
+  if text == "what do you need" {
+    let questions = []
+    let lesson = st["lesson_probe"]
+    if lesson != null { let questions = append(questions,hm_prompt(lesson[0][1],[lesson[0][0],lesson[1]])) }
+    let goal = st["goal_request"]
+    if goal != null { let questions = append(questions,goal["question"]) }
+    if len(questions) == 0 { return ["There is no pending goal observation.",st,false] }
+    return [join(questions,"\n"),st,false]
+  }
+  let why_number = text == "how did you get that number"
+  let why_either = contains(["why","why will that work","why does that work","how did you get that"],text)
+  if why_number or why_either {
+    if st["number_reason"] != null { return [st["number_reason"],st,false] }
+    if why_number { return ["Which calculation do you mean?",st,false] }
+    if st["planning"] != null { return [chat_plan_reason(st),st,false] }
+  }
+  if text != "" { let st = put(st,"number_reason",null) }
   let request = chat_lesson(text)
   for prefix in ["no, it should be ", "it should be ", "the correct answer is "] {
     if slice(text,0,len(prefix)) != prefix { continue }
@@ -159,12 +176,15 @@ skill chat_handle(st,line) -> Any {
   let reply = r[0]
   if command == "use" and r[2] != null {
     let law = r[2]
+    let reason = ""
     if law[1] {
       let values = sev(O("map",[law[0],V("x")]),null,xs,null,[])
+      let reason = "The learned rule " ++ show(law[0]) ++ " maps " ++ hm_csv(xs) ++ " to " ++ hm_csv(values) ++ ". Their " ++ ws[0] ++ " is " ++ r[0] ++ "."
       let reply = reply ++ ". I applied " ++ show(law[0]) ++ " to each input, then took the " ++ ws[0] ++ " of " ++ hm_csv(values) ++ "."
     } else {
       let reply = reply ++ ". I took the " ++ ws[0] ++ " first, then applied " ++ show(law[0]) ++ "."
     }
+    let st = put(st,"number_reason",reason)
   }
   let last = null
   if command == "use" and hm_number(r[0]) != null { let last = [ws,xs] }

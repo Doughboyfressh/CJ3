@@ -1,3 +1,4 @@
+import "chatprofile.pi"
 skill research_key(q) -> Any {
   let key = lower(trim(q))
   if len(key) > 0 and contains(["?","."],slice(key,len(key)-1,len(key))) {
@@ -7,7 +8,7 @@ skill research_key(q) -> Any {
 }
 
 skill research_recall(q) -> Any {
-  let t = read_file("out\\research.kb")
+  let t = read_file(chat_data("research.kb"))
   if t == null { return null }
   let key = research_key(q)
   for line in split(t, "\n") {

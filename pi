@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Start the native Pi dialogue from any working directory."""
+from pathlib import Path
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+root = Path(__file__).resolve().parent
+os.chdir(root)
+windows = os.name == "nt"
+binary = root / "out" / ("pi-chat.exe" if windows else "pi-chat")
+if not binary.is_file():
+    build = ["cmd", "/c", "build.cmd"] if windows else ["sh", "build.sh"]
+    subprocess.run([*build, "examples/native/chat.pi", str(binary.relative_to(root))], check=True)
+
+profile = root / ".pi-profile"
+if not (profile / "active").is_file():
+    with tempfile.TemporaryDirectory(dir=root) as tmp:
+        staged = Path(tmp) / "profile"
+        staged.mkdir()
+        legacy = root / "out"
+        for pattern in ("chat_facts.txt", "chat_questions.txt", "chat_lessons.txt",
+                        "chat_language.txt", "chat_curve_*.txt", "chat_neuron.log",
+                        "brain_memory.txt", "research.kb"):
+            for source in legacy.glob(pattern):
+                shutil.copy2(source, staged / source.name)
+        (staged / "active").write_text("1\n")
+        try:
+            staged.rename(profile)
+        except OSError:
+            if not (profile / "active").is_file():
+                raise
+sys.exit(subprocess.call([str(binary), *sys.argv[1:]]))

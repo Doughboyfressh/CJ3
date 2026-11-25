@@ -18,6 +18,22 @@ Two other experiments approach language learning differently. Tongue induces rea
 
 On this branch, you can teach Heed a word and use it in a new calculation. The research branch extends Heed to learn hidden states, plan actions, and choose when to reuse earlier repairs. It includes runnable SQLite, queue, file-store, and simulated-dispenser experiments. [Read the research branch and benchmarks](https://github.com/Doughboyfressh/CJ3/tree/pi/neural-list-router#research-results).
 
+## Start Pi
+
+Run `./pi` for a conversation or `./pi ask "QUESTION"` for one turn.
+On Windows use `pi.cmd`. The launcher uses Python 3 and builds the native
+chat program on first use. Calling the launcher by its full path from another
+directory uses the same checkout and profile. Both modes can teach and save
+lessons. Each invocation starts a fresh conversation with the saved knowledge.
+
+The first launch copies existing facts, notes, language and curve lessons,
+research records, pending lesson questions, and neuron feedback from `out/`
+into `.pi-profile/`. Rebuilding or removing the compiled binaries preserves
+those files. Repair history and standalone experimental outputs still use
+`out/`. To refresh the launcher binary after editing the sources, run
+`./build.sh examples/native/chat.pi out/pi-chat` (Windows:
+`build.cmd examples/native/chat.pi out/pi-chat.exe`).
+
 ## Native chat
 
 Build `examples/native/chat.pi` and `examples/native/ask.pi` with the build

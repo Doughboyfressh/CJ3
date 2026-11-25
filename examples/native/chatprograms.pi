@@ -194,8 +194,45 @@ skill chat_follow_goal(turn) -> Any {
   return [reply,put(st,"program_result",reply),false]
 }
 
+# Compare the whole planned trace (including any starting prefix) with the
+# observations used for this plan. Unobserved traces are model predictions.
+skill chat_plan_reason(st) -> Any {
+  let current = st["planning"]
+  if current == null { return "There is no current plan to explain." }
+  if st["goal_request"] != null { return "I still need an observation. " ++ st["goal_request"]["question"] }
+  let result = st["plan_result"]
+  let goal = str(current[1])
+  if result == "Goal unreachable in learned model." {
+    return "In the model learned from these observations, no sequence from the starting state reaches outcome " ++ goal ++ "."
+  }
+  let prefix = if current[2] == null { "" } else { current[2] }
+  let trace = trim(prefix ++ " " ++ trim(slice(result,4,len(result))))
+  let labels = {}
+  let lines = split(current[0],"\n")
+  for line in slice(lines,1,len(lines)) {
+    let row = trim(line)
+    if row != "" { labels = put(labels,trim(slice(row,1,len(row))),slice(row,0,1)) }
+  }
+  let where = if trace == "" { "at reset" } else { "after " ++ trace ++ " from reset" }
+  let reason = if labels[trace] == goal {
+    "The recorded outcome " ++ where ++ " was " ++ goal ++ ", which matches the goal."
+  } else {
+    "The learned model predicts outcome " ++ goal ++ " " ++ where ++ ". That exact sequence has no recorded outcome."
+  }
+  if trace != prefix and labels[prefix] != null {
+    let start = if prefix == "" { "At reset" } else { "After " ++ prefix }
+    let reason = start ++ " the recorded outcome was " ++ labels[prefix] ++ ". " ++ reason
+  }
+  if result == "plan" { let reason = reason ++ " The plan calls for no additional action." }
+  if st["plan_subject"] != null { let reason = "For " ++ st["plan_subject"] ++ ": " ++ reason }
+  return reason
+}
+
 skill chat_goal_turn(st,line) -> Any {
   let text = lower(line)
+  if contains(["why will that work","why will that action work","why will that plan work","explain the plan"],research_key(line)) {
+    return [chat_plan_reason(st),st,false]
+  }
   let subject = null
   let command = line
   for action in ["on","off"] {
@@ -368,7 +405,7 @@ skill chat_plan_advance(st,raw,goal,prefix,witness,probed) -> Any {
   } else {
     if slice(answer,0,4) != "plan" and answer != "Goal unreachable in learned model." { return [answer,st,false] }
   }
-  let updated = put(st,"planning",[raw,goal,prefix])
+  let updated = put(put(st,"planning",[raw,goal,prefix]),"plan_result",answer)
   if probe != null {
     let question = if st["plan_subject"] == null { answer } else { chat_probe_question(st["plan_subject"],probe) }
     let updated = goal_request(updated,question,st["plan_subject"],probe,chat_plan_observed)

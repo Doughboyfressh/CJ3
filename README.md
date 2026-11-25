@@ -97,6 +97,20 @@ meets the goal. The inferred model and its observations belong to this chat
 session; `Cancel plan` clears them. When starting from a trace file, chat
 holds a snapshot and keeps subsequent answers in the session.
 
+Say `Find a way to turn on lamp A.` to start a named plan. Pi treats
+`on` as the available event and 1 as the desired outcome (`off` uses 0).
+To specify other actions, say `Plan goal 1 for lamp A using events press reset`.
+Pi checks saved research for each requested trace, cites the source, and
+continues planning. It asks for the first missing or conflicting observation,
+then resumes when you answer. These commands propose actions from reset.
+
+During a planning question, say `Research plan for lamp A` to identify the
+system. Pi looks up the exact question about that system and the requested
+event sequence. A recorded answer of 0 or 1 with a source and evidence goes
+to the planner immediately. Chat shows the evidence and the next question or
+plan. Say `Research plan` for the next observation. If the lookup cannot
+supply a sourced binary answer, the question stays open for a manual outcome.
+
 Ordinary turns can also use what Pi has learned. Teach a list operation with
 `Pivot maps list 2,1,3 to 3,1,2.`, then give the language example
 `Teach language kef => pivot`. After restarting chat, `Kef on 4,9,1`

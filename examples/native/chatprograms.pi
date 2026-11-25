@@ -1,3 +1,4 @@
+import "goalrequest.pi"
 import "tracestates.pi"
 
 # Run native entry points from this checkout. Libraries have no main of their own.
@@ -93,10 +94,10 @@ skill chat_research(st,line) -> Any {
   if slice(text,0,9) != "research " { return null }
   let q = trim(slice(line,9,len(line)))
   let subject = st["plan_subject"]
-  let pending = st["plan_probe"]
+  let request = st["goal_request"]
   let shortcut = text == "research plan" or slice(text,0,18) == "research plan for "
   if shortcut {
-    if pending == null { return ["There is no pending planning observation.",st,false] }
+    if request == null { return ["There is no pending planning observation.",st,false] }
     if text != "research plan" {
       let name = trim(slice(line,18,len(line)))
       if subject != null and research_key(name) != research_key(subject) {
@@ -106,10 +107,12 @@ skill chat_research(st,line) -> Any {
     }
     if subject == null or trim(subject) == "" { return ["Use research plan for SYSTEM to identify the system under study.",st,false] }
     let st = put(st,"plan_subject",subject)
+    let request = put(put(request,"subject",subject),"question",chat_probe_question(subject,request["context"]))
+    let st = put(st,"goal_request",request)
   }
   let question = null
-  if pending != null and subject != null {
-    let question = chat_probe_question(subject,pending)
+  if request != null and subject != null {
+    let question = request["question"]
     if shortcut { let q = question }
   }
   if question == null or research_key(q) != research_key(question) {
@@ -131,10 +134,11 @@ skill chat_research(st,line) -> Any {
   if observation != null and observation[0] == "conflict" {
     return ["Sources disagree: " ++ q ++ "\nGive outcome 0 or outcome 1.",st,false]
   }
-  if record == null or not contains(["0","1"],trim(record[1])) or trim(record[2]) == "" or trim(record[3]) == "" {
+  if observation == null {
     return [reply ++ "\nThe plan still needs a sourced binary outcome.",next,false]
   }
-  let plan = chat_plan(st,"outcome " ++ trim(record[1]))
+  let reply = q ++ "\n" ++ observation[0] ++ "\nevidence: " ++ observation[2] ++ "\nsource: " ++ observation[1]
+  let plan = goal_answer(st,request,observation[0])
   return [reply ++ "\n" ++ plan[0],put(plan[1],"program_result",reply),false]
 }
 
@@ -166,23 +170,24 @@ skill chat_known_outcomes(subject) -> Any {
 
 skill chat_follow_goal(turn) -> Any {
   let st = turn[1]
-  let subject = st["plan_subject"]
-  if subject == null or st["plan_probe"] == null { return turn }
+  let request = st["goal_request"]
+  if request == null or request["subject"] == null { return turn }
+  let subject = request["subject"]
   let known = chat_known_outcomes(subject)
   let findings = []
-  while st["plan_probe"] != null {
-    let trace = st["plan_probe"]
-    let q = chat_probe_question(subject,trace)
+  while st["goal_request"] != null {
+    let request = st["goal_request"]
+    let q = request["question"]
     let item = known[research_key(q)]
     if item == null { break }
     if item[0] == "conflict" {
       let findings = append(findings,"Sources disagree: " ++ q)
       break
     }
-    let turn = chat_plan(st,"outcome " ++ item[0])
+    let turn = goal_answer(st,request,item[0])
     let findings = append(findings,q ++ " " ++ item[0] ++ "\nevidence: " ++ item[2] ++ "\nsource: " ++ item[1])
     let st = turn[1]
-    if st["plan_probe"] == trace { break }
+    if st["goal_request"] != null and st["goal_request"]["id"] == request["id"] { break }
   }
   if len(findings) == 0 { return turn }
   let reply = join(append(findings,turn[0]),"\n")
@@ -216,7 +221,15 @@ skill chat_goal_turn(st,line) -> Any {
       }
     }
   }
-  return chat_plan_step(st,command,subject,true)
+  if text == "what do you need?" or text == "what do you need" {
+    let request = st["goal_request"]
+    if request == null { return ["There is no pending goal observation.",st,false] }
+    return [request["question"],st,false]
+  }
+  let turn = goal_chat_answer(st,line)
+  if turn == null { let turn = chat_plan_start(st,command,subject) }
+  if turn == null or turn[1]["goal_sequence"] == st["goal_sequence"] { return turn }
+  return chat_follow_goal(turn)
 }
 
 # Learn phrases from demonstrations with Tongue, keeping corrections across sessions.
@@ -263,21 +276,24 @@ skill chat_meaning(text) -> Any {
   return join(result," ")
 }
 
-# Keep observations, goal and starting prefix together. Replies refer to the
-# exact experiment requested, even across unrelated conversation turns.
-skill chat_plan(st,line) -> Any {
-  return chat_plan_step(st,line,null,false)
+skill goal_chat_answer(st,line) -> Any {
+  let text = lower(line)
+  let labelled = slice(text,0,8) == "outcome "
+  let request = st["goal_request"]
+  if request == null {
+    if labelled { return ["There is no pending planning observation.",st,false] }
+    return null
+  }
+  if not labelled and (st["lesson_probe"] != null or not contains(["0","1"],text)) { return null }
+  let bit = if labelled { trim(slice(text,8,len(text))) } else { text }
+  return goal_answer(st,request,bit)
 }
 
-skill chat_plan_step(st,line,subject,follow) -> Any {
+skill chat_plan_start(st,line,subject) -> Any {
   let text = lower(line)
-  let probed = false
-  let expected = null
-  let witness = null
   let current = st["planning"]
-  let pending = st["plan_probe"]
   if text == "cancel plan" {
-    return ["Plan cleared.",put(put(put(st,"planning",null),"plan_probe",null),"neuron_expected",null),false]
+    return ["Plan cleared.",put(put(put(st,"planning",null),"goal_request",null),"neuron_expected",null),false]
   }
   let raw = null
   let goal = null
@@ -306,31 +322,34 @@ skill chat_plan_step(st,line,subject,follow) -> Any {
       }
     }
     if goal != 0 and goal != 1 { return ["Give a binary goal (0 or 1).",st,false] }
-  } else {
-    let labelled = slice(text,0,8) == "outcome "
-    if pending == null {
-      if labelled { return ["There is no pending planning observation.",st,false] }
-      return null
-    }
-    # A bare number may already answer Heed’s arithmetic clarification.
-    if not labelled and (st["lesson_probe"] != null or not contains(["0","1"],text)) { return null }
-    let bit = if labelled { trim(slice(text,8,len(text))) } else { text }
-    if not contains(["0","1"],bit) { return ["Give outcome 0 or outcome 1.",st,false] }
-    let probed = st["neuron_probed"]
-    if st["neuron_expected"] != null {
-      let st = neuron_observe(st,if bit == st["neuron_expected"] { 0 } else { 1 })
-    }
-    let raw = current[0] ++ "\n" ++ trim(bit ++ " " ++ pending)
-    let goal = current[1]
-    let prefix = current[2]
-    if probed and bit == str(goal) {
-      let steps = split(pending)
-      let start = if prefix == null { [] } else { split(prefix) }
-      if slice(steps,0,len(start)) == start {
-        let witness = trim("plan " ++ join(slice(steps,len(start),len(steps))," "))
-      }
+  } else { return null }
+  if current == null { let st = put(st,"plan_subject",subject) }
+  return chat_plan_advance(st,raw,goal,prefix,null,false)
+}
+
+skill chat_plan_observed(st,request,bit) -> Any {
+  let current = st["planning"]
+  let pending = request["context"]
+  let witness = null
+  let probed = st["neuron_probed"]
+  if st["neuron_expected"] != null {
+    let st = neuron_observe(st,if bit == st["neuron_expected"] { 0 } else { 1 })
+  }
+  let raw = current[0] ++ "\n" ++ trim(bit ++ " " ++ pending)
+  let goal = current[1]
+  let prefix = current[2]
+  if probed and bit == str(goal) {
+    let steps = split(pending)
+    let start = if prefix == null { [] } else { split(prefix) }
+    if slice(steps,0,len(start)) == start {
+      let witness = trim("plan " ++ join(slice(steps,len(start),len(steps))," "))
     }
   }
+  return chat_plan_advance(st,raw,goal,prefix,witness,probed)
+}
+
+skill chat_plan_advance(st,raw,goal,prefix,witness,probed) -> Any {
+  let expected = null
   let answer = if witness == null { ts_observations(raw,prefix,null,goal) } else { witness }
   if answer == "Goal unreachable in learned model." and not probed and neuron_gate(st) {
     let check = ts_observations(raw,prefix,2,goal)
@@ -349,12 +368,13 @@ skill chat_plan_step(st,line,subject,follow) -> Any {
   } else {
     if slice(answer,0,4) != "plan" and answer != "Goal unreachable in learned model." { return [answer,st,false] }
   }
-  if current == null { let st = put(st,"plan_subject",subject) }
-  let updated = put(put(st,"planning",[raw,goal,prefix]),"plan_probe",probe)
+  let updated = put(st,"planning",[raw,goal,prefix])
+  if probe != null {
+    let question = if st["plan_subject"] == null { answer } else { chat_probe_question(st["plan_subject"],probe) }
+    let updated = goal_request(updated,question,st["plan_subject"],probe,chat_plan_observed)
+  } else { let updated = put(updated,"goal_request",null) }
   let updated = put(put(updated,"neuron_expected",expected),"neuron_probed",probed)
-  let turn = [answer,put(updated,"program_result",answer),false]
-  if follow and probe != null { return chat_follow_goal(turn) }
-  return turn
+  return [answer,put(updated,"program_result",answer),false]
 }
 
 skill chat_repair(st,text) -> Any {

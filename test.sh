@@ -146,6 +146,11 @@ fi
   grep -Fx 'Sources disagree: For lamp A, starting from reset, what is the outcome after on?' resumed-goal.txt
   grep -Fx 'plan on' resumed-goal.txt
   grep -Fx 'Starting from reset, what is the outcome before any events? Reply outcome 0 or outcome 1.' resumed-goal.txt
+  printf '%s\n' 'Find a way to turn on lamp A.' 'What do you need?' 'outcome unknown' 'What do you need?' 'outcome 1' 'What do you need?' | ./chat > goal-request.txt
+  [ "$(grep -Fxc 'For lamp A, starting from reset, what is the outcome after on?' goal-request.txt)" = 2 ]
+  grep -Fx 'Give outcome 0 or outcome 1.' goal-request.txt
+  grep -Fx 'plan on' goal-request.txt
+  grep -Fx 'There is no pending goal observation.' goal-request.txt
   printf '%s\n' 'Teach curve wave 8=0 0=0 2=3 6=-3 4=0' | ./chat > trained.txt
   grep -Fx '5 samples, 2 hidden ReLU neurons.' trained.txt
   printf '%s\n' 'Curve wave at 5' 'Curve wave at 8' 'Curve wave at 9' 'Teach curve wave 2=0 6=0' 'Teach curve wave 3=9 bad' 'Curve wave at 3' | ./chat > curves.txt

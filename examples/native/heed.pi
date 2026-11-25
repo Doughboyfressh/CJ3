@@ -471,6 +471,7 @@ skill main() -> Any {
     if bound == null or bound < 1 { return "Usage: heed states-check FILE POSITIVE-STATE-BOUND" }
     return ts_command(arg(2),null,bound,null)
   }
+  if arg(1) == "states-refine" { return ts_read(arg(2),null,null,null,true) }
   if arg(1) == "states" { return ts_command(arg(2),arg(3),null,null) }
   if arg(1) == "explore-score" { return dx_score(arg(2),arg(3)) }
   if arg(1) == "explore" { return dx_run(arg(2),arg(3),arg(4)) }

@@ -84,6 +84,59 @@ still exhaust 96 experiments. The query order up to success is identical.
 These savings come from returning a witnessed solution sooner. The default
 evaluation continues to a provisional model for the held-out predictions.
 
+### Refining a provisional model
+
+The frozen fraction learner merges `acbc` and `aa` into the same rejecting
+state. Appending `c` distinguishes them. The action names and binary labels
+are the only information supplied to the learner. The optional refiner looks
+for short loops that restore a state elsewhere in the inferred table, then
+tries inserting them in observed successful traces where the model predicts
+failure. On disagreement, native `states-refine` bisects a counterexample
+and adds one distinguishing suffix to the observation table. This is an
+experimental strategy for spending a remaining observation budget.
+
+Starting with a fresh log, run from the repository root:
+
+```sh
+python3 tools/trace_agent.py out/heed out/fraction.obs --events a b c --goal 1 --finish-model --budget 96 --oracle python3 tools/frozen_tasks.py --observe fraction
+python3 tools/refine_model.py out/heed out/fraction.obs --budget 96 --oracle python3 tools/frozen_tasks.py --observe fraction
+python3 tools/check_refinement.py out/heed
+```
+
+The refiner extends the log in place and charges the original observations
+against the same limit. It returns a table only when consistent with all
+logged observations. On the fraction task the first challenge found a missed
+positive at observation 57. The six-state model finished after 75. Excluding
+every trace used by either run, positive recall through length seven rose
+from 25/78 to 34/78 with zero false positives in both cases. The probe design
+was developed after inspecting this task. In a separate twelve-seed panel of
+generated finite machines under a 96-query cap, ten runs yielded both models.
+Errors on their 7,243 common unseen length-six traces fell from 74 to 12;
+all of that improvement came from one seed. One baseline did not finish and
+one refinement did not finish. The baseline stops when it finds a consistent
+table and can spend fewer observations. These figures do not establish an
+advantage over every alternative use of the remaining budget.
+
+For a cost-matched control, keep a copy of the original 56-observation log
+before running refinement. Both arms use the focused suffix splitter. Only
+the choice of probe differs. The control tries the shortest unseen trace,
+and gets exactly the number of observations the targeted arm used, including
+refits. The evaluation excludes the union of both training logs.
+
+```sh
+python3 tools/check_refinement.py out/heed --fraction-log out/fraction-original.obs
+python3 tools/check_refinement.py out/heed --matched --first-seed 100 --machines 48
+```
+
+On the fraction task, each arm spent 75 observations total. Of 52 unseen
+positive traces of exactly length seven, targeted probes recognized 20 and
+the control recognized 14, with zero false positives in either arm. On 48
+fresh finite machines, three initial models exhausted the budget. Among the
+45 remaining, targeted refinement completed 38 models and shortest-unseen
+completed 40. On all 36 paired completions the error counts tied, totaling
+130 errors per arm across 26,032 common unseen length-six traces. The
+fraction result does not justify preferring targeted probes by default.
+
 ## Learn a door rule by acting
 
 Build Heed, then run three episodes from the repository root:

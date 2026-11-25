@@ -127,6 +127,15 @@ fi
   printf '%s\n' 'Plan goal 1 using events on' 'outcome 0' "Who is Ann's grandparent?" 'outcome 2' '1' '1' 'Plan goal 0' 'Cancel plan' 'outcome 1' | ./chat > planning.txt
   printf '%s\n' 'Starting from reset, what is the outcome before any events? Reply outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on? Reply outcome 0 or outcome 1.' "Tom is Ann's grandparent." 'Give outcome 0 or outcome 1.' 'Starting from reset, what is the outcome after on on? Reply outcome 0 or outcome 1.' 'plan on' 'plan' 'Plan cleared.' 'There is no pending planning observation.' 'Goodbye. I know 6 facts.' > planning.expect
   cmp planning.expect planning.txt
+  printf '%s\n' 'For lamp A, starting from reset, what is the outcome before any events? ||| 0 ||| bench log ||| Lamp dark at reset' 'For lamp A, starting from reset, what is the outcome after on? ||| 1 ||| bench log ||| Lamp lit after on' 'For lamp A, starting from reset, what is the outcome after on on? ||| unknown ||| bench log ||| No reading' >> out/research.kb
+  printf '%s\n' 'Plan goal 1 using events on' 'Research plan for lamp A' 'Research Demo?' 'Research plan for lamp B' 'Research For lamp A, starting from reset, what is the outcome after on?' 'Research plan' 'outcome 1' 'Research plan' | ./chat > research-plan.txt
+  grep -Fx 'evidence: Lamp dark at reset' research-plan.txt
+  grep -Fx 'This plan is already researching lamp A.' research-plan.txt
+  grep -Fx 'evidence: Lamp lit after on' research-plan.txt
+  grep -Fx 'Starting from reset, what is the outcome after on on? Reply outcome 0 or outcome 1.' research-plan.txt
+  grep -Fx 'The plan still needs a sourced binary outcome.' research-plan.txt
+  grep -Fx 'plan on' research-plan.txt
+  grep -Fx 'There is no pending planning observation.' research-plan.txt
   printf '%s\n' 'Teach curve wave 8=0 0=0 2=3 6=-3 4=0' | ./chat > trained.txt
   grep -Fx '5 samples, 2 hidden ReLU neurons.' trained.txt
   printf '%s\n' 'Curve wave at 5' 'Curve wave at 8' 'Curve wave at 9' 'Teach curve wave 2=0 6=0' 'Teach curve wave 3=9 bad' 'Curve wave at 3' | ./chat > curves.txt

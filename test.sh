@@ -136,6 +136,16 @@ fi
   grep -Fx 'The plan still needs a sourced binary outcome.' research-plan.txt
   grep -Fx 'plan on' research-plan.txt
   grep -Fx 'There is no pending planning observation.' research-plan.txt
+  printf '%s\n' 'For lamp A, starting from reset, what is the outcome after on on? ||| 1 ||| bench log ||| Lamp remained lit' >> out/research.kb
+  printf '%s\n' 'Find a way to turn on lamp A.' | ./chat > auto-plan.txt
+  grep -Fx 'source: bench log' auto-plan.txt
+  grep -Fx 'evidence: Lamp remained lit' auto-plan.txt
+  grep -Fx 'plan on' auto-plan.txt
+  printf '%s\n' 'For lamp A, starting from reset, what is the outcome after on? ||| 0 ||| second log ||| Lamp stayed dark' >> out/research.kb
+  printf '%s\n' 'Plan goal 1 for lamp A using events on' 'outcome 1' 'Find a way to turn on lamp B.' | ./chat > resumed-goal.txt
+  grep -Fx 'Sources disagree: For lamp A, starting from reset, what is the outcome after on?' resumed-goal.txt
+  grep -Fx 'plan on' resumed-goal.txt
+  grep -Fx 'Starting from reset, what is the outcome before any events? Reply outcome 0 or outcome 1.' resumed-goal.txt
   printf '%s\n' 'Teach curve wave 8=0 0=0 2=3 6=-3 4=0' | ./chat > trained.txt
   grep -Fx '5 samples, 2 hidden ReLU neurons.' trained.txt
   printf '%s\n' 'Curve wave at 5' 'Curve wave at 8' 'Curve wave at 9' 'Teach curve wave 2=0 6=0' 'Teach curve wave 3=9 bad' 'Curve wave at 3' | ./chat > curves.txt

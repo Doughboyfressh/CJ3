@@ -109,8 +109,7 @@ skill chat_research(st,line) -> Any {
   }
   let question = null
   if pending != null and subject != null {
-    let experiment = if pending == "" { "before any events" } else { "after " ++ pending }
-    let question = "For " ++ subject ++ ", starting from reset, what is the outcome " ++ experiment ++ "?"
+    let question = chat_probe_question(subject,pending)
     if shortcut { let q = question }
   }
   if question == null or research_key(q) != research_key(question) {
@@ -127,11 +126,97 @@ skill chat_research(st,line) -> Any {
     let reply = record[0] ++ "\n" ++ record[1] ++ "\nevidence: " ++ record[3] ++ "\nsource: " ++ record[2]
   }
   let next = put(st,"program_result",reply)
+  let known = chat_known_outcomes(subject)
+  let observation = known[research_key(q)]
+  if observation != null and observation[0] == "conflict" {
+    return ["Sources disagree: " ++ q ++ "\nGive outcome 0 or outcome 1.",st,false]
+  }
   if record == null or not contains(["0","1"],trim(record[1])) or trim(record[2]) == "" or trim(record[3]) == "" {
     return [reply ++ "\nThe plan still needs a sourced binary outcome.",next,false]
   }
   let plan = chat_plan(st,"outcome " ++ trim(record[1]))
   return [reply ++ "\n" ++ plan[0],put(plan[1],"program_result",reply),false]
+}
+
+skill chat_probe_question(subject,trace) -> Any {
+  let experiment = if trace == "" { "before any events" } else { "after " ++ trace }
+  return "For " ++ subject ++ ", starting from reset, what is the outcome " ++ experiment ++ "?"
+}
+
+# Read the notebook once per turn. Conflicting sourced readings need a human observation.
+skill chat_known_outcomes(subject) -> Any {
+  let rows = read_file("out/research.kb")
+  let known = {}
+  if rows == null { return known }
+  let prefix = lower("For " ++ subject ++ ", starting from reset, what is the outcome ")
+  for line in split(rows,"\n") {
+    let fields = split(line," ||| ")
+    if len(fields) != 4 { continue }
+    let key = research_key(fields[0])
+    if slice(key,0,len(prefix)) != prefix { continue }
+    let bit = trim(fields[1])
+    if not contains(["0","1"],bit) or trim(fields[2]) == "" or trim(fields[3]) == "" { continue }
+    let previous = known[key]
+    if previous != null and previous[0] != bit { known = put(known,key,["conflict"]) } else {
+      known = put(known,key,[bit,trim(fields[2]),trim(fields[3])])
+    }
+  }
+  return known
+}
+
+skill chat_follow_goal(turn) -> Any {
+  let st = turn[1]
+  let subject = st["plan_subject"]
+  if subject == null or st["plan_probe"] == null { return turn }
+  let known = chat_known_outcomes(subject)
+  let findings = []
+  while st["plan_probe"] != null {
+    let trace = st["plan_probe"]
+    let q = chat_probe_question(subject,trace)
+    let item = known[research_key(q)]
+    if item == null { break }
+    if item[0] == "conflict" {
+      let findings = append(findings,"Sources disagree: " ++ q)
+      break
+    }
+    let turn = chat_plan(st,"outcome " ++ item[0])
+    let findings = append(findings,q ++ " " ++ item[0] ++ "\nevidence: " ++ item[2] ++ "\nsource: " ++ item[1])
+    let st = turn[1]
+    if st["plan_probe"] == trace { break }
+  }
+  if len(findings) == 0 { return turn }
+  let reply = join(append(findings,turn[0]),"\n")
+  return [reply,put(st,"program_result",reply),false]
+}
+
+skill chat_goal_turn(st,line) -> Any {
+  let text = lower(line)
+  let subject = null
+  let command = line
+  for action in ["on","off"] {
+    let prefix = "find a way to turn " ++ action ++ " "
+    if slice(text,0,len(prefix)) != prefix { continue }
+    let subject = trim(slice(line,len(prefix),len(line)))
+    if ends(subject,".") or ends(subject,"?") { let subject = trim(slice(subject,0,len(subject)-1)) }
+    if subject == "" { return ["Which system should I plan for?",st,false] }
+    let goal = if action == "on" { "1" } else { "0" }
+    let command = "plan goal " ++ goal ++ " using events " ++ action
+    break
+  }
+  if slice(text,0,10) == "plan goal " and contains(text," for ") and not contains(text," | ") {
+    let words = split(text)
+    if len(words) >= 7 and words[3] == "for" {
+      let parts = split(line)
+      for i in range(5,len(words)-1) {
+        if words[i] == "using" and words[i+1] == "events" {
+          let subject = join(slice(parts,4,i)," ")
+          let command = "plan goal " ++ words[2] ++ " using events " ++ join(slice(parts,i+2,len(parts))," ")
+          break
+        }
+      }
+    }
+  }
+  return chat_plan_step(st,command,subject,true)
 }
 
 # Learn phrases from demonstrations with Tongue, keeping corrections across sessions.
@@ -181,6 +266,10 @@ skill chat_meaning(text) -> Any {
 # Keep observations, goal and starting prefix together. Replies refer to the
 # exact experiment requested, even across unrelated conversation turns.
 skill chat_plan(st,line) -> Any {
+  return chat_plan_step(st,line,null,false)
+}
+
+skill chat_plan_step(st,line,subject,follow) -> Any {
   let text = lower(line)
   let probed = false
   let expected = null
@@ -260,10 +349,12 @@ skill chat_plan(st,line) -> Any {
   } else {
     if slice(answer,0,4) != "plan" and answer != "Goal unreachable in learned model." { return [answer,st,false] }
   }
-  if current == null { let st = put(st,"plan_subject",null) }
+  if current == null { let st = put(st,"plan_subject",subject) }
   let updated = put(put(st,"planning",[raw,goal,prefix]),"plan_probe",probe)
   let updated = put(put(updated,"neuron_expected",expected),"neuron_probed",probed)
-  return [answer,put(updated,"program_result",answer),false]
+  let turn = [answer,put(updated,"program_result",answer),false]
+  if follow and probe != null { return chat_follow_goal(turn) }
+  return turn
 }
 
 skill chat_repair(st,text) -> Any {

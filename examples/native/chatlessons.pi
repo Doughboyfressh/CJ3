@@ -115,7 +115,7 @@ skill chat_handle(st,line) -> Any {
   }
   let notebook = chat_note(trim(line))
   if notebook != null { return [notebook,st,false] }
-  let plan = chat_plan(st,trim(line))
+  let plan = chat_goal_turn(st,trim(line))
   if plan != null { return plan }
   let finding = chat_research(st,trim(line))
   if finding != null { return finding }

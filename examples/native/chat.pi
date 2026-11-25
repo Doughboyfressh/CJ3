@@ -1,11 +1,9 @@
-# Native Pi dialogue with persistent facts and searchable notes.
-import "conversation.pi"
-import "notes.pi"
-import "chatlessons.pi"
+import "chatentry.pi"
 
 skill main() -> Any {
   # Console output uses UTF-8.
   do rt_console_utf8()
+  if arg(1) == "ask" { return chat_ask(2) }
   if arg(1) == "memory" { return hm_command(arg(2),arg(3),arg(4),arg(5),arg(6)) }
   if arg(1) == "--remember" or arg(1) == "--recall" {
     let words = []
@@ -17,11 +15,10 @@ skill main() -> Any {
     return note_command(arg(1) == "--remember",join(words," "))
   }
   if arg(1) != null { return "Usage: chat [--remember NOTE | --recall QUERY | memory FILE teach|use PHRASE LIST [ANSWER]]" }
-  let pending = chat_saved_probe()
-  let st = load_facts("out/chat_facts.txt")
+  let st = chat_state()
+  let pending = st["lesson_probe"]
   if pending != null {
-    let st = put(st,"lesson_probe",pending)
     do print(hm_prompt(pending[0][1],[pending[0][0],pending[1]]))
   }
-  return converse_with("out/chat_facts.txt",chat_handle,st)
+  return converse_with(chat_data("chat_facts.txt"),chat_handle,st)
 }

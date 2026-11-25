@@ -1,3 +1,4 @@
+import "chatprofile.pi"
 import "chatneuron.pi"
 import "curvenet.pi"
 import "researchmemory.pi"
@@ -53,11 +54,11 @@ skill chat_save_probe(probe) -> Any {
       let record = record ++ "|" ++ hm_prompt(target[1][1],[target[1][0],target[2]])
     }
   }
-  return rt_append_file("out/chat_questions.txt","\n" ++ record ++ "!\n")
+  return rt_append_file(chat_data("chat_questions.txt"),"\n" ++ record ++ "!\n")
 }
 
 skill chat_saved_probe() -> Any {
-  let data = read_file("out/chat_questions.txt")
+  let data = read_file(chat_data("chat_questions.txt"))
   if data == null { return null }
   for line in reverse(split(data,"\n")) {
     if line == "clear!" { return null }
@@ -160,12 +161,12 @@ skill chat_handle(st,line) -> Any {
   let ws = request[1]
   let xs = request[2]
   let command = request[0]
-  let r = hm_turn("out/chat_lessons.txt",request[0],ws,join(ws," of "),xs,request[3])
+  let r = hm_turn(chat_data("chat_lessons.txt"),request[0],ws,join(ws," of "),xs,request[3])
   if target != null and (r[1] != null or r[2] != null) {
     let command = "use"
     let ws = target[1]
     let xs = target[2]
-    let r = hm_turn("out/chat_lessons.txt","use",ws,join(ws," of "),xs,null)
+    let r = hm_turn(chat_data("chat_lessons.txt"),"use",ws,join(ws," of "),xs,null)
   }
   if request[0] == "use" { let target = request }
   let next = null
@@ -195,7 +196,7 @@ skill chat_handle(st,line) -> Any {
 # Keep the input and the successful instruction together for the next turn.
 # Heed owns the observations, program selection, and evaluation for both interfaces.
 skill chat_transform(st,text) -> Any {
-  let path = "out/chat_lessons.txt"
+  let path = chat_data("chat_lessons.txt")
   let domain = "order"
   for kind in ["list","grid"] {
     let lesson = split(text," maps " ++ kind ++ " ")
@@ -210,7 +211,7 @@ skill chat_transform(st,text) -> Any {
 }
 
 skill chat_apply(st,text) -> Any {
-  let path = "out/chat_lessons.txt"
+  let path = chat_data("chat_lessons.txt")
   let domain = "order"
   let steps = []
   let raw = null
@@ -265,7 +266,7 @@ skill chat_grounded(st,text,line) -> Any {
       let action = chat_apply(st,"apply " ++ lower(names) ++ " to " ++ raw)
       if action != null {
         if slice(action[0],0,1) == "[" { return [action[0],put(action[1],"program_result",action[0]),false] }
-        let book = hm_load("out/chat_lessons.txt")
+        let book = hm_load(chat_data("chat_lessons.txt"))
         if taught or (book != null and book[domain ++ ":" ++ phrase] != null) { return action }
       }
     }

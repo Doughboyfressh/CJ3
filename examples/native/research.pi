@@ -1619,10 +1619,10 @@ skill docs_for(terms) -> Any {
 }
 
 skill remember(q, a) -> Any {
-  let old = read_file("out\\research.kb")
+  let old = read_file(chat_data("research.kb"))
   let line = q ++ " ||| " ++ a[0] ++ " ||| " ++ a[3] ++ " ||| " ++ a[2]
-  if old == null { return write_file("out\\research.kb", line) }
-  return write_file("out\\research.kb", old ++ "\n" ++ line)
+  if old == null { return write_file(chat_data("research.kb"), line) }
+  return write_file(chat_data("research.kb"), old ++ "\n" ++ line)
 }
 
 skill ask(q) -> Any {

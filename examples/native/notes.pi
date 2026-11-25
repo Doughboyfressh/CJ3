@@ -1,4 +1,5 @@
-skill MEMFILE() -> Any { return "out/brain_memory.txt" }
+import "chatprofile.pi"
+skill MEMFILE() -> Any { return chat_data("brain_memory.txt") }
 
 skill mem_all() -> Any {
   let t = read_file(MEMFILE())

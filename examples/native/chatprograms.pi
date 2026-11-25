@@ -1,3 +1,4 @@
+import "chatprofile.pi"
 import "goalrequest.pi"
 import "tracestates.pi"
 
@@ -149,7 +150,7 @@ skill chat_probe_question(subject,trace) -> Any {
 
 # Read the notebook once per turn. Conflicting sourced readings need a human observation.
 skill chat_known_outcomes(subject) -> Any {
-  let rows = read_file("out/research.kb")
+  let rows = read_file(chat_data("research.kb"))
   let known = {}
   if rows == null { return known }
   let prefix = lower("For " ++ subject ++ ", starting from reset, what is the outcome ")
@@ -269,7 +270,7 @@ skill chat_language(line) -> Any {
   let text = lower(line)
   let teach = slice(text,0,15) == "teach language "
   if not teach and slice(text,0,10) != "interpret " { return null }
-  let path = "out/chat_language.txt"
+  let path = chat_data("chat_language.txt")
   if teach {
     let pair = split(slice(line,15,len(line))," => ")
     if len(pair) != 2 or trim(pair[0]) == "" or trim(pair[1]) == "" {
@@ -284,7 +285,7 @@ skill chat_language(line) -> Any {
 }
 
 skill chat_meaning(text) -> Any {
-  let history = read_file("out/chat_language.txt")
+  let history = read_file(chat_data("chat_language.txt"))
   if history == null or text == "" { return null }
   let vocabulary = {}
   let known = {}

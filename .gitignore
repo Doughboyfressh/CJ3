@@ -10,3 +10,4 @@ __pycache__/
 
 # keep the bootstrap compilers (seed/pic.exe for Windows, seed/pic for Linux) -- they are required to build Pi
 # and live outside out/
+.pi-profile/

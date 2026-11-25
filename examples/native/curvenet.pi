@@ -1,3 +1,4 @@
+import "chatprofile.pi"
 # A scalar piecewise-linear network in breakpoint form. An interior point
 # contributes one ReLU weighted by the change in slope. Collinear points
 # are retained in the lesson file so that later corrections can expose them.
@@ -86,7 +87,7 @@ skill chat_curve(st,text) -> Any {
   if not teach and words[0] != "curve" { return null }
   let i = if teach { 2 } else { 1 }
   if len(words) <= i+1 or not hm_word(words[i]) { return ["Use teach curve NAME X=Y ... or curve NAME at X or curve NAME neurons.",st,false] }
-  let path = "out/chat_curve_" ++ words[i] ++ ".txt"
+  let path = chat_data("chat_curve_" ++ words[i] ++ ".txt")
   let data = read_file(path)
   if data == null { let data = "" }
   let suffix = ""

@@ -1,0 +1,6 @@
+# The launcher prepares a checkout-local profile. Standalone programs also
+# support existing working directories that keep their data in out/.
+skill chat_data(name) -> Any {
+  if read_file(".pi-profile/active") != null { return ".pi-profile/" ++ name }
+  return "out/" ++ name
+}

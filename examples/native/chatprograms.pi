@@ -258,11 +258,6 @@ skill chat_goal_turn(st,line) -> Any {
       }
     }
   }
-  if text == "what do you need?" or text == "what do you need" {
-    let request = st["goal_request"]
-    if request == null { return ["There is no pending goal observation.",st,false] }
-    return [request["question"],st,false]
-  }
   let turn = goal_chat_answer(st,line)
   if turn == null { let turn = chat_plan_start(st,command,subject) }
   if turn == null or turn[1]["goal_sequence"] == st["goal_sequence"] { return turn }

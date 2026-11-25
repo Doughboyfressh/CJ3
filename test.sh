@@ -156,6 +156,11 @@ fi
   grep -Fx 'For beacon C: At reset the recorded outcome was 0. The recorded outcome after on from reset was 1, which matches the goal.' plan-reasons.txt
   grep -Fx 'After flip flip the recorded outcome was 0. The learned model predicts outcome 1 after flip flip flip from reset. That exact sequence has no recorded outcome.' plan-reasons.txt
   grep -Fx 'There is no current plan to explain.' plan-reasons.txt
+  printf '%s\n' 'Plan goal 1 for relay G using events press' 'The sum of lums for 2 and 3 is 10.' 'What do you need?' '24' 'outcome 0' 'outcome 1' 'outcome 1' 'What is the product of lums for 1 and 7?' 'Why will that work?' 'Explain the plan' | ./chat > followups.txt
+  [ "$(grep -Fxc 'What is product of lums on 2,3?' followups.txt)" = 2 ]
+  grep -Fx 'For relay G, starting from reset, what is the outcome before any events?' followups.txt
+  grep -Fx 'The learned rule (e * 2) maps 1,7 to 2,14. Their product is 28.' followups.txt
+  grep -Fx 'For relay G: At reset the recorded outcome was 0. The recorded outcome after press from reset was 1, which matches the goal.' followups.txt
   printf '%s\n' 'Teach curve wave 8=0 0=0 2=3 6=-3 4=0' | ./chat > trained.txt
   grep -Fx '5 samples, 2 hidden ReLU neurons.' trained.txt
   printf '%s\n' 'Curve wave at 5' 'Curve wave at 8' 'Curve wave at 9' 'Teach curve wave 2=0 6=0' 'Teach curve wave 3=9 bad' 'Curve wave at 3' | ./chat > curves.txt

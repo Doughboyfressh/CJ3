@@ -151,6 +151,11 @@ fi
   grep -Fx 'Give outcome 0 or outcome 1.' goal-request.txt
   grep -Fx 'plan on' goal-request.txt
   grep -Fx 'There is no pending goal observation.' goal-request.txt
+  printf '%s\n' 'events flip' '0' '1 flip' '0 flip flip' > toggle.obs
+  printf '%s\n' 'Find a way to turn on beacon C.' '0' '1' '1' "Who is Ann's grandparent?" 'Why will that action work?' 'Plan goal 1 | toggle.obs | flip flip' 'Why will that work?' 'Cancel plan' 'Explain the plan' | ./chat > plan-reasons.txt
+  grep -Fx 'For beacon C: At reset the recorded outcome was 0. The recorded outcome after on from reset was 1, which matches the goal.' plan-reasons.txt
+  grep -Fx 'After flip flip the recorded outcome was 0. The learned model predicts outcome 1 after flip flip flip from reset. That exact sequence has no recorded outcome.' plan-reasons.txt
+  grep -Fx 'There is no current plan to explain.' plan-reasons.txt
   printf '%s\n' 'Teach curve wave 8=0 0=0 2=3 6=-3 4=0' | ./chat > trained.txt
   grep -Fx '5 samples, 2 hidden ReLU neurons.' trained.txt
   printf '%s\n' 'Curve wave at 5' 'Curve wave at 8' 'Curve wave at 9' 'Teach curve wave 2=0 6=0' 'Teach curve wave 3=9 bad' 'Curve wave at 3' | ./chat > curves.txt

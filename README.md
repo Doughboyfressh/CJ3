@@ -104,7 +104,7 @@ Pi checks saved research for each requested trace, cites the source, and
 continues planning. It asks for the first missing or conflicting observation,
 then resumes when you answer. Ask `What do you need?` to see the exact
 observation currently pending. Research and chat deliver answers to the same
-request, which carries the operation to resume. These commands propose actions from reset.
+request, which carries the operation to resume. Ask `Why will that work?` to see the recorded outcome for the proposed sequence, or whether Pi inferred it from its model. These commands propose actions from reset.
 
 During a planning question, say `Research plan for lamp A` to identify the
 system. Pi looks up the exact question about that system and the requested

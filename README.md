@@ -36,6 +36,12 @@ Chat saves observations in `out/chat_lessons.txt`. Chat also saves its pending q
 Reply with a signed integer, or type `cancel` to clear it across sessions.
 When the clarification settles an earlier question, Pi answers it immediately.
 
+To correct a numeric prediction, reply `No, it should be 12.` Pi records the
+corrected result for the same word, operation and inputs, then fits the rule
+to the saved observations again. The correction applies to the immediately
+preceding prediction in this chat. After changing subjects or restarting,
+give the observation explicitly.
+
 Chat uses Pi's native English fact and question grammar. Use `chat memory` with the same arguments as `heed memory` below to teach
 and apply executable rules. Both commands share the same lesson reader and
 can take turns updating the same file.
@@ -176,6 +182,68 @@ The target table supplies reset-and-run outcomes; the selector sees only
 those observations. The historical database format and context keys match
 the research driver; a matching research database can be used at the same
 path. These counts measure simulated target interactions.
+
+- **Language, its own way.** `tonguelib.pi` learns a language from example sentences with no network and
+  nothing trained: it keeps the smallest set of readable rules that explains everything it heard, and checks
+  each rule against all of it. `tongue.pi` measures it on the SCAN benchmark: from the 422 shortest commands
+  it reads the other 20,488 correctly, including every sentence the benchmark's splits hold back. `heed.pi`
+  uses the same learner on the mind's own tasks: an English instruction Pi was never given is read as a
+  program and run. When it is then shown examples for one it got wrong, it checks its own reading against
+  them and mends it (a new word, a wrong order) before it falls back on searching.
+
+### Refining a provisional model
+
+The frozen fraction learner merges `acbc` and `aa` into the same rejecting
+state. Appending `c` distinguishes them. The action names and binary labels
+are the only information supplied to the learner. The optional refiner looks
+for short loops that restore a state elsewhere in the inferred table, then
+tries inserting them in observed successful traces where the model predicts
+failure. On disagreement, native `states-refine` bisects a counterexample
+and adds one distinguishing suffix to the observation table. This is an
+experimental strategy for spending a remaining observation budget.
+
+Starting with a fresh log, run from the repository root:
+
+```sh
+python3 tools/trace_agent.py out/heed out/fraction.obs --events a b c --goal 1 --finish-model --budget 96 --oracle python3 tools/frozen_tasks.py --observe fraction
+python3 tools/refine_model.py out/heed out/fraction.obs --budget 96 --oracle python3 tools/frozen_tasks.py --observe fraction
+python3 tools/check_refinement.py out/heed
+```
+
+The refiner extends the log in place and charges the original observations
+against the same limit. It returns a table only when consistent with all
+logged observations. On the fraction task the first challenge found a missed
+positive at observation 57. The six-state model finished after 75. Excluding
+every trace used by either run, positive recall through length seven rose
+from 25/78 to 34/78 with zero false positives in both cases. The probe design
+was developed after inspecting this task. In a separate twelve-seed panel of
+generated finite machines under a 96-query cap, ten runs yielded both models.
+Errors on their 7,243 common unseen length-six traces fell from 74 to 12;
+all of that improvement came from one seed. One baseline did not finish and
+one refinement did not finish. The baseline stops when it finds a consistent
+table and can spend fewer observations. These figures do not establish an
+advantage over every alternative use of the remaining budget.
+
+For a cost-matched control, keep a copy of the original 56-observation log
+before running refinement. Both arms use the focused suffix splitter. Only
+the choice of probe differs. The control tries the shortest unseen trace,
+and gets exactly the number of observations the targeted arm used, including
+refits. The evaluation excludes the union of both training logs.
+
+```sh
+python3 tools/check_refinement.py out/heed --fraction-log out/fraction-original.obs
+python3 tools/check_refinement.py out/heed --matched --first-seed 100 --machines 48
+```
+
+On the fraction task, each arm spent 75 observations total. Of 52 unseen
+positive traces of exactly length seven, targeted probes recognized 20 and
+the control recognized 14, with zero false positives in either arm. On 48
+fresh finite machines, three initial models exhausted the budget. Among the
+45 remaining, targeted refinement completed 38 models and shortest-unseen
+completed 40. On all 36 paired completions the error counts tied, totaling
+130 errors per arm across 26,032 common unseen length-six traces. The
+fraction result does not justify preferring targeted probes by default.
+
 
 ## Quick start
 

@@ -38,6 +38,12 @@ those files. Repair history is imported into the same profile on launch, includi
 
 ## Autonomous investigation
 
+Ask `Find an input that makes the hidden machine output 14.` Pi uses its
+last learned arithmetic rule if available. With an empty investigation history,
+it first experiments with its simulated machine, checks and saves the rule,
+then searches inputs from -8 through 8 for the requested output. An unreachable
+output leaves the current machine and its history intact.
+
 Say `investigate on your own` to start one experiment in Pi’s integer-program
 world. Pi generates a hidden arithmetic program, ranks inputs by disagreement
 among 584 candidate programs, and observes the result of each selected input.

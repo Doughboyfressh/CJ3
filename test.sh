@@ -110,7 +110,13 @@ fi
   cmp shapes.expect shapes.txt
   ln -s "$root/examples" examples
   ln -s "$root/out/t_g2" out/pic
-  printf '%s\n' 'investigate on your own' | ./chat > discovery.txt
+  ./ask 'Find an input that makes the hidden machine output nonsense.' > invalid-goal.txt
+  grep -Fx 'Give a whole-number output between -100000000 and 100000000.' invalid-goal.txt
+  [ ! -e out/investigations.txt ]
+  printf '%s\n' 'Find an input that makes the hidden machine output 14.' | ./chat > discovery.txt
+  grep -Fx 'Input 7 gives 14 under the learned rule (x * 2).' discovery.txt
+  [ "$(./ask 'What input gives the hidden machine output 3?')" = 'The learned rule (x * 2) gives no input from -8 to 8 for output 3.' ]
+  [ "$(wc -l < out/investigations.txt)" -eq 1 ]
   grep -Fx 'Saved (x * 2) after checking six reserved inputs.' discovery.txt
   [ "$(./ask 'use discovery on 7')" = '(x * 2) at 7 = 14' ]
   ./ask 'investigate on your own' > next-discovery.txt

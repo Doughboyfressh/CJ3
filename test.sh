@@ -142,6 +142,12 @@ fi
   grep -Fx 'plan on' research-plan.txt
   grep -Fx 'There is no pending planning observation.' research-plan.txt
   printf '%s\n' 'For lamp A, starting from reset, what is the outcome after on on? ||| 1 ||| bench log ||| Lamp remained lit' >> out/research.kb
+  printf '%s\n' "Who is Ann's grandparent?" 'Find a way to turn on studio lamp.' 'Why will that work?' | ./chat > bench-plan.txt
+  grep -Fx "Tom is Ann's grandparent." bench-plan.txt
+  grep -Fx 'evidence: Simulated reset, then dim and measured 0.' bench-plan.txt
+  grep -Fx 'evidence: Simulated reset, then brighten and measured 1.' bench-plan.txt
+  grep -Fx 'plan brighten' bench-plan.txt
+  grep -Fx 'For studio lamp: At reset the recorded outcome was 0. The recorded outcome after brighten from reset was 1, which matches the goal.' bench-plan.txt
   printf '%s\n' 'Find a way to turn on lamp A.' | ./chat > auto-plan.txt
   grep -Fx 'source: bench log' auto-plan.txt
   grep -Fx 'evidence: Lamp remained lit' auto-plan.txt

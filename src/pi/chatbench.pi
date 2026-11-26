@@ -1,0 +1,46 @@
+# A resettable simulated instrument. The planner sees only the reading after
+# replaying its chosen trace, never the transition table or intermediate states.
+skill chat_bench(subject) -> Any {
+  let name = join(split(lower(subject)),"-")
+  if len(name) == 0 or len(name) > 80 { return null }
+  for ch in chars(name) {
+    if not contains("abcdefghijklmnopqrstuvwxyz0123456789-",ch) { return null }
+  }
+  let path = "examples/native/benches/" ++ name ++ ".bench"
+  let raw = read_file(path)
+  if raw == null { return null }
+  let rows = split(trim(raw),"\n")
+  let header = split(trim(rows[0]))
+  if len(header) != 2 or header[0] != "reset" { return null }
+  let states = {}
+  let events = []
+  for row in slice(rows,1,len(rows)) {
+    let fields = split(trim(row))
+    if len(fields) < 2 or len(fields) % 2 != 0 { return null }
+    if states[fields[0]] != null or not contains(["0","1"],fields[1]) { return null }
+    let edges = {}
+    for i in range(0,(len(fields)-2)//2) {
+      let event = fields[2+i*2]
+      if edges[event] != null { return null }
+      if not contains(events,event) { let events = append(events,event) }
+      let edges = put(edges,event,fields[3+i*2])
+    }
+    let states = put(states,fields[0],[fields[1],edges])
+  }
+  return [path,header[1],states,events]
+}
+
+skill chat_bench_probe(bench,trace) -> Any {
+  if bench == null { return null }
+  let states = bench[2]
+  let state = states[bench[1]]
+  if state == null { return null }
+  for event in split(trace) {
+    let target = state[1][event]
+    if target == null { return null }
+    let state = states[target]
+    if state == null { return null }
+  }
+  let replay = if trace == "" { "reset" } else { "reset, then " ++ trace }
+  return [state[0],bench[0],"Simulated " ++ replay ++ " and measured " ++ state[0] ++ "."]
+}

@@ -2,11 +2,13 @@
 
 Pi is an experimental AI system built in its own self-hosting programming language. Its native learner, Heed, turns examples into executable rules, asks questions when several rules fit, and reuses saved observations on later tasks. The Heed examples below run from a fresh checkout with the bundled compiler.
 
+The shared chat handler and its learning, planning, and memory modules live in [src/pi](src/pi). The native entry points in `examples/native/` also use these modules.
+
 ## How the pieces fit
 
 | Component | Role |
 | --- | --- |
-| [Heed](examples/native/heed.pi) and [Mind](examples/native/mindcore.pi) | Heed learns from lessons and chooses questions. Mind represents and evaluates the programs that explain those lessons. |
+| [Heed](examples/native/heed.pi) and [Mind](src/pi/mindcore.pi) | Heed learns from lessons and chooses questions. Mind represents and evaluates the programs that explain those lessons. |
 | [Softwell](softwell/README.md) | Pi’s software-defined CPU, GPU, RAM, and SSD. It models execution and data movement on a shared clock, with 64 KB of modeled RAM and an 8 MB modeled SSD. |
 | [Compiler](examples/pic.pi) and [runtime](examples/native/rt.pi) | The compiler builds native x64 executables for Linux and Windows, including itself. The runtime supplies text, collections, exact integers, files, and region-based memory management. |
 
@@ -29,7 +31,7 @@ lessons. Each invocation starts a fresh conversation with the saved knowledge.
 The first launch copies existing facts, notes, language and curve lessons,
 research records, pending lesson questions, and neuron feedback from `out/`
 into `.pi-profile/`. Rebuilding or removing the compiled binaries preserves
-those files. Repair history and standalone experimental outputs still use
+those files. Repair history is imported into the same profile on launch, including for an existing profile. Standalone experimental outputs still use
 `out/`. To refresh the launcher binary after editing the sources, run
 `./build.sh examples/native/chat.pi out/pi-chat` (Windows:
 `build.cmd examples/native/chat.pi out/pi-chat.exe`).
@@ -198,7 +200,7 @@ Build `examples/native/heed.pi` and `examples/native/chat.pi` and run chat
 from the checkout with Python 3 on PATH. Alternate `repair task slow` and
 `repair task fast` to run the two bundled resettable dispenser simulations.
 The Python driver from the research branch chooses a repair strategy from
-paired observation costs stored in `out/repair_history.sqlite`. Once both
+paired observation costs stored in `.pi-profile/repair_history.sqlite` when using the launcher (standalone runs without a profile use `out/repair_history.sqlite`). Once both
 diagnostic outcomes have enough support, it buys an early observation only
 when the observed savings would cover the cost. Chat reports the chosen
 strategy and the number of times the target was actually observed. The

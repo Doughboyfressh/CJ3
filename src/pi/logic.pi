@@ -1,0 +1,169 @@
+# A reasoning engine for Pi: facts and rules as data, answered by backward chaining.
+#   term     : text or number (a constant), text starting with "?" (a variable), or a list [relation, arg, ...]
+#   clause   : [head, [goal, ...]] -- a fact has no goals
+#   ask(kb, goal, limit) -> every proven instance of goal (up to limit)
+# Built-in goals: ["eq", a, b] (unify)  ["neq", a, b]  ["lt", a, b]  ["le", a, b]  ["add", a, b, c] (c = a+b)
+#   ["sub", a, b, c]  ["mul", a, b, c]  ["not", goal] (goal cannot be proven -- negation as failure)
+
+skill isvar(t) -> Any {
+  if typeof(t) != "text" { return false }
+  return slice(t, 0, 1) == "?"
+}
+
+# follow a variable through the bindings to what it stands for
+skill walk(t, s) -> Any {
+  let x = t
+  let going = true
+  while going {
+    if isvar(x) {
+      let v = s[x]
+      if v == null { let going = false } else { let x = v }
+    } else {
+      let going = false
+    }
+  }
+  return x
+}
+
+# extend bindings s so that a and b become the same term, or null if they cannot
+skill unify(a, b, s) -> Any {
+  if s == null { return null }
+  let a = walk(a, s)
+  let b = walk(b, s)
+  if isvar(a) {
+    if a == b { return s }
+    return put(s, a, b)
+  }
+  if isvar(b) { return put(s, b, a) }
+  if typeof(a) == "list" and typeof(b) == "list" {
+    if len(a) != len(b) { return null }
+    let s2 = s
+    for i in range(0, len(a)) {
+      let s2 = unify(a[i], b[i], s2)
+      if s2 == null { return null }
+    }
+    return s2
+  }
+  if a == b { return s }
+  return null
+}
+
+# a term with every bound variable replaced by its value
+skill resolve(t, s) -> Any {
+  let t = walk(t, s)
+  if typeof(t) == "list" {
+    let out = []
+    for x in t { let out = append(out, resolve(x, s)) }
+    return out
+  }
+  return t
+}
+
+# fresh variables for each use of a clause
+skill rename(t, n) -> Any {
+  if isvar(t) { return t ++ "_" ++ str(n) }
+  if typeof(t) == "list" {
+    let out = []
+    for x in t { let out = append(out, rename(x, n)) }
+    return out
+  }
+  return t
+}
+
+skill isnum(t) -> Any { return typeof(t) == "int" or typeof(t) == "real" }
+
+# built-in goals: a list of resulting bindings, or null if g is not a built-in
+skill builtin(g, s) -> Any {
+  if typeof(g) != "list" { return null }
+  let r = g[0]
+  if r == "eq" {
+    let s2 = unify(g[1], g[2], s)
+    if s2 == null { return [] }
+    return [s2]
+  }
+  if r == "neq" {
+    if resolve(g[1], s) == resolve(g[2], s) { return [] }
+    return [s]
+  }
+  if r == "lt" or r == "le" {
+    let a = resolve(g[1], s)
+    let b = resolve(g[2], s)
+    if isnum(a) == false or isnum(b) == false { return [] }
+    if r == "lt" and a < b { return [s] }
+    if r == "le" and a <= b { return [s] }
+    return []
+  }
+  if r == "add" or r == "sub" or r == "mul" {
+    let a = resolve(g[1], s)
+    let b = resolve(g[2], s)
+    if isnum(a) == false or isnum(b) == false { return [] }
+    let v = a + b
+    if r == "sub" { let v = a - b }
+    if r == "mul" { let v = a * b }
+    let s2 = unify(g[3], v, s)
+    if s2 == null { return [] }
+    return [s2]
+  }
+  return null
+}
+
+# prove goals left to right, depth-first; returns [list of bindings, clause counter]
+skill prove(goals, s, kb, depth, gen, limit) -> Any {
+  if len(goals) == 0 { return [[s], gen] }
+  if depth <= 0 { return [[], gen] }
+  let g = walk(goals[0], s)
+  let rest = slice(goals, 1, len(goals))
+  if typeof(g) == "list" {
+    if g[0] == "not" {
+      let r = prove([g[1]], s, kb, depth, gen, 1)
+      if len(r[0]) > 0 { return [[], r[1]] }
+      return prove(rest, s, kb, depth, r[1], limit)
+    }
+  }
+  let b = builtin(g, s)
+  if b != null {
+    let out = []
+    for s2 in b {
+      let r = prove(rest, s2, kb, depth, gen, limit - len(out))
+      let out = out ++ r[0]
+      let gen = r[1]
+      if len(out) >= limit { return [out, gen] }
+    }
+    return [out, gen]
+  }
+  let out = []
+  for clause in kb {
+    let gen = gen + 1
+    let c = rename(clause, gen)
+    let s2 = unify(g, c[0], s)
+    if s2 != null {
+      let r = prove(c[1] ++ rest, s2, kb, depth - 1, gen, limit - len(out))
+      let out = out ++ r[0]
+      let gen = r[1]
+      if len(out) >= limit { return [out, gen] }
+    }
+  }
+  return [out, gen]
+}
+
+# every proven instance of goal (at most limit), most direct first
+skill ask(kb, goal, limit) -> Any {
+  let r = prove([goal], {}, kb, 40, 0, limit)
+  let out = []
+  for s in r[0] { let out = append(out, resolve(goal, s)) }
+  return out
+}
+
+# is goal provable at all?
+skill holds(kb, goal) -> Any { return len(ask(kb, goal, 1)) > 0 }
+
+# the values a variable takes across the answers
+skill values_of(kb, goal, var) -> Any {
+  let r = prove([goal], {}, kb, 40, 0, 200)
+  let out = []
+  for s in r[0] {
+    let v = resolve(var, s)
+    if contains(out, v) == false { let out = append(out, v) }
+  }
+  return out
+}

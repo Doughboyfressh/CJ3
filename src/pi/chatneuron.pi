@@ -1,0 +1,41 @@
+import "chatprofile.pi"
+# One scalar recurrent state, shared across prediction domains. A surprise
+# has target 1, agreement has target 0. Updates and gating use fixed point.
+skill neuron_update(value,error) -> Any {
+  return (3*value + 1024*error + 2) // 4
+}
+
+skill neuron_start(st) -> Any {
+  if st["neuron_slot"] != null { return st }
+  let slot = rt_sw_ssd_alloc(8)
+  let value = 512
+  let log = read_file(chat_data("chat_neuron.log"))
+  if log != null {
+    for row in split(log,"\n") {
+      if row == "0" or row == "1" { let value = neuron_update(value,int(row)) }
+    }
+  }
+  if slot >= 0 { do rt_sw_ssd_put(slot,0,value) }
+  return put(st,"neuron_slot",slot)
+}
+
+skill neuron_observe(st,error) -> Any {
+  let slot = st["neuron_slot"]
+  if slot >= 0 {
+    let value = int(rt_sw_ssd_real(slot,0))
+    do rt_sw_ssd_put(slot,0,neuron_update(value,error))
+    if not rt_append_file(chat_data("chat_neuron.log"),str(error) ++ "\n") {
+      return put(st,"neuron_unsaved",true)
+    }
+  }
+  return st
+}
+
+skill neuron_gate(st) -> Any {
+  let slot = st["neuron_slot"]
+  if slot < 0 { return false }
+  let before = rt_sw_pg()
+  let value = int(rt_sw_ssd_real(slot,0))
+  # A cold 1024-cycle Softwell page read adds 1/8 to the probe threshold.
+  return value > 512 + (rt_sw_pg()-before) // 8
+}

@@ -1,0 +1,93 @@
+import "chatprofile.pi"
+skill MEMFILE() -> Any { return chat_data("brain_memory.txt") }
+
+skill mem_all() -> Any {
+  let t = read_file(MEMFILE())
+  if t == null { return [] }
+  let out = []
+  for ln in split(t, "\n") {
+    let x = trim(ln)
+    if len(x) > 0 and slice(x, 0, 1) != "#" { let out = append(out, x) }
+  }
+  return out
+}
+
+skill mem_add(note) -> Any {
+  let t = read_file(MEMFILE())
+  if t == null { let t = "# Pi's saved notes. One note per line.\n" }
+  let one = trim(join(split(note, "\n"), " "))
+  return write_file(MEMFILE(), t ++ one ++ "\n")
+}
+
+skill mem_stop() -> Any {
+  return ["the", "and", "for", "are", "was", "were", "that", "this", "with", "what", "which", "who", "how", "why", "when", "where", "from", "have", "has", "had", "you", "your", "not", "but", "can", "its", "into", "than", "then", "them", "they", "there", "their", "about", "would", "could", "should", "will", "does", "did", "all", "any", "some", "one", "two", "use", "let", "also", "more", "most", "such", "only", "very", "just", "our", "out", "too", "each", "other", "these", "those", "is", "of", "to", "in", "on", "at", "a", "an"]
+}
+
+skill mem_words(s) -> Any {
+  let out = []
+  let w = ""
+  for c in chars(lower(s)) ++ [" "] {
+    if contains("abcdefghijklmnopqrstuvwxyz0123456789", c) { let w = w ++ c } else {
+      if len(w) >= 3 and contains(mem_stop(), w) == false and contains(out, w) == false { let out = append(out, w) }
+      let w = ""
+    }
+  }
+  return out
+}
+
+skill mem_find(query, k) -> Any {
+  let notes = mem_all()
+  if len(notes) == 0 { return [] }
+  let q = mem_words(query)
+  let nw = []
+  for x in notes { let nw = append(nw, mem_words(x)) }
+  let scored = []
+  for i in range(0, len(notes)) {
+    let sc = 0.0
+    for w in q {
+      if contains(nw[i], w) {
+        let df = 0
+        for ws in nw {
+          if contains(ws, w) { let df = df + 1 }
+        }
+        let sc = sc + 1.0 / df
+      }
+    }
+    if sc > 0.0 { let scored = append(scored, [sc, i]) }
+  }
+  let best = []
+  for t in range(0, k) {
+    let bi = 0 - 1
+    for j in range(0, len(scored)) {
+      if contains(best, scored[j][1]) == false {
+        if bi < 0 { let bi = j } else {
+          if scored[j][0] > scored[bi][0] or (scored[j][0] == scored[bi][0] and scored[j][1] > scored[bi][1]) { let bi = j }
+        }
+      }
+    }
+    if bi >= 0 { let best = append(best, scored[bi][1]) }
+  }
+  let out = []
+  for i in best { let out = append(out, notes[i]) }
+  return out
+}
+
+skill note_command(save, text) -> Any {
+  if save {
+    if mem_add(text) == null { return "could not save note to " ++ MEMFILE() }
+    return "saved (" ++ str(len(mem_all())) ++ " notes)"
+  }
+  let found = mem_find(text,5)
+  if len(found) == 0 { return "no notes about that" }
+  return join(found,"\n")
+}
+
+skill chat_note(line) -> Any {
+  let text = lower(line)
+  for prefix in ["remember that ","remember ","recall my note about ","recall "] {
+    if slice(text,0,len(prefix)) == prefix {
+      return note_command(slice(prefix,0,8) == "remember",slice(line,len(prefix),len(line)))
+    }
+  }
+  return null
+}

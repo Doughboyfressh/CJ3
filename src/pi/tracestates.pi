@@ -1,0 +1,209 @@
+# Observation-table inference for deterministic binary-output processes.
+# Rows are prefixes; columns are suffix experiments. A missing cell is a
+# membership query to the caller. No simulator is available in this module.
+skill ts_key(trace) -> Any { return join(trace," ") }
+
+skill ts_signature(prefix,suffixes,labels) -> Any {
+  let bits = []
+  for suffix in suffixes {
+    let key = ts_key(prefix ++ suffix)
+    if labels[key] == null { return [null,key] }
+    bits = append(bits,labels[key])
+  }
+  return [bits,null]
+}
+
+# Conformance experiments from a state cover, middle words and a
+# distinguishing suffix set. The caller supplies a bound on hidden states.
+skill ts_check(alphabet,prefixes,suffixes,labels,bound) -> Any {
+  if bound > 50000 { return "Conformance search budget exceeded." }
+  if len(prefixes) > bound { return "State bound contradicted by observations." }
+  let words = [[]]
+  let checks = 0
+  let depth = 0
+  while depth <= bound-len(prefixes)+1 {
+    for word in words {
+      for prefix in prefixes {
+        for suffix in suffixes {
+          let key = ts_key(prefix ++ word ++ suffix)
+          if labels[key] == null { return "observe " ++ key }
+          checks = checks+1
+          if checks > 50000 { return "Conformance search budget exceeded." }
+        }
+      }
+    }
+    if depth < bound-len(prefixes)+1 {
+      if len(words)*len(alphabet) > 50000 { return "Conformance search budget exceeded." }
+      let next = []
+      for word in words {
+        for symbol in alphabet { next = append(next,append(word,symbol)) }
+      }
+      words = next
+    }
+    depth = depth+1
+  }
+  return null
+}
+
+# Search the learned transition graph for a shortest input sequence that
+# achieves a requested output after an already-observed prefix.
+skill ts_plan(alphabet,transitions,outputs,start,goal) -> Any {
+  let queue = [[start,[]]]
+  let seen = put({},str(start),true)
+  let i = 0
+  while i < len(queue) {
+    let state = queue[i][0]
+    let path = queue[i][1]
+    if outputs[str(state)] == goal { return "plan" ++ if len(path) == 0 { "" } else { " " ++ ts_key(path) } }
+    for symbol in alphabet {
+      let next = transitions[str(state) ++ " " ++ symbol]
+      if seen[str(next)] == null {
+        queue = append(queue,[next,append(path,symbol)])
+        seen = put(seen,str(next),true)
+      }
+    }
+    i = i+1
+  }
+  return "Goal unreachable in learned model."
+}
+
+skill ts_infer(alphabet,traces,labels,query,bound,goal,focused) -> Any {
+  let prefixes = [[]]
+  let suffixes = [[]]
+  while true {
+    let signatures = {}
+    let transitions = {}
+    let outputs = {}
+    let i = 0
+    while i < len(prefixes) {
+      let prefix = prefixes[i]
+      let row = ts_signature(prefix,suffixes,labels)
+      if row[0] == null { return "observe " ++ row[1] }
+      signatures = put(signatures,str(row[0]),i)
+      outputs = put(outputs,str(i),row[0][0])
+      i = i+1
+    }
+    i = 0
+    while i < len(prefixes) {
+      for symbol in alphabet {
+        let extension = append(prefixes[i],symbol)
+        let row = ts_signature(extension,suffixes,labels)
+        if row[0] == null { return "observe " ++ row[1] }
+        let key = str(row[0])
+        let target = signatures[key]
+        if target == null {
+          target = len(prefixes)
+          prefixes = append(prefixes,extension)
+          signatures = put(signatures,key,target)
+          outputs = put(outputs,str(target),row[0][0])
+        }
+        transitions = put(transitions,str(i) ++ " " ++ symbol,target)
+      }
+      i = i+1
+    }
+    let counterexample = null
+    for trace in traces {
+      if counterexample == null {
+        let state = ts_follow(transitions,trace)
+        if outputs[str(state)] != labels[ts_key(trace)] { counterexample = trace }
+      }
+    }
+    if counterexample == null {
+      if bound != null {
+        let check = ts_check(alphabet,prefixes,suffixes,labels,bound)
+        if check != null { return check }
+      }
+      if goal != null { return ts_plan(alphabet,transitions,outputs,ts_follow(transitions,query),goal) }
+      if query == null {
+        let lines = ["consistent states " ++ str(len(prefixes))]
+        for state in range(0,len(prefixes)) {
+          let cells = [str(outputs[str(state)])]
+          for symbol in alphabet {
+            cells = append(cells,str(transitions[str(state) ++ " " ++ symbol]))
+          }
+          lines = append(lines,join(cells," "))
+        }
+        return join(lines,"\n")
+      }
+      return "predict " ++ str(outputs[str(ts_follow(transitions,query))])
+    }
+    if focused {
+      # H(i) runs the remaining suffix from the access trace of the state
+      # predicted after i events. H(0) is the observed label and H(n) the
+      # disagreeing prediction. Adjacent unequal labels isolate a bad merge.
+      let lo = 0
+      let hi = len(counterexample)
+      let initial = labels[ts_key(counterexample)]
+      while hi-lo > 1 {
+        let mid = (lo+hi) // 2
+        let state = ts_follow(transitions,slice(counterexample,0,mid))
+        let key = ts_key(prefixes[state] ++ slice(counterexample,mid,len(counterexample)))
+        if labels[key] == null { return "observe " ++ key }
+        if labels[key] == initial { lo = mid } else { hi = mid }
+      }
+      let suffix = slice(counterexample,hi,len(counterexample))
+      if contains(suffixes,suffix) { return "Counterexample did not separate model states." }
+      suffixes = append(suffixes,suffix)
+    } else {
+      # A wrong trace separates at least two histories previously represented
+      # by the same state. Its suffixes supply the distinguishing experiments.
+      for start in range(0,len(counterexample)) {
+        let suffix = slice(counterexample,start,len(counterexample))
+        if not contains(suffixes,suffix) { suffixes = append(suffixes,suffix) }
+      }
+    }
+  }
+}
+
+skill ts_follow(transitions,trace) -> Any {
+  let state = 0
+  for symbol in trace { state = transitions[str(state) ++ " " ++ symbol] }
+  return state
+}
+
+skill ts_command(path,request,bound,goal) -> Any {
+  return ts_read(path,request,bound,goal,false)
+}
+
+skill ts_read(path,request,bound,goal,focused) -> Any {
+  if path == null { return "Usage: heed states FILE [space-separated trace]" }
+  return ts_parse(read_file(path),request,bound,goal,focused)
+}
+
+skill ts_observations(raw,request,bound,goal) -> Any {
+  return ts_parse(raw,request,bound,goal,false)
+}
+
+skill ts_parse(raw,request,bound,goal,focused) -> Any {
+  if raw == null or raw == "" { return "Missing trace file." }
+  let lines = split(raw,"\n")
+  let header = split(trim(lines[0])," ")
+  if len(header) < 2 or header[0] != "events" { return "Expected events header." }
+  let alphabet = []
+  for symbol in slice(header,1,len(header)) {
+    if symbol == "" or contains(alphabet,symbol) { return "Invalid alphabet." }
+    alphabet = append(alphabet,symbol)
+  }
+  let traces = []
+  let labels = {}
+  for line in slice(lines,1,len(lines)) {
+    let clean = trim(line)
+    if clean != "" {
+      let fields = split(clean," ")
+      if fields[0] != "0" and fields[0] != "1" { return "Invalid trace outcome." }
+      let trace = slice(fields,1,len(fields))
+      for symbol in trace { if not contains(alphabet,symbol) { return "Unknown event." } }
+      let key = ts_key(trace)
+      let label = if fields[0] == "1" { 1 } else { 0 }
+      if labels[key] != null and labels[key] != label { return "Conflicting trace outcomes." }
+      if labels[key] == null { traces = append(traces,trace) }
+      labels = put(labels,key,label)
+    }
+  }
+  let query = if goal == null { null } else { [] }
+  if request != null {
+    query = if request == "" { [] } else { split(request," ") }
+    for symbol in query { if not contains(alphabet,symbol) { return "Unknown event." } }
+  }
+  return ts_infer(alphabet,traces,labels,query,bound,goal,focused)
+}

@@ -110,6 +110,11 @@ fi
   cmp shapes.expect shapes.txt
   ln -s "$root/examples" examples
   ln -s "$root/out/t_g2" out/pic
+  printf '%s\n' 'investigate on your own' | ./chat > discovery.txt
+  grep -Fx 'Saved (x * 2) after checking six reserved inputs.' discovery.txt
+  [ "$(./ask 'use discovery on 7')" = '(x * 2) at 7 = 14' ]
+  ./ask 'investigate on your own' > next-discovery.txt
+  grep -Fx 'Saved ((x + 3))^2 after checking six reserved inputs.' next-discovery.txt
   printf '%s\n' 'events on' '0' '1 on' '1 on on' > light.obs
   printf '%s\n' 'Demo? ||| Juniper ||| local ||| Telescope log' > out/research.kb
   printf '%s\n' 'Remember that Juniper is a telescope.' 'Teach language dax => RED' 'Teach language dax twice => RED RED' 'Teach language lug => BLUE' 'Teach language lug twice => BLUE BLUE' 'Teach language zup => GREEN' | ./chat >/dev/null

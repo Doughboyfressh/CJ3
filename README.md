@@ -36,6 +36,17 @@ those files. Repair history is imported into the same profile on launch, includi
 `./build.sh examples/native/chat.pi out/pi-chat` (Windows:
 `build.cmd examples/native/chat.pi out/pi-chat.exe`).
 
+## Autonomous investigation
+
+Say `investigate on your own` to start one experiment in Pi’s integer-program
+world. Pi generates a hidden arithmetic program, ranks inputs by disagreement
+among 584 candidate programs, and observes the result of each selected input.
+When the survivors agree across the probe range, it checks the shortest survivor
+on six reserved inputs and saves a passing rule. Say `use discovery on 7` to
+evaluate the last saved rule. Another investigation advances the generator to
+a new episode. The experiment language and the probe-selection criterion are
+supplied by the software.
+
 ## Native chat
 
 Build `examples/native/chat.pi` and `examples/native/ask.pi` with the build

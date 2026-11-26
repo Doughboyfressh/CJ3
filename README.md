@@ -126,6 +126,19 @@ meets the goal. The inferred model and its observations belong to this chat
 session; `Cancel plan` clears them. When starting from a trace file, chat
 holds a snapshot and keeps subsequent answers in the session.
 
+Try `Find a way to turn on studio lamp.` in ordinary chat. The planner
+gets the available controls from a local simulated instrument. Whenever
+it needs a reading missing from the research notebook, it resets the
+simulator, replays its chosen sequence, and feeds the measured bit back
+into the pending plan. Chat displays the probes and returns `plan brighten`.
+Ask `Why will that work?` to see the observation supporting the action.
+
+Simulated instruments live in `examples/native/benches/`. For example,
+`studio-lamp.bench` starts with `reset dark`. Each following row gives
+a state, its binary reading, and pairs of event and destination names.
+A turn can run up to 32 new probes. An unavailable reading or conflicting
+notebook evidence leaves the planner's question open.
+
 Say `Find a way to turn on lamp A.` to start a named plan. Pi treats
 `on` as the available event and 1 as the desired outcome (`off` uses 0).
 To specify other actions, say `Plan goal 1 for lamp A using events press reset`.

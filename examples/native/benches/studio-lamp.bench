@@ -1,0 +1,3 @@
+reset dark
+dark 0 dim dark brighten lit
+lit 1 dim dark brighten lit

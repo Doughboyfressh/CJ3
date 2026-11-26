@@ -1,4 +1,5 @@
 import "chatprofile.pi"
+import "chatbench.pi"
 import "goalrequest.pi"
 import "tracestates.pi"
 
@@ -177,12 +178,20 @@ skill chat_follow_goal(turn) -> Any {
   if request == null or request["subject"] == null { return turn }
   let subject = request["subject"]
   let known = chat_known_outcomes(subject)
+  let bench = chat_bench(subject)
+  let probes = 0
   let findings = []
   while st["goal_request"] != null {
     let request = st["goal_request"]
     let q = request["question"]
     let item = known[research_key(q)]
-    if item == null { break }
+    if item == null {
+      if probes >= 32 { break }
+      let item = chat_bench_probe(bench,request["context"])
+      if item == null { break }
+      let known = put(known,research_key(q),item)
+      let probes = probes+1
+    }
     if item[0] == "conflict" {
       let findings = append(findings,"Sources disagree: " ++ q)
       break
@@ -245,7 +254,10 @@ skill chat_goal_turn(st,line) -> Any {
     if ends(subject,".") or ends(subject,"?") { let subject = trim(slice(subject,0,len(subject)-1)) }
     if subject == "" { return ["Which system should I plan for?",st,false] }
     let goal = if action == "on" { "1" } else { "0" }
-    let command = "plan goal " ++ goal ++ " using events " ++ action
+    let bench = chat_bench(subject)
+    let events = action
+    if bench != null and len(bench[3]) > 0 { let events = join(bench[3]," ") }
+    let command = "plan goal " ++ goal ++ " using events " ++ events
     break
   }
   if slice(text,0,10) == "plan goal " and contains(text," for ") and not contains(text," | ") {

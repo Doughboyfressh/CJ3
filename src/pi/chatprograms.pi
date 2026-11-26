@@ -77,6 +77,8 @@ skill chat_run(name,args) -> Any {
 
 skill chat_program_turn(line) -> Any {
   let text = lower(line)
+  if text == "investigate on your own" { return chat_run("investigate",[]) }
+  if slice(text,0,17) == "use discovery on " { return chat_run("investigate",["use",trim(slice(text,17,len(text)))]) }
   let language = chat_language(line)
   if language != null { return language }
   if text == "list programs" or text == "list programs." { return chat_programs() }

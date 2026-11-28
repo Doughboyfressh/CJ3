@@ -133,6 +133,15 @@ simulator, replays its chosen sequence, and feeds the measured bit back
 into the pending plan. Chat displays the probes and returns `plan brighten`.
 Ask `Why will that work?` to see the observation supporting the action.
 
+Try “The studio lamp is dark. How can I light it?” or “It’s stuffy in here.
+Can you get the air moving?” on one line. The effect catalog in
+`examples/native/benches/outcomes.txt` links request phrases to a device
+and desired sensor reading. It contains no plans. Chat can also interpret
+a taught phrase that resolves to a catalog phrase. The fan requires
+two controls in sequence. When the initial model predicts the goal is
+unreachable on a simulated bench, Pi tries further observation-table
+checks within its probe budget.
+
 Simulated instruments live in `examples/native/benches/`. For example,
 `studio-lamp.bench` starts with `reset dark`. Each following row gives
 a state, its binary reading, and pairs of event and destination names.

@@ -1,0 +1,4 @@
+reset idle
+idle 0 enable armed spin idle
+armed 0 enable armed spin moving
+moving 1 enable armed spin moving

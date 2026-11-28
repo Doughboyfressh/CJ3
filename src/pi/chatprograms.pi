@@ -240,6 +240,47 @@ skill chat_plan_reason(st) -> Any {
   return reason
 }
 
+# Match a requested effect to a sensor reading. The catalog describes what
+# each reading means; only the simulator knows how to reach it.
+skill chat_effect_goal(st,line) -> Any {
+  let sentences = split(research_key(line),".")
+  let request = trim(sentences[len(sentences)-1])
+  let intent = null
+  for prefix in ["can you ","how can i ","how do i ","please "] {
+    if slice(request,0,len(prefix)) == prefix {
+      let intent = trim(slice(request,len(prefix),len(request)))
+      break
+    }
+  }
+  if intent == null or intent == "" { return null }
+  let context = " " ++ trim(join(slice(sentences,0,len(sentences)-1)," ")) ++ " "
+  let catalog = read_file("examples/native/benches/outcomes.txt")
+  if catalog == null { return null }
+  let rows = []
+  let named = []
+  for row in split(catalog,"\n") {
+    let fields = split(trim(row)," | ")
+    if len(fields) != 3 or not contains(["0","1"],fields[1]) { continue }
+    let rows = append(rows,fields)
+    if contains(context," " ++ fields[0] ++ " ") and not contains(named,fields[0]) {
+      let named = append(named,fields[0])
+    }
+  }
+  let meaning = chat_meaning(intent)
+  let matches = []
+  for fields in rows {
+    if fields[2] != intent and fields[2] != meaning { continue }
+    if len(named) > 0 and not contains(named,fields[0]) { continue }
+    if contains(split(fields[2]),"it") and len(named) == 0 {
+      if trim(context) != "" or st["plan_subject"] != fields[0] { continue }
+    }
+    let pair = [fields[0],fields[1]]
+    if not contains(matches,pair) { let matches = append(matches,pair) }
+  }
+  if len(matches) == 1 { return matches[0] }
+  return null
+}
+
 skill chat_goal_turn(st,line) -> Any {
   let text = lower(line)
   if contains(["why will that work","why will that action work","why will that plan work","explain the plan"],research_key(line)) {
@@ -247,6 +288,7 @@ skill chat_goal_turn(st,line) -> Any {
   }
   let subject = null
   let command = line
+  let desired = chat_effect_goal(st,line)
   for action in ["on","off"] {
     let prefix = "find a way to turn " ++ action ++ " "
     if slice(text,0,len(prefix)) != prefix { continue }
@@ -254,11 +296,15 @@ skill chat_goal_turn(st,line) -> Any {
     if ends(subject,".") or ends(subject,"?") { let subject = trim(slice(subject,0,len(subject)-1)) }
     if subject == "" { return ["Which system should I plan for?",st,false] }
     let goal = if action == "on" { "1" } else { "0" }
-    let bench = chat_bench(subject)
-    let events = action
-    if bench != null and len(bench[3]) > 0 { let events = join(bench[3]," ") }
-    let command = "plan goal " ++ goal ++ " using events " ++ events
+    let desired = [subject,goal]
     break
+  }
+  if desired != null {
+    let subject = desired[0]
+    let bench = chat_bench(subject)
+    let events = if desired[1] == "1" { "on" } else { "off" }
+    if bench != null and len(bench[3]) > 0 { let events = join(bench[3]," ") }
+    let command = "plan goal " ++ desired[1] ++ " using events " ++ events
   }
   if slice(text,0,10) == "plan goal " and contains(text," for ") and not contains(text," | ") {
     let words = split(text)
@@ -370,7 +416,11 @@ skill chat_plan_start(st,line,subject) -> Any {
     }
     if goal != 0 and goal != 1 { return ["Give a binary goal (0 or 1).",st,false] }
   } else { return null }
-  if current == null { let st = put(st,"plan_subject",subject) }
+  if current == null {
+    let st = put(st,"plan_subject",subject)
+    let simulated = subject != null and chat_bench(subject) != null
+    let st = put(st,"plan_simulated",simulated)
+  }
   return chat_plan_advance(st,raw,goal,prefix,null,false)
 }
 
@@ -398,7 +448,7 @@ skill chat_plan_observed(st,request,bit) -> Any {
 skill chat_plan_advance(st,raw,goal,prefix,witness,probed) -> Any {
   let expected = null
   let answer = if witness == null { ts_observations(raw,prefix,null,goal) } else { witness }
-  if answer == "Goal unreachable in learned model." and not probed and neuron_gate(st) {
+  if answer == "Goal unreachable in learned model." and (st["plan_simulated"] or (not probed and neuron_gate(st))) {
     let check = ts_observations(raw,prefix,2,goal)
     if slice(check,0,8) == "observe " {
       let answer = check

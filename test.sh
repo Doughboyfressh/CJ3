@@ -204,6 +204,10 @@ fi
   ./chat memory lessons teach "sum of ravels" 2,3 10 >/dev/null
   "$root/out/t_heed" memory lessons teach "product of ravels" 2,3 24 >/dev/null
   [ "$(./chat memory lessons use "product of ravels" 3,5,7)" = "840" ]
+  printf '%s\n' 'The studio lamp is dark. How can I light it?' "It's stuffy in here. Can you get the air moving?" 'Why will that work?' | ./chat > effect-plan.txt
+  grep -Fx 'plan brighten' effect-plan.txt
+  grep -Fx 'plan enable spin' effect-plan.txt
+  grep -Fx 'For desk fan: At reset the recorded outcome was 0. The recorded outcome after enable spin from reset was 1, which matches the goal.' effect-plan.txt
 )
 if [ "$?" = 0 ]; then echo "ok   native chat and ask share persistent facts"; else echo "FAIL native dialogue integration"; fail=1; fi
 if [ "$fail" = 0 ]; then echo "ALL PASS: fixpoint and $n programs"; exit 0; fi
